@@ -1,0 +1,638 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; scanner — ported from the reference's internal/scanner/scanner.go.
+;
+; SLICE 1. What is ported and what is not is listed at `unported_pos` below, and
+; the omissions are LOUD rather than silent: the scanner records the position of
+; the first construct it cannot handle and answers KindUnknown, so a fixture
+; containing one is reported as UNPORTED instead of producing a plausible token
+; stream that quietly disagrees with the reference.
+;
+; ── Three things measured rather than assumed, because getting any of them wrong
+; ── would have been silent:
+;
+; (1) `char()` answers a BYTE, not a decoded rune. The reference writes
+;     `rune(s.text[s.pos])`, which takes one byte and widens it — every case
+;     label in its switch is ASCII, and only the default arm decodes UTF-8. A
+;     port that "helpfully" decodes here would change how many positions a
+;     multi-byte character advances and desynchronize every span after it.
+;
+; (2) Scaly's `char` does NOT sign-extend: byte 0xC3 widens to 195, not -61
+;     (measured). That is what makes the reference's -1 EOF sentinel portable —
+;     with sign extension, a byte >= 0x80 would collide with it.
+;
+; (3) The dispatch is a run of INDEPENDENT `if` blocks that return, not an
+;     `else if` chain. A chain nests one planner level per arm at roughly 110 KB
+;     of planner stack per arm under the unoptimized bootstrap stages (root
+;     CLAUDE.md), and this switch has about forty arms. Independent ifs are also
+;     exactly equivalent here: the reference's arms are disjoint by construction,
+;     since each tests the same `ch` against a distinct literal.
+;
+; ── One deliberate simplification, stated rather than hidden: this slice keeps
+; no `tokenValue`. The reference stores one so a literal's PARSED value (escapes
+; decoded) can differ from its source text. For every construct ported here the
+; two are equal, so the value is exactly text[token_start..pos] and the caller
+; can slice it. It comes back with the literals, which is where it starts to
+; carry information.
+
+use scaly.containers.String
+
+; The reference embeds this in Scanner so Mark()/Rewind() can save and restore
+; the whole mutable block as one value (the parser speculates in JSDoc). Go's
+; embedding also promotes the fields, which is why the reference writes `s.pos`;
+; here it is a named field, so the save/restore intent is visible at every use
+; instead of only at Mark(). Our own compiler's lexer arrived at the same shape
+; independently (`LexerState` in scalyc/compiler/lexer.scaly), which is a decent
+; sign it is the right one.
+define ScannerState
+(
+    pos: int
+    full_start_pos: int
+    token_start: int
+    token: int
+    token_flags: int
+)
+{
+    init(p: int, fsp: int, ts: int, tk: int, tf: int)
+    {
+        set pos: p
+        set full_start_pos: fsp
+        set token_start: ts
+        set token: tk
+        set token_flags: tf
+    }
+}
+
+define Scanner
+(
+    buffer: pointer[char]
+    end: int
+    skip_trivia: bool
+
+    ; Position of the first construct this slice does not implement, or -1.
+    ; NOT part of the reference — it exists so an incomplete port reports its own
+    ; incompleteness instead of emitting a well-formed wrong answer.
+    ;
+    ; Not implemented yet: string literals, template literals, numeric literals,
+    ; regular expressions, identifiers written with unicode escapes, private
+    ; names and the shebang (`#`), conflict-marker trivia, the JSX language
+    ; variant, non-ASCII identifiers, and the JSDoc machinery (comment
+    ; directives, leading-asterisk skipping, tag scanning).
+    unported_pos: int
+
+    state: ScannerState
+)
+{
+    init(source: String)
+    {
+        set buffer: source.get_buffer()
+        set end: source.length() as int
+        set skip_trivia: true
+        set unported_pos: 0 - 1
+        set state: ScannerState(0, 0, 0, KindUnknown, TokenFlagsNone)
+    }
+
+    ; ── character access ────────────────────────────────────────────────────
+    ; Both answer -1 past the end, exactly as the reference does.
+
+    function char(this) returns int
+    {
+        if state.pos < end
+            return *(buffer + state.pos) as int
+        0 - 1
+    }
+
+    function char_at(this, offset: int) returns int
+    {
+        let p state.pos + offset
+        if p < end
+            return *(buffer + p) as int
+        0 - 1
+    }
+
+    function is_digit(c: int) returns bool
+        (c >= ("0" as char) as int) and (c <= ("9" as char) as int)
+
+    function is_line_break(c: int) returns bool
+        (c = ("\n" as char) as int) or (c = ("\r" as char) as int)
+
+    ; An identifier's first byte, ASCII fast path only (reference: scanIdentifier).
+    function is_ident_start_ascii(c: int) returns bool
+    {
+        if (c >= ("a" as char) as int) and (c <= ("z" as char) as int)
+            return true
+        if (c >= ("A" as char) as int) and (c <= ("Z" as char) as int)
+            return true
+        if c = ("_" as char) as int
+            return true
+        c = ("$" as char) as int
+    }
+
+    function is_ident_part_ascii(c: int) returns bool
+    {
+        if is_ident_start_ascii(c)
+            return true
+        is_digit(c)
+    }
+
+    ; ── accessors ───────────────────────────────────────────────────────────
+    ;
+    ; These mirror the reference's Token()/TokenStart()/TokenEnd()/TokenFlags()/
+    ; TokenFullStart(), and porting them is not decoration: reaching into
+    ; `scanner.state.token_start` from another package is `Emitter: member not
+    ; found: ScannerState.token_start`, exit 16 — a by-value struct nested in a
+    ; struct is not laid out in a root that never declared it. So the shape the
+    ; reference already had is also the shape that works here.
+
+    function token(this) returns int
+        state.token
+
+    function token_start(this) returns int
+        state.token_start
+
+    ; The reference's TokenEnd() is the scan position — a token ends where the
+    ; scanner stopped.
+    function token_end(this) returns int
+        state.pos
+
+    function token_full_start(this) returns int
+        state.full_start_pos
+
+    function token_flags(this) returns int
+        state.token_flags
+
+    ; The first position this slice could not scan, or -1.
+    function unported_at(this) returns int
+        unported_pos
+
+    ; True once scan() has answered end-of-file.
+    ;
+    ; This exists because a module-level `define` constant of one package is NOT
+    ; visible from another (root CLAUDE.md: export the VALUE behind an entry
+    ; point, never a cross-package constant) — and that includes a program root,
+    ; where `k = KindEndOfFile` is a hard `unknown identifier` even with the
+    ; `use` the diagnostic suggests. Every caller outside this package needs the
+    ; question answered rather than the constant exported, so the question is
+    ; what is exported. The alternative — writing the literal 1 at each call
+    ; site — is the same magic number the Kind file exists to abolish.
+    function at_eof(this) returns bool
+        state.token = KindEndOfFile
+
+    ; ── JSDoc tag detection ─────────────────────────────────────────────────
+    ;
+    ; The reference's hasJSDocTag/scanJSDocCommentForTags. This is NOT JSDoc
+    ; parsing — it is a byte scan over the comment that answers two questions
+    ; (does it carry @deprecated; does it carry @see/@link) and sets two flags
+    ; on the token that FOLLOWS the comment. Small, self-contained and exact, so
+    ; it is ported rather than deferred with the rest of the JSDoc machinery.
+    ;
+    ; Note the flags land on the next token: token_flags is cleared once per
+    ; scan() call, not once per loop iteration, so a comment consumed as trivia
+    ; leaves its marks behind. That is what makes a JSDoc comment observable at
+    ; all when skip_trivia is on.
+
+    ; The reference's hasJSDocTag for ONE tag: `text` starts just past the `@`,
+    ; and the tag must be followed by the comment's end or a delimiter.
+    function jsdoc_tag_at(buf: pointer[char], from: int, limit: int, tag: pointer[const_char], taglen: int) returns bool
+    {
+        if from + taglen > limit
+            return false
+        var i: int 0
+        while i < taglen
+        {
+            if (*(buf + from + i) as int) <> (*(tag + i) as int)
+                return false
+            set i: i + 1
+        }
+        if from + taglen = limit
+            return true
+        let c *(buf + from + taglen) as int
+        if (c = 32) or (c = 9) or (c = 10) or (c = 13)
+            return true
+        if c = ("}" as char) as int
+            return true
+        c = ("*" as char) as int
+    }
+
+    procedure scan_jsdoc_for_tags(this, start: int, limit: int)
+    {
+        let both TokenFlagsPrecedingJSDocWithDeprecated | TokenFlagsPrecedingJSDocWithSeeOrLink
+        var p: int start
+        repeat
+        {
+            var at: int 0 - 1
+            var i: int p
+            while i < limit
+            {
+                if (*(buffer + i) as int) = ("@" as char) as int
+                {
+                    set at: i
+                    break
+                }
+                set i: i + 1
+            }
+            if at < 0
+                return
+            set p: at + 1
+
+            ; NOTE the parentheses around every flag test. `&` has precedence 5
+            ; and `=` has 6, so `flags & F = 0` parses as `flags & (F = 0)` —
+            ; the root CLAUDE.md records the same trap for `xor`.
+            if (state.token_flags & TokenFlagsPrecedingJSDocWithDeprecated) = 0
+            {
+                if jsdoc_tag_at(buffer, p, limit, "deprecated", 10)
+                    set state.token_flags: state.token_flags | TokenFlagsPrecedingJSDocWithDeprecated
+            }
+
+            if (state.token_flags & TokenFlagsPrecedingJSDocWithSeeOrLink) = 0
+            {
+                var seen: bool false
+                if jsdoc_tag_at(buffer, p, limit, "see", 3)
+                    set seen: true
+                if jsdoc_tag_at(buffer, p, limit, "link", 4)
+                    set seen: true
+                if jsdoc_tag_at(buffer, p, limit, "linkcode", 8)
+                    set seen: true
+                if jsdoc_tag_at(buffer, p, limit, "linkplain", 9)
+                    set seen: true
+                if seen
+                    set state.token_flags: state.token_flags | TokenFlagsPrecedingJSDocWithSeeOrLink
+            }
+
+            if (state.token_flags & both) = both
+                return
+        }
+    }
+
+    ; ── the token this slice cannot produce ─────────────────────────────────
+
+    procedure unported(this) returns int
+    {
+        if unported_pos < 0
+            set unported_pos: state.pos
+        set state.token: KindUnknown
+        KindUnknown
+    }
+
+    ; ── the scan loop ───────────────────────────────────────────────────────
+    ;
+    ; Structured as the reference's: set the full start, clear the flags, then
+    ; loop — trivia that is being skipped `continue`s, everything else returns.
+
+    procedure scan(this) returns int
+    {
+        set state.full_start_pos: state.pos
+        set state.token_flags: TokenFlagsNone
+
+        repeat
+        {
+            let ch this.char()
+            set state.token_start: state.pos
+
+            ; end of file
+            if ch < 0
+            {
+                set state.token: KindEndOfFile
+                return KindEndOfFile
+            }
+
+            ; ── trivia ──────────────────────────────────────────────────────
+
+            ; horizontal whitespace: tab, vertical tab, form feed, space
+            if (ch = 9) or (ch = 11) or (ch = 12) or (ch = 32)
+            {
+                set state.pos: state.pos + 1
+                if skip_trivia
+                    continue
+                while true
+                {
+                    let c2 this.char()
+                    if not ((c2 = 9) or (c2 = 11) or (c2 = 12) or (c2 = 32))
+                        break
+                    set state.pos: state.pos + 1
+                }
+                set state.token: KindWhitespaceTrivia
+                return KindWhitespaceTrivia
+            }
+
+            ; line breaks. The flag is set BEFORE the skip test, because it
+            ; describes the token that follows and must survive skipping.
+            if is_line_break(ch)
+            {
+                set state.token_flags: state.token_flags | TokenFlagsPrecedingLineBreak
+                if skip_trivia
+                {
+                    set state.pos: state.pos + 1
+                    ; The reference collapses the whole following run of spaces
+                    ; and \t..\r here in one pass.
+                    while true
+                    {
+                        let c2 this.char()
+                        if not ((c2 = 32) or ((c2 >= 9) and (c2 <= 13)))
+                            break
+                        set state.pos: state.pos + 1
+                    }
+                    continue
+                }
+                if (ch = ("\r" as char) as int) and (this.char_at(1) = ("\n" as char) as int)
+                    set state.pos: state.pos + 2
+                if not ((ch = ("\r" as char) as int) and (this.char_at(1) = ("\n" as char) as int))
+                    set state.pos: state.pos + 1
+                set state.token: KindNewLineTrivia
+                return KindNewLineTrivia
+            }
+
+            ; ── comments, and the slash operators that share the character ──
+
+            if ch = ("/" as char) as int
+            {
+                ; single-line comment
+                if this.char_at(1) = ("/" as char) as int
+                {
+                    set state.pos: state.pos + 2
+                    while true
+                    {
+                        let c2 this.char()
+                        if c2 < 0
+                            break
+                        if is_line_break(c2)
+                            break
+                        set state.pos: state.pos + 1
+                    }
+                    if skip_trivia
+                        continue
+                    set state.token: KindSingleLineCommentTrivia
+                    return KindSingleLineCommentTrivia
+                }
+
+                ; multi-line comment
+                if this.char_at(1) = ("*" as char) as int
+                {
+                    set state.pos: state.pos + 2
+                    ; `/**` opens JSDoc — but `/**/` does not, which is why the
+                    ; reference tests the character AFTER the second asterisk.
+                    let is_jsdoc (this.char() = ("*" as char) as int) and (this.char_at(1) <> ("/" as char) as int)
+                    var closed: bool false
+                    while true
+                    {
+                        let c2 this.char()
+                        if c2 < 0
+                            break
+                        if (c2 = ("*" as char) as int) and (this.char_at(1) = ("/" as char) as int)
+                        {
+                            set state.pos: state.pos + 2
+                            set closed: true
+                            break
+                        }
+                        set state.pos: state.pos + 1
+                        if is_line_break(c2)
+                            set state.token_flags: state.token_flags | TokenFlagsPrecedingLineBreak
+                    }
+                    if is_jsdoc
+                    {
+                        set state.token_flags: state.token_flags | TokenFlagsPrecedingJSDocComment
+                        this.scan_jsdoc_for_tags(state.token_start, state.pos)
+                    }
+                    if skip_trivia
+                        continue
+                    if not closed
+                        set state.token_flags: state.token_flags | TokenFlagsUnterminated
+                    set state.token: KindMultiLineCommentTrivia
+                    return KindMultiLineCommentTrivia
+                }
+
+                if this.char_at(1) = ("=" as char) as int
+                {
+                    set state.pos: state.pos + 2
+                    set state.token: KindSlashEqualsToken
+                    return KindSlashEqualsToken
+                }
+                set state.pos: state.pos + 1
+                set state.token: KindSlashToken
+                return KindSlashToken
+            }
+
+            ; ── one-character punctuation ───────────────────────────────────
+
+            if ch = ("(" as char) as int
+                return this.punct1(KindOpenParenToken)
+            if ch = (")" as char) as int
+                return this.punct1(KindCloseParenToken)
+            if ch = ("[" as char) as int
+                return this.punct1(KindOpenBracketToken)
+            if ch = ("]" as char) as int
+                return this.punct1(KindCloseBracketToken)
+            if ch = ("{" as char) as int
+                return this.punct1(KindOpenBraceToken)
+            if ch = ("}" as char) as int
+                return this.punct1(KindCloseBraceToken)
+            if ch = (";" as char) as int
+                return this.punct1(KindSemicolonToken)
+            if ch = ("," as char) as int
+                return this.punct1(KindCommaToken)
+            if ch = (":" as char) as int
+                return this.punct1(KindColonToken)
+            if ch = ("~" as char) as int
+                return this.punct1(KindTildeToken)
+            if ch = ("@" as char) as int
+                return this.punct1(KindAtToken)
+
+            ; `>` is deliberately NOT extended to >>, >>=, >= and friends. The
+            ; reference emits a bare KindGreaterThanToken and lets the parser
+            ; re-scan, because a generic argument list closes with `>` and the
+            ; scanner cannot know whether `>>` is a shift or two closers.
+            if ch = (">" as char) as int
+                return this.punct1(KindGreaterThanToken)
+
+            ; ── multi-character punctuation ─────────────────────────────────
+
+            if ch = ("!" as char) as int
+            {
+                if this.char_at(1) = ("=" as char) as int
+                {
+                    if this.char_at(2) = ("=" as char) as int
+                        return this.punctn(3, KindExclamationEqualsEqualsToken)
+                    return this.punctn(2, KindExclamationEqualsToken)
+                }
+                return this.punct1(KindExclamationToken)
+            }
+
+            if ch = ("%" as char) as int
+            {
+                if this.char_at(1) = ("=" as char) as int
+                    return this.punctn(2, KindPercentEqualsToken)
+                return this.punct1(KindPercentToken)
+            }
+
+            if ch = ("&" as char) as int
+            {
+                if this.char_at(1) = ("&" as char) as int
+                {
+                    if this.char_at(2) = ("=" as char) as int
+                        return this.punctn(3, KindAmpersandAmpersandEqualsToken)
+                    return this.punctn(2, KindAmpersandAmpersandToken)
+                }
+                if this.char_at(1) = ("=" as char) as int
+                    return this.punctn(2, KindAmpersandEqualsToken)
+                return this.punct1(KindAmpersandToken)
+            }
+
+            if ch = ("|" as char) as int
+            {
+                if this.char_at(1) = ("|" as char) as int
+                {
+                    if this.char_at(2) = ("=" as char) as int
+                        return this.punctn(3, KindBarBarEqualsToken)
+                    return this.punctn(2, KindBarBarToken)
+                }
+                if this.char_at(1) = ("=" as char) as int
+                    return this.punctn(2, KindBarEqualsToken)
+                return this.punct1(KindBarToken)
+            }
+
+            if ch = ("^" as char) as int
+            {
+                if this.char_at(1) = ("=" as char) as int
+                    return this.punctn(2, KindCaretEqualsToken)
+                return this.punct1(KindCaretToken)
+            }
+
+            if ch = ("*" as char) as int
+            {
+                if this.char_at(1) = ("=" as char) as int
+                    return this.punctn(2, KindAsteriskEqualsToken)
+                if this.char_at(1) = ("*" as char) as int
+                {
+                    if this.char_at(2) = ("=" as char) as int
+                        return this.punctn(3, KindAsteriskAsteriskEqualsToken)
+                    return this.punctn(2, KindAsteriskAsteriskToken)
+                }
+                ; The reference also consumes a JSDoc leading asterisk here;
+                ; that path is inert while skipJSDocLeadingAsterisks is 0, which
+                ; it always is outside JSDoc.
+                return this.punct1(KindAsteriskToken)
+            }
+
+            if ch = ("+" as char) as int
+            {
+                if this.char_at(1) = ("=" as char) as int
+                    return this.punctn(2, KindPlusEqualsToken)
+                if this.char_at(1) = ("+" as char) as int
+                    return this.punctn(2, KindPlusPlusToken)
+                return this.punct1(KindPlusToken)
+            }
+
+            if ch = ("-" as char) as int
+            {
+                if this.char_at(1) = ("=" as char) as int
+                    return this.punctn(2, KindMinusEqualsToken)
+                if this.char_at(1) = ("-" as char) as int
+                    return this.punctn(2, KindMinusMinusToken)
+                return this.punct1(KindMinusToken)
+            }
+
+            if ch = ("." as char) as int
+            {
+                ; `.5` is a numeric literal — unported, and it must not be
+                ; mistaken for a dot followed by something.
+                if is_digit(this.char_at(1))
+                    return this.unported()
+                if (this.char_at(1) = ("." as char) as int) and (this.char_at(2) = ("." as char) as int)
+                    return this.punctn(3, KindDotDotDotToken)
+                return this.punct1(KindDotToken)
+            }
+
+            if ch = ("<" as char) as int
+            {
+                ; A `<<` at the start of a conflict marker is trivia in the
+                ; reference; that check is unported, so bail rather than scan it
+                ; as a shift.
+                if this.char_at(1) = ("<" as char) as int
+                {
+                    if this.char_at(2) = ("=" as char) as int
+                        return this.punctn(3, KindLessThanLessThanEqualsToken)
+                    return this.punctn(2, KindLessThanLessThanToken)
+                }
+                if this.char_at(1) = ("=" as char) as int
+                    return this.punctn(2, KindLessThanEqualsToken)
+                return this.punct1(KindLessThanToken)
+            }
+
+            if ch = ("=" as char) as int
+            {
+                if this.char_at(1) = ("=" as char) as int
+                {
+                    if this.char_at(2) = ("=" as char) as int
+                        return this.punctn(3, KindEqualsEqualsEqualsToken)
+                    return this.punctn(2, KindEqualsEqualsToken)
+                }
+                if this.char_at(1) = (">" as char) as int
+                    return this.punctn(2, KindEqualsGreaterThanToken)
+                return this.punct1(KindEqualsToken)
+            }
+
+            if ch = ("?" as char) as int
+            {
+                if (this.char_at(1) = ("." as char) as int) and (not is_digit(this.char_at(2)))
+                    return this.punctn(2, KindQuestionDotToken)
+                if this.char_at(1) = ("?" as char) as int
+                {
+                    if this.char_at(2) = ("=" as char) as int
+                        return this.punctn(3, KindQuestionQuestionEqualsToken)
+                    return this.punctn(2, KindQuestionQuestionToken)
+                }
+                return this.punct1(KindQuestionToken)
+            }
+
+            ; ── identifiers and keywords, ASCII fast path ───────────────────
+
+            if is_ident_start_ascii(ch)
+            {
+                let start state.pos
+                set state.pos: state.pos + 1
+                while true
+                {
+                    let c2 this.char()
+                    if c2 < 0
+                        break
+                    if not is_ident_part_ascii(c2)
+                        break
+                    set state.pos: state.pos + 1
+                }
+                ; A `\` here starts a unicode escape inside the identifier, and a
+                ; byte >= 0x80 starts a non-ASCII identifier part. Both leave the
+                ; reference's fast path, and neither is ported.
+                let after this.char()
+                if after = ("\\" as char) as int
+                    return this.unported()
+                if after >= 128
+                    return this.unported()
+                let k get_identifier_token(buffer + start, state.pos - start)
+                set state.token: k
+                return k
+            }
+
+            ; ── everything this slice does not implement ────────────────────
+            ;
+            ; Digits, quotes, backticks, `\`, `#`, and any non-ASCII byte.
+            return this.unported()
+        }
+    }
+
+    ; Consume n bytes and answer the token. Split out so the forty punctuation
+    ; arms above stay one line each and can be read against the reference's
+    ; switch without scrolling.
+    procedure punct1(this, k: int) returns int
+    {
+        set state.pos: state.pos + 1
+        set state.token: k
+        k
+    }
+
+    procedure punctn(this, n: int, k: int) returns int
+    {
+        set state.pos: state.pos + n
+        set state.token: k
+        k
+    }
+}
