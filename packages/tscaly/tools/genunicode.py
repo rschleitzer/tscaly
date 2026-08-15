@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+#
+# genunicode.py — generate tscaly/UnicodeId.scaly from the reference's
+# identifier range tables (internal/stringutil/identifier_parts_generated.go).
+#
+# Those tables are themselves generated upstream from @unicode/unicode-15.1.0
+# ("DO NOT EDIT"), so transcribing 1365 ranges by hand would be absurd twice
+# over. This reads them and emits the Scaly form.
+#
+# ── Two structural facts, MEASURED from the tables rather than assumed, because
+# ── the simplification below is only valid if they hold:
+#
+# (1) Go splits each table into R16 (code points that fit in uint16) and R32,
+#     and `unicode.Is` searches R16 when the rune is <= the last R16 Hi and R32
+#     otherwise. In BOTH tables the two halves are disjoint — the last R16 Hi is
+#     0xFFDC and the first R32 Lo is 0x10000 — so concatenating them into one
+#     ascending array and doing a single search is exactly equivalent. The split
+#     is a memory layout, not semantics.
+# (2) Both halves are already sorted ascending by Lo, which is what makes a
+#     binary search legitimate at all. The generator re-checks both properties
+#     and refuses to emit if a pin bump breaks either.
+#
+# STRIDE IS NOT DECORATION. 508 of the start table's 624 ranges have stride 1,
+# but the rest run up to 1205 — a range with stride 25 contains every 25th code
+# point in its span and nothing else. Dropping the stride check would silently
+# admit thousands of code points that are not identifier characters.
+#
+# `LatinOffset` is deliberately not carried: it is used by `unicode.In` and
+# `IsExcludingLatin`, never by `Is`, which is the only entry point the scanner
+# reaches.
+
+import os
+import re
+import sys
+
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+SRC = os.path.join(
+    REPO,
+    "packages/tscaly/_submodules/typescript-go/internal/stringutil/"
+    "identifier_parts_generated.go",
+)
+DST = os.path.join(REPO, "packages/tscaly/0.1.0/tscaly/UnicodeId.scaly")
+
+TABLES = [
+    ("unicodeESNextIdentifierStart", "UID_START", "is_unicode_identifier_start"),
+    ("unicodeESNextIdentifierPart", "UID_PART", "is_unicode_identifier_part"),
+]
+
+ENTRY = re.compile(r"\{0x([0-9A-Fa-f]+), 0x([0-9A-Fa-f]+), (\d+)\}")
+
+
+def read_table(text, var):
+    try:
+        i = text.index("var %s = &unicode.RangeTable{" % var)
+    except ValueError:
+        sys.exit("genunicode: table %s not found — the reference changed" % var)
+    j = text.index("\n}\n", i)
+    body = text[i:j]
+
+    out = []
+    for section, width in (("R16", "16"), ("R32", "32")):
+        m = re.search(
+            r"%s: \[\]unicode\.Range%s\{(.*?)\n\t\}," % (section, width), body, re.S
+        )
+        if not m:
+            continue
+        part = [
+            (int(a, 16), int(b, 16), int(s)) for a, b, s in ENTRY.findall(m.group(1))
+        ]
+        if not part:
+            continue
+        if any(part[k][0] > part[k + 1][0] for k in range(len(part) - 1)):
+            sys.exit("genunicode: %s.%s is not sorted — binary search invalid" % (var, section))
+        if out and part[0][0] <= out[-1][1]:
+            sys.exit(
+                "genunicode: %s R16/R32 overlap (last Hi 0x%X, first Lo 0x%X) — "
+                "merging them is no longer equivalent to unicode.Is"
+                % (var, out[-1][1], part[0][0])
+            )
+        out.extend(part)
+    if not out:
+        sys.exit("genunicode: %s parsed as empty" % var)
+    return out
+
+
+def array(name, values):
+    # `int[]` — the type of a const array global is the ARRAY type; `int` alone
+    # is a parse error at the opening bracket. Multi-line literals and a trailing
+    # comma are both fine (cf. HASH_PRIMES in the stdlib).
+    lines = ["define %s: int[] [" % name]
+    row = []
+    for v in values:
+        row.append("0x%X" % v)
+        if len(row) == 12:
+            lines.append("    " + ", ".join(row) + ",")
+            row = []
+    if row:
+        lines.append("    " + ", ".join(row) + ",")
+    # ★ KEEP THE TRAILING COMMA. A MULTI-LINE const array literal requires one
+    # after the last element; without it the newline ends the construct and the
+    # parse fails with `expected ']'` pointing at the OPENING bracket — not at
+    # the line that is actually missing something. (A SINGLE-line literal needs
+    # no trailing comma, which is why the short probes all passed.) Measured;
+    # the stdlib's HASH_PRIMES carries the same comma.
+    lines.append("]")
+    return lines
+
+
+def emit(tables):
+    out = []
+    out.append("; SPDX-License-Identifier: Apache-2.0")
+    out.append(";")
+    out.append("; UnicodeId — the ECMAScript identifier code-point tables, ported from the")
+    out.append("; reference's internal/stringutil/identifier_parts_generated.go (itself")
+    out.append("; generated from @unicode/unicode-15.1.0).")
+    out.append(";")
+    out.append("; GENERATED by packages/tscaly/tools/genunicode.py. Do not edit; edit the")
+    out.append("; generator. Regenerate after a submodule pin bump.")
+    out.append(";")
+    out.append("; Go stores each table as R16 + R32 and picks a half by magnitude. The two")
+    out.append("; halves are disjoint here (last R16 Hi 0xFFDC, first R32 Lo 0x10000) and")
+    out.append("; both are sorted, so they are concatenated into ONE ascending array and")
+    out.append("; searched once — exactly equivalent, and the generator refuses to emit if")
+    out.append("; a pin bump ever breaks either property.")
+    out.append(";")
+    out.append("; ★ THE STRIDE IS LOAD-BEARING. Most ranges step by 1, but some step by up")
+    out.append("; to 1205: such a range holds every Nth code point of its span and nothing")
+    out.append("; else. Ignoring the stride would silently admit thousands of code points")
+    out.append("; that are not identifier characters — a wrong answer that looks like a")
+    out.append("; right one, which is exactly what this port is organized against.")
+    out.append(";")
+    out.append("; The search is written out once per table rather than shared: a const array")
+    out.append("; global is an [N x T] VALUE, not a pointer, and passing one to a")
+    out.append("; pointer[T] parameter loses name resolution for the rest of the file (root")
+    out.append("; CLAUDE.md). It has to be indexed in place, so the duplication is the")
+    out.append("; generator's job rather than a reviewer's problem.")
+    out.append("")
+
+    for _, prefix, fn in tables:
+        lo, hi, stride, n = tables_data[prefix]
+        out.append("; %d ranges." % n)
+        out.extend(array(prefix + "_LO", lo))
+        out.append("")
+        out.extend(array(prefix + "_HI", hi))
+        out.append("")
+        out.extend(array(prefix + "_STRIDE", stride))
+        out.append("")
+        out.append("function %s(c: int) returns bool" % fn)
+        out.append("{")
+        out.append("    var lo: int 0")
+        out.append("    var hi: int %d" % (n - 1))
+        out.append("    while lo <= hi")
+        out.append("    {")
+        out.append("        let mid (lo + hi) / 2")
+        out.append("        if c < %s_LO[mid]" % prefix)
+        out.append("            set hi: mid - 1")
+        out.append("        else")
+        out.append("        {")
+        out.append("            if c > %s_HI[mid]" % prefix)
+        out.append("                set lo: mid + 1")
+        out.append("            else")
+        out.append("            {")
+        out.append("                let st %s_STRIDE[mid]" % prefix)
+        out.append("                if st = 1")
+        out.append("                    return true")
+        out.append("                return ((c - %s_LO[mid]) %% st) = 0" % prefix)
+        out.append("            }")
+        out.append("        }")
+        out.append("    }")
+        out.append("    false")
+        out.append("}")
+        out.append("")
+
+    return "\n".join(out)
+
+
+def main():
+    if not os.path.exists(SRC):
+        sys.exit(
+            "genunicode: reference not found at\n  %s\n"
+            "Initialize the submodule:\n"
+            "  git submodule update --init packages/tscaly/_submodules/typescript-go"
+            % SRC
+        )
+
+    text = open(SRC, encoding="utf-8").read()
+
+    global tables_data
+    tables_data = {}
+    total = 0
+    for var, prefix, _ in TABLES:
+        rows = read_table(text, var)
+        tables_data[prefix] = (
+            [r[0] for r in rows],
+            [r[1] for r in rows],
+            [r[2] for r in rows],
+            len(rows),
+        )
+        total += len(rows)
+
+    with open(DST, "w", encoding="utf-8") as f:
+        f.write(emit(TABLES))
+
+    print(
+        "genunicode: %d ranges (%s) -> %s"
+        % (
+            total,
+            ", ".join("%s %d" % (p, tables_data[p][3]) for _, p, _ in TABLES),
+            os.path.relpath(DST, REPO),
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
