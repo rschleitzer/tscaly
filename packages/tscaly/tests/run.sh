@@ -172,6 +172,12 @@ is_accepted() {
   grep -q "^$1	" "$ACCEPTED" 2>/dev/null
 }
 
+# Clear the whole per-case tree, not just the cases about to run. Renaming the
+# case key once already left a previous run's directories behind, and a stale
+# result directory is indistinguishable from a fresh one when something later
+# reads them.
+rm -rf "$OUT/cases"
+
 matched=0; unported=0; failed=0; accepted=0; stale=0
 failures=()
 stales=()

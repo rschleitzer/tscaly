@@ -2,7 +2,7 @@
 ;
 ; scanner — ported from the reference's internal/scanner/scanner.go.
 ;
-; SLICE 1. What is ported and what is not is listed at `unported_pos` below, and
+; SLICES 1-2. What is ported and what is not is listed at `unported_pos` below, and
 ; the omissions are LOUD rather than silent: the scanner records the position of
 ; the first construct it cannot handle and answers KindUnknown, so a fixture
 ; containing one is reported as UNPORTED instead of producing a plausible token
@@ -73,11 +73,24 @@ define Scanner
     ; NOT part of the reference — it exists so an incomplete port reports its own
     ; incompleteness instead of emitting a well-formed wrong answer.
     ;
-    ; Not implemented yet: string literals, template literals, numeric literals,
-    ; regular expressions, identifiers written with unicode escapes, private
-    ; names and the shebang (`#`), conflict-marker trivia, the JSX language
-    ; variant, non-ASCII identifiers, and the JSDoc machinery (comment
-    ; directives, leading-asterisk skipping, tag scanning).
+    ; Not implemented yet, and all but the first two rest on the SAME missing
+    ; piece — the Unicode identifier tables:
+    ;
+    ;   * regular expressions, conflict-marker trivia, the JSX language variant,
+    ;     and the rest of the JSDoc machinery (comment directives,
+    ;     leading-asterisk skipping)
+    ;   * a NON-ASCII identifier (IsIdentifierStart/IsIdentifierPart)
+    ;   * an identifier written with a unicode escape, and the top-level `\`
+    ;     case that decides between one and an invalid character
+    ;
+    ; The escaped-identifier case also needs tokenValue: the reference looks the
+    ; DECODED text up in the keyword table, so `\u0063onst` is the keyword
+    ; `const` — which no lookup over raw source bytes can see.
+    ;
+    ; Slice 2 added numeric and string literals (legacy octal, separators,
+    ; bigint, leading zero, escape sequences with surrogate pairing), template
+    ; literals, private names, the shebang, and UTF-8 decoding where the
+    ; reference decodes: both comment bodies and the default arm.
     unported_pos: int
 
     state: ScannerState
@@ -177,6 +190,767 @@ define Scanner
     ; site — is the same magic number the Kind file exists to abolish.
     function at_eof(this) returns bool
         state.token = KindEndOfFile
+
+    ; ── UTF-8 ───────────────────────────────────────────────────────────────
+    ;
+    ; The reference reaches for `charAndSize()` — a decoded rune plus its byte
+    ; length — in exactly the places where a non-ASCII character can change the
+    ; answer: inside both comment bodies, in the default arm of the scan switch,
+    ; and after a backslash. Everywhere else it stays byte-wise, and so do we.
+    ;
+    ; Go returns (RuneError, 1) for an INVALID sequence and (RuneError, 3) for a
+    ; correctly encoded U+FFFD, and the reference's binary-file check compares
+    ; against RuneError without distinguishing the two. That quirk is ported: a
+    ; file containing a literal U+FFFD is declared binary. It is the reference's
+    ; behaviour, and diverging silently would be worse than reproducing it.
+    ;
+    ; Split into two pure functions rather than one returning a pair: Scaly
+    ; returns a single value, and a hidden "last size" field is state that can go
+    ; stale. Re-reading the lead byte costs nothing.
+
+    ; Byte length of the sequence at p — 1 for an invalid one, which is exactly
+    ; how Go resynchronizes. The accept ranges reject overlong forms, the
+    ; surrogate block and anything past U+10FFFF.
+    function utf8_size_at(this, p: int) returns int
+    {
+        if p >= end
+            return 1
+        let b0 *(buffer + p) as int
+        if b0 < 0x80
+            return 1
+        if b0 < 0xC2
+            return 1
+        var need: int 0
+        var lo: int 0x80
+        var hi: int 0xBF
+        if b0 <= 0xDF
+            set need: 1
+        else
+        {
+            if b0 <= 0xEF
+            {
+                set need: 2
+                if b0 = 0xE0
+                    set lo: 0xA0
+                if b0 = 0xED
+                    set hi: 0x9F
+            }
+            else
+            {
+                if b0 > 0xF4
+                    return 1
+                set need: 3
+                if b0 = 0xF0
+                    set lo: 0x90
+                if b0 = 0xF4
+                    set hi: 0x8F
+            }
+        }
+        if p + need >= end
+            return 1
+        let c1 *(buffer + p + 1) as int
+        if (c1 < lo) or (c1 > hi)
+            return 1
+        var i: int 2
+        while i <= need
+        {
+            let c *(buffer + p + i) as int
+            if (c < 0x80) or (c > 0xBF)
+                return 1
+            set i: i + 1
+        }
+        need + 1
+    }
+
+    function utf8_decode_at(this, p: int) returns int
+    {
+        let n this.utf8_size_at(p)
+        if p >= end
+            return 0 - 1
+        let b0 *(buffer + p) as int
+        if n = 1
+        {
+            if b0 < 0x80
+                return b0
+            ; An invalid sequence decodes to U+FFFD, as Go's RuneError does.
+            return 0xFFFD
+        }
+        var cp: int 0
+        if n = 2
+            set cp: b0 & 0x1F
+        else
+        {
+            if n = 3
+                set cp: b0 & 0x0F
+            else
+                set cp: b0 & 0x07
+        }
+        var i: int 1
+        while i < n
+        {
+            set cp: (cp << 6) | ((*(buffer + p + i) as int) & 0x3F)
+            set i: i + 1
+        }
+        cp
+    }
+
+    ; ── character classes over decoded runes ────────────────────────────────
+
+    ; The reference's IsLineBreak: LF, CR, and the two ECMAScript separators.
+    ; NOTE it is NOT the same predicate the string scanner uses — that one
+    ; compares bytes against '\n' and '\r' only, so U+2028 inside a string
+    ; literal is an ordinary character. Do not unify them.
+    function is_line_break_rune(c: int) returns bool
+    {
+        if (c = 10) or (c = 13)
+            return true
+        (c = 0x2028) or (c = 0x2029)
+    }
+
+    ; The reference's IsWhiteSpaceSingleLine. U+0085 (next line) is in here and
+    ; deliberately NOT in the line-break set — it is Zs, and ECMAScript's line
+    ; terminator table does not list it.
+    function is_white_space_single_line(c: int) returns bool
+    {
+        if (c = 32) or (c = 9) or (c = 11) or (c = 12)
+            return true
+        if (c = 0x0085) or (c = 0x00A0) or (c = 0x1680)
+            return true
+        if (c >= 0x2000) and (c <= 0x200A)
+            return true
+        if (c = 0x202F) or (c = 0x205F) or (c = 0x3000)
+            return true
+        c = 0xFEFF
+    }
+
+    ; ── digit classification ────────────────────────────────────────────────
+
+    function is_octal_digit(c: int) returns bool
+        (c >= ("0" as char) as int) and (c <= ("7" as char) as int)
+
+    function is_hex_digit(c: int) returns bool
+    {
+        if is_digit(c)
+            return true
+        if (c >= ("a" as char) as int) and (c <= ("f" as char) as int)
+            return true
+        (c >= ("A" as char) as int) and (c <= ("F" as char) as int)
+    }
+
+    function hex_digit_value(c: int) returns int
+    {
+        if is_digit(c)
+            return c - (("0" as char) as int)
+        if (c >= ("a" as char) as int) and (c <= ("f" as char) as int)
+            return (c - (("a" as char) as int)) + 10
+        (c - (("A" as char) as int)) + 10
+    }
+
+    ; True when every digit in [from, to) is an octal digit. The reference
+    ; computes this inside scanDigits and returns it alongside the text; splitting
+    ; it out keeps scan_digits single-valued instead of hiding a second result in
+    ; a field.
+    function all_octal(this, from: int, to: int) returns bool
+    {
+        var i: int from
+        while i < to
+        {
+            if not is_octal_digit(*(buffer + i) as int)
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    ; The reference parses hex text with strconv.ParseInt(_, 16, 32) and IGNORES
+    ; the error, so an overflowing sequence yields MaxInt32 — which is above
+    ; 0x10FFFF and therefore rejected as an invalid extended escape. Clamping
+    ; preserves exactly that outcome without needing the same overflow value.
+    function hex_value(this, from: int, to: int) returns int
+    {
+        var v: int 0
+        var i: int from
+        while i < to
+        {
+            let c *(buffer + i) as int
+            if is_hex_digit(c)
+            {
+                set v: (v * 16) + hex_digit_value(c)
+                if v > 0x7FFFFFFF
+                    set v: 0x7FFFFFFF
+            }
+            set i: i + 1
+        }
+        v
+    }
+
+    function is_high_surrogate(c: int) returns bool
+        (c >= 0xD800) and (c <= 0xDBFF)
+
+    function is_low_surrogate(c: int) returns bool
+        (c >= 0xDC00) and (c <= 0xDFFF)
+
+    ; ── numeric literals ────────────────────────────────────────────────────
+
+    ; The reference's scanHexDigits, minus the string it builds: answers how many
+    ; HEX DIGITS were consumed (separators excluded) so the caller can apply its
+    ; `digitCount < minCount` test. NOTE that on that failure the reference does
+    ; NOT rewind — pos stays where the scan stopped — so neither does this.
+    procedure scan_hex_digits(this, min_count: int, scan_many: bool, can_sep: bool) returns int
+    {
+        var digit_count: int 0
+        var allow_sep: bool false
+        var prev_sep: bool false
+        while (digit_count < min_count) or scan_many
+        {
+            let c this.char()
+            if is_hex_digit(c)
+            {
+                set allow_sep: can_sep
+                set prev_sep: false
+                set digit_count: digit_count + 1
+            }
+            else
+            {
+                if not (can_sep and (c = ("_" as char) as int))
+                    break
+                ; The reference's separator arms here differ from
+                ; scan_number_fragment's: they set ContainsSeparator and then only
+                ; REPORT — no ContainsInvalidSeparator. Do not "unify" the two.
+                set state.token_flags: state.token_flags | TokenFlagsContainsSeparator
+                if allow_sep
+                {
+                    set allow_sep: false
+                    set prev_sep: true
+                }
+            }
+            set state.pos: state.pos + 1
+        }
+        digit_count
+    }
+
+    ; The reference's scanNumberFragment, minus the string: answers how many
+    ; DIGITS were consumed, which is exactly its emptiness test — `result` only
+    ; ever receives text after digits have been seen, so zero digits means the
+    ; empty string.
+    procedure scan_number_fragment(this) returns int
+    {
+        var digits: int 0
+        var allow_sep: bool false
+        var prev_sep: bool false
+        repeat
+        {
+            let before state.pos
+            while is_digit(this.char())
+                set state.pos: state.pos + 1
+            if state.pos > before
+            {
+                set digits: digits + (state.pos - before)
+                set allow_sep: true
+                set prev_sep: false
+            }
+            if this.char() <> ("_" as char) as int
+                break
+            set state.token_flags: state.token_flags | TokenFlagsContainsSeparator
+            if allow_sep
+            {
+                set allow_sep: false
+                set prev_sep: true
+            }
+            else
+                ; UNCONDITIONAL in the reference — the two error messages below it
+                ; differ on isPreviousTokenSeparator, the flag does not.
+                set state.token_flags: state.token_flags | TokenFlagsContainsInvalidSeparator
+            set state.pos: state.pos + 1
+        }
+        if prev_sep
+            set state.token_flags: state.token_flags | TokenFlagsContainsInvalidSeparator
+        digits
+    }
+
+    procedure scan_digits(this) returns int
+    {
+        let start state.pos
+        while is_digit(this.char())
+            set state.pos: state.pos + 1
+        state.pos - start
+    }
+
+    procedure scan_binary_or_octal_digits(this, base: int) returns int
+    {
+        var digits: int 0
+        var allow_sep: bool false
+        var prev_sep: bool false
+        repeat
+        {
+            let c this.char()
+            if is_digit(c) and ((c - (("0" as char) as int)) < base)
+            {
+                set digits: digits + 1
+                set allow_sep: true
+                set prev_sep: false
+            }
+            else
+            {
+                if c <> ("_" as char) as int
+                    break
+                set state.token_flags: state.token_flags | TokenFlagsContainsSeparator
+                if allow_sep
+                {
+                    set allow_sep: false
+                    set prev_sep: true
+                }
+            }
+            set state.pos: state.pos + 1
+        }
+        digits
+    }
+
+    ; The `n` suffix is the whole of this for our purposes — the reference's
+    ; remaining body normalizes tokenValue through a cache, which produces no
+    ; position and no flag.
+    procedure scan_big_int_suffix(this) returns int
+    {
+        if this.char() = ("n" as char) as int
+        {
+            set state.pos: state.pos + 1
+            return KindBigIntLiteral
+        }
+        KindNumericLiteral
+    }
+
+    ; The ASCII identifier-part run, used only by scan_number's trailing check.
+    procedure scan_identifier_parts_ascii(this) returns int
+    {
+        let start state.pos
+        while is_ident_part_ascii(this.char())
+            set state.pos: state.pos + 1
+        state.pos - start
+    }
+
+    procedure scan_number(this) returns int
+    {
+        let start state.pos
+
+        if this.char() = ("0" as char) as int
+        {
+            set state.pos: state.pos + 1
+            if this.char() = ("_" as char) as int
+            {
+                ; `0_` — the separator is rejected outright and the whole literal
+                ; is re-scanned from the start as an ordinary fragment.
+                set state.token_flags: state.token_flags | TokenFlagsContainsSeparator | TokenFlagsContainsInvalidSeparator
+                set state.pos: start
+                this.scan_number_fragment()
+            }
+            else
+            {
+                let dstart state.pos
+                let n this.scan_digits()
+                ; n = 0 is a bare `0`, which continues into the fraction and
+                ; exponent below.
+                if n > 0
+                {
+                    if this.all_octal(dstart, state.pos)
+                    {
+                        ; A legacy octal literal (`0777`). The reference reports
+                        ; it and RETURNS here, so no fraction or exponent is
+                        ; scanned afterwards — `077.5` is the octal 077 followed
+                        ; by `.5`, not a decimal.
+                        set state.token_flags: state.token_flags | TokenFlagsOctal
+                        return KindNumericLiteral
+                    }
+                    set state.token_flags: state.token_flags | TokenFlagsContainsLeadingZero
+                }
+            }
+        }
+        else
+            this.scan_number_fragment()
+
+        let fixed_part_end state.pos
+
+        if this.char() = ("." as char) as int
+        {
+            set state.pos: state.pos + 1
+            this.scan_number_fragment()
+        }
+
+        var end_pos: int state.pos
+
+        if (this.char() = ("E" as char) as int) or (this.char() = ("e" as char) as int)
+        {
+            set state.pos: state.pos + 1
+            set state.token_flags: state.token_flags | TokenFlagsScientific
+            if (this.char() = ("+" as char) as int) or (this.char() = ("-" as char) as int)
+                set state.pos: state.pos + 1
+            let e this.scan_number_fragment()
+            if e > 0
+                set end_pos: state.pos
+        }
+
+        ; A leading-zero decimal reports and returns before the trailing-name
+        ; check below can move pos.
+        if (state.token_flags & TokenFlagsContainsLeadingZero) <> 0
+            return KindNumericLiteral
+
+        var result: int KindNumericLiteral
+        if fixed_part_end = state.pos
+            set result: this.scan_big_int_suffix()
+
+        ; A name immediately after a numeric literal is an error, and the
+        ; reference RESTORES pos so the name is scanned as its own token — except
+        ; on two bigint-specific paths, where it returns with pos past the name.
+        ; Both are observable in the token stream, so both are ported.
+        let after this.char()
+        if after >= 128
+            return this.unported()
+        if is_ident_start_ascii(after)
+        {
+            let id_start state.pos
+            let id_len this.scan_identifier_parts_ascii()
+            if (result <> KindBigIntLiteral) and (id_len = 1)
+            {
+                if (*(buffer + id_start) as int) = ("n" as char) as int
+                {
+                    if (state.token_flags & TokenFlagsScientific) <> 0
+                        return result
+                    if fixed_part_end < id_start
+                        return result
+                }
+            }
+            set state.pos: id_start
+        }
+        result
+    }
+
+    ; ── escape sequences ────────────────────────────────────────────────────
+    ;
+    ; The reference takes an EscapeSequenceScanningFlags parameter. There is
+    ; exactly one caller here — the string literal, which always passes
+    ; `String | ReportErrors` — and under that constant every regex-specific
+    ; branch is unreachable: RegularExpression, AnyUnicodeMode and AtomEscape are
+    ; all clear, while AllowExtendedUnicodeEscape is satisfied by the String bit.
+    ; The parameter is therefore not carried yet. It comes back with the second
+    ; caller (templates, then regex), which is when it starts to select anything.
+    ;
+    ; No decoded value is produced — see the file header. What is ported is the
+    ; extent and the flags, which is all the token stream can observe.
+
+    procedure scan_unicode_escape(this) returns int
+    {
+        set state.pos: state.pos + 2
+        let start state.pos
+        let extended this.char() = ("{" as char) as int
+
+        var hstart: int state.pos
+        var n: int 0
+        if extended
+        {
+            set state.pos: state.pos + 1
+            set hstart: state.pos
+            set n: this.scan_hex_digits(1, true, false)
+        }
+        else
+        {
+            set state.token_flags: state.token_flags | TokenFlagsUnicodeEscape
+            set n: this.scan_hex_digits(4, false, false)
+        }
+
+        if n = 0
+        {
+            set state.token_flags: state.token_flags | TokenFlagsContainsInvalidEscape
+            return 0 - 1
+        }
+        ; scan_hex_digits does not rewind on a short count, and neither does the
+        ; reference — but the non-extended form demands exactly 4.
+        if (not extended) and (n < 4)
+        {
+            set state.token_flags: state.token_flags | TokenFlagsContainsInvalidEscape
+            return 0 - 1
+        }
+
+        let hex_val this.hex_value(hstart, state.pos)
+
+        if extended
+        {
+            var invalid: bool false
+            if hex_val > 0x10FFFF
+                set invalid: true
+            if state.pos >= end
+                set invalid: true
+            else
+            {
+                ; Read the closing brace BEFORE consuming it — testing char()
+                ; again afterwards would be testing the character past it.
+                if this.char() = ("}" as char) as int
+                    set state.pos: state.pos + 1
+                else
+                    set invalid: true
+            }
+            if invalid
+            {
+                set state.token_flags: state.token_flags | TokenFlagsContainsInvalidEscape
+                return 0 - 1
+            }
+            set state.token_flags: state.token_flags | TokenFlagsExtendedUnicodeEscape
+        }
+        hex_val
+    }
+
+    ; Speculative: consumes a following \uXXXX only when it is a low surrogate,
+    ; and restores BOTH pos and the flags otherwise — the reference suppresses
+    ; diagnostics here for the same reason, since the caller re-scans.
+    procedure scan_low_surrogate_escape(this, high: int) returns int
+    {
+        if this.char() <> ("\\" as char) as int
+            return 0 - 1
+        if this.char_at(1) <> ("u" as char) as int
+            return 0 - 1
+        let saved_pos state.pos
+        let saved_flags state.token_flags
+        let low this.scan_unicode_escape()
+        if is_low_surrogate(low)
+            return low
+        set state.pos: saved_pos
+        set state.token_flags: saved_flags
+        0 - 1
+    }
+
+    procedure scan_escape_sequence(this) returns bool
+    {
+        let start state.pos
+        set state.pos: state.pos + 1
+        let ch this.char()
+        if ch < 0
+            return true
+        set state.pos: state.pos + 1
+
+        ; \0 not followed by a digit is the NUL escape and nothing more.
+        if ch = ("0" as char) as int
+        {
+            if not is_digit(this.char())
+                return true
+        }
+
+        ; Legacy octal escapes. `\0`-`\3` admit two more octal digits (the
+        ; reference reaches the '4'..'7' arm by fallthrough), `\4`-`\7` only one.
+        if (ch >= ("0" as char) as int) and (ch <= ("3" as char) as int)
+        {
+            if is_octal_digit(this.char())
+                set state.pos: state.pos + 1
+            if is_octal_digit(this.char())
+                set state.pos: state.pos + 1
+            set state.token_flags: state.token_flags | TokenFlagsContainsInvalidEscape
+            return true
+        }
+        if (ch >= ("4" as char) as int) and (ch <= ("7" as char) as int)
+        {
+            if is_octal_digit(this.char())
+                set state.pos: state.pos + 1
+            set state.token_flags: state.token_flags | TokenFlagsContainsInvalidEscape
+            return true
+        }
+        if (ch = ("8" as char) as int) or (ch = ("9" as char) as int)
+        {
+            set state.token_flags: state.token_flags | TokenFlagsContainsInvalidEscape
+            return true
+        }
+
+        ; \x followed by exactly two hex digits.
+        if ch = ("x" as char) as int
+        {
+            while state.pos < start + 4
+            {
+                if not is_hex_digit(this.char())
+                {
+                    set state.token_flags: state.token_flags | TokenFlagsContainsInvalidEscape
+                    return true
+                }
+                set state.pos: state.pos + 1
+            }
+            set state.token_flags: state.token_flags | TokenFlagsHexEscape
+            return true
+        }
+
+        if ch = ("u" as char) as int
+        {
+            ; scan_unicode_escape re-reads the `\u`, so back up over both bytes.
+            set state.pos: state.pos - 2
+            let cp this.scan_unicode_escape()
+            if cp < 0
+                return true
+            if is_high_surrogate(cp)
+                this.scan_low_surrogate_escape(cp)
+            return true
+        }
+
+        ; A line continuation: backslash then a line terminator.
+        if ch = ("\r" as char) as int
+        {
+            if this.char() = ("\n" as char) as int
+                set state.pos: state.pos + 1
+            return true
+        }
+
+        ; An escaped MULTI-BYTE character. The reference backs up over the
+        ; single-byte advance and re-advances by the rune's real size; guessing
+        ; one byte here would shift every span that follows.
+        ;
+        ; U+2028 and U+2029 are line continuations and every other rune stands
+        ; for itself — a distinction in the decoded VALUE only, with the same
+        ; position and no flag either way, so it costs nothing to omit until
+        ; tokenValue exists.
+        if ch >= 128
+        {
+            set state.pos: state.pos - 1
+            set state.pos: state.pos + this.utf8_size_at(state.pos)
+            return true
+        }
+
+        ; Any other escaped ASCII character stands for itself: \b \t \n \v \f \r
+        ; \' \" \\ and everything unlisted.
+        true
+    }
+
+    ; ── identifiers ─────────────────────────────────────────────────────────
+    ;
+    ; The reference's scanIdentifier(prefixLength). The prefix exists for `#`:
+    ; a private name is scanned as one token whose text INCLUDES the `#`, by
+    ; stepping over it and scanning from there.
+    ;
+    ; Answers 1 for an identifier, 0 for "this is not one" (pos left at
+    ; start + prefixLength, as the reference leaves it), and -1 when the unicode
+    ; path would be needed, which is not ported.
+    procedure scan_identifier(this, prefix_len: int) returns int
+    {
+        let start state.pos
+        set state.pos: state.pos + prefix_len
+        let c0 this.char()
+        if is_ident_start_ascii(c0)
+        {
+            set state.pos: state.pos + 1
+            while is_ident_part_ascii(this.char())
+                set state.pos: state.pos + 1
+            let after this.char()
+            ; The reference's fast path holds while the next character is ASCII
+            ; and not a backslash; otherwise it rewinds and re-scans with the
+            ; unicode tables.
+            if (after < 128) and (after <> ("\\" as char) as int)
+                return 1
+            set state.pos: start + prefix_len
+            return 0 - 1
+        }
+        if c0 >= 128
+            return 0 - 1
+        if c0 = ("\\" as char) as int
+            return 0 - 1
+        0
+    }
+
+    ; ── template literals ───────────────────────────────────────────────────
+    ;
+    ; The reference's scanTemplateAndSetTokenValue. Called from the scan loop it
+    ; always starts on a backtick, so it answers NoSubstitutionTemplateLiteral or
+    ; TemplateHead; the Middle/Tail pair comes from the parser's re-scan after a
+    ; `}`, which this slice has no caller for.
+    ;
+    ; Answers the Kind, or -1 when an escape inside it is not ported.
+    procedure scan_template(this) returns int
+    {
+        let started_with_backtick this.char() = ("\`" as char) as int
+        set state.pos: state.pos + 1
+
+        repeat
+        {
+            let ch this.char()
+
+            if (ch < 0) or (ch = ("\`" as char) as int)
+            {
+                if ch = ("\`" as char) as int
+                    set state.pos: state.pos + 1
+                else
+                    set state.token_flags: state.token_flags | TokenFlagsUnterminated
+                if started_with_backtick
+                    return KindNoSubstitutionTemplateLiteral
+                return KindTemplateTail
+            }
+
+            if (ch = ("$" as char) as int) and (this.char_at(1) = ("{" as char) as int)
+            {
+                set state.pos: state.pos + 2
+                if started_with_backtick
+                    return KindTemplateHead
+                return KindTemplateMiddle
+            }
+
+            if ch = ("\\" as char) as int
+            {
+                ; Same escape scanner as the string literal. The reference passes
+                ; a different flag set here (ReportErrors is clear), but that
+                ; selects diagnostics only — no position and no token flag
+                ; differs — which is why the parameter is still not carried.
+                if not this.scan_escape_sequence()
+                    return 0 - 1
+                continue
+            }
+
+            ; <CR> and <CR><LF> normalize to <LF> in a template VALUE. Only the
+            ; position matters here; the normalization is a tokenValue concern.
+            if ch = ("\r" as char) as int
+            {
+                set state.pos: state.pos + 1
+                if this.char() = ("\n" as char) as int
+                    set state.pos: state.pos + 1
+                continue
+            }
+
+            set state.pos: state.pos + 1
+        }
+    }
+
+    ; ── string literals ─────────────────────────────────────────────────────
+    ;
+    ; The reference has a fast path that finds the closing quote with one
+    ; IndexByte and takes the whole span when it contains no backslash and no
+    ; line break. It is a pure optimization — the loop below reaches the same
+    ; position and the same flags in every case, including the empty string and
+    ; the unterminated one — so only the loop is ported. Add the fast path when
+    ; a measurement asks for it, not before.
+
+    procedure scan_string(this) returns bool
+    {
+        let quote this.char()
+        if quote = ("'" as char) as int
+            set state.token_flags: state.token_flags | TokenFlagsSingleQuote
+        set state.pos: state.pos + 1
+
+        repeat
+        {
+            let ch this.char()
+            if ch < 0
+            {
+                set state.token_flags: state.token_flags | TokenFlagsUnterminated
+                return true
+            }
+            if ch = quote
+            {
+                set state.pos: state.pos + 1
+                return true
+            }
+            if ch = ("\\" as char) as int
+            {
+                if not this.scan_escape_sequence()
+                    return false
+                continue
+            }
+            if is_line_break(ch)
+            {
+                set state.token_flags: state.token_flags | TokenFlagsUnterminated
+                return true
+            }
+            set state.pos: state.pos + 1
+        }
+    }
 
     ; ── JSDoc tag detection ─────────────────────────────────────────────────
     ;
@@ -352,12 +1126,15 @@ define Scanner
                     set state.pos: state.pos + 2
                     while true
                     {
-                        let c2 this.char()
-                        if c2 < 0
+                        if state.pos >= end
                             break
-                        if is_line_break(c2)
+                        ; Decoded, not byte-wise: U+2028 and U+2029 END a
+                        ; single-line comment, and a byte scan would run past
+                        ; them to the next LF.
+                        let sz this.utf8_size_at(state.pos)
+                        if is_line_break_rune(this.utf8_decode_at(state.pos))
                             break
-                        set state.pos: state.pos + 1
+                        set state.pos: state.pos + sz
                     }
                     if skip_trivia
                         continue
@@ -375,17 +1152,20 @@ define Scanner
                     var closed: bool false
                     while true
                     {
-                        let c2 this.char()
-                        if c2 < 0
+                        if state.pos >= end
                             break
-                        if (c2 = ("*" as char) as int) and (this.char_at(1) = ("/" as char) as int)
+                        if (this.char() = ("*" as char) as int) and (this.char_at(1) = ("/" as char) as int)
                         {
                             set state.pos: state.pos + 2
                             set closed: true
                             break
                         }
-                        set state.pos: state.pos + 1
-                        if is_line_break(c2)
+                        ; Decoded: U+2028 inside a block comment sets
+                        ; PrecedingLineBreak on the token that follows the
+                        ; comment, which a byte scan cannot see.
+                        let cp this.utf8_decode_at(state.pos)
+                        set state.pos: state.pos + this.utf8_size_at(state.pos)
+                        if is_line_break_rune(cp)
                             set state.token_flags: state.token_flags | TokenFlagsPrecedingLineBreak
                     }
                     if is_jsdoc
@@ -533,10 +1313,15 @@ define Scanner
 
             if ch = ("." as char) as int
             {
-                ; `.5` is a numeric literal — unported, and it must not be
-                ; mistaken for a dot followed by something.
+                ; `.5` is a numeric literal, and scan_number handles it from the
+                ; dot: its leading-zero branch does not fire, the fragment scan
+                ; consumes nothing, and the fraction branch takes over.
                 if is_digit(this.char_at(1))
-                    return this.unported()
+                {
+                    let k this.scan_number()
+                    set state.token: k
+                    return k
+                }
                 if (this.char_at(1) = ("." as char) as int) and (this.char_at(2) = ("." as char) as int)
                     return this.punctn(3, KindDotDotDotToken)
                 return this.punct1(KindDotToken)
@@ -584,37 +1369,179 @@ define Scanner
                 return this.punct1(KindQuestionToken)
             }
 
+            ; ── numeric literals ────────────────────────────────────────────
+
+            if ch = ("0" as char) as int
+            {
+                let c1 this.char_at(1)
+
+                if (c1 = ("X" as char) as int) or (c1 = ("x" as char) as int)
+                {
+                    set state.pos: state.pos + 2
+                    this.scan_hex_digits(1, true, true)
+                    set state.token_flags: state.token_flags | TokenFlagsHexSpecifier
+                    let k this.scan_big_int_suffix()
+                    set state.token: k
+                    return k
+                }
+
+                if (c1 = ("B" as char) as int) or (c1 = ("b" as char) as int)
+                {
+                    set state.pos: state.pos + 2
+                    this.scan_binary_or_octal_digits(2)
+                    set state.token_flags: state.token_flags | TokenFlagsBinarySpecifier
+                    let k this.scan_big_int_suffix()
+                    set state.token: k
+                    return k
+                }
+
+                if (c1 = ("O" as char) as int) or (c1 = ("o" as char) as int)
+                {
+                    set state.pos: state.pos + 2
+                    this.scan_binary_or_octal_digits(8)
+                    set state.token_flags: state.token_flags | TokenFlagsOctalSpecifier
+                    let k this.scan_big_int_suffix()
+                    set state.token: k
+                    return k
+                }
+
+                ; The reference falls through from '0' into the '1'..'9' arm.
+                let k this.scan_number()
+                set state.token: k
+                return k
+            }
+
+            if is_digit(ch)
+            {
+                let k this.scan_number()
+                set state.token: k
+                return k
+            }
+
+            ; ── string literals ─────────────────────────────────────────────
+
+            if (ch = ("\"" as char) as int) or (ch = ("'" as char) as int)
+            {
+                if not this.scan_string()
+                    return this.unported()
+                set state.token: KindStringLiteral
+                return KindStringLiteral
+            }
+
             ; ── identifiers and keywords, ASCII fast path ───────────────────
 
             if is_ident_start_ascii(ch)
             {
                 let start state.pos
-                set state.pos: state.pos + 1
-                while true
-                {
-                    let c2 this.char()
-                    if c2 < 0
-                        break
-                    if not is_ident_part_ascii(c2)
-                        break
-                    set state.pos: state.pos + 1
-                }
-                ; A `\` here starts a unicode escape inside the identifier, and a
-                ; byte >= 0x80 starts a non-ASCII identifier part. Both leave the
-                ; reference's fast path, and neither is ported.
-                let after this.char()
-                if after = ("\\" as char) as int
-                    return this.unported()
-                if after >= 128
+                let r this.scan_identifier(0)
+                if r < 0
                     return this.unported()
                 let k get_identifier_token(buffer + start, state.pos - start)
                 set state.token: k
                 return k
             }
 
-            ; ── everything this slice does not implement ────────────────────
+            ; ── template literals ───────────────────────────────────────────
+
+            if ch = ("\`" as char) as int
+            {
+                let k this.scan_template()
+                if k < 0
+                    return this.unported()
+                set state.token: k
+                return k
+            }
+
+            ; ── private names and the shebang ───────────────────────────────
+
+            if ch = ("#" as char) as int
+            {
+                if this.char_at(1) = ("!" as char) as int
+                {
+                    if state.pos = 0
+                    {
+                        ; A shebang, and only at offset 0. It is trivia: skipped
+                        ; whole, with no token of its own.
+                        set state.pos: state.pos + 2
+                        while state.pos < end
+                        {
+                            if is_line_break_rune(this.utf8_decode_at(state.pos))
+                                break
+                            set state.pos: state.pos + this.utf8_size_at(state.pos)
+                        }
+                        continue
+                    }
+                    ; `#!` anywhere else is an error and consumes ONE character.
+                    set state.pos: state.pos + 1
+                    set state.token: KindUnknown
+                    return KindUnknown
+                }
+
+                ; `#\` opens a private name written with a unicode escape.
+                if this.char_at(1) = ("\\" as char) as int
+                    return this.unported()
+
+                ; Whether or not a name follows, the token is a private
+                ; identifier — a bare `#` is one that spans just the `#`.
+                let r this.scan_identifier(1)
+                if r < 0
+                    return this.unported()
+                set state.token: KindPrivateIdentifier
+                return KindPrivateIdentifier
+            }
+
+            ; ── the default arm ─────────────────────────────────────────────
             ;
-            ; Digits, quotes, backticks, `\`, `#`, and any non-ASCII byte.
+            ; The reference tries scanIdentifier FIRST here, which is what makes
+            ; a non-ASCII identifier start work — and deciding that needs the
+            ; Unicode identifier tables, which are not ported. So only the two
+            ; rune classes that can never BE an identifier start are handled
+            ; (whitespace and line terminators are Zs/Zl/Zp, disjoint from
+            ; L*/Nl/$/_), and everything else bails. Handling them here is
+            ; therefore faithful, not a reordering.
+
+            if ch >= 128
+            {
+                let cp this.utf8_decode_at(state.pos)
+                let sz this.utf8_size_at(state.pos)
+
+                ; Go returns RuneError for an invalid sequence, and the reference
+                ; compares against it without telling that apart from a genuine
+                ; U+FFFD — so both mean "binary file" and swallow the rest.
+                if cp = 0xFFFD
+                {
+                    set state.pos: end
+                    set state.token: KindNonTextFileMarkerTrivia
+                    return KindNonTextFileMarkerTrivia
+                }
+
+                if is_white_space_single_line(cp)
+                {
+                    set state.pos: state.pos + sz
+                    ; U+0085 continues even when trivia is NOT being skipped —
+                    ; the reference singles it out.
+                    if (cp = 0x0085) or skip_trivia
+                        continue
+                    while true
+                    {
+                        let c2 this.utf8_decode_at(state.pos)
+                        if not is_white_space_single_line(c2)
+                            break
+                        set state.pos: state.pos + this.utf8_size_at(state.pos)
+                    }
+                    set state.token: KindWhitespaceTrivia
+                    return KindWhitespaceTrivia
+                }
+
+                if is_line_break_rune(cp)
+                {
+                    set state.token_flags: state.token_flags | TokenFlagsPrecedingLineBreak
+                    set state.pos: state.pos + sz
+                    continue
+                }
+            }
+
+            ; Templates, regular expressions, `#`, `\` and non-ASCII identifiers.
             return this.unported()
         }
     }
