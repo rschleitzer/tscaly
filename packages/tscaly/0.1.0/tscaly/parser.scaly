@@ -2,11 +2,11 @@
 ;
 ; parser — ported from the reference's internal/parser/parser.go.
 ;
-; SLICES 1–4. The spine, the declaration router, the TYPE surface and the
-; SIGNATURE — parameters, return types, function declarations. Anything
-; outside them reports its own POSITION as unported rather than building a
-; plausible tree that quietly disagrees with the reference — the same mechanism
-; the scanner carries, and for the same reason.
+; SLICES 1–5. The spine, the declaration router, the TYPE surface, the
+; SIGNATURE and the EXPRESSION ladder. Anything outside them reports its own
+; POSITION as unported rather than building a plausible tree that quietly
+; disagrees with the reference — the same mechanism the scanner carries, and for
+; the same reason.
 ;
 ; ── What is parsed ──────────────────────────────────────────────────────────
 ;
@@ -23,6 +23,13 @@
 ;   slice 4  the SIGNATURE (see the SIGNATURES banner): parameter lists, return
 ;            types and type predicates, the function declaration, and the
 ;            function and constructor TYPES the type parser was waiting on
+;   slice 5  the EXPRESSION ladder (see the EXPRESSIONS banner), and with it
+;            three things that only became REACHABLE once expressions parsed:
+;            `await`/`using` at statement start (both fall through to an
+;            expression statement when the look-ahead says no declaration), the
+;            HasJSDoc clear on a `(`-headed expression statement, and the
+;            top-level-await REPARSE condition — the reference's second pass
+;            over statements that used `await` as a name in a module
 ;
 ; ── What it deliberately does not, each stated rather than left to be noticed ─
 ;
@@ -42,14 +49,12 @@
 ;   real (unported is not a pass), but they are not equally strong, and
 ;   CLAUDE.md's control table says which each one is.
 ;
-; ★ EXPRESSIONS. The ladder above a primary expression — binary operators,
-;   calls, member access, `as`, the conditional operator — is unported. It is
-;   the largest remaining block by a wide margin: 40.1 % of first blockers after
-;   slice 4, against 17.8 % for the next one. Note which way the dependency
-;   runs: the TYPE and SIGNATURE sides are complete enough to parse on their
-;   own, while several facts on both (a postfix `[` after a line break, `type`
-;   used as a name, `yield` inside a generator) cannot be TESTED until an
-;   expression can be parsed beside them.
+; ★ THE LADDER IS IN (slice 5), and the shape of what is left changed
+;   completely with it. The largest remaining block is the CLASS family — the
+;   class statement, the class declaration and the class expression together are
+;   26.0 % of corpus first blockers — followed by interface/namespace/enum at
+;   21.5 % and the object TYPE literal at 12.8 %. What the ladder itself still
+;   omits is named at the EXPRESSIONS banner, one line per construct.
 ;
 ; ★ ERROR RECOVERY. The reference parses lists through parsing CONTEXTS with
 ;   per-context element and terminator predicates and a token-skipping recovery.
@@ -58,7 +63,7 @@
 ;   shortcut that changes results: recovery only runs after a diagnostic, and a
 ;   diagnostic is already an unported report.
 ;
-; ── Two mapping decisions, both for CLAUDE.md §3 ────────────────────────────
+; ── Three mapping decisions, all for CLAUDE.md §3 ───────────────────────────
 ;
 ; (1) `lookAhead(callback)` becomes a method per call site that marks, scans and
 ;     rewinds inline. Go passes a func value; Scaly's only escaping-closure form
@@ -72,6 +77,11 @@
 ;     and this switch has about forty. The arms are disjoint by construction —
 ;     each tests the same token against a distinct kind — so the two are exactly
 ;     equivalent here. Same reasoning as the scanner's, one level up.
+;
+; (3) `unported` has TWO records since slice 5, because the reference's `rewind`
+;     truncates its diagnostics and ours has to have the same lifetime. Which
+;     record a site writes says what its report means — see the ParserState
+;     header, which is where the argument lives.
 
 use scaly.memory.Page
 use scaly.containers.Array
@@ -107,6 +117,21 @@ use tscaly.ast.ParameterData
 use tscaly.ast.FunctionDeclarationData
 use tscaly.ast.FunctionTypeData
 use tscaly.ast.ConstructorTypeData
+use tscaly.ast.BinaryExpressionData
+use tscaly.ast.ConditionalExpressionData
+use tscaly.ast.YieldExpressionData
+use tscaly.ast.AsExpressionData
+use tscaly.ast.TypeAssertionData
+use tscaly.ast.PropertyAccessData
+use tscaly.ast.ElementAccessData
+use tscaly.ast.CallExpressionData
+use tscaly.ast.NewExpressionData
+use tscaly.ast.ExpressionWithTypeArgumentsData
+use tscaly.ast.ElementListData
+use tscaly.ast.ArrowFunctionData
+use tscaly.ast.FunctionExpressionData
+use tscaly.ast.PropertyAssignmentData
+use tscaly.ast.ShorthandPropertyAssignmentData
 
 ; The reference's jsdocScannerInfo — what the scanner noticed about the JSDoc
 ; comment preceding the token the parser is about to consume. It is captured at
@@ -119,10 +144,60 @@ use tscaly.ast.ConstructorTypeData
 ; are plain tags and the numbering is ours. Add an entry only when the list it
 ; names is actually parsed — an unreachable arm of isListElement/isListTerminator
 ; is an untested transcription of a table that is easy to get subtly wrong.
-define PCTypeArguments:     int 0
-define PCTypeParameters:    int 1
-define PCTupleElementTypes: int 2
-define PCParameters:        int 3
+define PCTypeArguments:       int 0
+define PCTypeParameters:      int 1
+define PCTupleElementTypes:   int 2
+define PCParameters:          int 3
+define PCArgumentExpressions: int 4
+define PCArrayLiteralMembers: int 5
+define PCObjectLiteralMembers: int 6
+
+; ── operator precedence, ported from internal/ast/precedence.go ─────────────
+;
+; The reference declares these with `iota`, so the VALUES are an artifact of the
+; declaration order and only their ORDER is meaningful — which is why they are
+; written out here rather than derived. Two of them are aliases rather than
+; positions of their own (Coalesce IS LogicalOR), exactly as upstream has it.
+;
+; Invalid is -1 and is lower than every real precedence, which is what makes
+; parseBinaryExpressionRest stop on a token that is not a binary operator: the
+; loop's test is `newPrecedence > precedence`, and Lowest is 0.
+define OperatorPrecedenceComma:          int 0
+define OperatorPrecedenceSpread:         int 1
+define OperatorPrecedenceYield:          int 2
+define OperatorPrecedenceAssignment:     int 3
+define OperatorPrecedenceConditional:    int 4
+define OperatorPrecedenceLogicalOR:      int 5
+define OperatorPrecedenceLogicalAND:     int 6
+define OperatorPrecedenceBitwiseOR:      int 7
+define OperatorPrecedenceBitwiseXOR:     int 8
+define OperatorPrecedenceBitwiseAND:     int 9
+define OperatorPrecedenceEquality:       int 10
+define OperatorPrecedenceRelational:     int 11
+define OperatorPrecedenceShift:          int 12
+define OperatorPrecedenceAdditive:       int 13
+define OperatorPrecedenceMultiplicative: int 14
+define OperatorPrecedenceExponentiation: int 15
+define OperatorPrecedenceUnary:          int 16
+define OperatorPrecedenceUpdate:         int 17
+define OperatorPrecedenceLeftHandSide:   int 18
+define OperatorPrecedenceOptionalChain:  int 19
+define OperatorPrecedenceMember:         int 20
+define OperatorPrecedencePrimary:        int 21
+define OperatorPrecedenceParentheses:    int 22
+
+define OperatorPrecedenceLowest:   int OperatorPrecedenceComma
+define OperatorPrecedenceHighest:  int OperatorPrecedenceParentheses
+define OperatorPrecedenceCoalesce: int OperatorPrecedenceLogicalOR
+define OperatorPrecedenceInvalid:  int 0 - 1
+
+; The reference's core.Tristate, for the one question that needs three answers:
+; does a `(`, `<` or `async` start an arrow function? TRUE parses one without
+; further ado, FALSE never does, and UNKNOWN speculates — and the three are not
+; collapsible, because UNKNOWN is the case that must be able to change its mind.
+define TristateFalse:   int 0
+define TristateTrue:    int 1
+define TristateUnknown: int 2
 
 ; The reference's ParseFlags — the signature context a parameter list and a
 ; function body are parsed in. Only the three this slice can REACH are declared:
@@ -139,20 +214,59 @@ define JsdocInfoHasDeprecated: int 1 << 1
 define JsdocInfoHasSeeOrLink: int 1 << 2
 
 ; The reference's ParserState (mark/rewind). It saves the scanner's block plus
-; the parser's own speculative state; the diagnostic and jsdoc list lengths it
-; also truncates have no counterpart here, because this slice keeps no lists.
+; the parser's own speculative state.
+;
+; ★★★ It ALSO saves the unported record since slice 5, which REVERSES the
+; decision §3.9e recorded — and the reason is that the reference's own `rewind`
+; TRUNCATES p.diagnostics back to the saved length. A speculation that reported
+; errors and was then discarded reports NOTHING upstream. Our `unported` stands
+; in for those diagnostics, so it has to have their lifetime; keeping it sticky
+; made a discarded speculation poison the whole parse.
+;
+; That is not a corner case. `a << b` puts the expression ladder into
+; tryParseTypeArgumentsInExpression, which parses `<b>` as a type-parameter list,
+; fails to find a comma, and throws the whole thing away — upstream with its
+; diagnostics, here with an unported record that used to survive. A shift
+; operator was unparsable.
+;
+; ★★ What §3.9e was actually protecting is a DIFFERENT question, and it now has
+; its own channel rather than a different rewind. Two records, and which one a
+; site writes says what its report MEANS:
+;
+;   unported      the reference would have emitted a DIAGNOSTIC here. Rewound
+;                 with the speculation that produced it, exactly as
+;                 p.diagnostics is. Almost every site.
+;   unanswerable  this port cannot ANSWER a question whose answer the caller is
+;                 about to use. NOT rewound, because the answer travels out of
+;                 the speculation even though the parse does not.
+;                 `skip_parameter_start` is the only site, and the whole of
+;                 §3.9e is about it: answering `false` there would route
+;                 `([a]: T) => U` down the parenthesized-type path and build a
+;                 tree nobody has checked.
+;
+; Getting it backwards is silent in both directions: `unported` where the answer
+; escapes lets a wrong tree through, and `unanswerable` where the reference
+; discards over-reports a construct this port can in fact parse.
 define ParserState
 (
     scanner_state: ScannerState
     context_flags: int
     has_parse_error: bool
+    statement_has_await_identifier: bool
+    unported_pos: int
+    unported_tag: pointer[const_char]
+    unported_detail: int
 )
 {
-    init(ss: ScannerState, cf: int, hpe: bool)
+    init(ss: ScannerState, cf: int, hpe: bool, hai: bool, up: int, ut: pointer[const_char], ud: int)
     {
         set scanner_state: ss
         set context_flags: cf
         set has_parse_error: hpe
+        set statement_has_await_identifier: hai
+        set unported_pos: up
+        set unported_tag: ut
+        set unported_detail: ud
     }
 }
 
@@ -180,6 +294,14 @@ define Parser
     unported_tag: pointer[const_char]
     unported_detail: int
 
+    ; The second record — "this port cannot ANSWER this question" — which a
+    ; rewind does NOT restore, because the answer leaves the speculation even
+    ; though the parse does not. One site writes it; see the ParserState header
+    ; and `unanswerable_bool`.
+    unanswerable_pos: int
+    unanswerable_tag: pointer[const_char]
+    unanswerable_detail: int
+
     ; The await context a parameter list was entered FROM. The reference reads
     ; it out of a closure — parseParametersWorker captures it before it changes
     ; the context flags, and the per-element callback uses it for the parameter's
@@ -192,6 +314,36 @@ define Parser
     ; live only for the duration of one parse_delimited_list(PCParameters) call
     ; and is saved and restored around it, exactly as a capture would be.
     parameter_outer_await_context: bool
+
+    ; parseParametersWorker's `allowAmbiguity`, travelling the same way and for
+    ; the same reason: the element callback is a static arm of parse_list_element
+    ; (§3.9d/§3.9e), so what the reference closes over has to be state here. It
+    ; is false only inside the speculative half of an arrow-function parse.
+    parameter_allow_ambiguity: bool
+
+    ; The reference's `notParenthesizedArrow` — the set of token positions at
+    ; which a speculative arrow-function parse has already failed, so the same
+    ; text is never speculated over twice. It is a pure MEMO: the reference adds
+    ; to it only where the parse answered nil, and re-running would answer nil
+    ; again. Carried anyway, because without it a run of nested parentheses
+    ; re-speculates at every level.
+    not_parenthesized_arrow: pointer[Array[int]]
+
+    ; The reference's `statementHasAwaitIdentifier`: did the TOP-LEVEL statement
+    ; now being parsed contain an identifier literally named `await`, outside any
+    ; await context? Upstream uses it to decide which statements to RE-PARSE with
+    ; AwaitContext on, after the whole file has been parsed once
+    ; (reparseTopLevelAwait). This port has the detection and not the reparse, so
+    ; a statement that would be re-parsed is reported as unported instead — see
+    ; parse_source_file. It is saved and restored by mark/rewind, exactly as the
+    ; reference saves it.
+    statement_has_await_identifier: bool
+
+    ; ... and the file-level half of it: did ANY top-level statement record such
+    ; a span? The reference keeps the spans themselves (possibleAwaitSpans),
+    ; because it re-parses exactly those statements; this port only has to know
+    ; that there was one.
+    has_possible_await_span: bool
 )
 {
     init(host: pointer[Page], scanner: pointer[Scanner])
@@ -202,9 +354,16 @@ define Parser
         set this.context_flags: NodeFlagsNone
         set this.has_parse_error: false
         set this.parameter_outer_await_context: false
+        set this.parameter_allow_ambiguity: true
+        set this.not_parenthesized_arrow: null
+        set this.statement_has_await_identifier: false
+        set this.has_possible_await_span: false
         set this.unported_pos: 0 - 1
         set this.unported_tag: null
         set this.unported_detail: 0
+        set this.unanswerable_pos: 0 - 1
+        set this.unanswerable_tag: null
+        set this.unanswerable_detail: 0
     }
 
     ; ── the entry point ─────────────────────────────────────────────────────
@@ -233,14 +392,30 @@ define Parser
         file
     }
 
+    ; The two records fold here, and the DIAGNOSTIC one wins when both are set:
+    ; it is the report that stopped the parse that is standing now, while an
+    ; unanswerable one may have been left behind by a speculation whose text was
+    ; then parsed another way. Either one alone stops the parse.
     function unported_at(this) returns int
-        unported_pos
+    {
+        if unported_pos >= 0
+            return unported_pos
+        unanswerable_pos
+    }
 
     function unported_tag_at(this) returns pointer[const_char]
-        unported_tag
+    {
+        if unported_pos >= 0
+            return unported_tag
+        unanswerable_tag
+    }
 
     function unported_detail_at(this) returns int
-        unported_detail
+    {
+        if unported_pos >= 0
+            return unported_detail
+        unanswerable_detail
+    }
 
     ; Record the first unported construct and answer null, so a bail-out is one
     ; statement at the call site: `return this.unported("tag", token)`.
@@ -260,7 +435,11 @@ define Parser
     }
 
     function is_unported(this) returns bool
-        unported_pos >= 0
+    {
+        if unported_pos >= 0
+            return true
+        unanswerable_pos >= 0
+    }
 
     ; ── node construction ───────────────────────────────────────────────────
 
@@ -384,6 +563,12 @@ define Parser
         if (scanner.token_flags() & (TokenFlagsIsInvalid | TokenFlagsUnterminated)) <> 0
             this.unported("scan-error", token)
 
+        ; ... and the half that sets no flag at all, through the scanner's own
+        ; error position. Today that is the merge-conflict marker, which is
+        ; TRIVIA — so the token stream is identical and only the tree differs.
+        if scanner.first_error_at() >= 0
+            this.unported("scan-error", token)
+
         ; Carry the scanner's own omission up. Every span after an unscannable
         ; construct is meaningless, so the tree must not be reported.
         if scanner.unported_at() >= 0
@@ -487,14 +672,22 @@ define Parser
     ; ── speculation ─────────────────────────────────────────────────────────
 
     function mark(this) returns ParserState
-        ParserState(scanner.mark(), context_flags, has_parse_error)
+        ParserState(scanner.mark(), context_flags, has_parse_error, statement_has_await_identifier, unported_pos, unported_tag, unported_detail)
 
+    ; ★ The unported record is restored HERE, with everything else — the
+    ; reference truncates p.diagnostics at exactly this point. See the ParserState
+    ; header; the one report that must outlive a rewind goes to the separate
+    ; `unanswerable` record instead, which this deliberately does not touch.
     procedure rewind(this, saved: ParserState)
     {
         scanner.rewind(saved.scanner_state)
         set token: scanner.token()
         set context_flags: saved.context_flags
         set has_parse_error: saved.has_parse_error
+        set statement_has_await_identifier: saved.statement_has_await_identifier
+        set unported_pos: saved.unported_pos
+        set unported_tag: saved.unported_tag
+        set unported_detail: saved.unported_detail
     }
 
     ; lookAhead(nextTokenIsBindingIdentifierOrStartOfDestructuring), inlined —
@@ -531,7 +724,7 @@ define Parser
         {
             if this.is_unported()
                 return null
-            let s this.parse_statement()
+            let s this.parse_top_level_statement()
             if s = null
                 return null
             statements.add(s)
@@ -540,12 +733,106 @@ define Parser
         if this.is_unported()
             return null
 
+        ; Now the whole file is in hand, which is when the reference decides
+        ; whether to re-parse — see parse_top_level_statement.
+        if has_possible_await_span
+        {
+            if file_is_external_module(statements)
+                return this.unported("toplevel-await-reparse", 0)
+        }
+
         let end_jsdoc this.jsdoc_scanner_info()
         let eof this.parse_token_node()
         if this.with_jsdoc(eof, end_jsdoc) = null
             return null
 
         this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(statements, eof))), pos)
+    }
+
+    ; ★★★ parseToplevelStatement, minus the half this port does not have.
+    ;
+    ; Upstream parses the file ONCE, notes which top-level statements used
+    ; `await` as an identifier while not in an await context, and then RE-PARSES
+    ; exactly those statements with AwaitContext on (reparseTopLevelAwait) —
+    ; re-positioning the scanner, re-slicing the diagnostics, and replacing the
+    ; statements in place. It is a second pass over the source, and it is a slice
+    ; of its own.
+    ;
+    ; The DETECTION half is ported, because it is what decides whether the tree
+    ; this port produced is the tree the reference produced: when the answer is
+    ; yes, every node of that statement carries AwaitContext on the reference's
+    ; side and none of them do here. So the condition is reported rather than the
+    ; difference being left to surface as an unexplained failure — which is
+    ; exactly how it DID surface, on two corpus cases, the moment member access
+    ; started parsing and `M.await(1)` became reachable.
+    procedure parse_top_level_statement(this) returns pointer[AstNode]
+    {
+        set statement_has_await_identifier: false
+        let statement this.parse_statement()
+        if statement = null
+            return null
+        ; The reference records a SPAN here (possibleAwaitSpans) and does nothing
+        ; with it yet; whether it re-parses is decided at the end of the file.
+        if statement_has_await_identifier
+        {
+            if (statement.flags & NodeFlagsAwaitContext) = 0
+                set has_possible_await_span: true
+        }
+        statement
+    }
+
+    ; ★★★ The reparse runs only for an external MODULE:
+    ;
+    ;     !result.IsDeclarationFile && result.ExternalModuleIndicator != nil
+    ;                                && len(p.possibleAwaitSpans) > 0
+    ;
+    ; and the indicator is `isAnExternalModuleIndicatorNode` over the top-level
+    ; statements: an export modifier, an import declaration, an export
+    ; assignment, an export declaration, an `import x = require(…)`, or an
+    ; `import.meta` anywhere in the tree.
+    ;
+    ; ★ Every one of those but the FIRST is a construct this slice reports as
+    ; unported, so a file that parsed to the end can only be a module by the
+    ; export-modifier arm — which is why one test suffices here and is not a
+    ; simplification. (`IsDeclarationFile` is the `.d.ts` name test; the pinned
+    ; corpus has no such case, as the oracle's own header records.)
+    ;
+    ; This condition was NOT in the first version of this check, and the control
+    ; that found it is worth keeping in mind: removing the detection altogether
+    ; turned two corpus cases red and the fixture MATCHED — which can only mean
+    ; the fixture was being reported for something the reference does not do. It
+    ; had no export, so it was never a module.
+    function file_is_external_module(statements: pointer[Array[pointer[AstNode]]]) returns bool
+    {
+        if statements = null
+            return false
+        let len statements.get_length() as int
+        var i 0
+        while i < len
+        {
+            if statement_has_export_modifier(*(statements.get_buffer() + i))
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    ; ast.HasSyntacticModifier(node, ModifierFlagsExport), asked of the node's
+    ; own children: a modifier is an ordinary Token node here, and the three
+    ; declaration forms this slice builds all carry theirs as leading children.
+    function statement_has_export_modifier(n: pointer[AstNode]) returns bool
+    {
+        var i 0
+        while true
+        {
+            let c AstNode.child_at(n, i)
+            if c = null
+                break
+            if AstNode.kind_of(c) = KindExportKeyword
+                return true
+            set i: i + 1
+        }
+        false
     }
 
     ; ── statements ──────────────────────────────────────────────────────────
@@ -571,6 +858,23 @@ define Parser
             ; `{` or `[` follows; otherwise it is an ordinary identifier and the
             ; reference falls through to the expression statement.
             if this.is_let_declaration()
+                return this.parse_variable_statement(this.node_pos(), this.jsdoc_scanner_info(), null)
+        }
+
+        ; ★ `await using x = f()` and `using x = f()` are DECLARATIONS; a bare
+        ; `await e;` and a bare `using;` are expression statements. Both arms
+        ; fall through when the look-ahead says no, exactly as the reference's
+        ; switch does — and both were on the unported list until parser slice 5,
+        ; because until the ladder landed the fall-through had nowhere to go.
+        if token = KindAwaitKeyword
+        {
+            if this.is_await_using_declaration()
+                return this.parse_variable_statement(this.node_pos(), this.jsdoc_scanner_info(), null)
+        }
+
+        if token = KindUsingKeyword
+        {
+            if this.is_using_declaration()
                 return this.parse_variable_statement(this.node_pos(), this.jsdoc_scanner_info(), null)
         }
 
@@ -604,11 +908,10 @@ define Parser
     ; nests forty planner levels; a run of independent tests nests none.
     function statement_start_is_unported(k: int) returns bool
     {
-        ; ... reached through parseStatement's own cases
-        if k = KindAwaitKeyword
-            return true
-        if k = KindUsingKeyword
-            return true
+        ; ... reached through parseStatement's own cases. `await` and `using`
+        ; used to be here and are not any more: parse_statement routes them the
+        ; way the reference does, to a variable statement or to an expression
+        ; statement, and neither is unported since slice 5.
         if k = KindClassKeyword
             return true
         if k = KindDoKeyword
@@ -1430,6 +1733,17 @@ define Parser
         if token = KindUsingKeyword
             set flags: NodeFlagsUsing
 
+        ; `await using` consumes TWO keywords and carries both bits. The
+        ; reference's arm can also fall out of the switch without setting a flag
+        ; — that is its `break`, reached when the look-ahead says this is not a
+        ; declaration after all — but parse_statement is the only caller here and
+        ; it has already asked the same question, so that path cannot be entered.
+        if token = KindAwaitKeyword
+        {
+            set flags: NodeFlagsAwaitUsing
+            this.next_token()
+        }
+
         this.next_token()
 
         ; The reference's `for (let of X)` look-ahead produces an EMPTY
@@ -1530,6 +1844,15 @@ define Parser
         if ok = false
             return this.unported("identifier-expected", token)
         let pos this.node_pos()
+
+        ; The reference's newIdentifier sets statementHasAwaitIdentifier when the
+        ; identifier's TEXT is "await". Our scanner keeps no tokenValue, and it
+        ; does not need to: the two are the same question, because an escaped
+        ; `await` still scans as KindAwaitKeyword (with the escape flag) and
+        ; next_token already reports THAT as unported.
+        if token = KindAwaitKeyword
+            set statement_has_await_identifier: true
+
         ; The reference takes scanner.TokenValue() here and interns it. Our
         ; scanner keeps no tokenValue yet, and no node in this slice reads one.
         this.next_token_without_check()
@@ -1542,6 +1865,12 @@ define Parser
     procedure parse_identifier_name(this) returns pointer[AstNode]
         this.create_identifier(token_is_identifier_or_keyword(token))
 
+    ; ★ A BINDING named `await` does not count towards the top-level-await
+    ; reparse — `let await = 1` declares a variable, it does not use one — so the
+    ; flag is saved and restored around it. Three more sites do the same
+    ; (parse_property_name, parse_function_block, parse_right_side_of_dot's
+    ; identifier-only branch); every other one belongs to a declaration form this
+    ; slice reports as unported anyway.
     procedure parse_binding_identifier(this) returns pointer[AstNode]
     {
         ; Its own tag rather than create_identifier's: the histogram is the
@@ -1549,7 +1878,10 @@ define Parser
         ; type position wanted a name" are different work.
         if this.is_binding_identifier() = false
             return this.unported("binding-identifier", token)
-        this.create_identifier(true)
+        let saved_await_identifier statement_has_await_identifier
+        let id this.create_identifier(true)
+        set statement_has_await_identifier: saved_await_identifier
+        id
     }
 
     ; The reference's canParseSemicolon/tryParseSemicolon/parseSemicolon —
@@ -1586,10 +1918,16 @@ define Parser
     procedure parse_expression_or_labeled_statement(this) returns pointer[AstNode]
     {
         let pos this.node_pos()
-        ; The reference clears HasJSDoc again when the expression started with
-        ; `(`. A parenthesized expression is unported, so that arm cannot run
-        ; and is left out rather than carried untested.
-        let jsdoc this.jsdoc_scanner_info()
+        var jsdoc this.jsdoc_scanner_info()
+
+        ; ★ The reference clears HasJSDoc again when the expression started with
+        ; `(`, and the question has to be asked BEFORE the expression is parsed —
+        ; by then the token is long gone. Slice 4's note here said the arm could
+        ; not run because a parenthesized expression was unported; slice 5 makes
+        ; it reachable, and it is one of the few places where a flag depends on
+        ; how the expression STARTED rather than on what it turned out to be.
+        let has_paren token = KindOpenParenToken
+
         let expression this.parse_expression()
         if expression = null
             return null
@@ -1606,27 +1944,102 @@ define Parser
             return null
 
         let result this.finish_node(this.new_node(KindExpressionStatement, NodeData.ExpressionStatement(ExpressionStatementData(expression))), pos)
+        if has_paren
+            set jsdoc: jsdoc & ~JsdocInfoHasJsdoc
         this.with_jsdoc(result, jsdoc)
     }
 
-    ; ── expressions ─────────────────────────────────────────────────────────
+    ; ════════════════════════════════════════════════════════════════════════
+    ; EXPRESSIONS — parser slice 5
+    ; ════════════════════════════════════════════════════════════════════════
     ;
-    ; The reference's ladder is parseExpression -> parseAssignmentExpressionOrHigher
-    ; -> parseBinaryExpressionOrHigher -> parseUnaryExpressionOrHigher ->
-    ; parseUpdateExpression -> parseLeftHandSideExpressionOrHigher ->
-    ; parseMemberExpressionOrHigher -> parsePrimaryExpression. This slice has the
-    ; two ends of it and nothing between: anything that is not a primary
-    ; expression standing alone is unported.
+    ; The reference's ladder, top to bottom:
+    ;
+    ;   parseExpression                     the comma operator
+    ;   parseAssignmentExpressionOrHigher   yield, arrow functions, assignment
+    ;   parseConditionalExpressionRest      ? :
+    ;   parseBinaryExpressionOrHigher       precedence climbing, `as`/`satisfies`
+    ;   parseUnaryExpressionOrHigher        + - ~ ! delete typeof void await <T>
+    ;   parseUpdateExpression               ++ -- , prefix and postfix
+    ;   parseLeftHandSideExpressionOrHigher calls, super, import
+    ;   parseMemberExpressionOrHigher       . [] ! ?. <T>
+    ;   parsePrimaryExpression              the leaves and the bracketed forms
+    ;
+    ; The slice was read off the unported histogram, where the two expression
+    ; tags together were 40.1 % of first blockers against 17.8 % for the next
+    ; one — and unlike slices 2, 3 and 4 there is no cheaper sub-slice inside
+    ; it: `.`, `(`, `[`, `{` and `as` all end in parseMemberExpressionOrHigher
+    ; or parseBinaryExpressionOrHigher, so the ladder is indivisible in a way
+    ; the declaration router and the type surface were not.
+    ;
+    ; ── What is NOT ported, each because it is the head of another slice ────
+    ;
+    ;   template expressions and tagged  they need ReScanTemplateToken
+    ;     templates
+    ;   regular expression literals      they need ReScanSlashToken
+    ;   class expressions                the class slice
+    ;   decorators / `@expr`             the decorator slice (also a modifier)
+    ;   private identifiers `#x`         they need a node and an intern table
+    ;   `import(…)` and `import.meta`    both set SOURCE FILE flags
+    ;                                    (PossiblyContainsDynamicImport /
+    ;                                    …ImportMeta), which this port does not
+    ;                                    model — so parsing them would produce a
+    ;                                    SourceFile whose flags disagree, which
+    ;                                    the yardstick compares
+    ;   object literal methods and       they are parseMethodDeclaration and
+    ;     accessors                      parseAccessorDeclaration, i.e. the class
+    ;                                    member slice under another name
+    ;   binding patterns `[a]` `{a}`     unchanged from slice 4, and now reached
+    ;                                    from one more direction: `({x}) => …`
+    ;
+    ; ── Three faithfulness notes ────────────────────────────────────────────
+    ;
+    ; (1) More reference nodes carry a field the dump cannot see: the OPERATOR of
+    ;     a PrefixUnaryExpression and a PostfixUnaryExpression, the keyword of a
+    ;     MetaProperty, the `MultiLine` flag of an array or object literal. They
+    ;     are not stored, and that is a gap rather than a saving — see ast.scaly.
+    ;
+    ; (2) `checkJSSyntax`, which the reference calls on most of these nodes,
+    ;     returns immediately unless the node is in a JavaScript file. This port
+    ;     never sets NodeFlagsJavaScriptFile, so it is work that provably does
+    ;     nothing here rather than work that was skipped.
+    ;
+    ; (3) `typeHasArrowFunctionBlockingParseError`, which the reference consults
+    ;     before committing to a speculative arrow function, asks whether the
+    ;     return type contains a MISSING node. A missing node is only ever
+    ;     produced after a diagnostic, and a diagnostic is already unported here,
+    ;     so the predicate is constantly false and is left out.
 
     procedure parse_expression(this) returns pointer[AstNode]
     {
-        let e this.parse_assignment_expression_or_higher()
-        if e = null
+        ; The decorator context is cleared for the whole expression: a decorator
+        ; is unambiguous while it is being parsed, and its own `[` must not be
+        ; read as an element access (see parse_member_expression_rest).
+        let saved context_flags
+        this.set_context_flags(NodeFlagsDecoratorContext, false)
+
+        let pos this.node_pos()
+        var expr this.parse_assignment_expression_or_higher()
+        if expr = null
             return null
-        ; The comma operator builds a BinaryExpression chain.
-        if token = KindCommaToken
-            return this.unported("comma-operator", token)
-        e
+
+        while true
+        {
+            let operator_token this.parse_optional_token(KindCommaToken)
+            if this.is_unported()
+                return null
+            if operator_token = null
+                break
+            let right this.parse_assignment_expression_or_higher()
+            if right = null
+                return null
+            set expr: this.make_binary_expression(expr, operator_token, right, pos)
+            if expr = null
+                return null
+        }
+
+        set context_flags: saved
+        expr
     }
 
     ; doInContext(DisallowIn, false, parseExpression) — the shape every
@@ -1641,60 +2054,1055 @@ define Parser
         result
     }
 
-    procedure parse_assignment_expression_or_higher(this) returns pointer[AstNode]
+    ; The same wrapper around ONE assignment expression: an object literal's
+    ; initializer and a shorthand property's are parsed this way.
+    procedure parse_assignment_expression_allow_in(this) returns pointer[AstNode]
     {
-        let e this.parse_primary_expression()
-        if e = null
-            return null
-
-        ; Everything the ladder would do above a primary expression: a binary or
-        ; assignment operator, a call, a member access, a template tag, `as`,
-        ; the conditional operator. Each would change the tree, so each stops
-        ; the port here rather than being dropped.
-        if continues_expression(token)
-            return this.unported("expression-continues", token)
-        e
+        let saved context_flags
+        this.set_context_flags(NodeFlagsDisallowInContext, false)
+        let result this.parse_assignment_expression_or_higher()
+        set context_flags: saved
+        result
     }
 
-    ; True for a token that would keep the reference's expression ladder going.
-    ; The test is a RANGE plus the few punctuators outside it, taken from the
-    ; Kind table's contiguous runs: every binary operator (which includes every
-    ; assignment operator) lies in FirstBinaryOperator..LastBinaryOperator.
-    function continues_expression(k: int) returns bool
+    procedure parse_assignment_expression_or_higher(this) returns pointer[AstNode]
+        this.parse_assignment_expression_or_higher_worker(true)
+
+    ; ★ `allow_return_type_in_arrow_function` threads through the whole ladder
+    ; and looks like a flag that could be dropped. It cannot: it is what tells
+    ; `x ? (a): b => c : d` apart from an arrow function with a return type, and
+    ; the only place it is FALSE is the true-branch of a conditional expression.
+    procedure parse_assignment_expression_or_higher_worker(this, allow_return_type: bool) returns pointer[AstNode]
     {
-        if (k >= KindFirstBinaryOperator) and (k <= KindLastBinaryOperator)
+        if this.is_yield_expression()
+            return this.parse_yield_expression()
+        if this.is_unported()
+            return null
+
+        ; Productions 4 and 5 — an arrow function. It is neither a
+        ; LeftHandSideExpression nor the start of a ConditionalExpression, so a
+        ; successful parse ends the question here.
+        let arrow this.try_parse_parenthesized_arrow_function_expression(allow_return_type)
+        if this.is_unported()
+            return null
+        if arrow <> null
+            return arrow
+
+        let async_arrow this.try_parse_async_simple_arrow_function_expression(allow_return_type)
+        if this.is_unported()
+            return null
+        if async_arrow <> null
+            return async_arrow
+
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+        let expr this.parse_binary_expression_or_higher(OperatorPrecedenceLowest)
+        if expr = null
+            return null
+
+        ; `x => …`. The single un-parenthesized parameter is not looked ahead
+        ; for; it is recognised AFTERWARDS, from an expression that turned out to
+        ; be one identifier followed by an arrow.
+        if AstNode.kind_of(expr) = KindIdentifier
+        {
+            if token = KindEqualsGreaterThanToken
+                return this.parse_simple_arrow_function_expression(pos, expr, allow_return_type, jsdoc, null)
+        }
+
+        ; Productions 2 and 3 — assignment. The re-scan is what merges `>` `>`
+        ; `=` into `>>=`; without it every shift-assignment would read as a
+        ; comparison.
+        var is_assignment false
+        if is_left_hand_side_expression_kind(AstNode.kind_of(expr))
+        {
+            if is_assignment_operator(this.re_scan_greater_than_token())
+                set is_assignment: true
+        }
+        if is_assignment
+        {
+            let operator_token this.parse_token_node()
+            if operator_token = null
+                return null
+            let right this.parse_assignment_expression_or_higher_worker(allow_return_type)
+            if right = null
+                return null
+            return this.make_binary_expression(expr, operator_token, right, pos)
+        }
+
+        this.parse_conditional_expression_rest(expr, pos, allow_return_type)
+    }
+
+    procedure make_binary_expression(this, left: pointer[AstNode], operator_token: pointer[AstNode], right: pointer[AstNode], pos: int) returns pointer[AstNode]
+        this.finish_node(this.new_node(KindBinaryExpression, NodeData.BinaryExpression(BinaryExpressionData(left, operator_token, right))), pos)
+
+    ; ── yield ───────────────────────────────────────────────────────────────
+
+    procedure is_yield_expression(this) returns bool
+    {
+        if token <> KindYieldKeyword
+            return false
+        if this.in_yield_context()
             return true
-        if k = KindDotToken
-            return true
-        if k = KindQuestionDotToken
-            return true
-        if k = KindOpenParenToken
-            return true
-        if k = KindOpenBracketToken
-            return true
-        if k = KindQuestionToken
-            return true
-        if k = KindExclamationToken
-            return true
-        if k = KindPlusPlusToken
-            return true
-        if k = KindMinusMinusToken
-            return true
-        if k = KindAsKeyword
-            return true
-        if k = KindSatisfiesKeyword
-            return true
+        ; Outside a generator `yield` is an ordinary identifier — `yield(foo)` is
+        ; a call. The reference's heuristic is that a name or a literal directly
+        ; after it cannot be anything but a yield operand.
+        this.look_ahead_next_token_is_identifier_or_keyword_or_literal_on_same_line()
+    }
+
+    procedure parse_yield_expression(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        this.next_token()
+
+        var takes_operand false
+        if this.has_preceding_line_break() = false
+        {
+            if token = KindAsteriskToken
+                set takes_operand: true
+            if this.is_start_of_expression()
+                set takes_operand: true
+        }
+
+        var asterisk_token null as pointer[AstNode]
+        var expression null as pointer[AstNode]
+        if takes_operand
+        {
+            set asterisk_token: this.parse_optional_token(KindAsteriskToken)
+            if this.is_unported()
+                return null
+            set expression: this.parse_assignment_expression_or_higher()
+            if expression = null
+                return null
+        }
+
+        this.finish_node(this.new_node(KindYieldExpression, NodeData.YieldExpression(YieldExpressionData(asterisk_token, expression))), pos)
+    }
+
+    ; ── the conditional operator ────────────────────────────────────────────
+
+    procedure parse_conditional_expression_rest(this, left_operand: pointer[AstNode], pos: int, allow_return_type: bool) returns pointer[AstNode]
+    {
+        let question_token this.parse_optional_token(KindQuestionToken)
+        if this.is_unported()
+            return null
+        if question_token = null
+            return left_operand
+
+        ; `in` is allowed in the true branch and NOT re-allowed in the false one
+        ; — the reference is explicit that this asymmetry is deliberate.
+        let saved context_flags
+        this.set_context_flags(NodeFlagsDisallowInContext, false)
+        let true_expression this.parse_assignment_expression_or_higher_worker(false)
+        set context_flags: saved
+        if true_expression = null
+            return null
+
+        ; The reference continues with a MISSING identifier when the `:` is not
+        ; there; that is a diagnostic, so parse_expected_token stops instead.
+        let colon_token this.parse_expected_token(KindColonToken)
+        if colon_token = null
+            return null
+
+        let false_expression this.parse_assignment_expression_or_higher_worker(allow_return_type)
+        if false_expression = null
+            return null
+
+        this.finish_node(this.new_node(KindConditionalExpression, NodeData.ConditionalExpression(ConditionalExpressionData(left_operand, question_token, true_expression, colon_token, false_expression))), pos)
+    }
+
+    ; ── binary operators ────────────────────────────────────────────────────
+
+    procedure parse_binary_expression_or_higher(this, precedence: int) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let left_operand this.parse_unary_expression_or_higher()
+        if left_operand = null
+            return null
+        this.parse_binary_expression_rest(precedence, left_operand, pos)
+    }
+
+    ; Precedence climbing, transcribed with the reference's own two rules: a
+    ; left-associative operator is taken when its precedence is strictly HIGHER
+    ; than the caller's, and `**` — the only right-associative one — when it is
+    ; higher OR EQUAL.
+    procedure parse_binary_expression_rest(this, precedence: int, start_operand: pointer[AstNode], pos: int) returns pointer[AstNode]
+    {
+        var left_operand start_operand
+        var last_operand start_operand
+
+        while true
+        {
+            let op this.re_scan_greater_than_token()
+            let new_precedence get_binary_operator_precedence(op)
+
+            var consume false
+            if op = KindAsteriskAsteriskToken
+                set consume: new_precedence >= precedence
+            else
+                set consume: new_precedence > precedence
+            if consume = false
+                break
+
+            ; `for (a in b)` — inside the initializer, `in` is not an operator.
+            if op = KindInKeyword
+            {
+                if this.in_disallow_in_context()
+                    break
+            }
+
+            var is_type_operator false
+            if op = KindAsKeyword
+                set is_type_operator: true
+            if op = KindSatisfiesKeyword
+                set is_type_operator: true
+
+            if is_type_operator
+            {
+                ; ASI: `var x = foo` / `as (Bar)` on the next line is an
+                ; initialized variable followed by a CALL to something named
+                ; `as`, not a type assertion.
+                if this.has_preceding_line_break()
+                    break
+                this.next_token()
+
+                ; `a ## b as T` may not swallow an operator binding tighter than
+                ; `##`, because that would make the `as` impossible to erase
+                ; without changing the meaning.
+                var last_precedence OperatorPrecedenceHighest
+                if AstNode.kind_of(last_operand) = KindBinaryExpression
+                    set last_precedence: get_binary_operator_precedence(AstNode.binary_operator_kind(last_operand))
+
+                let type_node this.parse_type()
+                if type_node = null
+                    return null
+
+                var kind KindAsExpression
+                if op = KindSatisfiesKeyword
+                    set kind: KindSatisfiesExpression
+                var n null as pointer[AstNode]
+                if op = KindSatisfiesKeyword
+                    set n: this.new_node(kind, NodeData.SatisfiesExpression(AsExpressionData(left_operand, type_node)))
+                else
+                    set n: this.new_node(kind, NodeData.AsExpression(AsExpressionData(left_operand, type_node)))
+                set left_operand: this.finish_node(n, AstNode.pos_of(left_operand))
+                if left_operand = null
+                    return null
+
+                if get_binary_operator_precedence(this.re_scan_greater_than_token()) > last_precedence
+                    break
+            }
+            else
+            {
+                let operator_token this.parse_token_node()
+                if operator_token = null
+                    return null
+                let right this.parse_binary_expression_or_higher(new_precedence)
+                if right = null
+                    return null
+                set left_operand: this.make_binary_expression(left_operand, operator_token, right, pos)
+                if left_operand = null
+                    return null
+                set last_operand: left_operand
+            }
+        }
+
+        left_operand
+    }
+
+    ; ast.GetBinaryOperatorPrecedence. Every arm is the reference's; the answer
+    ; for anything else is Invalid, which is what stops the climb.
+    function get_binary_operator_precedence(k: int) returns int
+    {
+        if k = KindQuestionQuestionToken
+            return OperatorPrecedenceCoalesce
+        if k = KindBarBarToken
+            return OperatorPrecedenceLogicalOR
+        if k = KindAmpersandAmpersandToken
+            return OperatorPrecedenceLogicalAND
+        if k = KindBarToken
+            return OperatorPrecedenceBitwiseOR
+        if k = KindCaretToken
+            return OperatorPrecedenceBitwiseXOR
+        if k = KindAmpersandToken
+            return OperatorPrecedenceBitwiseAND
+        if k = KindEqualsEqualsToken
+            return OperatorPrecedenceEquality
+        if k = KindExclamationEqualsToken
+            return OperatorPrecedenceEquality
+        if k = KindEqualsEqualsEqualsToken
+            return OperatorPrecedenceEquality
+        if k = KindExclamationEqualsEqualsToken
+            return OperatorPrecedenceEquality
+        if k = KindLessThanToken
+            return OperatorPrecedenceRelational
+        if k = KindGreaterThanToken
+            return OperatorPrecedenceRelational
+        if k = KindLessThanEqualsToken
+            return OperatorPrecedenceRelational
+        if k = KindGreaterThanEqualsToken
+            return OperatorPrecedenceRelational
         if k = KindInstanceOfKeyword
+            return OperatorPrecedenceRelational
+        if k = KindInKeyword
+            return OperatorPrecedenceRelational
+        if k = KindAsKeyword
+            return OperatorPrecedenceRelational
+        if k = KindSatisfiesKeyword
+            return OperatorPrecedenceRelational
+        if k = KindLessThanLessThanToken
+            return OperatorPrecedenceShift
+        if k = KindGreaterThanGreaterThanToken
+            return OperatorPrecedenceShift
+        if k = KindGreaterThanGreaterThanGreaterThanToken
+            return OperatorPrecedenceShift
+        if k = KindPlusToken
+            return OperatorPrecedenceAdditive
+        if k = KindMinusToken
+            return OperatorPrecedenceAdditive
+        if k = KindAsteriskToken
+            return OperatorPrecedenceMultiplicative
+        if k = KindSlashToken
+            return OperatorPrecedenceMultiplicative
+        if k = KindPercentToken
+            return OperatorPrecedenceMultiplicative
+        if k = KindAsteriskAsteriskToken
+            return OperatorPrecedenceExponentiation
+        OperatorPrecedenceInvalid
+    }
+
+    ; ast.IsAssignmentOperator. The sixteen assignment operators are one
+    ; CONTIGUOUS run of the Kind table (63..78), which is why this is a range
+    ; test and the reference's enumeration is not transcribed — the same
+    ; property the keyword and binary-operator tests rest on.
+    function is_assignment_operator(k: int) returns bool
+        (k >= KindFirstAssignment) and (k <= KindLastAssignment)
+
+    ; ast.isLeftHandSideExpressionKind. The JSX kinds are in the reference's
+    ; list and are left out here for the same reason the JSX parser is: neither
+    ; side selects that language variant.
+    function is_left_hand_side_expression_kind(k: int) returns bool
+    {
+        if k = KindPropertyAccessExpression
+            return true
+        if k = KindElementAccessExpression
+            return true
+        if k = KindNewExpression
+            return true
+        if k = KindCallExpression
+            return true
+        if k = KindTaggedTemplateExpression
+            return true
+        if k = KindArrayLiteralExpression
+            return true
+        if k = KindParenthesizedExpression
+            return true
+        if k = KindObjectLiteralExpression
+            return true
+        if k = KindClassExpression
+            return true
+        if k = KindFunctionExpression
+            return true
+        if k = KindIdentifier
+            return true
+        if k = KindPrivateIdentifier
+            return true
+        if k = KindRegularExpressionLiteral
+            return true
+        if k = KindNumericLiteral
+            return true
+        if k = KindBigIntLiteral
+            return true
+        if k = KindStringLiteral
             return true
         if k = KindNoSubstitutionTemplateLiteral
             return true
-        if k = KindTemplateHead
+        if k = KindTemplateExpression
             return true
-        false
+        if k = KindFalseKeyword
+            return true
+        if k = KindNullKeyword
+            return true
+        if k = KindThisKeyword
+            return true
+        if k = KindTrueKeyword
+            return true
+        if k = KindSuperKeyword
+            return true
+        if k = KindNonNullExpression
+            return true
+        if k = KindExpressionWithTypeArguments
+            return true
+        if k = KindMetaProperty
+            return true
+        if k = KindImportKeyword
+            return true
+        k = KindMissingDeclaration
     }
+
+    ; ── unary and update ────────────────────────────────────────────────────
+
+    procedure parse_unary_expression_or_higher(this) returns pointer[AstNode]
+    {
+        if this.is_update_expression()
+        {
+            let pos this.node_pos()
+            let update_expression this.parse_update_expression()
+            if update_expression = null
+                return null
+            ; `a ** b` — the exponent binds to the UPDATE expression, so the
+            ; climb is re-entered here rather than one level up.
+            if token = KindAsteriskAsteriskToken
+                return this.parse_binary_expression_rest(get_binary_operator_precedence(token), update_expression, pos)
+            return update_expression
+        }
+
+        let simple this.parse_simple_unary_expression()
+        if simple = null
+            return null
+        ; `-a ** b` is a grammar error the reference reports and then parses
+        ; anyway. A diagnostic, hence unported.
+        if token = KindAsteriskAsteriskToken
+            return this.unported("unary-exponentiation", token)
+        simple
+    }
+
+    function is_update_expression(this) returns bool
+    {
+        if token = KindPlusToken
+            return false
+        if token = KindMinusToken
+            return false
+        if token = KindTildeToken
+            return false
+        if token = KindExclamationToken
+            return false
+        if token = KindDeleteKeyword
+            return false
+        if token = KindTypeOfKeyword
+            return false
+        if token = KindVoidKeyword
+            return false
+        if token = KindAwaitKeyword
+            return false
+        ; `<` is an update expression only under the JSX variant, where it opens
+        ; an element. Here it opens a type assertion, which is a unary form.
+        if token = KindLessThanToken
+            return false
+        true
+    }
+
+    procedure parse_update_expression(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+
+        var is_prefix false
+        if token = KindPlusPlusToken
+            set is_prefix: true
+        if token = KindMinusMinusToken
+            set is_prefix: true
+        if is_prefix
+        {
+            this.next_token()
+            let operand this.parse_left_hand_side_expression_or_higher()
+            if operand = null
+                return null
+            return this.finish_node(this.new_node(KindPrefixUnaryExpression, NodeData.PrefixUnaryExpression(WrappedTypeData(operand))), pos)
+        }
+
+        let expression this.parse_left_hand_side_expression_or_higher()
+        if expression = null
+            return null
+
+        var is_postfix false
+        if token = KindPlusPlusToken
+            set is_postfix: true
+        if token = KindMinusMinusToken
+            set is_postfix: true
+        if is_postfix
+        {
+            ; ASI: a `++` on the NEXT line belongs to the next statement.
+            if this.has_preceding_line_break() = false
+            {
+                this.next_token()
+                return this.finish_node(this.new_node(KindPostfixUnaryExpression, NodeData.PostfixUnaryExpression(WrappedTypeData(expression))), pos)
+            }
+        }
+
+        expression
+    }
+
+    procedure parse_simple_unary_expression(this) returns pointer[AstNode]
+    {
+        if token = KindPlusToken
+            return this.parse_prefix_unary_expression()
+        if token = KindMinusToken
+            return this.parse_prefix_unary_expression()
+        if token = KindTildeToken
+            return this.parse_prefix_unary_expression()
+        if token = KindExclamationToken
+            return this.parse_prefix_unary_expression()
+
+        if token = KindDeleteKeyword
+            return this.parse_keyword_unary_expression(KindDeleteExpression)
+        if token = KindTypeOfKeyword
+            return this.parse_keyword_unary_expression(KindTypeOfExpression)
+        if token = KindVoidKeyword
+            return this.parse_keyword_unary_expression(KindVoidExpression)
+
+        if token = KindLessThanToken
+            return this.parse_type_assertion()
+
+        if token = KindAwaitKeyword
+        {
+            if this.is_await_expression()
+                return this.parse_keyword_unary_expression(KindAwaitExpression)
+        }
+
+        this.parse_update_expression()
+    }
+
+    procedure parse_prefix_unary_expression(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        this.next_token()
+        let operand this.parse_simple_unary_expression()
+        if operand = null
+            return null
+        this.finish_node(this.new_node(KindPrefixUnaryExpression, NodeData.PrefixUnaryExpression(WrappedTypeData(operand))), pos)
+    }
+
+    ; parseDeleteExpression / parseTypeOfExpression / parseVoidExpression /
+    ; parseAwaitExpression are four copies of one body in the reference, and the
+    ; only thing that differs is the node kind. Kept as one function with the
+    ; kind as an argument, which is the same grouping WrappedTypeData makes on
+    ; the ast side.
+    procedure parse_keyword_unary_expression(this, kind: int) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        this.next_token()
+        let operand this.parse_simple_unary_expression()
+        if operand = null
+            return null
+        var n null as pointer[AstNode]
+        if kind = KindDeleteExpression
+            set n: this.new_node(kind, NodeData.DeleteExpression(WrappedTypeData(operand)))
+        if kind = KindTypeOfExpression
+            set n: this.new_node(kind, NodeData.TypeOfExpression(WrappedTypeData(operand)))
+        if kind = KindVoidExpression
+            set n: this.new_node(kind, NodeData.VoidExpression(WrappedTypeData(operand)))
+        if kind = KindAwaitExpression
+            set n: this.new_node(kind, NodeData.AwaitExpression(WrappedTypeData(operand)))
+        this.finish_node(n, pos)
+    }
+
+    procedure is_await_expression(this) returns bool
+    {
+        if token <> KindAwaitKeyword
+            return false
+        if this.in_await_context()
+            return true
+        ; The same heuristic as `yield`: outside an async function `await` is an
+        ; ordinary name, and only a name or a literal right after it settles the
+        ; question.
+        this.look_ahead_next_token_is_identifier_or_keyword_or_literal_on_same_line()
+    }
+
+    ; `<T>x`. The TYPE comes first here — the opposite of `x as T` — which is
+    ; why the two do not share a record on the ast side.
+    procedure parse_type_assertion(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        if this.parse_expected(KindLessThanToken) = false
+            return null
+        let type_node this.parse_type()
+        if type_node = null
+            return null
+        if this.parse_expected(KindGreaterThanToken) = false
+            return null
+        let expression this.parse_simple_unary_expression()
+        if expression = null
+            return null
+        this.finish_node(this.new_node(KindTypeAssertionExpression, NodeData.TypeAssertionExpression(TypeAssertionData(type_node, expression))), pos)
+    }
+
+    ; ── the left-hand side ──────────────────────────────────────────────────
+
+    procedure parse_left_hand_side_expression_or_higher(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+
+        var expression null as pointer[AstNode]
+        if token = KindImportKeyword
+        {
+            ; Both `import(…)` and `import.meta` set a flag on the SOURCE FILE,
+            ; which this port does not model — so parsing them would produce a
+            ; file node whose flags disagree with the reference's, which is
+            ; exactly what the yardstick compares. Reported rather than parsed.
+            if this.look_ahead_next_token_is_open_paren_or_less_than()
+                return this.unported("import-expression", token)
+            if this.look_ahead_next_token_is_dot()
+                return this.unported("import-expression", token)
+            set expression: this.parse_member_expression_or_higher()
+        }
+        else
+        {
+            if token = KindSuperKeyword
+                set expression: this.parse_super_expression()
+            else
+                set expression: this.parse_member_expression_or_higher()
+        }
+        if expression = null
+            return null
+
+        this.parse_call_expression_rest(pos, expression)
+    }
+
+    procedure parse_super_expression(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let expression this.parse_token_node()
+        if expression = null
+            return null
+
+        ; `super<T>()` — the reference parses the type arguments and then reports
+        ; that super may not have any. A diagnostic, so it stops here. This
+        ; over-reports for a `super < x` comparison, which is not a shape any
+        ; real program has, and over-reporting is the direction this harness
+        ; errs in.
+        if token = KindLessThanToken
+            return this.unported("super-type-arguments", token)
+
+        if token = KindOpenParenToken
+            return expression
+        if token = KindDotToken
+            return expression
+        if token = KindOpenBracketToken
+            return expression
+
+        ; Anything else is the reference's "super must be followed by an
+        ; argument list or member access" diagnostic.
+        this.unported("super-must-be-followed", token)
+    }
+
+    procedure parse_member_expression_or_higher(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let expression this.parse_primary_expression()
+        if expression = null
+            return null
+        this.parse_member_expression_rest(pos, expression, true)
+    }
+
+    procedure parse_member_expression_rest(this, pos: int, start_expression: pointer[AstNode], allow_optional_chain: bool) returns pointer[AstNode]
+    {
+        var expression start_expression
+
+        while true
+        {
+            var question_dot_token null as pointer[AstNode]
+            var is_property_access false
+            var took_chain false
+
+            if allow_optional_chain
+            {
+                if this.is_start_of_optional_property_or_element_access_chain()
+                {
+                    set took_chain: true
+                    set question_dot_token: this.parse_expected_token(KindQuestionDotToken)
+                    if question_dot_token = null
+                        return null
+                    set is_property_access: token_is_identifier_or_keyword(token)
+                }
+            }
+            if took_chain = false
+                set is_property_access: this.parse_optional(KindDotToken)
+            if this.is_unported()
+                return null
+
+            if is_property_access
+            {
+                set expression: this.parse_property_access_expression_rest(pos, expression, question_dot_token)
+                if expression = null
+                    return null
+                continue
+            }
+
+            ; In a decorator context a `[` opens a computed property name, not an
+            ; element access — unless a `?.` said otherwise.
+            var allow_element false
+            if question_dot_token <> null
+                set allow_element: true
+            else
+            {
+                if this.in_decorator_context() = false
+                    set allow_element: true
+            }
+            if allow_element
+            {
+                if this.parse_optional(KindOpenBracketToken)
+                {
+                    set expression: this.parse_element_access_expression_rest(pos, expression, question_dot_token)
+                    if expression = null
+                        return null
+                    continue
+                }
+            }
+
+            if this.is_template_start_of_tagged_template()
+                return this.unported("tagged-template", token)
+
+            if question_dot_token = null
+            {
+                if token = KindExclamationToken
+                {
+                    if this.has_preceding_line_break() = false
+                    {
+                        this.next_token()
+                        set expression: this.finish_node(this.new_node(KindNonNullExpression, NodeData.NonNullExpression(WrappedTypeData(expression))), pos)
+                        if expression = null
+                            return null
+                        continue
+                    }
+                }
+
+                let type_arguments this.try_parse_type_arguments_in_expression()
+                if this.is_unported()
+                    return null
+                if type_arguments <> null
+                {
+                    set expression: this.finish_node(this.new_node(KindExpressionWithTypeArguments, NodeData.ExpressionWithTypeArguments(ExpressionWithTypeArgumentsData(expression, type_arguments))), pos)
+                    if expression = null
+                        return null
+                    continue
+                }
+            }
+
+            return expression
+        }
+
+        expression
+    }
+
+    procedure is_start_of_optional_property_or_element_access_chain(this) returns bool
+    {
+        if token <> KindQuestionDotToken
+            return false
+        this.look_ahead_next_token_is_identifier_or_keyword_or_open_bracket_or_template()
+    }
+
+    procedure parse_property_access_expression_rest(this, pos: int, expression: pointer[AstNode], question_dot_token: pointer[AstNode]) returns pointer[AstNode]
+    {
+        ; The reference allows a PRIVATE identifier here (`a.#x`); ours reports
+        ; it, since a private identifier is a node this slice does not build.
+        let name this.parse_right_side_of_dot(true)
+        if name = null
+            return null
+
+        var is_optional_chain false
+        if question_dot_token <> null
+            set is_optional_chain: true
+        else
+            set is_optional_chain: this.try_reparse_optional_chain(expression)
+
+        ; `f<T>.x` — an instantiation expression cannot be followed by a property
+        ; access, which the reference reports.
+        if AstNode.kind_of(expression) = KindExpressionWithTypeArguments
+            return this.unported("instantiation-property-access", token)
+
+        let n this.new_node(KindPropertyAccessExpression, NodeData.PropertyAccessExpression(PropertyAccessData(expression, question_dot_token, name)))
+        if is_optional_chain
+            set n.flags: n.flags | NodeFlagsOptionalChain
+        this.finish_node(n, pos)
+    }
+
+    procedure parse_element_access_expression_rest(this, pos: int, expression: pointer[AstNode], question_dot_token: pointer[AstNode]) returns pointer[AstNode]
+    {
+        ; `a[]` — the reference reports that an element access needs an argument
+        ; and synthesizes a missing identifier.
+        if token = KindCloseBracketToken
+            return this.unported("empty-element-access", token)
+
+        let argument_expression this.parse_expression_allow_in()
+        if argument_expression = null
+            return null
+        if this.parse_expected(KindCloseBracketToken) = false
+            return null
+
+        var is_optional_chain false
+        if question_dot_token <> null
+            set is_optional_chain: true
+        else
+            set is_optional_chain: this.try_reparse_optional_chain(expression)
+
+        let n this.new_node(KindElementAccessExpression, NodeData.ElementAccessExpression(ElementAccessData(expression, question_dot_token, argument_expression)))
+        if is_optional_chain
+            set n.flags: n.flags | NodeFlagsOptionalChain
+        this.finish_node(n, pos)
+    }
+
+    ; ★ An optional chain survives a `!`: in `a?.b!.c` the non-null expression
+    ; sits BETWEEN the two links, and the flag has to be pushed down through it
+    ; so that `.c` knows it is still in the chain. That is what this walk does,
+    ; and it MUTATES nodes that were already finished — the one place in the
+    ; parser where a node's flags change after finish_node.
+    procedure try_reparse_optional_chain(this, start_node: pointer[AstNode]) returns bool
+    {
+        if (start_node.flags & NodeFlagsOptionalChain) <> 0
+            return true
+        if AstNode.kind_of(start_node) <> KindNonNullExpression
+            return false
+
+        var expr AstNode.child_at(start_node, 0)
+        while true
+        {
+            if expr = null
+                return false
+            if AstNode.kind_of(expr) <> KindNonNullExpression
+                break
+            if (expr.flags & NodeFlagsOptionalChain) <> 0
+                break
+            set expr: AstNode.child_at(expr, 0)
+        }
+        if expr = null
+            return false
+        if (expr.flags & NodeFlagsOptionalChain) = 0
+            return false
+
+        var n start_node
+        while AstNode.kind_of(n) = KindNonNullExpression
+        {
+            set n.flags: n.flags | NodeFlagsOptionalChain
+            set n: AstNode.child_at(n, 0)
+            if n = null
+                break
+        }
+        true
+    }
+
+    procedure parse_call_expression_rest(this, pos: int, start_expression: pointer[AstNode]) returns pointer[AstNode]
+    {
+        var expression start_expression
+
+        while true
+        {
+            set expression: this.parse_member_expression_rest(pos, expression, true)
+            if expression = null
+                return null
+
+            var type_arguments null as pointer[Array[pointer[AstNode]]]
+            let question_dot_token this.parse_optional_token(KindQuestionDotToken)
+            if this.is_unported()
+                return null
+            if question_dot_token <> null
+            {
+                set type_arguments: this.try_parse_type_arguments_in_expression()
+                if this.is_unported()
+                    return null
+                if this.is_template_start_of_tagged_template()
+                    return this.unported("tagged-template", token)
+            }
+
+            var is_call false
+            if type_arguments <> null
+                set is_call: true
+            if token = KindOpenParenToken
+                set is_call: true
+
+            if is_call
+            {
+                ; `f<T>(x)` came through parse_member_expression_rest as an
+                ; ExpressionWithTypeArguments; the call absorbs it back into one
+                ; CallExpression, which is why the type arguments are read off
+                ; the node rather than re-parsed.
+                if question_dot_token = null
+                {
+                    if AstNode.kind_of(expression) = KindExpressionWithTypeArguments
+                    {
+                        set type_arguments: AstNode.type_arguments_of(expression)
+                        set expression: AstNode.child_at(expression, 0)
+                        if expression = null
+                            return null
+                    }
+                }
+
+                let argument_list this.parse_argument_list()
+                if argument_list = null
+                    return null
+
+                var is_optional_chain false
+                if question_dot_token <> null
+                    set is_optional_chain: true
+                else
+                    set is_optional_chain: this.try_reparse_optional_chain(expression)
+
+                let n this.new_node(KindCallExpression, NodeData.CallExpression(CallExpressionData(expression, question_dot_token, type_arguments, argument_list)))
+                if is_optional_chain
+                    set n.flags: n.flags | NodeFlagsOptionalChain
+                set expression: this.finish_node(n, pos)
+                if expression = null
+                    return null
+                continue
+            }
+
+            ; A `?.` that led nowhere: the reference reports "Identifier expected"
+            ; and builds a property access onto a missing name.
+            if question_dot_token <> null
+                return this.unported("optional-chain-identifier", token)
+
+            break
+        }
+
+        expression
+    }
+
+    procedure parse_argument_list(this) returns pointer[Array[pointer[AstNode]]]
+    {
+        if this.parse_expected(KindOpenParenToken) = false
+            return null
+        let list this.parse_delimited_list(PCArgumentExpressions)
+        if list = null
+            return null
+        if this.parse_expected(KindCloseParenToken) = false
+            return null
+        list
+    }
+
+    ; doInContext(DisallowIn|DecoratorContext, false, …) — an argument is parsed
+    ; with `in` allowed and outside any decorator.
+    procedure parse_argument_expression(this) returns pointer[AstNode]
+    {
+        let saved context_flags
+        this.set_context_flags(NodeFlagsDisallowInContext | NodeFlagsDecoratorContext, false)
+        let result this.parse_argument_or_array_literal_element()
+        set context_flags: saved
+        result
+    }
+
+    procedure parse_argument_or_array_literal_element(this) returns pointer[AstNode]
+    {
+        if token = KindDotDotDotToken
+            return this.parse_spread_element()
+        ; An ELISION — `[, 1]` — is a zero-width OmittedExpression sitting where
+        ; the missing element would have been. It has no fields and no children,
+        ; so it is a Token whose kind says what it is.
+        if token = KindCommaToken
+            return this.finish_node(this.new_node(KindOmittedExpression, NodeData.Token(TokenData())), this.node_pos())
+        this.parse_assignment_expression_or_higher()
+    }
+
+    procedure parse_spread_element(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        if this.parse_expected(KindDotDotDotToken) = false
+            return null
+        let expression this.parse_assignment_expression_or_higher()
+        if expression = null
+            return null
+        this.finish_node(this.new_node(KindSpreadElement, NodeData.SpreadElement(WrappedTypeData(expression))), pos)
+    }
+
+    function is_template_start_of_tagged_template(this) returns bool
+    {
+        if token = KindNoSubstitutionTemplateLiteral
+            return true
+        token = KindTemplateHead
+    }
+
+    ; ── type arguments in an expression ─────────────────────────────────────
+    ;
+    ; ★★★ This is the function that forced the unported record to be rewindable.
+    ; `a << b` reaches it — `<<` passes the precondition — and it then
+    ; parses `<b>` as a type-parameter list, fails to find a comma, and throws
+    ; the whole thing away. In the reference the diagnostics go with it; here the
+    ; unported record has to, or a shift operator would be unparsable.
+    ;
+    ; The reference also refuses to run in a JavaScript file, where `<` is
+    ; unambiguously a comparison. This port never sets NodeFlagsJavaScriptFile,
+    ; so that half of the precondition is constantly false and is left out.
+    procedure try_parse_type_arguments_in_expression(this) returns pointer[Array[pointer[AstNode]]]
+    {
+        var eligible false
+        if token = KindLessThanToken
+            set eligible: true
+        if token = KindLessThanLessThanToken
+            set eligible: true
+        if eligible = false
+            return null
+
+        let saved this.mark()
+        var result null as pointer[Array[pointer[AstNode]]]
+
+        if this.re_scan_less_than_token() = KindLessThanToken
+        {
+            this.next_token()
+            let type_arguments this.parse_delimited_list(PCTypeArguments)
+            if type_arguments <> null
+            {
+                ; Without the closing `>` it was never a type argument list.
+                if this.re_scan_greater_than_token() = KindGreaterThanToken
+                {
+                    this.next_token()
+                    ; `f<number>(42)` is a call; `a < b > c` is two comparisons.
+                    ; What follows decides, and only that.
+                    if this.can_follow_type_arguments_in_expression()
+                        set result: type_arguments
+                }
+            }
+        }
+
+        if result <> null
+            return result
+        this.rewind(saved)
+        null
+    }
+
+    procedure can_follow_type_arguments_in_expression(this) returns bool
+    {
+        if token = KindOpenParenToken
+            return true
+        if token = KindNoSubstitutionTemplateLiteral
+            return true
+        if token = KindTemplateHead
+            return true
+        ; A list followed by `<` never makes sense; followed by `>` it is
+        ; ambiguous with a re-scanned `>>`; and here `+` and `-` are unary.
+        if token = KindLessThanToken
+            return false
+        if token = KindGreaterThanToken
+            return false
+        if token = KindPlusToken
+            return false
+        if token = KindMinusToken
+            return false
+        if this.has_preceding_line_break()
+            return true
+        if this.is_binary_operator()
+            return true
+        this.is_start_of_expression() = false
+    }
+
+    function is_binary_operator(this) returns bool
+    {
+        if this.in_disallow_in_context()
+        {
+            if token = KindInKeyword
+                return false
+        }
+        get_binary_operator_precedence(token) <> OperatorPrecedenceInvalid
+    }
+
+    ; ── primary expressions ─────────────────────────────────────────────────
 
     procedure parse_primary_expression(this) returns pointer[AstNode]
     {
+        if token = KindNoSubstitutionTemplateLiteral
+        {
+            ; An invalid template is re-scanned by the reference, which needs
+            ; ReScanTemplateToken.
+            if (scanner.token_flags() & TokenFlagsIsInvalid) <> 0
+                return this.unported("template-rescan", token)
+            return this.parse_literal_expression(KindNoSubstitutionTemplateLiteral)
+        }
         if token = KindNumericLiteral
             return this.parse_literal_expression(KindNumericLiteral)
         if token = KindBigIntLiteral
@@ -1713,15 +3121,1132 @@ define Parser
         if token = KindFalseKeyword
             return this.parse_token_node()
 
+        if token = KindOpenParenToken
+            return this.parse_parenthesized_expression()
+        if token = KindOpenBracketToken
+            return this.parse_array_literal_expression()
+        if token = KindOpenBraceToken
+            return this.parse_object_literal_expression()
+
+        ; An ASYNC ARROW function was already handled above; what is left is
+        ; `async function`, and a bare `async` that is an ordinary name. The
+        ; reference falls THROUGH to the identifier case for the second, which is
+        ; why this arm cannot be an unconditional return.
+        if token = KindAsyncKeyword
+        {
+            if this.look_ahead_next_token_is_function_keyword_on_same_line()
+                return this.parse_function_expression()
+        }
+
+        if token = KindAtToken
+            return this.unported("decorated-expression", token)
+        if token = KindClassKeyword
+            return this.unported("class-expression", token)
+        if token = KindFunctionKeyword
+            return this.parse_function_expression()
+        if token = KindNewKeyword
+            return this.parse_new_expression_or_new_dot_target()
+
+        ; A `/` here is a regular expression, which needs ReScanSlashToken. The
+        ; reference falls through to its "Expression expected" diagnostic when
+        ; the re-scan says otherwise — also unported, so one tag covers both.
+        if token = KindSlashToken
+            return this.unported("regular-expression", token)
+        if token = KindSlashEqualsToken
+            return this.unported("regular-expression", token)
+
+        if token = KindTemplateHead
+            return this.unported("template-expression", token)
+        if token = KindPrivateIdentifier
+            return this.unported("private-identifier", token)
+
         if this.is_identifier()
             return this.parse_identifier()
 
-        ; parenthesized, array and object literals, templates, regular
-        ; expressions, function/class expressions, `new`, decorators, private
-        ; names — all unported. So is the reference's fallback, which reports
-        ; "Expression expected" and synthesizes a missing identifier.
+        ; The reference's fallback reports "Expression expected" and synthesizes
+        ; a missing identifier.
         this.unported("primary-expression", token)
     }
+
+    procedure parse_parenthesized_expression(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+        if this.parse_expected(KindOpenParenToken) = false
+            return null
+        let expression this.parse_expression_allow_in()
+        if expression = null
+            return null
+        if this.parse_expected(KindCloseParenToken) = false
+            return null
+        let result this.finish_node(this.new_node(KindParenthesizedExpression, NodeData.ParenthesizedExpression(WrappedTypeData(expression))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    procedure parse_array_literal_expression(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        if this.parse_expected(KindOpenBracketToken) = false
+            return null
+        let elements this.parse_delimited_list(PCArrayLiteralMembers)
+        if elements = null
+            return null
+        if this.parse_expected(KindCloseBracketToken) = false
+            return null
+        this.finish_node(this.new_node(KindArrayLiteralExpression, NodeData.ArrayLiteralExpression(ElementListData(elements))), pos)
+    }
+
+    procedure parse_object_literal_expression(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        if this.parse_expected(KindOpenBraceToken) = false
+            return null
+        let properties this.parse_delimited_list(PCObjectLiteralMembers)
+        if properties = null
+            return null
+        if this.parse_expected(KindCloseBraceToken) = false
+            return null
+        this.finish_node(this.new_node(KindObjectLiteralExpression, NodeData.ObjectLiteralExpression(ElementListData(properties))), pos)
+    }
+
+    procedure parse_object_literal_element(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+
+        if this.parse_optional(KindDotDotDotToken)
+        {
+            let spread this.parse_assignment_expression_or_higher()
+            if spread = null
+                return null
+            let spread_result this.finish_node(this.new_node(KindSpreadAssignment, NodeData.SpreadAssignment(WrappedTypeData(spread))), pos)
+            return this.with_jsdoc(spread_result, jsdoc)
+        }
+
+        let modifiers this.parse_modifiers(true, false, false)
+        if this.is_unported()
+            return null
+
+        ; `get x() {}` / `set x(v) {}` are parseAccessorDeclaration, i.e. the
+        ; class-member slice reached from the object literal.
+        if this.parse_contextual_modifier(KindGetKeyword)
+            return this.unported("object-literal-accessor", KindGetKeyword)
+        if this.parse_contextual_modifier(KindSetKeyword)
+            return this.unported("object-literal-accessor", KindSetKeyword)
+
+        let asterisk_token this.parse_optional_token(KindAsteriskToken)
+        if this.is_unported()
+            return null
+
+        ; ★ Asked BEFORE the name is parsed, and it decides shorthand-ness. A
+        ; keyword property name (`{ default: 1 }`) is a name and NOT an
+        ; identifier, so it can never be shorthand — which is exactly what this
+        ; captures and what re-asking afterwards would lose.
+        let token_is_identifier this.is_identifier()
+
+        let name this.parse_property_name()
+        if name = null
+            return null
+
+        var postfix_token this.parse_optional_token(KindQuestionToken)
+        if postfix_token = null
+            set postfix_token: this.parse_optional_token(KindExclamationToken)
+        if this.is_unported()
+            return null
+
+        var is_method false
+        if asterisk_token <> null
+            set is_method: true
+        if token = KindOpenParenToken
+            set is_method: true
+        if token = KindLessThanToken
+            set is_method: true
+        if is_method
+            return this.unported("object-literal-method", token)
+
+        var is_shorthand false
+        if token_is_identifier
+        {
+            if token <> KindColonToken
+                set is_shorthand: true
+        }
+
+        if is_shorthand
+        {
+            ; `{ a = 1 }` — the CoverInitializedName production, which is only
+            ; legal as a destructuring pattern and is reported by the checker,
+            ; not here.
+            let equals_token this.parse_optional_token(KindEqualsToken)
+            if this.is_unported()
+                return null
+            var object_assignment_initializer null as pointer[AstNode]
+            if equals_token <> null
+            {
+                set object_assignment_initializer: this.parse_assignment_expression_allow_in()
+                if object_assignment_initializer = null
+                    return null
+            }
+            let short_result this.finish_node(this.new_node(KindShorthandPropertyAssignment, NodeData.ShorthandPropertyAssignment(ShorthandPropertyAssignmentData(modifiers, name, postfix_token, equals_token, object_assignment_initializer))), pos)
+            return this.with_jsdoc(short_result, jsdoc)
+        }
+
+        if this.parse_expected(KindColonToken) = false
+            return null
+        let initializer this.parse_assignment_expression_allow_in()
+        if initializer = null
+            return null
+        let result this.finish_node(this.new_node(KindPropertyAssignment, NodeData.PropertyAssignment(PropertyAssignmentData(modifiers, name, postfix_token, initializer))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    procedure parse_property_name(this) returns pointer[AstNode]
+    {
+        let saved_await_identifier statement_has_await_identifier
+        let prop this.parse_property_name_worker(true)
+        set statement_has_await_identifier: saved_await_identifier
+        prop
+    }
+
+    procedure parse_property_name_worker(this, allow_computed_property_names: bool) returns pointer[AstNode]
+    {
+        if token = KindStringLiteral
+            return this.parse_literal_expression(KindStringLiteral)
+        if token = KindNumericLiteral
+            return this.parse_literal_expression(KindNumericLiteral)
+        if token = KindBigIntLiteral
+            return this.parse_literal_expression(KindBigIntLiteral)
+        if allow_computed_property_names
+        {
+            if token = KindOpenBracketToken
+                return this.parse_computed_property_name()
+        }
+        if token = KindPrivateIdentifier
+            return this.unported("private-identifier", token)
+        this.parse_identifier_name()
+    }
+
+    procedure parse_computed_property_name(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        if this.parse_expected(KindOpenBracketToken) = false
+            return null
+        ; A full expression, comma operator included — the grammar allows only an
+        ; assignment expression and the grammar CHECKER reports the difference.
+        let expression this.parse_expression_allow_in()
+        if expression = null
+            return null
+        if this.parse_expected(KindCloseBracketToken) = false
+            return null
+        this.finish_node(this.new_node(KindComputedPropertyName, NodeData.ComputedPropertyName(WrappedTypeData(expression))), pos)
+    }
+
+    procedure parse_contextual_modifier(this, k: int) returns bool
+    {
+        let saved this.mark()
+        if token = k
+        {
+            if this.next_token_can_follow_modifier()
+                return true
+        }
+        this.rewind(saved)
+        false
+    }
+
+    ; ── the function expression ─────────────────────────────────────────────
+
+    procedure parse_function_expression(this) returns pointer[AstNode]
+    {
+        let saved context_flags
+        this.set_context_flags(NodeFlagsDecoratorContext, false)
+
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+        let modifiers this.parse_modifiers(false, false, false)
+        if this.is_unported()
+            return null
+        if this.parse_expected(KindFunctionKeyword) = false
+            return null
+
+        let asterisk_token this.parse_optional_token(KindAsteriskToken)
+        if this.is_unported()
+            return null
+
+        var signature_flags ParseFlagsNone
+        if asterisk_token <> null
+            set signature_flags: signature_flags | ParseFlagsYield
+        let is_async has_modifier(modifiers, KindAsyncKeyword)
+        if is_async
+            set signature_flags: signature_flags | ParseFlagsAwait
+
+        ; ★ The NAME is parsed inside the yield/await context the signature
+        ; declares — not outside it, as the parameters' context is. That is why
+        ; `function* yield() {}` is an error while `function yield() {}` is not,
+        ; and it is a separate save/restore from the one around the whole
+        ; function.
+        let name_saved context_flags
+        if asterisk_token <> null
+            this.set_context_flags(NodeFlagsYieldContext, true)
+        if is_async
+            this.set_context_flags(NodeFlagsAwaitContext, true)
+        var name null as pointer[AstNode]
+        if this.is_binding_identifier()
+        {
+            set name: this.parse_binding_identifier()
+            if name = null
+                return null
+        }
+        set context_flags: name_saved
+
+        let type_parameters this.parse_type_parameters()
+        if this.is_unported()
+            return null
+        let parameters this.parse_parameters(signature_flags)
+        if parameters = null
+            return null
+
+        var return_type null as pointer[AstNode]
+        if token = KindColonToken
+        {
+            set return_type: this.parse_return_type(KindColonToken, false)
+            if return_type = null
+                return null
+        }
+
+        ; A function EXPRESSION always has a body — there is no overload form —
+        ; so this is parse_function_block, not parse_function_block_or_semicolon.
+        let body this.parse_function_block(signature_flags)
+        set context_flags: saved
+        if body = null
+            return null
+
+        let result this.finish_node(this.new_node(KindFunctionExpression, NodeData.FunctionExpression(FunctionExpressionData(modifiers, asterisk_token, name, type_parameters, parameters, return_type, body))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    ; ── new ─────────────────────────────────────────────────────────────────
+
+    procedure parse_new_expression_or_new_dot_target(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        if this.parse_expected(KindNewKeyword) = false
+            return null
+
+        ; `new.target`. The reference's MetaProperty additionally stores WHICH
+        ; keyword it was built from, a field the dump cannot see.
+        if this.parse_optional(KindDotToken)
+        {
+            let meta_name this.parse_identifier_name()
+            if meta_name = null
+                return null
+            return this.finish_node(this.new_node(KindMetaProperty, NodeData.MetaProperty(WrappedTypeData(meta_name))), pos)
+        }
+
+        ; ★ allowOptionalChain is FALSE here: `new a?.b()` is invalid, and the
+        ; reference reports it below rather than parsing a chain.
+        let expression_pos this.node_pos()
+        let primary this.parse_primary_expression()
+        if primary = null
+            return null
+        var expression this.parse_member_expression_rest(expression_pos, primary, false)
+        if expression = null
+            return null
+
+        var type_arguments null as pointer[Array[pointer[AstNode]]]
+        if AstNode.kind_of(expression) = KindExpressionWithTypeArguments
+        {
+            set type_arguments: AstNode.type_arguments_of(expression)
+            set expression: AstNode.child_at(expression, 0)
+            if expression = null
+                return null
+        }
+
+        if token = KindQuestionDotToken
+            return this.unported("new-optional-chain", token)
+
+        var argument_list null as pointer[Array[pointer[AstNode]]]
+        if token = KindOpenParenToken
+        {
+            set argument_list: this.parse_argument_list()
+            if argument_list = null
+                return null
+        }
+
+        this.finish_node(this.new_node(KindNewExpression, NodeData.NewExpression(NewExpressionData(expression, type_arguments, argument_list))), pos)
+    }
+
+    ; ── arrow functions ─────────────────────────────────────────────────────
+    ;
+    ; ★★★ The most expensive shape in the ladder, and the reason is that a
+    ; parameter LIST and a parenthesized EXPRESSION are the same text until the
+    ; `=>` arrives: `(x = 10)`, `(x, y)` and `a ? (b): c` all read as signatures.
+    ; The reference answers with a TRISTATE and speculates on the UNKNOWN half —
+    ; and a speculation that is thrown away takes its diagnostics with it, which
+    ; is what the rewound unported record models (see ParserState).
+    ;
+    ; ★ One consequence for this port specifically: `({x}) => …` and `([x]) => …`
+    ; are UNKNOWN, so the speculative parse runs, and it walks straight into a
+    ; binding pattern — unported. `({ x: 1 })` therefore reports unported even
+    ; though the parenthesized object literal it turns out to be is perfectly
+    ; parsable here. That over-reports, which is the direction to err in, and it
+    ; closes with the binding-pattern slice.
+
+    procedure try_parse_parenthesized_arrow_function_expression(this, allow_return_type: bool) returns pointer[AstNode]
+    {
+        let tristate this.is_parenthesized_arrow_function_expression()
+        if this.is_unported()
+            return null
+        if tristate = TristateFalse
+            return null
+
+        ; Definitely an arrow: parse it without requiring a following `=>`, so
+        ; that the diagnostics land where the user's error is.
+        if tristate = TristateTrue
+            return this.parse_parenthesized_arrow_function_expression(true, true)
+
+        let saved this.mark()
+        let result this.parse_possible_parenthesized_arrow_function_expression(allow_return_type)
+        if result = null
+            this.rewind(saved)
+        result
+    }
+
+    procedure is_parenthesized_arrow_function_expression(this) returns int
+    {
+        var probe false
+        if token = KindOpenParenToken
+            set probe: true
+        if token = KindLessThanToken
+            set probe: true
+        if token = KindAsyncKeyword
+            set probe: true
+        if probe
+        {
+            let saved this.mark()
+            let r this.next_is_parenthesized_arrow_function_expression()
+            this.rewind(saved)
+            return r
+        }
+        ; A standalone `=>` is the reference's error-recovery tweak: it is what
+        ; the user most likely meant to write.
+        if token = KindEqualsGreaterThanToken
+            return TristateTrue
+        TristateFalse
+    }
+
+    procedure next_is_parenthesized_arrow_function_expression(this) returns int
+    {
+        if token = KindAsyncKeyword
+        {
+            this.next_token()
+            if this.has_preceding_line_break()
+                return TristateFalse
+            var opens false
+            if token = KindOpenParenToken
+                set opens: true
+            if token = KindLessThanToken
+                set opens: true
+            if opens = false
+                return TristateFalse
+        }
+
+        let first token
+        let second this.next_token()
+
+        if first = KindOpenParenToken
+        {
+            if second = KindCloseParenToken
+            {
+                ; "() =>", "(): " and "() {". The last is not an arrow function,
+                ; but it is probably what was meant.
+                let third this.next_token()
+                if third = KindEqualsGreaterThanToken
+                    return TristateTrue
+                if third = KindColonToken
+                    return TristateTrue
+                if third = KindOpenBraceToken
+                    return TristateTrue
+                return TristateFalse
+            }
+
+            ; "([" and "({" may start a binding pattern — or an expression.
+            if second = KindOpenBracketToken
+                return TristateUnknown
+            if second = KindOpenBraceToken
+                return TristateUnknown
+
+            ; "(..." is a rest parameter and nothing else.
+            if second = KindDotDotDotToken
+                return TristateTrue
+
+            ; "(xxx yyy" with xxx a modifier is not legal, and is treated as a
+            ; lambda so the error message can say so.
+            var modifier_start false
+            if is_modifier_kind(second)
+            {
+                if second <> KindAsyncKeyword
+                {
+                    if this.look_ahead_next_token_is_identifier()
+                        set modifier_start: true
+                }
+            }
+            if modifier_start
+            {
+                if this.next_token() = KindAsKeyword
+                    return TristateFalse
+                return TristateTrue
+            }
+
+            ; `(this` is not a valid parameter name and is parsed as one anyway,
+            ; so that the error is semantic rather than syntactic.
+            var name_start this.is_identifier()
+            if name_start = false
+            {
+                if second = KindThisKeyword
+                    set name_start: true
+            }
+            if name_start = false
+                return TristateFalse
+
+            let third this.next_token()
+            if third = KindColonToken
+                return TristateTrue
+            if third = KindQuestionToken
+            {
+                this.next_token()
+                if token = KindColonToken
+                    return TristateTrue
+                if token = KindCommaToken
+                    return TristateTrue
+                if token = KindEqualsToken
+                    return TristateTrue
+                if token = KindCloseParenToken
+                    return TristateTrue
+                return TristateFalse
+            }
+            if third = KindCommaToken
+                return TristateUnknown
+            if third = KindEqualsToken
+                return TristateUnknown
+            if third = KindCloseParenToken
+                return TristateUnknown
+            return TristateFalse
+        }
+
+        ; `first` is `<`, a generic arrow function's type parameter list. The
+        ; reference's JSX override belongs to the JSX variant, which is not
+        ; selected here.
+        var generic_start this.is_identifier()
+        if generic_start = false
+        {
+            if token = KindConstKeyword
+                set generic_start: true
+        }
+        if generic_start = false
+            return TristateFalse
+        TristateUnknown
+    }
+
+    procedure parse_possible_parenthesized_arrow_function_expression(this, allow_return_type: bool) returns pointer[AstNode]
+    {
+        let token_pos scanner.token_start()
+        if this.not_parenthesized_arrow_has(token_pos)
+            return null
+        let result this.parse_parenthesized_arrow_function_expression(false, allow_return_type)
+        if result = null
+            this.not_parenthesized_arrow_add(token_pos)
+        result
+    }
+
+    function not_parenthesized_arrow_has(this, pos: int) returns bool
+    {
+        if not_parenthesized_arrow = null
+            return false
+        let a not_parenthesized_arrow
+        let len a.get_length() as int
+        var i 0
+        while i < len
+        {
+            if *(a.get_buffer() + i) = pos
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    procedure not_parenthesized_arrow_add(this, pos: int)
+    {
+        if not_parenthesized_arrow = null
+        {
+            let fresh host.allocate(sizeof Array[int], alignof Array[int]) as pointer[Array[int]]
+            set *fresh: Array[int]()
+            set not_parenthesized_arrow: fresh
+        }
+        let a not_parenthesized_arrow
+        a.add(pos)
+    }
+
+    procedure parse_parenthesized_arrow_function_expression(this, allow_ambiguity: bool, allow_return_type: bool) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+        let modifiers this.parse_modifiers_for_arrow_function()
+        if this.is_unported()
+            return null
+        var is_async false
+        if modifiers <> null
+            set is_async: true
+        var signature_flags ParseFlagsNone
+        if is_async
+            set signature_flags: ParseFlagsAwait
+
+        ; An arrow function is never a generator, so there is no yield flag.
+        let type_parameters this.parse_type_parameters()
+        if this.is_unported()
+            return null
+
+        ; A missing `(` is a diagnostic on the allowAmbiguity side and a clean
+        ; "not an arrow" on the other; parse_expected already recorded the first,
+        ; and the caller's rewind discards it for the second.
+        if this.parse_expected(KindOpenParenToken) = false
+            return null
+
+        let parameters this.parse_parameters_worker(signature_flags, allow_ambiguity)
+        if parameters = null
+            return null
+        if this.parse_expected(KindCloseParenToken) = false
+            return null
+
+        ; Asked BEFORE the return type is parsed — by then the `:` is consumed.
+        let has_return_colon token = KindColonToken
+        var return_type null as pointer[AstNode]
+        if token = KindColonToken
+        {
+            set return_type: this.parse_return_type(KindColonToken, false)
+            if return_type = null
+                return null
+        }
+
+        ; Parsing a signature is not enough: "(x = 10)", "(x,y)" and "a ? (b): c"
+        ; are all valid signatures and none of them is an arrow function. One
+        ; token of look-ahead settles it.
+        if allow_ambiguity = false
+        {
+            var commits false
+            if token = KindEqualsGreaterThanToken
+                set commits: true
+            if token = KindOpenBraceToken
+                set commits: true
+            if commits = false
+                return null
+        }
+
+        ; The reference also accepts a `{` here, synthesizing a MISSING `=>` for
+        ; the error case and parsing an IDENTIFIER as the body when neither is
+        ; present. Both are diagnostics, so parse_expected_token stops instead —
+        ; which means that past this point the token WAS `=>`.
+        let equals_greater_than_token this.parse_expected_token(KindEqualsGreaterThanToken)
+        if equals_greater_than_token = null
+            return null
+        let body this.parse_arrow_function_expression_body(is_async, allow_return_type)
+        if body = null
+            return null
+
+        ; `x ? y => ({ y }) : z => ({ z })`. In the true branch of a conditional
+        ; a `:` ends the expression, so a return type may not be consumed there
+        ; unless a SECOND colon follows.
+        if allow_return_type = false
+        {
+            if has_return_colon
+            {
+                if token <> KindColonToken
+                    return null
+            }
+        }
+
+        let result this.finish_node(this.new_node(KindArrowFunction, NodeData.ArrowFunction(ArrowFunctionData(modifiers, type_parameters, parameters, return_type, equals_greater_than_token, body))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    procedure parse_modifiers_for_arrow_function(this) returns pointer[Array[pointer[AstNode]]]
+    {
+        if token <> KindAsyncKeyword
+            return null
+        let pos this.node_pos()
+        this.next_token()
+        let m this.finish_node(this.new_node(KindAsyncKeyword, NodeData.Token(TokenData())), pos)
+        if m = null
+            return null
+        let list AstNode.new_node_list(host)
+        list.add(m)
+        list
+    }
+
+    procedure parse_arrow_function_expression_body(this, is_async: bool, allow_return_type: bool) returns pointer[AstNode]
+    {
+        if token = KindOpenBraceToken
+        {
+            var block_flags ParseFlagsNone
+            if is_async
+                set block_flags: ParseFlagsAwait
+            return this.parse_function_block(block_flags)
+        }
+
+        ; A plain STATEMENT after the arrow means the opening brace was probably
+        ; forgotten. The reference recovers with ParseFlagsIgnoreMissingOpenBrace,
+        ; which always reports.
+        var looks_like_a_block false
+        if token <> KindSemicolonToken
+        {
+            if token <> KindFunctionKeyword
+            {
+                if token <> KindClassKeyword
+                {
+                    if this.is_start_of_statement()
+                    {
+                        if this.is_start_of_expression_statement() = false
+                            set looks_like_a_block: true
+                    }
+                }
+            }
+        }
+        if looks_like_a_block
+            return this.unported("arrow-body-missing-brace", token)
+
+        let saved context_flags
+        this.set_context_flags(NodeFlagsAwaitContext, is_async)
+        this.set_context_flags(NodeFlagsYieldContext, false)
+        let node this.parse_assignment_expression_or_higher_worker(allow_return_type)
+        set context_flags: saved
+        node
+    }
+
+    function is_start_of_expression_statement(this) returns bool
+    {
+        ; None of `{`, `function`, `class` or `@` can start an expression
+        ; statement, per the grammar.
+        if token = KindOpenBraceToken
+            return false
+        if token = KindFunctionKeyword
+            return false
+        if token = KindClassKeyword
+            return false
+        if token = KindAtToken
+            return false
+        this.is_start_of_expression()
+    }
+
+    ; ── the async simple arrow function ─────────────────────────────────────
+
+    procedure try_parse_async_simple_arrow_function_expression(this, allow_return_type: bool) returns pointer[AstNode]
+    {
+        if token <> KindAsyncKeyword
+            return null
+        if this.look_ahead_next_is_un_parenthesized_async_arrow_function() = false
+            return null
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+        let async_modifier this.parse_modifiers_for_arrow_function()
+        if this.is_unported()
+            return null
+        let expr this.parse_binary_expression_or_higher(OperatorPrecedenceLowest)
+        if expr = null
+            return null
+        this.parse_simple_arrow_function_expression(pos, expr, allow_return_type, jsdoc, async_modifier)
+    }
+
+    ; ★ This look-ahead PARSES — it runs the whole binary ladder to see whether
+    ; what follows `async` is one identifier and an arrow — so anything it
+    ; reports is thrown away with it, which the rewind now does.
+    procedure look_ahead_next_is_un_parenthesized_async_arrow_function(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_is_un_parenthesized_async_arrow_function()
+        this.rewind(saved)
+        r
+    }
+
+    procedure next_is_un_parenthesized_async_arrow_function(this) returns bool
+    {
+        if token <> KindAsyncKeyword
+            return false
+        this.next_token()
+        ; `async => x` is a plain arrow function whose parameter is named async.
+        if this.has_preceding_line_break()
+            return false
+        if token = KindEqualsGreaterThanToken
+            return false
+        let expr this.parse_binary_expression_or_higher(OperatorPrecedenceLowest)
+        if expr = null
+            return false
+        if this.has_preceding_line_break()
+            return false
+        if AstNode.kind_of(expr) <> KindIdentifier
+            return false
+        token = KindEqualsGreaterThanToken
+    }
+
+    procedure parse_simple_arrow_function_expression(this, pos: int, identifier: pointer[AstNode], allow_return_type: bool, jsdoc: int, async_modifier: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
+    {
+        ; The single parameter is SYNTHESIZED around the identifier that was
+        ; already parsed, and it starts where that identifier does — not where
+        ; the arrow function does, which differs whenever an `async` precedes it.
+        let parameter this.finish_node(this.new_node(KindParameter, NodeData.Parameter(ParameterData(null, null, identifier, null, null, null))), AstNode.pos_of(identifier))
+        if parameter = null
+            return null
+        let parameters AstNode.new_node_list(host)
+        parameters.add(parameter)
+
+        let equals_greater_than_token this.parse_expected_token(KindEqualsGreaterThanToken)
+        if equals_greater_than_token = null
+            return null
+
+        var is_async false
+        if async_modifier <> null
+            set is_async: true
+        let body this.parse_arrow_function_expression_body(is_async, allow_return_type)
+        if body = null
+            return null
+
+        let result this.finish_node(this.new_node(KindArrowFunction, NodeData.ArrowFunction(ArrowFunctionData(async_modifier, null, parameters, null, equals_greater_than_token, body))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    ; ── the expression-start predicates ─────────────────────────────────────
+
+    procedure is_start_of_expression(this) returns bool
+    {
+        if this.is_start_of_left_hand_side_expression()
+            return true
+        ; `yield` and `await` always start an expression: either they are names,
+        ; or they are keywords and started a yield/await expression.
+        if unary_expression_start_token(token)
+            return true
+        ; Error tolerance: a leading binary operator is taken as the start of an
+        ; expression, so that a missing left operand is one diagnostic rather
+        ; than a cascade.
+        if this.is_binary_operator()
+            return true
+        this.is_identifier()
+    }
+
+    function unary_expression_start_token(k: int) returns bool
+    {
+        if k = KindPlusToken
+            return true
+        if k = KindMinusToken
+            return true
+        if k = KindTildeToken
+            return true
+        if k = KindExclamationToken
+            return true
+        if k = KindDeleteKeyword
+            return true
+        if k = KindTypeOfKeyword
+            return true
+        if k = KindVoidKeyword
+            return true
+        if k = KindPlusPlusToken
+            return true
+        if k = KindMinusMinusToken
+            return true
+        if k = KindLessThanToken
+            return true
+        if k = KindAwaitKeyword
+            return true
+        if k = KindYieldKeyword
+            return true
+        if k = KindPrivateIdentifier
+            return true
+        k = KindAtToken
+    }
+
+    procedure is_start_of_left_hand_side_expression(this) returns bool
+    {
+        if left_hand_side_start_token(token)
+            return true
+        if token = KindImportKeyword
+            return this.look_ahead_next_token_is_open_paren_or_less_than_or_dot()
+        this.is_identifier()
+    }
+
+    function left_hand_side_start_token(k: int) returns bool
+    {
+        if k = KindThisKeyword
+            return true
+        if k = KindSuperKeyword
+            return true
+        if k = KindNullKeyword
+            return true
+        if k = KindTrueKeyword
+            return true
+        if k = KindFalseKeyword
+            return true
+        if k = KindNumericLiteral
+            return true
+        if k = KindBigIntLiteral
+            return true
+        if k = KindStringLiteral
+            return true
+        if k = KindNoSubstitutionTemplateLiteral
+            return true
+        if k = KindTemplateHead
+            return true
+        if k = KindOpenParenToken
+            return true
+        if k = KindOpenBracketToken
+            return true
+        if k = KindOpenBraceToken
+            return true
+        if k = KindFunctionKeyword
+            return true
+        if k = KindClassKeyword
+            return true
+        if k = KindNewKeyword
+            return true
+        if k = KindSlashToken
+            return true
+        if k = KindSlashEqualsToken
+            return true
+        k = KindIdentifier
+    }
+
+    ; isStartOfStatement. Its only caller in this slice is the arrow function's
+    ; body, which asks whether a missing `{` is the likelier reading — but it is
+    ; the reference's own statement predicate and the statement-list contexts
+    ; will want it too.
+    procedure is_start_of_statement(this) returns bool
+    {
+        if statement_start_token(token)
+            return true
+        if token = KindImportKeyword
+        {
+            if this.is_start_of_declaration()
+                return true
+            return this.look_ahead_next_token_is_open_paren_or_less_than_or_dot()
+        }
+        if token = KindConstKeyword
+            return this.is_start_of_declaration()
+        if token = KindExportKeyword
+            return this.is_start_of_declaration()
+        ; When these do not start a declaration they are an identifier in an
+        ; expression statement, which is still a statement.
+        if contextual_statement_start_token(token)
+            return true
+        ; ... and these may instead be the start of a CLASS MEMBER, which is not
+        ; a statement — so an identifier directly after one says "member".
+        if class_member_start_token(token)
+        {
+            if this.is_start_of_declaration()
+                return true
+            return this.look_ahead_next_token_is_identifier_or_keyword_on_same_line() = false
+        }
+        this.is_start_of_expression()
+    }
+
+    function statement_start_token(k: int) returns bool
+    {
+        if k = KindAtToken
+            return true
+        if k = KindSemicolonToken
+            return true
+        if k = KindOpenBraceToken
+            return true
+        if k = KindVarKeyword
+            return true
+        if k = KindLetKeyword
+            return true
+        if k = KindUsingKeyword
+            return true
+        if k = KindFunctionKeyword
+            return true
+        if k = KindClassKeyword
+            return true
+        if k = KindEnumKeyword
+            return true
+        if k = KindIfKeyword
+            return true
+        if k = KindDoKeyword
+            return true
+        if k = KindWhileKeyword
+            return true
+        if k = KindForKeyword
+            return true
+        if k = KindContinueKeyword
+            return true
+        if k = KindBreakKeyword
+            return true
+        if k = KindReturnKeyword
+            return true
+        if k = KindWithKeyword
+            return true
+        if k = KindSwitchKeyword
+            return true
+        if k = KindThrowKeyword
+            return true
+        if k = KindTryKeyword
+            return true
+        if k = KindDebuggerKeyword
+            return true
+        ; `catch` and `finally` do not really start a statement; the reference
+        ; says they do so that they parse and are reported later.
+        if k = KindCatchKeyword
+            return true
+        k = KindFinallyKeyword
+    }
+
+    function contextual_statement_start_token(k: int) returns bool
+    {
+        if k = KindAsyncKeyword
+            return true
+        if k = KindDeclareKeyword
+            return true
+        if k = KindInterfaceKeyword
+            return true
+        if k = KindModuleKeyword
+            return true
+        if k = KindNamespaceKeyword
+            return true
+        if k = KindTypeKeyword
+            return true
+        if k = KindGlobalKeyword
+            return true
+        k = KindDeferKeyword
+    }
+
+    function class_member_start_token(k: int) returns bool
+    {
+        if k = KindAccessorKeyword
+            return true
+        if k = KindPublicKeyword
+            return true
+        if k = KindPrivateKeyword
+            return true
+        if k = KindProtectedKeyword
+            return true
+        if k = KindStaticKeyword
+            return true
+        k = KindReadonlyKeyword
+    }
+
+    ; ── the look-ahead wrappers for the ladder ──────────────────────────────
+
+    procedure look_ahead_next_token_is_open_paren_or_less_than(this) returns bool
+    {
+        let saved this.mark()
+        this.next_token()
+        var r token = KindOpenParenToken
+        if r = false
+        {
+            if token = KindLessThanToken
+                set r: true
+        }
+        this.rewind(saved)
+        r
+    }
+
+    procedure look_ahead_next_token_is_open_paren_or_less_than_or_dot(this) returns bool
+    {
+        let saved this.mark()
+        this.next_token()
+        var r token = KindOpenParenToken
+        if r = false
+        {
+            if token = KindLessThanToken
+                set r: true
+        }
+        if r = false
+        {
+            if token = KindDotToken
+                set r: true
+        }
+        this.rewind(saved)
+        r
+    }
+
+    procedure look_ahead_next_token_is_dot(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_token() = KindDotToken
+        this.rewind(saved)
+        r
+    }
+
+    procedure look_ahead_next_token_is_identifier(this) returns bool
+    {
+        let saved this.mark()
+        this.next_token()
+        let r this.is_identifier()
+        this.rewind(saved)
+        r
+    }
+
+    procedure look_ahead_next_token_is_identifier_or_keyword_or_literal_on_same_line(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_token_is_identifier_or_keyword_or_literal_on_same_line()
+        this.rewind(saved)
+        r
+    }
+
+    procedure next_token_is_identifier_or_keyword_or_literal_on_same_line(this) returns bool
+    {
+        this.next_token()
+        var ok token_is_identifier_or_keyword(token)
+        if ok = false
+        {
+            if token = KindNumericLiteral
+                set ok: true
+        }
+        if ok = false
+        {
+            if token = KindBigIntLiteral
+                set ok: true
+        }
+        if ok = false
+        {
+            if token = KindStringLiteral
+                set ok: true
+        }
+        if ok = false
+            return false
+        this.has_preceding_line_break() = false
+    }
+
+    procedure look_ahead_next_token_is_identifier_or_keyword_or_open_bracket_or_template(this) returns bool
+    {
+        let saved this.mark()
+        this.next_token()
+        var r token_is_identifier_or_keyword(token)
+        if r = false
+        {
+            if token = KindOpenBracketToken
+                set r: true
+        }
+        if r = false
+        {
+            if this.is_template_start_of_tagged_template()
+                set r: true
+        }
+        this.rewind(saved)
+        r
+    }
+
+    ; parseExpectedToken. The reference synthesizes a MISSING token when the
+    ; expected one is absent, which is always preceded by a diagnostic — so the
+    ; absent case is where this port stops.
+    procedure parse_expected_token(this, kind: int) returns pointer[AstNode]
+    {
+        if token = kind
+            return this.parse_token_node()
+        this.unported("expected-token", kind)
+        null
+    }
+
+    function in_disallow_in_context(this) returns bool
+        (context_flags & NodeFlagsDisallowInContext) <> 0
+
+    function in_decorator_context(this) returns bool
+        (context_flags & NodeFlagsDecoratorContext) <> 0
 
     procedure parse_literal_expression(this, kind: int) returns pointer[AstNode]
     {
@@ -2018,6 +4543,8 @@ define Parser
             if token <> KindQuestionToken
                 return constraint
         }
+        ; The reference PARSED a type here and is throwing it away, diagnostics
+        ; included — which is what the rewind does now. See ParserState.
         this.rewind(saved)
         null
     }
@@ -2376,9 +4903,15 @@ define Parser
         ; always the reference's diagnostic one.
         if token = KindPrivateIdentifier
             return this.unported("private-identifier", token)
+        ; ★ Only the identifier-NAME branch lets an `await` count. `a.await` is a
+        ; use of the name and reaches the reparse; a dotted ENTITY name in a type
+        ; does not, which is why the other branch puts the flag back.
         if allow_identifier_names
             return this.parse_identifier_name()
-        this.parse_identifier()
+        let saved_await_identifier statement_has_await_identifier
+        let id this.parse_identifier()
+        set statement_has_await_identifier: saved_await_identifier
+        id
     }
 
     ; ── type arguments ──────────────────────────────────────────────────────
@@ -2391,6 +4924,16 @@ define Parser
     procedure re_scan_less_than_token(this) returns int
     {
         set token: scanner.re_scan_less_than_token()
+        token
+    }
+
+    ; The other direction, and the ladder's: the scan never merges `>`, so
+    ; parseBinaryExpressionRest asks for `>=`, `>>`, `>>>`, `>>=` and `>>>=`
+    ; before EVERY operator test. See the scanner's own comment for why the
+    ; asymmetry is deliberate.
+    procedure re_scan_greater_than_token(this) returns int
+    {
+        set token: scanner.re_scan_greater_than_token()
         token
     }
 
@@ -2673,7 +5216,7 @@ define Parser
         ; is preceded by a diagnostic, so it is the unported edge here.
         if this.parse_expected(KindOpenParenToken) = false
             return null
-        let parameters this.parse_parameters_worker(flags)
+        let parameters this.parse_parameters_worker(flags, true)
         if parameters = null
             return null
         if this.parse_expected(KindCloseParenToken) = false
@@ -2681,13 +5224,16 @@ define Parser
         parameters
     }
 
-    procedure parse_parameters_worker(this, flags: int) returns pointer[Array[pointer[AstNode]]]
+    procedure parse_parameters_worker(this, flags: int, allow_ambiguity: bool) returns pointer[Array[pointer[AstNode]]]
     {
         ; Captured BEFORE the flags move — this is the context the parameter's
         ; decorators belong to. See the field's comment for why it travels as
-        ; state rather than in a closure.
+        ; state rather than in a closure. `allow_ambiguity` rides along for the
+        ; same reason.
         let saved_outer parameter_outer_await_context
+        let saved_ambiguity parameter_allow_ambiguity
         set parameter_outer_await_context: this.in_await_context()
+        set parameter_allow_ambiguity: allow_ambiguity
 
         let saved context_flags
         this.set_context_flags(NodeFlagsYieldContext, (flags & ParseFlagsYield) <> 0)
@@ -2695,10 +5241,11 @@ define Parser
         let parameters this.parse_delimited_list(PCParameters)
         set context_flags: saved
         set parameter_outer_await_context: saved_outer
+        set parameter_allow_ambiguity: saved_ambiguity
         parameters
     }
 
-    procedure parse_parameter_ex(this, in_outer_await_context: bool) returns pointer[AstNode]
+    procedure parse_parameter_ex(this, in_outer_await_context: bool, allow_ambiguity: bool) returns pointer[AstNode]
     {
         let pos this.node_pos()
         let jsdoc this.jsdoc_scanner_info()
@@ -2742,6 +5289,18 @@ define Parser
         if this.is_unported()
             return null
 
+        ; ★ The speculative half of an arrow-function parse. Answering NULL here
+        ; is not a failure — it is "this text is not a parameter list", and the
+        ; caller rewinds. It is the only path on which a null element of a
+        ; delimited list means something other than "the port stopped", which is
+        ; why parse_parenthesized_arrow_function_expression is careful to
+        ; distinguish the two by is_unported() rather than by the result.
+        if allow_ambiguity = false
+        {
+            if this.is_parameter_name_start() = false
+                return null
+        }
+
         let name this.parse_name_of_parameter(modifiers)
         if name = null
             return null
@@ -2768,6 +5327,19 @@ define Parser
 
         let result this.finish_node(this.new_node(KindParameter, NodeData.Parameter(ParameterData(modifiers, dot_dot_dot_token, name, question_token, type_node, initializer))), pos)
         this.with_jsdoc(result, jsdoc)
+    }
+
+    ; isParameterNameStart. The reference is deliberately permissive here —
+    ; isBindingIdentifier rather than isIdentifier — because refusing `await` or
+    ; `yield` during a speculative parse produces far more follow-on errors than
+    ; letting the function parse and complaining later.
+    function is_parameter_name_start(this) returns bool
+    {
+        if this.is_binding_identifier()
+            return true
+        if token = KindOpenBracketToken
+            return true
+        token = KindOpenBraceToken
     }
 
     procedure parse_name_of_parameter(this, modifiers: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
@@ -2945,6 +5517,9 @@ define Parser
     procedure parse_function_block(this, flags: int) returns pointer[AstNode]
     {
         let saved context_flags
+        ; An `await` used as a name INSIDE a function body says nothing about the
+        ; enclosing top-level statement, so the flag is put back on the way out.
+        let saved_await_identifier statement_has_await_identifier
         this.set_context_flags(NodeFlagsYieldContext, (flags & ParseFlagsYield) <> 0)
         this.set_context_flags(NodeFlagsAwaitContext, (flags & ParseFlagsAwait) <> 0)
         ; A function expression or arrow function may itself be parsed in a
@@ -2952,6 +5527,7 @@ define Parser
         this.set_context_flags(NodeFlagsDecoratorContext, false)
         let block this.parse_block()
         set context_flags: saved
+        set statement_has_await_identifier: saved_await_identifier
         block
     }
 
@@ -3062,7 +5638,21 @@ define Parser
         if ctx = PCTupleElementTypes
             return this.parse_tuple_element_name_or_tuple_element_type()
         if ctx = PCParameters
-            return this.parse_parameter_ex(parameter_outer_await_context)
+            return this.parse_parameter_ex(parameter_outer_await_context, parameter_allow_ambiguity)
+        if ctx = PCArgumentExpressions
+            return this.parse_argument_expression()
+        ; ★ An ARRAY literal's element is NOT wrapped in the argument context:
+        ; the reference passes parseArgumentOrArrayLiteralElement directly here
+        ; and parseArgumentExpression there, and the wrapper CLEARS DisallowIn
+        ; and DecoratorContext while the array path inherits both. Both therefore
+        ; allow `in` at the top level — the difference only shows inside a `for`
+        ; initializer or a decorator, and both of those are unported, so no case
+        ; in this suite can see it. Ported as written rather than collapsed,
+        ; because the difference becomes real with the first of those slices.
+        if ctx = PCArrayLiteralMembers
+            return this.parse_argument_or_array_literal_element()
+        if ctx = PCObjectLiteralMembers
+            return this.parse_object_literal_element()
         this.parse_type()
     }
 
@@ -3080,6 +5670,39 @@ define Parser
                 return true
             return this.is_identifier()
         }
+        if ctx = PCObjectLiteralMembers
+        {
+            ; `[`, `*` and `...` really do start a member; the lone `.` does not,
+            ; and is admitted so that a half-typed `{ a. }` does not close the
+            ; literal (the reference names the completion test it is for).
+            if token = KindOpenBracketToken
+                return true
+            if token = KindAsteriskToken
+                return true
+            if token = KindDotDotDotToken
+                return true
+            if token = KindDotToken
+                return true
+            return this.is_literal_property_name()
+        }
+        if ctx = PCArrayLiteralMembers
+        {
+            ; A comma is an ELISION and therefore an element; the `.` is the
+            ; same completion tolerance as above.
+            if token = KindCommaToken
+                return true
+            if token = KindDotToken
+                return true
+            if token = KindDotDotDotToken
+                return true
+            return this.is_start_of_expression()
+        }
+        if ctx = PCArgumentExpressions
+        {
+            if token = KindDotDotDotToken
+                return true
+            return this.is_start_of_expression()
+        }
         ; PCTypeArguments and PCTupleElementTypes share one arm upstream too.
         if token = KindCommaToken
             return true
@@ -3090,6 +5713,19 @@ define Parser
     {
         if token = KindEndOfFile
             return true
+        if ctx = PCObjectLiteralMembers
+            return token = KindCloseBraceToken
+        if ctx = PCArrayLiteralMembers
+            return token = KindCloseBracketToken
+        if ctx = PCArgumentExpressions
+        {
+            ; `;` is there for error recovery, and is ported for the same reason
+            ; the recovery tokens below are: leaving it out would loop where the
+            ; reference stops.
+            if token = KindCloseParenToken
+                return true
+            return token = KindSemicolonToken
+        }
         if ctx = PCTypeParameters
         {
             ; Everything but `>` is there for error recovery, and is ported
@@ -3297,14 +5933,19 @@ define Parser
             this.next_token()
             return true
         }
-        ; The reference answers "yes, if the binding pattern parses without a
+        ; ★★★ The reference answers "yes, if the binding pattern parses without a
         ; diagnostic". Both halves are unported, and answering `false` instead
         ; would be worse than reporting: it would send `([a]: T) => U` down the
         ; parenthesized-type path and build a tree nobody checked.
+        ;
+        ; This is the ONE site whose report has to outlive a rewind, and it is
+        ; the whole reason there are two records — every caller here is a
+        ; look-ahead, so a rewindable report would be erased the moment the
+        ; ANSWER was handed back and used. See the ParserState header.
         if token = KindOpenBracketToken
-            return this.unported_bool("binding-pattern")
+            return this.unanswerable_bool("binding-pattern")
         if token = KindOpenBraceToken
-            return this.unported_bool("binding-pattern")
+            return this.unanswerable_bool("binding-pattern")
         false
     }
 
@@ -3312,6 +5953,18 @@ define Parser
     procedure unported_bool(this, tag: pointer[const_char]) returns bool
     {
         this.unported(tag, token)
+        false
+    }
+
+    ; ... and the same again for the record a rewind does not restore.
+    procedure unanswerable_bool(this, tag: pointer[const_char]) returns bool
+    {
+        if unanswerable_pos < 0
+        {
+            set unanswerable_pos: scanner.token_full_start()
+            set unanswerable_tag: tag
+            set unanswerable_detail: token
+        }
         false
     }
 

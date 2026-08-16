@@ -1,0 +1,17 @@
+const a = x => x;
+const b = (x) => x;
+const c = () => 1;
+const d = (x, y) => x + y;
+const e = (x: number): string => "s";
+const f = (x = 1) => x;
+const g = (...rest: number[]) => rest;
+const h = <T>(x: T) => x;
+const i = async () => 1;
+const j = async x => x;
+const k = async (x: number) => x;
+const l = x => y => x + y;
+const m = () => { return 1; };
+const n = (x: number) => (y: number) => x + y;
+const o = 1 ? (x): number => x : 2;
+const p = (x?: number) => x;
+const q = () => () => 1;

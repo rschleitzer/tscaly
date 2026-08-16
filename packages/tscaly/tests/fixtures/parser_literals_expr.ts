@@ -1,0 +1,15 @@
+const arr = [1, 2, 3];
+const empty = [];
+const elision = [, 1, , 2, ];
+const spread = [1, ...arr, 2];
+const nested = [[1], [2, [3]]];
+const obj = { a: 1, b: 2 };
+const objEmpty = {};
+const shorthand = { a, b };
+const shortInit = { a = 1 };
+const computed = { ["k"]: 1, [1 + 2]: 2 };
+const strName = { "s": 1, 3: 2, 0x4: 3 };
+const kw = { default: 1, in: 2, function: 3 };
+const objSpread = { ...obj, a: 1 };
+const deep = { a: { b: [1, { c: 2 }] } };
+const trailing = { a: 1, };

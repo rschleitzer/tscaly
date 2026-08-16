@@ -1,0 +1,22 @@
+declare const o: any;
+const a = o.b;
+const b = o.b.c.d;
+const c = o[1];
+const d = o["k"];
+const e = o.b[1].c;
+const f = o!;
+const g = o!.b;
+const h = o?.b;
+const i = o?.[1];
+const j = o?.b?.c;
+const k = o?.b!.c;
+const l = o();
+const m = o(1, 2);
+const n = o(...[1]);
+const p = o.b(1).c(2);
+const q = o<string>(1);
+const r = new o();
+const s = new o(1, 2);
+const t = new o.b();
+const u = new o<string>();
+function w() { return new.target; }
