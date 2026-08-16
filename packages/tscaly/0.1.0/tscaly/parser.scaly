@@ -2,46 +2,55 @@
 ;
 ; parser — ported from the reference's internal/parser/parser.go.
 ;
-; SLICE 1. The spine only: a source file of statements, the statements a file of
-; plain declarations is made of, and primary expressions. Everything else
-; reports its own POSITION as unported rather than building a plausible tree
-; that quietly disagrees with the reference — the same mechanism the scanner
-; carries, and for the same reason.
+; SLICES 1–3. The spine, the declaration router, and the TYPE surface. Anything
+; outside them reports its own POSITION as unported rather than building a
+; plausible tree that quietly disagrees with the reference — the same mechanism
+; the scanner carries, and for the same reason.
 ;
-; ── What this slice parses ──────────────────────────────────────────────────
+; ── What is parsed ──────────────────────────────────────────────────────────
 ;
-;   SourceFile, EndOfFile
-;   EmptyStatement, Block, ExpressionStatement
-;   VariableStatement / VariableDeclarationList / VariableDeclaration
-;     (var / let / const-as-`let`-shape is NOT included: `const` goes through
-;      the reference's modifier path, which is unported)
-;   Identifier, NumericLiteral, BigIntLiteral, StringLiteral, and the keyword
-;   expressions this / super / null / true / false
+;   slice 1  SourceFile, EndOfFile
+;            EmptyStatement, Block, ExpressionStatement
+;            VariableStatement / VariableDeclarationList / VariableDeclaration
+;            Identifier, NumericLiteral, BigIntLiteral, StringLiteral, and the
+;            keyword expressions this / super / null / true / false
+;   slice 2  modifiers and the declaration ROUTER — every declaration form goes
+;            through parse_declaration, because modifiers are parsed before
+;            anyone knows what they modify
+;   slice 3  the type parser (see the TYPES banner far below), the type ALIAS
+;            declaration, and `: T` type annotations
 ;
 ; ── What it deliberately does not, each stated rather than left to be noticed ─
 ;
 ; ★ DIAGNOSTICS. The reference emits TS1xxx parse errors, and the yardstick
-;   compares their code and span. This slice emits NONE — and so any path that
+;   compares their code and span. These slices emit NONE — and so any path that
 ;   WOULD emit one reports unported instead. That is the honest boundary: a
 ;   parser that recovers from an error without producing the error is a parser
 ;   whose tree cannot be compared, and one that invents a code is worse. It also
 ;   means NodeFlagsThisNodeHasError is never set here, because it cannot be
 ;   reached without a diagnostic first.
 ;
-; ★ TYPE ANNOTATIONS. `: T` in a variable declaration is unported — there is no
-;   type parser yet. This is why the slice covers so few corpus cases: a .ts
-;   file that declares no types is a rare thing.
+;   ★★ It also has a consequence for the negative controls: because the port
+;   bails at every point the reference would RECOVER at, most ways of breaking
+;   it on purpose surface as an extra UNPORTED rather than as a wrong tree. The
+;   controls that can actually go red are the ones that change the shape of a
+;   tree that still completes — child ORDER, node KIND, a range. Both kinds are
+;   real (unported is not a pass), but they are not equally strong, and
+;   CLAUDE.md's control table says which each one is.
 ;
-; ★ MODIFIERS. `export`, `declare`, `const`, `async` and the rest start the
-;   reference's parseDeclaration path. Unported, listed by kind below exactly as
-;   the reference's switch lists them.
+; ★ EXPRESSIONS. The ladder above a primary expression — binary operators,
+;   calls, member access, `as`, the conditional operator — is unported. It is
+;   the largest remaining block, and note which way the dependency runs: the
+;   TYPE side is complete enough that a type parses on its own, while several
+;   type-side facts (a postfix `[` after a line break, `type` used as a name)
+;   cannot be TESTED until an expression can be parsed beside them.
 ;
-; ★ ERROR RECOVERY. The reference parses lists through parsing CONTEXTS
-;   (PCSourceElements, PCBlockStatements, PCVariableDeclarations) with
+; ★ ERROR RECOVERY. The reference parses lists through parsing CONTEXTS with
 ;   per-context element and terminator predicates and a token-skipping recovery.
-;   The loops here are the well-formed path only. That is not a shortcut that
-;   changes results: recovery only runs after a diagnostic, and a diagnostic is
-;   already an unported report.
+;   The statement loops here are the well-formed path only, and the three type
+;   list contexts port the two predicates but not the recovery. That is not a
+;   shortcut that changes results: recovery only runs after a diagnostic, and a
+;   diagnostic is already an unported report.
 ;
 ; ── Two mapping decisions, both for CLAUDE.md §3 ────────────────────────────
 ;
@@ -75,11 +84,33 @@ use tscaly.ast.ExpressionStatementData
 use tscaly.ast.VariableStatementData
 use tscaly.ast.VariableDeclarationListData
 use tscaly.ast.VariableDeclarationData
+use tscaly.ast.WrappedTypeData
+use tscaly.ast.TypeListData
+use tscaly.ast.QualifiedNameData
+use tscaly.ast.TypeReferenceData
+use tscaly.ast.TypeQueryData
+use tscaly.ast.IndexedAccessTypeData
+use tscaly.ast.ConditionalTypeData
+use tscaly.ast.TypePredicateData
+use tscaly.ast.NamedTupleMemberData
+use tscaly.ast.TypeParameterData
+use tscaly.ast.TypeAliasDeclarationData
 
 ; The reference's jsdocScannerInfo — what the scanner noticed about the JSDoc
 ; comment preceding the token the parser is about to consume. It is captured at
 ; the START of a construct, because by the time the node is finished the token
 ; carrying the flags is long gone.
+; The reference's ParsingContext, for the three delimited lists this slice
+; needs. Upstream uses these as BIT POSITIONS in `parsingContexts`, a set it
+; consults during error recovery to decide whether an enclosing list could
+; consume the token it is stuck on. This slice has no recovery, so the values
+; are plain tags and the numbering is ours. Add an entry only when the list it
+; names is actually parsed — an unreachable arm of isListElement/isListTerminator
+; is an untested transcription of a table that is easy to get subtly wrong.
+define PCTypeArguments:     int 0
+define PCTypeParameters:    int 1
+define PCTupleElementTypes: int 2
+
 define JsdocInfoNone:         int 0
 define JsdocInfoHasJsdoc:     int 1 << 0
 define JsdocInfoHasDeprecated: int 1 << 1
@@ -283,6 +314,20 @@ define Parser
             if scanner.has_unicode_escape() or scanner.has_extended_unicode_escape()
                 this.unported("keyword-escape", token)
         }
+        this.next_token_without_check()
+    }
+
+    ; The reference's nextTokenWithoutCheck — the same scan without the
+    ; escaped-keyword check above. The split is load-bearing rather than
+    ; cosmetic: an identifier NAME may legally BE a keyword (`a.default`, `type`
+    ; used as a variable name), and createIdentifier advances through THIS
+    ; entry point, so routing it through next_token would report unported for a
+    ; construct the reference accepts without a word.
+    ;
+    ; Our own two carry-ups stay on this side, because they are about the scan
+    ; itself and every caller needs them.
+    procedure next_token_without_check(this) returns int
+    {
         set token: scanner.scan()
 
         ; ★ A token the SCANNER found fault with means the reference emitted a
@@ -646,6 +691,8 @@ define Parser
             return this.parse_variable_statement(pos, jsdoc, modifiers)
         if token = KindUsingKeyword
             return this.parse_variable_statement(pos, jsdoc, modifiers)
+        if token = KindTypeKeyword
+            return this.parse_type_alias_declaration(pos, jsdoc, modifiers)
 
         ; The reference's remaining arms. Each is a whole declaration form and a
         ; slice of its own; the tag says which one stopped the case, so the
@@ -1303,9 +1350,13 @@ define Parser
             }
         }
 
-        ; parseTypeAnnotation. There is no type parser yet.
+        var type_node null as pointer[AstNode]
         if token = KindColonToken
-            return this.unported("type-annotation", token)
+        {
+            set type_node: this.parse_type_annotation()
+            if type_node = null
+                return null
+        }
 
         var initializer null as pointer[AstNode]
         if token <> KindInKeyword
@@ -1321,24 +1372,50 @@ define Parser
             }
         }
 
-        let result this.finish_node(this.new_node(KindVariableDeclaration, NodeData.VariableDeclaration(VariableDeclarationData(name, exclamation_token, null, initializer))), pos)
+        let result this.finish_node(this.new_node(KindVariableDeclaration, NodeData.VariableDeclaration(VariableDeclarationData(name, exclamation_token, type_node, initializer))), pos)
         this.with_jsdoc(result, jsdoc)
     }
 
-    procedure parse_binding_identifier(this) returns pointer[AstNode]
-    {
-        if this.is_binding_identifier() = false
-            return this.unported("binding-identifier", token)
-        this.parse_identifier_node()
-    }
+    ; ── identifiers ─────────────────────────────────────────────────────────
+    ;
+    ; The reference's createIdentifierWithDiagnostic and its three callers. They
+    ; differ ONLY in the question they ask before building the node, which is
+    ; why they are one function plus three one-liners here as well:
+    ;
+    ;   parseIdentifier      isIdentifier()               — a real identifier
+    ;   parseIdentifierName  tokenIsIdentifierOrKeyword() — a NAME, keywords included
+    ;   parseBindingIdentifier isBindingIdentifier()
+    ;
+    ; Every `false` answer leads into the reference's diagnostic arms (a
+    ; reserved word, a private identifier, "Identifier expected"), each of which
+    ; also synthesizes a MISSING identifier — a node with an empty name and a
+    ; zero-width range. So a false answer is where the port stops.
 
-    procedure parse_identifier_node(this) returns pointer[AstNode]
+    procedure create_identifier(this, ok: bool) returns pointer[AstNode]
     {
+        if ok = false
+            return this.unported("identifier-expected", token)
         let pos this.node_pos()
         ; The reference takes scanner.TokenValue() here and interns it. Our
         ; scanner keeps no tokenValue yet, and no node in this slice reads one.
-        this.next_token()
+        this.next_token_without_check()
         this.finish_node(this.new_node(KindIdentifier, NodeData.Identifier(IdentifierData())), pos)
+    }
+
+    procedure parse_identifier(this) returns pointer[AstNode]
+        this.create_identifier(this.is_identifier())
+
+    procedure parse_identifier_name(this) returns pointer[AstNode]
+        this.create_identifier(token_is_identifier_or_keyword(token))
+
+    procedure parse_binding_identifier(this) returns pointer[AstNode]
+    {
+        ; Its own tag rather than create_identifier's: the histogram is the
+        ; planning instrument, and "a binding position wanted a name" and "a
+        ; type position wanted a name" are different work.
+        if this.is_binding_identifier() = false
+            return this.unported("binding-identifier", token)
+        this.create_identifier(true)
     }
 
     ; The reference's canParseSemicolon/tryParseSemicolon — automatic semicolon
@@ -1480,7 +1557,7 @@ define Parser
             return this.parse_token_node()
 
         if this.is_identifier()
-            return this.parse_identifier_node()
+            return this.parse_identifier()
 
         ; parenthesized, array and object literals, templates, regular
         ; expressions, function/class expressions, `new`, decorators, private
@@ -1502,6 +1579,1302 @@ define Parser
             return this.finish_node(this.new_node(kind, NodeData.NumericLiteral(LiteralData())), pos)
         if kind = KindBigIntLiteral
             return this.finish_node(this.new_node(kind, NodeData.BigIntLiteral(LiteralData())), pos)
+        if kind = KindNoSubstitutionTemplateLiteral
+            return this.finish_node(this.new_node(kind, NodeData.NoSubstitutionTemplateLiteral(LiteralData())), pos)
         this.finish_node(this.new_node(kind, NodeData.StringLiteral(LiteralData())), pos)
+    }
+
+    ; ════════════════════════════════════════════════════════════════════════
+    ; TYPES — parser slice 3
+    ; ════════════════════════════════════════════════════════════════════════
+    ;
+    ; The reference's "// TYPES" section, ported as one unit because it IS one:
+    ; a type alias, a function signature, an interface member and a variable's
+    ; `: T` all call the same parseType, and none of them can be built before it
+    ; exists. `type X = …` is its smallest consumer, which is why it is the
+    ; declaration this slice adds.
+    ;
+    ; ── The ladder, top to bottom ───────────────────────────────────────────
+    ;
+    ;   parseType                    conditional type  (T extends U ? X : Y)
+    ;   parseUnionTypeOrHigher       A | B
+    ;   parseIntersectionTypeOrHigher A & B
+    ;   parseTypeOperatorOrHigher    keyof / unique / readonly / infer
+    ;   parsePostfixTypeOrHigher     T[]  T[K]  T!  T?
+    ;   parseNonArrayType            the leaves and the bracketed forms
+    ;
+    ; ── What is NOT ported, each because it is the head of another slice ────
+    ;
+    ;   function and constructor types   they need parseParameters
+    ;   the object type literal `{ … }`  it needs parseTypeMember — which is the
+    ;                                    interface-member slice, and a mapped
+    ;                                    type shares the tag because both stop
+    ;                                    at the same `{`
+    ;   `import(…)` types                they need the import machinery
+    ;   template literal types           they need ReScanTemplateToken
+    ;   the JSDoc prefix forms `*`, `??` they need two more re-scan entry points
+    ;
+    ; ── Three faithfulness notes, each one a thing that is easy to lose ─────
+    ;
+    ; (1) Some reference nodes carry a field the dump cannot see — the OPERATOR
+    ;     of a TypeOperatorNode, the operator of a PrefixUnaryExpression, the
+    ;     `IsTypeOf` flag of an ImportTypeNode. They are not stored here, and
+    ;     that is a real gap rather than a saving: the yardstick compares kind,
+    ;     range and flags, so it would not notice one being wrong. Stated so
+    ;     that the slice which first READS such a field knows to add it.
+    ;
+    ; (2) The reference's list parsing goes through parsing CONTEXTS with a
+    ;     per-context element predicate, terminator predicate and token-skipping
+    ;     recovery. The three contexts this slice needs are ported literally
+    ;     (is_list_element / is_list_terminator); the recovery is not, because
+    ;     it only runs after a diagnostic, and a diagnostic is already unported.
+    ;
+    ; (3) `unported` is STICKY and speculation does NOT undo it (§3.9e). So a
+    ;     look-ahead that walks into an unported construct stops the whole parse
+    ;     even if the reference would have discarded that branch. That
+    ;     over-reports and never under-reports, which is the direction this
+    ;     harness is built to err in.
+
+    ; ── context flags ───────────────────────────────────────────────────────
+    ;
+    ; setContextFlags. Go's `&^=` is AND-NOT, and Scaly spells it `& ~` — the
+    ; unary complement exists (CLAUDE.md §3.5f).
+
+    procedure set_context_flags(this, flags: int, value: bool)
+    {
+        if value
+            set context_flags: context_flags | flags
+        else
+            set context_flags: context_flags & ~flags
+    }
+
+    function in_disallow_conditional_types_context(this) returns bool
+        (context_flags & NodeFlagsDisallowConditionalTypesContext) <> 0
+
+    ; ── the entry points ────────────────────────────────────────────────────
+
+    procedure parse_type_annotation(this) returns pointer[AstNode]
+    {
+        if this.parse_optional(KindColonToken)
+            return this.parse_type()
+        null
+    }
+
+    procedure parse_type(this) returns pointer[AstNode]
+    {
+        let saved context_flags
+        this.set_context_flags(NodeFlagsTypeExcludesFlags, false)
+        let result this.parse_type_worker()
+        set context_flags: saved
+        result
+    }
+
+    ; doInContext(p, flags, value, (*Parser).parseType) — the only shape of
+    ; doInContext this slice needs, spelled out because it takes a func value.
+    procedure parse_type_in_context(this, flags: int, value: bool) returns pointer[AstNode]
+    {
+        let saved context_flags
+        this.set_context_flags(flags, value)
+        let result this.parse_type()
+        set context_flags: saved
+        result
+    }
+
+    procedure parse_type_worker(this) returns pointer[AstNode]
+    {
+        if this.is_start_of_function_type_or_constructor_type()
+            return this.unported("function-type", token)
+
+        let pos this.node_pos()
+        let type_node this.parse_union_type_or_higher()
+        if type_node = null
+            return null
+
+        if this.in_disallow_conditional_types_context()
+            return type_node
+        if this.has_preceding_line_break()
+            return type_node
+        if this.parse_optional(KindExtendsKeyword) = false
+            return type_node
+
+        ; The type following `extends` may not itself be conditional; the two
+        ; branches may.
+        let extends_type this.parse_type_in_context(NodeFlagsDisallowConditionalTypesContext, true)
+        if extends_type = null
+            return null
+        if this.parse_expected(KindQuestionToken) = false
+            return null
+        let true_type this.parse_type_in_context(NodeFlagsDisallowConditionalTypesContext, false)
+        if true_type = null
+            return null
+        if this.parse_expected(KindColonToken) = false
+            return null
+        let false_type this.parse_type_in_context(NodeFlagsDisallowConditionalTypesContext, false)
+        if false_type = null
+            return null
+
+        this.finish_node(this.new_node(KindConditionalType, NodeData.ConditionalType(ConditionalTypeData(type_node, extends_type, true_type, false_type))), pos)
+    }
+
+    ; ── union and intersection ──────────────────────────────────────────────
+    ;
+    ; The reference passes the constituent parser down as a func value; here the
+    ; `is_union` flag selects it. Both constituents are known statically, and a
+    ; callback is the shape the escape checker rejects (§3.9e).
+
+    procedure parse_union_type_or_higher(this) returns pointer[AstNode]
+        this.parse_union_or_intersection_type(KindBarToken, true)
+
+    procedure parse_intersection_type_or_higher(this) returns pointer[AstNode]
+        this.parse_union_or_intersection_type(KindAmpersandToken, false)
+
+    procedure parse_constituent_type(this, is_union: bool) returns pointer[AstNode]
+    {
+        if is_union
+            return this.parse_intersection_type_or_higher()
+        this.parse_type_operator_or_higher()
+    }
+
+    ; parseFunctionOrConstructorTypeToError. The reference parses the function
+    ; type and then reports that it must be parenthesized here; the node and the
+    ; diagnostic are both unported, so the whole arm is.
+    procedure parse_function_or_constructor_type_to_error(this, is_union: bool) returns pointer[AstNode]
+    {
+        if this.is_start_of_function_type_or_constructor_type()
+            return this.unported("function-type", token)
+        this.parse_constituent_type(is_union)
+    }
+
+    procedure parse_union_or_intersection_type(this, op: int, is_union: bool) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let has_leading_operator this.parse_optional(op)
+
+        var type_node null as pointer[AstNode]
+        if has_leading_operator
+            set type_node: this.parse_function_or_constructor_type_to_error(is_union)
+        else
+            set type_node: this.parse_constituent_type(is_union)
+        if type_node = null
+            return null
+
+        ; A LEADING operator makes it a union/intersection node even with one
+        ; constituent — `type A = | B` is a UnionType of one.
+        var is_list has_leading_operator
+        if token = op
+            set is_list: true
+        if is_list = false
+            return type_node
+
+        let types AstNode.new_node_list(host)
+        types.add(type_node)
+        while this.parse_optional(op)
+        {
+            let t this.parse_function_or_constructor_type_to_error(is_union)
+            if t = null
+                return null
+            types.add(t)
+        }
+
+        var n null as pointer[AstNode]
+        if is_union
+            set n: this.new_node(KindUnionType, NodeData.UnionType(TypeListData(types)))
+        else
+            set n: this.new_node(KindIntersectionType, NodeData.IntersectionType(TypeListData(types)))
+        this.finish_node(n, pos)
+    }
+
+    ; ── type operators ──────────────────────────────────────────────────────
+
+    procedure parse_type_operator_or_higher(this) returns pointer[AstNode]
+    {
+        if token = KindKeyOfKeyword
+            return this.parse_type_operator(token)
+        if token = KindUniqueKeyword
+            return this.parse_type_operator(token)
+        if token = KindReadonlyKeyword
+            return this.parse_type_operator(token)
+        if token = KindInferKeyword
+            return this.parse_infer_type()
+        this.parse_postfix_type_in_context()
+    }
+
+    procedure parse_postfix_type_in_context(this) returns pointer[AstNode]
+    {
+        let saved context_flags
+        this.set_context_flags(NodeFlagsDisallowConditionalTypesContext, false)
+        let result this.parse_postfix_type_or_higher()
+        set context_flags: saved
+        result
+    }
+
+    ; The reference's TypeOperatorNode stores WHICH operator; see faithfulness
+    ; note (1) — nothing reads it yet and the dump cannot see it.
+    procedure parse_type_operator(this, op: int) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        if this.parse_expected(op) = false
+            return null
+        let inner this.parse_type_operator_or_higher()
+        if inner = null
+            return null
+        this.finish_node(this.new_node(KindTypeOperator, NodeData.TypeOperator(WrappedTypeData(inner))), pos)
+    }
+
+    procedure parse_infer_type(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        if this.parse_expected(KindInferKeyword) = false
+            return null
+        let tp this.parse_type_parameter_of_infer_type()
+        if tp = null
+            return null
+        this.finish_node(this.new_node(KindInferType, NodeData.InferType(WrappedTypeData(tp))), pos)
+    }
+
+    procedure parse_type_parameter_of_infer_type(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let name this.parse_identifier()
+        if name = null
+            return null
+        let constraint this.try_parse_constraint_of_infer_type()
+        if this.is_unported()
+            return null
+        this.finish_node(this.new_node(KindTypeParameter, NodeData.TypeParameter(TypeParameterData(null, name, constraint, null, null))), pos)
+    }
+
+    ; `infer T extends U` is a constraint — unless a `?` follows, in which case
+    ; the `extends` belonged to an enclosing conditional type and the whole
+    ; speculation is rewound.
+    procedure try_parse_constraint_of_infer_type(this) returns pointer[AstNode]
+    {
+        let saved this.mark()
+        if this.parse_optional(KindExtendsKeyword)
+        {
+            let constraint this.parse_type_in_context(NodeFlagsDisallowConditionalTypesContext, true)
+            if constraint = null
+                return null
+            if this.in_disallow_conditional_types_context()
+                return constraint
+            if token <> KindQuestionToken
+                return constraint
+        }
+        this.rewind(saved)
+        null
+    }
+
+    ; ── postfix ─────────────────────────────────────────────────────────────
+
+    procedure parse_postfix_type_or_higher(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        var type_node this.parse_non_array_type()
+        if type_node = null
+            return null
+
+        while this.has_preceding_line_break() = false
+        {
+            if token = KindExclamationToken
+            {
+                this.next_token()
+                set type_node: this.finish_node(this.new_node(KindJSDocNonNullableType, NodeData.JSDocNonNullableType(WrappedTypeData(type_node))), pos)
+                continue
+            }
+
+            if token = KindQuestionToken
+            {
+                ; `T ? X : Y` — the `?` opens a conditional type's true branch
+                ; and does NOT make T nullable. A type following it is what
+                ; tells the two apart, and it is the whole reason this arm looks
+                ; ahead instead of testing a token.
+                if this.look_ahead_next_is_start_of_type()
+                    return type_node
+                this.next_token()
+                set type_node: this.finish_node(this.new_node(KindJSDocNullableType, NodeData.JSDocNullableType(WrappedTypeData(type_node))), pos)
+                continue
+            }
+
+            if token = KindOpenBracketToken
+            {
+                if this.parse_expected(KindOpenBracketToken) = false
+                    return null
+                if this.is_start_of_type(false)
+                {
+                    let index_type this.parse_type()
+                    if index_type = null
+                        return null
+                    if this.parse_expected(KindCloseBracketToken) = false
+                        return null
+                    set type_node: this.finish_node(this.new_node(KindIndexedAccessType, NodeData.IndexedAccessType(IndexedAccessTypeData(type_node, index_type))), pos)
+                    continue
+                }
+                if this.parse_expected(KindCloseBracketToken) = false
+                    return null
+                set type_node: this.finish_node(this.new_node(KindArrayType, NodeData.ArrayType(WrappedTypeData(type_node))), pos)
+                continue
+            }
+
+            return type_node
+        }
+        type_node
+    }
+
+    ; ── the leaves ──────────────────────────────────────────────────────────
+
+    procedure parse_non_array_type(this) returns pointer[AstNode]
+    {
+        if keyword_type_start(token)
+        {
+            ; A keyword type followed by a dot is a dotted type REFERENCE
+            ; (`string.Foo`), so the keyword is parsed and, on seeing the dot,
+            ; put back.
+            let saved this.mark()
+            let kw this.parse_keyword_type_node()
+            if token <> KindDotToken
+                return kw
+            this.rewind(saved)
+            return this.parse_type_reference()
+        }
+
+        ; The JSDoc PREFIX forms. `*=` and `??` additionally need a re-scan
+        ; entry point the scanner does not have yet.
+        if token = KindAsteriskEqualsToken
+            return this.unported("jsdoc-all-type", token)
+        if token = KindAsteriskToken
+            return this.unported("jsdoc-all-type", token)
+        if token = KindQuestionQuestionToken
+            return this.unported("jsdoc-nullable-type", token)
+        if token = KindQuestionToken
+            return this.parse_jsdoc_nullable_type()
+        if token = KindExclamationToken
+            return this.parse_jsdoc_non_nullable_type()
+
+        if literal_type_start(token)
+            return this.parse_literal_type_node(false)
+
+        if token = KindMinusToken
+        {
+            if this.look_ahead_next_token_is_numeric_or_bigint_literal()
+                return this.parse_literal_type_node(true)
+            return this.parse_type_reference()
+        }
+
+        ; `void` is a keyword type with no dotted fallback — there is no
+        ; `void.Foo`.
+        if token = KindVoidKeyword
+            return this.parse_keyword_type_node()
+
+        if token = KindThisKeyword
+        {
+            let this_keyword this.parse_this_type_node()
+            if this_keyword = null
+                return null
+            if token = KindIsKeyword
+            {
+                if this.has_preceding_line_break() = false
+                    return this.parse_this_type_predicate(this_keyword)
+            }
+            return this_keyword
+        }
+
+        if token = KindTypeOfKeyword
+        {
+            if this.look_ahead_next_is_start_of_type_of_import_type()
+                return this.unported("import-type", token)
+            return this.parse_type_query()
+        }
+
+        ; `{` opens an object type literal or a mapped type. Both are unported
+        ; and they share the tag: telling them apart costs a look-ahead whose
+        ; answer changes nothing here, and the histogram entry would be split
+        ; between two constructs that are one slice.
+        if token = KindOpenBraceToken
+            return this.unported("type-literal", token)
+
+        if token = KindOpenBracketToken
+            return this.parse_tuple_type()
+        if token = KindOpenParenToken
+            return this.parse_parenthesized_type()
+        if token = KindImportKeyword
+            return this.unported("import-type", token)
+
+        if token = KindAssertsKeyword
+        {
+            if this.look_ahead_next_token_is_identifier_or_keyword_on_same_line()
+                return this.parse_asserts_type_predicate()
+            return this.parse_type_reference()
+        }
+
+        if token = KindTemplateHead
+            return this.unported("template-literal-type", token)
+
+        this.parse_type_reference()
+    }
+
+    ; The ten keyword types that fall back to a dotted type reference. `void` is
+    ; deliberately not among them — see parse_non_array_type.
+    function keyword_type_start(k: int) returns bool
+    {
+        if k = KindAnyKeyword
+            return true
+        if k = KindUnknownKeyword
+            return true
+        if k = KindStringKeyword
+            return true
+        if k = KindNumberKeyword
+            return true
+        if k = KindBigIntKeyword
+            return true
+        if k = KindSymbolKeyword
+            return true
+        if k = KindBooleanKeyword
+            return true
+        if k = KindUndefinedKeyword
+            return true
+        if k = KindNeverKeyword
+            return true
+        k = KindObjectKeyword
+    }
+
+    function literal_type_start(k: int) returns bool
+    {
+        if k = KindNoSubstitutionTemplateLiteral
+            return true
+        if k = KindStringLiteral
+            return true
+        if k = KindNumericLiteral
+            return true
+        if k = KindBigIntLiteral
+            return true
+        if k = KindTrueKeyword
+            return true
+        if k = KindFalseKeyword
+            return true
+        k = KindNullKeyword
+    }
+
+    function keyword_literal(k: int) returns bool
+    {
+        if k = KindTrueKeyword
+            return true
+        if k = KindFalseKeyword
+            return true
+        k = KindNullKeyword
+    }
+
+    ; parseKeywordTypeNode. Identical in shape to parseTokenNode — a keyword
+    ; type is a node whose KIND is the keyword and which has no children, which
+    ; is why ast.scaly gives it no record of its own — and kept under its own
+    ; name because the reference has two and a reader looking at the type side
+    ; should find it there.
+    procedure parse_keyword_type_node(this) returns pointer[AstNode]
+        this.parse_token_node()
+
+    procedure parse_this_type_node(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        this.next_token()
+        this.finish_node(this.new_node(KindThisType, NodeData.Token(TokenData())), pos)
+    }
+
+    ; `this is T`. The node starts where the `this` did, not at the `is`.
+    procedure parse_this_type_predicate(this, lhs: pointer[AstNode]) returns pointer[AstNode]
+    {
+        this.next_token()
+        let t this.parse_type()
+        if t = null
+            return null
+        this.finish_node(this.new_node(KindTypePredicate, NodeData.TypePredicate(TypePredicateData(null, lhs, t))), AstNode.pos_of(lhs))
+    }
+
+    ; `asserts x`, `asserts x is T`, `asserts this is T`.
+    procedure parse_asserts_type_predicate(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        ; parseExpectedToken. Its missing-token recovery cannot run: the
+        ; look-ahead in parse_non_array_type is what routed us here, so the
+        ; `asserts` is known present.
+        let asserts_modifier this.parse_optional_token(KindAssertsKeyword)
+        if asserts_modifier = null
+            return this.unported("expected", KindAssertsKeyword)
+
+        var parameter_name null as pointer[AstNode]
+        if token = KindThisKeyword
+            set parameter_name: this.parse_this_type_node()
+        else
+            set parameter_name: this.parse_identifier()
+        if parameter_name = null
+            return null
+
+        var type_node null as pointer[AstNode]
+        if this.parse_optional(KindIsKeyword)
+        {
+            set type_node: this.parse_type()
+            if type_node = null
+                return null
+        }
+
+        this.finish_node(this.new_node(KindTypePredicate, NodeData.TypePredicate(TypePredicateData(asserts_modifier, parameter_name, type_node))), pos)
+    }
+
+    procedure parse_jsdoc_nullable_type(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        this.next_token()
+        let inner this.parse_type_operator_or_higher()
+        if inner = null
+            return null
+        this.finish_node(this.new_node(KindJSDocNullableType, NodeData.JSDocNullableType(WrappedTypeData(inner))), pos)
+    }
+
+    procedure parse_jsdoc_non_nullable_type(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        this.next_token()
+        let inner this.parse_type_operator_or_higher()
+        if inner = null
+            return null
+        this.finish_node(this.new_node(KindJSDocNonNullableType, NodeData.JSDocNonNullableType(WrappedTypeData(inner))), pos)
+    }
+
+    ; A literal type wraps the literal EXPRESSION, so `-1` is three nodes deep:
+    ; LiteralType > PrefixUnaryExpression > NumericLiteral, all three sharing
+    ; the same start.
+    procedure parse_literal_type_node(this, negative: bool) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        if negative
+            this.next_token()
+
+        var expression null as pointer[AstNode]
+        if keyword_literal(token)
+            set expression: this.parse_token_node()
+        else
+            set expression: this.parse_literal_expression(token)
+        if expression = null
+            return null
+
+        if negative
+            set expression: this.finish_node(this.new_node(KindPrefixUnaryExpression, NodeData.PrefixUnaryExpression(WrappedTypeData(expression))), pos)
+
+        this.finish_node(this.new_node(KindLiteralType, NodeData.LiteralType(WrappedTypeData(expression))), pos)
+    }
+
+    ; ── type references and entity names ────────────────────────────────────
+
+    procedure parse_type_reference(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let name this.parse_entity_name(true)
+        if name = null
+            return null
+        let args this.parse_type_arguments_of_type_reference()
+        if this.is_unported()
+            return null
+        this.finish_node(this.new_node(KindTypeReference, NodeData.TypeReference(TypeReferenceData(name, args))), pos)
+    }
+
+    procedure parse_entity_name(this, allow_reserved_words: bool) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        var entity null as pointer[AstNode]
+        if allow_reserved_words
+            set entity: this.parse_identifier_name()
+        else
+            set entity: this.parse_identifier()
+        if entity = null
+            return null
+
+        while this.parse_optional(KindDotToken)
+        {
+            ; `a.<T>` is a JSDoc-style generic. The reference leaves the dot
+            ; consumed and stops here, reporting the gap in the checker.
+            if token = KindLessThanToken
+                break
+            let right this.parse_right_side_of_dot(allow_reserved_words)
+            if right = null
+                return null
+            set entity: this.finish_node(this.new_node(KindQualifiedName, NodeData.QualifiedName(QualifiedNameData(entity, right))), pos)
+        }
+        entity
+    }
+
+    procedure parse_right_side_of_dot(this, allow_identifier_names: bool) returns pointer[AstNode]
+    {
+        ; The reference's ASI guard: `name.` at the end of a line followed by an
+        ; identifier on the NEXT line is two statements, not one member access,
+        ; so it reports Identifier_expected right after the dot and synthesizes
+        ; a missing identifier. Diagnostic plus missing node — unported.
+        if this.has_preceding_line_break()
+        {
+            if token_is_identifier_or_keyword(token)
+            {
+                if this.look_ahead_next_token_is_identifier_or_keyword_on_same_line()
+                    return this.unported("missing-identifier", token)
+            }
+        }
+        ; An entity name never allows a private identifier, so this arm is
+        ; always the reference's diagnostic one.
+        if token = KindPrivateIdentifier
+            return this.unported("private-identifier", token)
+        if allow_identifier_names
+            return this.parse_identifier_name()
+        this.parse_identifier()
+    }
+
+    ; ── type arguments ──────────────────────────────────────────────────────
+    ;
+    ; ★ The re-scan is what makes `Foo<<T>() => void>` parse at all: the scan
+    ; merged the two `<` into one token, and only the parser knows it is reading
+    ; a type. The CLOSING side needs no such thing — the scanner never merges
+    ; `>`, precisely so `Array<Array<string>>` can close twice.
+
+    procedure re_scan_less_than_token(this) returns int
+    {
+        set token: scanner.re_scan_less_than_token()
+        token
+    }
+
+    procedure parse_type_arguments_of_type_reference(this) returns pointer[Array[pointer[AstNode]]]
+    {
+        if this.has_preceding_line_break()
+            return null
+        if this.re_scan_less_than_token() <> KindLessThanToken
+            return null
+        this.parse_type_arguments()
+    }
+
+    procedure parse_type_arguments(this) returns pointer[Array[pointer[AstNode]]]
+    {
+        if token <> KindLessThanToken
+            return null
+        this.parse_bracketed_list(PCTypeArguments, KindLessThanToken, KindGreaterThanToken)
+    }
+
+    procedure parse_type_query(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        if this.parse_expected(KindTypeOfKeyword) = false
+            return null
+        let entity_name this.parse_entity_name(true)
+        if entity_name = null
+            return null
+
+        ; ASI, so the NEXT line's `<` cannot be read as this query's type
+        ; arguments.
+        var type_arguments null as pointer[Array[pointer[AstNode]]]
+        if this.has_preceding_line_break() = false
+        {
+            set type_arguments: this.parse_type_arguments()
+            if this.is_unported()
+                return null
+        }
+
+        this.finish_node(this.new_node(KindTypeQuery, NodeData.TypeQuery(TypeQueryData(entity_name, type_arguments))), pos)
+    }
+
+    ; ── tuples ──────────────────────────────────────────────────────────────
+
+    procedure parse_tuple_type(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let elements this.parse_bracketed_list(PCTupleElementTypes, KindOpenBracketToken, KindCloseBracketToken)
+        if elements = null
+            return null
+        this.finish_node(this.new_node(KindTupleType, NodeData.TupleType(TypeListData(elements))), pos)
+    }
+
+    procedure parse_tuple_element_name_or_tuple_element_type(this) returns pointer[AstNode]
+    {
+        if this.look_ahead_scan_start_of_named_tuple_element()
+        {
+            let pos this.node_pos()
+            let jsdoc this.jsdoc_scanner_info()
+            let dot_dot_dot_token this.parse_optional_token(KindDotDotDotToken)
+            let name this.parse_identifier_name()
+            if name = null
+                return null
+            let question_token this.parse_optional_token(KindQuestionToken)
+            if this.parse_expected(KindColonToken) = false
+                return null
+            let type_node this.parse_tuple_element_type()
+            if type_node = null
+                return null
+            let result this.finish_node(this.new_node(KindNamedTupleMember, NodeData.NamedTupleMember(NamedTupleMemberData(dot_dot_dot_token, name, question_token, type_node))), pos)
+            return this.with_jsdoc(result, jsdoc)
+        }
+        this.parse_tuple_element_type()
+    }
+
+    procedure scan_start_of_named_tuple_element(this) returns bool
+    {
+        if token = KindDotDotDotToken
+        {
+            if token_is_identifier_or_keyword(this.next_token()) = false
+                return false
+            return this.next_token_is_colon_or_question_colon()
+        }
+        if token_is_identifier_or_keyword(token) = false
+            return false
+        this.next_token_is_colon_or_question_colon()
+    }
+
+    procedure next_token_is_colon_or_question_colon(this) returns bool
+    {
+        if this.next_token() = KindColonToken
+            return true
+        if token <> KindQuestionToken
+            return false
+        this.next_token() = KindColonToken
+    }
+
+    procedure parse_tuple_element_type(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        if this.parse_optional(KindDotDotDotToken)
+        {
+            let rest this.parse_type()
+            if rest = null
+                return null
+            return this.finish_node(this.new_node(KindRestType, NodeData.RestType(WrappedTypeData(rest))), pos)
+        }
+
+        let type_node this.parse_type()
+        if type_node = null
+            return null
+
+        ; `[T?]`. The postfix `?` already built a JSDocNullableType, and what
+        ; distinguishes the tuple's optional element from the JSDoc PREFIX form
+        ; is where the node starts: a suffix `?` leaves the wrapper starting at
+        ; its inner type, a prefix `?` starts one token earlier. The node is
+        ; rebuilt rather than retagged, carrying flags and range over — exactly
+        ; what the reference does.
+        if AstNode.kind_of(type_node) <> KindJSDocNullableType
+            return type_node
+        let inner AstNode.child_at(type_node, 0)
+        if inner = null
+            return type_node
+        if AstNode.pos_of(type_node) <> AstNode.pos_of(inner)
+            return type_node
+
+        let n this.new_node(KindOptionalType, NodeData.OptionalType(WrappedTypeData(inner)))
+        set n.flags: type_node.flags
+        set n.pos: type_node.pos
+        set n.end: type_node.end
+        n
+    }
+
+    procedure parse_parenthesized_type(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        if this.parse_expected(KindOpenParenToken) = false
+            return null
+        let inner this.parse_type()
+        if inner = null
+            return null
+        if this.parse_expected(KindCloseParenToken) = false
+            return null
+        this.finish_node(this.new_node(KindParenthesizedType, NodeData.ParenthesizedType(WrappedTypeData(inner))), pos)
+    }
+
+    ; ── type parameters ─────────────────────────────────────────────────────
+
+    procedure parse_type_parameters(this) returns pointer[Array[pointer[AstNode]]]
+    {
+        if token <> KindLessThanToken
+            return null
+        this.parse_bracketed_list(PCTypeParameters, KindLessThanToken, KindGreaterThanToken)
+    }
+
+    procedure parse_type_parameter(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let modifiers this.parse_modifiers(false, true, false)
+        if this.is_unported()
+            return null
+        let name this.parse_identifier()
+        if name = null
+            return null
+
+        var constraint null as pointer[AstNode]
+        if this.parse_optional(KindExtendsKeyword)
+        {
+            ; The reference recovers from a constraint written as an EXPRESSION
+            ; (`<T extends "">`) by parsing one and reporting that a type was
+            ; expected. That needs the expression ladder AND a diagnostic, so it
+            ; is unported — and the test is inverted here on purpose: the
+            ; reference also takes the TYPE path when the text starts neither a
+            ; type nor an expression, so stopping on "does not start a type"
+            ; over-reports and never under-reports.
+            if this.is_start_of_type(false) = false
+                return this.unported("type-parameter-constraint-expression", token)
+            set constraint: this.parse_type()
+            if constraint = null
+                return null
+        }
+
+        var default_type null as pointer[AstNode]
+        if this.parse_optional(KindEqualsToken)
+        {
+            set default_type: this.parse_type()
+            if default_type = null
+                return null
+        }
+
+        this.finish_node(this.new_node(KindTypeParameter, NodeData.TypeParameter(TypeParameterData(modifiers, name, constraint, null, default_type))), pos)
+    }
+
+    ; ── the declaration ─────────────────────────────────────────────────────
+
+    procedure parse_type_alias_declaration(this, pos: int, jsdoc: int, modifiers: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
+    {
+        if this.parse_expected(KindTypeKeyword) = false
+            return null
+        ; The reference reports Line_break_not_permitted_here and CONTINUES, so
+        ; the tree is the same and only the diagnostic differs — which is
+        ; exactly the case this port must not paper over.
+        if this.has_preceding_line_break()
+            return this.unported("line-break-after-type", token)
+
+        let name this.parse_identifier()
+        if name = null
+            return null
+        let type_parameters this.parse_type_parameters()
+        if this.is_unported()
+            return null
+        if this.parse_expected(KindEqualsToken) = false
+            return null
+
+        ; `type X = intrinsic` is a keyword type; `type X = intrinsic.Y` is an
+        ; ordinary reference to something named `intrinsic`.
+        var type_node null as pointer[AstNode]
+        if token = KindIntrinsicKeyword
+        {
+            if this.look_ahead_next_is_not_dot()
+                set type_node: this.parse_keyword_type_node()
+        }
+        if type_node = null
+            set type_node: this.parse_type()
+        if type_node = null
+            return null
+
+        if this.parse_semicolon() = false
+            return null
+
+        let result this.finish_node(this.new_node(KindTypeAliasDeclaration, NodeData.TypeAliasDeclaration(TypeAliasDeclarationData(modifiers, name, type_parameters, type_node))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    ; ── delimited lists ─────────────────────────────────────────────────────
+    ;
+    ; parseBracketedList / parseDelimitedList for the three contexts above. The
+    ; element and terminator predicates are the reference's, arm for arm; the
+    ; recovery is not, because it runs only after a diagnostic.
+    ;
+    ; A list may legitimately come back EMPTY — `Foo<>` is a type reference with
+    ; zero type arguments, and the reference builds an empty NodeList for it —
+    ; so an empty Array here is a result, not a failure. Failure is null.
+
+    procedure parse_bracketed_list(this, ctx: int, opening: int, closing: int) returns pointer[Array[pointer[AstNode]]]
+    {
+        if this.parse_expected(opening) = false
+            return null
+        let list this.parse_delimited_list(ctx)
+        if list = null
+            return null
+        if this.parse_expected(closing) = false
+            return null
+        list
+    }
+
+    procedure parse_delimited_list(this, ctx: int) returns pointer[Array[pointer[AstNode]]]
+    {
+        let list AstNode.new_node_list(host)
+        while true
+        {
+            if this.is_list_element(ctx)
+            {
+                let element this.parse_list_element(ctx)
+                if element = null
+                    return null
+                list.add(element)
+                if this.parse_optional(KindCommaToken)
+                    continue
+                if this.is_list_terminator(ctx)
+                    break
+                ; Neither continued nor terminated: the reference reports
+                ; "',' expected" and recovers.
+                this.unported("list-comma", token)
+                return null
+            }
+            if this.is_list_terminator(ctx)
+                break
+            ; abortParsingListOrMoveToNextToken — a diagnostic on either path.
+            this.unported("list-element", token)
+            return null
+        }
+        list
+    }
+
+    procedure parse_list_element(this, ctx: int) returns pointer[AstNode]
+    {
+        if ctx = PCTypeParameters
+            return this.parse_type_parameter()
+        if ctx = PCTupleElementTypes
+            return this.parse_tuple_element_name_or_tuple_element_type()
+        this.parse_type()
+    }
+
+    procedure is_list_element(this, ctx: int) returns bool
+    {
+        if ctx = PCTypeParameters
+        {
+            ; `in` and `const` are variance/modifier keywords on a type
+            ; parameter, so a list can start with either.
+            if token = KindInKeyword
+                return true
+            if token = KindConstKeyword
+                return true
+            return this.is_identifier()
+        }
+        ; PCTypeArguments and PCTupleElementTypes share one arm upstream too.
+        if token = KindCommaToken
+            return true
+        this.is_start_of_type(false)
+    }
+
+    procedure is_list_terminator(this, ctx: int) returns bool
+    {
+        if token = KindEndOfFile
+            return true
+        if ctx = PCTypeParameters
+        {
+            ; Everything but `>` is there for error recovery, and is ported
+            ; because leaving it out would loop where the reference stops.
+            if token = KindGreaterThanToken
+                return true
+            if token = KindOpenParenToken
+                return true
+            if token = KindOpenBraceToken
+                return true
+            if token = KindExtendsKeyword
+                return true
+            return token = KindImplementsKeyword
+        }
+        if ctx = PCTupleElementTypes
+            return token = KindCloseBracketToken
+        ; PCTypeArguments: anything but a comma ends the list.
+        token <> KindCommaToken
+    }
+
+    ; ── the type-position predicates ────────────────────────────────────────
+
+    procedure is_start_of_type(this, in_start_of_parameter: bool) returns bool
+    {
+        if type_start_token(token)
+            return true
+        if token = KindFunctionKeyword
+            return in_start_of_parameter = false
+        if token = KindMinusToken
+        {
+            if in_start_of_parameter
+                return false
+            return this.look_ahead_next_token_is_numeric_or_bigint_literal()
+        }
+        if token = KindOpenParenToken
+        {
+            ; `(` is only a type start if what follows could be a parameter list
+            ; or a type — otherwise `(1)` would read as one.
+            if in_start_of_parameter
+                return false
+            return this.look_ahead_next_is_parenthesized_or_function_type()
+        }
+        this.is_identifier()
+    }
+
+    ; The unconditional arm of isStartOfType, transcribed from the reference's
+    ; case list. A run of independent tests rather than a chain — the same
+    ; reason the scan switch is one (see the header).
+    function type_start_token(k: int) returns bool
+    {
+        if k = KindAnyKeyword
+            return true
+        if k = KindUnknownKeyword
+            return true
+        if k = KindStringKeyword
+            return true
+        if k = KindNumberKeyword
+            return true
+        if k = KindBigIntKeyword
+            return true
+        if k = KindBooleanKeyword
+            return true
+        if k = KindReadonlyKeyword
+            return true
+        if k = KindSymbolKeyword
+            return true
+        if k = KindUniqueKeyword
+            return true
+        if k = KindVoidKeyword
+            return true
+        if k = KindUndefinedKeyword
+            return true
+        if k = KindNullKeyword
+            return true
+        if k = KindThisKeyword
+            return true
+        if k = KindTypeOfKeyword
+            return true
+        if k = KindNeverKeyword
+            return true
+        if k = KindOpenBraceToken
+            return true
+        if k = KindOpenBracketToken
+            return true
+        if k = KindLessThanToken
+            return true
+        if k = KindBarToken
+            return true
+        if k = KindAmpersandToken
+            return true
+        if k = KindNewKeyword
+            return true
+        if k = KindStringLiteral
+            return true
+        if k = KindNumericLiteral
+            return true
+        if k = KindBigIntLiteral
+            return true
+        if k = KindTrueKeyword
+            return true
+        if k = KindFalseKeyword
+            return true
+        if k = KindObjectKeyword
+            return true
+        if k = KindAsteriskToken
+            return true
+        if k = KindQuestionToken
+            return true
+        if k = KindExclamationToken
+            return true
+        if k = KindDotDotDotToken
+            return true
+        if k = KindInferKeyword
+            return true
+        if k = KindImportKeyword
+            return true
+        if k = KindAssertsKeyword
+            return true
+        if k = KindNoSubstitutionTemplateLiteral
+            return true
+        k = KindTemplateHead
+    }
+
+    procedure is_start_of_parameter(this, is_jsdoc_parameter: bool) returns bool
+    {
+        if token = KindDotDotDotToken
+            return true
+        if this.is_binding_identifier_or_private_identifier_or_pattern()
+            return true
+        if is_modifier_kind(token)
+            return true
+        if token = KindAtToken
+            return true
+        this.is_start_of_type(is_jsdoc_parameter = false)
+    }
+
+    function is_binding_identifier_or_private_identifier_or_pattern(this) returns bool
+    {
+        if token = KindOpenBraceToken
+            return true
+        if token = KindOpenBracketToken
+            return true
+        if token = KindPrivateIdentifier
+            return true
+        this.is_binding_identifier()
+    }
+
+    procedure is_start_of_function_type_or_constructor_type(this) returns bool
+    {
+        if token = KindLessThanToken
+            return true
+        if token = KindOpenParenToken
+            return this.look_ahead_next_is_unambiguously_start_of_function_type()
+        if token = KindNewKeyword
+            return true
+        if token = KindAbstractKeyword
+            return this.look_ahead_next_token_is_new_keyword()
+        false
+    }
+
+    procedure next_is_unambiguously_start_of_function_type(this) returns bool
+    {
+        this.next_token()
+        if token = KindCloseParenToken
+            return true
+        if token = KindDotDotDotToken
+            return true
+        if this.skip_parameter_start()
+        {
+            if token = KindColonToken
+                return true
+            if token = KindCommaToken
+                return true
+            if token = KindQuestionToken
+                return true
+            if token = KindEqualsToken
+                return true
+            if token = KindCloseParenToken
+                return this.next_token() = KindEqualsGreaterThanToken
+        }
+        false
+    }
+
+    procedure skip_parameter_start(this) returns bool
+    {
+        if is_modifier_kind(token)
+            this.parse_modifiers(false, false, false)
+        this.parse_optional(KindDotDotDotToken)
+        if this.is_identifier()
+        {
+            this.next_token()
+            return true
+        }
+        if token = KindThisKeyword
+        {
+            this.next_token()
+            return true
+        }
+        ; The reference answers "yes, if the binding pattern parses without a
+        ; diagnostic". Both halves are unported, and answering `false` instead
+        ; would be worse than reporting: it would send `([a]: T) => U` down the
+        ; parenthesized-type path and build a tree nobody checked.
+        if token = KindOpenBracketToken
+            return this.unported_bool("binding-pattern")
+        if token = KindOpenBraceToken
+            return this.unported_bool("binding-pattern")
+        false
+    }
+
+    ; unported() answers a node; a predicate needs the same record with a bool.
+    procedure unported_bool(this, tag: pointer[const_char]) returns bool
+    {
+        this.unported(tag, token)
+        false
+    }
+
+    procedure next_is_start_of_type(this) returns bool
+    {
+        this.next_token()
+        this.is_start_of_type(false)
+    }
+
+    procedure next_token_is_numeric_or_bigint_literal(this) returns bool
+    {
+        this.next_token()
+        if token = KindNumericLiteral
+            return true
+        token = KindBigIntLiteral
+    }
+
+    procedure next_is_parenthesized_or_function_type(this) returns bool
+    {
+        this.next_token()
+        if token = KindCloseParenToken
+            return true
+        if this.is_start_of_parameter(false)
+            return true
+        this.is_start_of_type(false)
+    }
+
+    procedure next_is_start_of_type_of_import_type(this) returns bool
+    {
+        this.next_token()
+        token = KindImportKeyword
+    }
+
+    procedure next_token_is_identifier_or_keyword_on_same_line(this) returns bool
+    {
+        if token_is_identifier_or_keyword(this.next_token()) = false
+            return false
+        this.has_preceding_line_break() = false
+    }
+
+    ; ── the look-ahead wrappers for the type surface ────────────────────────
+    ;
+    ; One per call site, as in §3.9e. They are mechanical, and that is the
+    ; point: the mark/rewind pair is the part that must never be forgotten.
+
+    procedure look_ahead_next_is_start_of_type(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_is_start_of_type()
+        this.rewind(saved)
+        r
+    }
+
+    procedure look_ahead_next_token_is_numeric_or_bigint_literal(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_token_is_numeric_or_bigint_literal()
+        this.rewind(saved)
+        r
+    }
+
+    procedure look_ahead_next_is_parenthesized_or_function_type(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_is_parenthesized_or_function_type()
+        this.rewind(saved)
+        r
+    }
+
+    procedure look_ahead_next_is_unambiguously_start_of_function_type(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_is_unambiguously_start_of_function_type()
+        this.rewind(saved)
+        r
+    }
+
+    procedure look_ahead_next_token_is_new_keyword(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_token() = KindNewKeyword
+        this.rewind(saved)
+        r
+    }
+
+    procedure look_ahead_next_is_start_of_type_of_import_type(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_is_start_of_type_of_import_type()
+        this.rewind(saved)
+        r
+    }
+
+    procedure look_ahead_next_token_is_identifier_or_keyword_on_same_line(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_token_is_identifier_or_keyword_on_same_line()
+        this.rewind(saved)
+        r
+    }
+
+    procedure look_ahead_scan_start_of_named_tuple_element(this) returns bool
+    {
+        let saved this.mark()
+        let r this.scan_start_of_named_tuple_element()
+        this.rewind(saved)
+        r
+    }
+
+    procedure look_ahead_next_is_not_dot(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_token() <> KindDotToken
+        this.rewind(saved)
+        r
     }
 }

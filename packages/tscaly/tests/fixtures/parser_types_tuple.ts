@@ -1,0 +1,10 @@
+type A = [];
+type B = [string];
+type C = [string, number];
+type D = [string?];
+type E = [...string[]];
+type F = [first: string, second: number];
+type G = [first: string, second?: number];
+type H = [...rest: number[]];
+type I = [head: string, ...rest: number[]];
+type J = [[string], [number]];
