@@ -1,0 +1,842 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; parser — ported from the reference's internal/parser/parser.go.
+;
+; SLICE 1. The spine only: a source file of statements, the statements a file of
+; plain declarations is made of, and primary expressions. Everything else
+; reports its own POSITION as unported rather than building a plausible tree
+; that quietly disagrees with the reference — the same mechanism the scanner
+; carries, and for the same reason.
+;
+; ── What this slice parses ──────────────────────────────────────────────────
+;
+;   SourceFile, EndOfFile
+;   EmptyStatement, Block, ExpressionStatement
+;   VariableStatement / VariableDeclarationList / VariableDeclaration
+;     (var / let / const-as-`let`-shape is NOT included: `const` goes through
+;      the reference's modifier path, which is unported)
+;   Identifier, NumericLiteral, BigIntLiteral, StringLiteral, and the keyword
+;   expressions this / super / null / true / false
+;
+; ── What it deliberately does not, each stated rather than left to be noticed ─
+;
+; ★ DIAGNOSTICS. The reference emits TS1xxx parse errors, and the yardstick
+;   compares their code and span. This slice emits NONE — and so any path that
+;   WOULD emit one reports unported instead. That is the honest boundary: a
+;   parser that recovers from an error without producing the error is a parser
+;   whose tree cannot be compared, and one that invents a code is worse. It also
+;   means NodeFlagsThisNodeHasError is never set here, because it cannot be
+;   reached without a diagnostic first.
+;
+; ★ TYPE ANNOTATIONS. `: T` in a variable declaration is unported — there is no
+;   type parser yet. This is why the slice covers so few corpus cases: a .ts
+;   file that declares no types is a rare thing.
+;
+; ★ MODIFIERS. `export`, `declare`, `const`, `async` and the rest start the
+;   reference's parseDeclaration path. Unported, listed by kind below exactly as
+;   the reference's switch lists them.
+;
+; ★ ERROR RECOVERY. The reference parses lists through parsing CONTEXTS
+;   (PCSourceElements, PCBlockStatements, PCVariableDeclarations) with
+;   per-context element and terminator predicates and a token-skipping recovery.
+;   The loops here are the well-formed path only. That is not a shortcut that
+;   changes results: recovery only runs after a diagnostic, and a diagnostic is
+;   already an unported report.
+;
+; ── Two mapping decisions, both for CLAUDE.md §3 ────────────────────────────
+;
+; (1) `lookAhead(callback)` becomes a method per call site that marks, scans and
+;     rewinds inline. Go passes a func value; Scaly's only escaping-closure form
+;     is `return \x: …`, and a speculation helper taking a callback is exactly
+;     the shape the escape checker exists to reject. The saved block is
+;     ScannerState — which is the whole reason the scanner keeps one (§3.5).
+;
+; (2) The reference's `switch p.token` becomes a run of INDEPENDENT `if` blocks
+;     that return, never an `else if` chain: a chain nests one planner level per
+;     arm at roughly 110 KB of planner stack per arm under the bootstrap stages,
+;     and this switch has about forty. The arms are disjoint by construction —
+;     each tests the same token against a distinct kind — so the two are exactly
+;     equivalent here. Same reasoning as the scanner's, one level up.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use tscaly.scanner.Scanner
+use tscaly.scanner.ScannerState
+use tscaly.ast.AstNode
+use tscaly.ast.NodeData
+use tscaly.ast.TokenData
+use tscaly.ast.IdentifierData
+use tscaly.ast.LiteralData
+use tscaly.ast.EmptyStatementData
+use tscaly.ast.SourceFileData
+use tscaly.ast.BlockData
+use tscaly.ast.ExpressionStatementData
+use tscaly.ast.VariableStatementData
+use tscaly.ast.VariableDeclarationListData
+use tscaly.ast.VariableDeclarationData
+
+; The reference's jsdocScannerInfo — what the scanner noticed about the JSDoc
+; comment preceding the token the parser is about to consume. It is captured at
+; the START of a construct, because by the time the node is finished the token
+; carrying the flags is long gone.
+define JsdocInfoNone:         int 0
+define JsdocInfoHasJsdoc:     int 1 << 0
+define JsdocInfoHasDeprecated: int 1 << 1
+define JsdocInfoHasSeeOrLink: int 1 << 2
+
+; The reference's ParserState (mark/rewind). It saves the scanner's block plus
+; the parser's own speculative state; the diagnostic and jsdoc list lengths it
+; also truncates have no counterpart here, because this slice keeps no lists.
+define ParserState
+(
+    scanner_state: ScannerState
+    context_flags: int
+    has_parse_error: bool
+)
+{
+    init(ss: ScannerState, cf: int, hpe: bool)
+    {
+        set scanner_state: ss
+        set context_flags: cf
+        set has_parse_error: hpe
+    }
+}
+
+define Parser
+(
+    host: pointer[Page]
+    scanner: pointer[Scanner]
+    token: int
+    context_flags: int
+    has_parse_error: bool
+
+    ; Position of the first construct this slice does not implement, or -1.
+    ; NOT part of the reference. It also carries the SCANNER's own omission up:
+    ; a scan that could not proceed makes every span after it meaningless, so
+    ; the parser must not report a tree built on one.
+    unported_pos: int
+)
+{
+    init(host: pointer[Page], scanner: pointer[Scanner])
+    {
+        set this.host: host
+        set this.scanner: scanner
+        set this.token: KindUnknown
+        set this.context_flags: NodeFlagsNone
+        set this.has_parse_error: false
+        set this.unported_pos: 0 - 1
+    }
+
+    ; ── the entry point ─────────────────────────────────────────────────────
+    ;
+    ; A concept STATIC taking the page explicitly: a user program calling a
+    ; cross-package free function with a concept-pointer parameter fails
+    ; resolution, while a static resolves (root CLAUDE.md). `out_unported`
+    ; receives the unported position, or -1 — an out-parameter of scalar type,
+    ; which is the safe direction (an out-parameter carrying a String-bearing
+    ; struct is the live dangling class in this repo).
+    ;
+    ; The result is the SourceFile node, or null when nothing could be parsed.
+    ; A non-negative `out_unported` invalidates the tree: read it FIRST.
+    function parse(host: pointer[Page], source: String, out_unported: pointer[int]) returns pointer[AstNode]
+    {
+        let sc host.allocate(sizeof Scanner, alignof Scanner) as pointer[Scanner]
+        set *sc: Scanner(source)
+
+        let p host.allocate(sizeof Parser, alignof Parser) as pointer[Parser]
+        set *p: Parser(host, sc)
+
+        let file p.parse_source_file()
+        set *out_unported: p.unported_at()
+        file
+    }
+
+    function unported_at(this) returns int
+        unported_pos
+
+    ; Record the first unported position and answer null, so a bail-out is one
+    ; statement at the call site: `return this.unported()`.
+    procedure unported(this) returns pointer[AstNode]
+    {
+        if unported_pos < 0
+            set unported_pos: scanner.token_full_start()
+        null
+    }
+
+    function is_unported(this) returns bool
+        unported_pos >= 0
+
+    ; ── node construction ───────────────────────────────────────────────────
+
+    procedure new_node(this, kind: int, data: NodeData) returns pointer[AstNode]
+    {
+        let n AstNode.alloc(host)
+        set n.kind: kind
+        set n.flags: NodeFlagsNone
+        set n.pos: 0
+        set n.end: 0
+        set n.data: data
+        n
+    }
+
+    ; The reference's finishNode: the node's range is [pos, nodePos()), where
+    ; nodePos() is the FULL start of the token the parser is now looking at —
+    ; i.e. the end of the last token consumed. The context flags join here,
+    ; which is what makes them a property of where a node was parsed.
+    procedure finish_node(this, n: pointer[AstNode], pos: int) returns pointer[AstNode]
+    {
+        if n = null
+            return null
+        set n.pos: pos
+        set n.end: this.node_pos()
+        set n.flags: n.flags | context_flags
+        if has_parse_error
+        {
+            set n.flags: n.flags | NodeFlagsThisNodeHasError
+            set has_parse_error: false
+        }
+        n
+    }
+
+    ; ── token plumbing ──────────────────────────────────────────────────────
+
+    function node_pos(this) returns int
+        scanner.token_full_start()
+
+    function has_preceding_line_break(this) returns bool
+        scanner.has_preceding_line_break()
+
+    ; ── JSDoc ───────────────────────────────────────────────────────────────
+    ;
+    ; Only the CHEAP half of the reference's withJSDoc is ported, and that is
+    ; the half a .ts file takes: for a non-JavaScript file the reference sets
+    ; HasJSDoc (and PossiblyContainsDeprecatedTag) from a text scan the scanner
+    ; already did, and defers the actual JSDoc parse to first access. It parses
+    ; eagerly in exactly one case — the comment contains @see or @link, which
+    ; the unused-identifier check needs — and that eager parse is unported, so
+    ; it is reported rather than skipped.
+
+    function jsdoc_scanner_info(this) returns int
+    {
+        if scanner.has_preceding_jsdoc_comment() = false
+            return JsdocInfoNone
+        var info JsdocInfoHasJsdoc
+        if scanner.has_preceding_jsdoc_with_deprecated_tag()
+            set info: info | JsdocInfoHasDeprecated
+        if scanner.has_preceding_jsdoc_with_see_or_link()
+            set info: info | JsdocInfoHasSeeOrLink
+        info
+    }
+
+    ; Answers the node, so a caller can end with `this.with_jsdoc(result, jsdoc)`,
+    ; or null when the eager path is reached.
+    procedure with_jsdoc(this, n: pointer[AstNode], info: int) returns pointer[AstNode]
+    {
+        if n = null
+            return null
+        if (info & JsdocInfoHasJsdoc) = 0
+            return n
+        set n.flags: n.flags | NodeFlagsHasJSDoc
+        if (info & JsdocInfoHasDeprecated) <> 0
+            set n.flags: n.flags | NodeFlagsPossiblyContainsDeprecatedTag
+        if (info & JsdocInfoHasSeeOrLink) <> 0
+            return this.unported()
+        n
+    }
+
+    procedure next_token(this) returns int
+    {
+        ; The reference reports Keywords_cannot_contain_escape_characters here.
+        ; A diagnostic is unported, and swallowing it would produce a tree the
+        ; reference disagrees with while looking perfectly well-formed.
+        if is_keyword(token)
+        {
+            if scanner.has_unicode_escape() or scanner.has_extended_unicode_escape()
+                this.unported()
+        }
+        set token: scanner.scan()
+
+        ; Carry the scanner's own omission up. Every span after an unscannable
+        ; construct is meaningless, so the tree must not be reported.
+        if scanner.unported_at() >= 0
+        {
+            if unported_pos < 0
+                set unported_pos: scanner.unported_at()
+        }
+        token
+    }
+
+    procedure parse_optional(this, kind: int) returns bool
+    {
+        if token = kind
+        {
+            this.next_token()
+            return true
+        }
+        false
+    }
+
+    ; The reference reports "'x' expected" and CONTINUES. This slice has no
+    ; diagnostics, so a failed expectation is where the port stops.
+    procedure parse_expected(this, kind: int) returns bool
+    {
+        if token = kind
+        {
+            this.next_token()
+            return true
+        }
+        this.unported()
+        false
+    }
+
+    procedure parse_token_node(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let k token
+        this.next_token()
+        this.finish_node(this.new_node(k, NodeData.Token(TokenData())), pos)
+    }
+
+    procedure parse_optional_token(this, kind: int) returns pointer[AstNode]
+    {
+        if token = kind
+            return this.parse_token_node()
+        null
+    }
+
+    ; ── kind predicates, ported from internal/ast/utilities.go ──────────────
+    ;
+    ; Each is a >= / <= against a CONTIGUOUS run of the Kind table, which is why
+    ; that table's declaration order is load-bearing (see Kind.scaly).
+
+    function is_keyword(k: int) returns bool
+        (k >= KindFirstKeyword) and (k <= KindLastKeyword)
+
+    ; The reference's isIdentifier(). The yield/await context arms are omitted
+    ; because neither context can be entered in this slice — there is no
+    ; generator and no async function to enter one — and an arm that cannot run
+    ; is better absent than present and untested.
+    function is_identifier(this) returns bool
+    {
+        if token = KindIdentifier
+            return true
+        token > KindLastReservedWord
+    }
+
+    function is_binding_identifier(this) returns bool
+    {
+        if token = KindIdentifier
+            return true
+        token > KindLastReservedWord
+    }
+
+    ; ── speculation ─────────────────────────────────────────────────────────
+
+    function mark(this) returns ParserState
+        ParserState(scanner.mark(), context_flags, has_parse_error)
+
+    procedure rewind(this, saved: ParserState)
+    {
+        scanner.rewind(saved.scanner_state)
+        set token: scanner.token()
+        set context_flags: saved.context_flags
+        set has_parse_error: saved.has_parse_error
+    }
+
+    ; lookAhead(nextTokenIsBindingIdentifierOrStartOfDestructuring), inlined —
+    ; see the header for why the callback does not survive the port.
+    procedure is_let_declaration(this) returns bool
+    {
+        let saved this.mark()
+        this.next_token()
+        var r this.is_binding_identifier()
+        if r = false
+        {
+            if token = KindOpenBraceToken
+                set r: true
+        }
+        if r = false
+        {
+            if token = KindOpenBracketToken
+                set r: true
+        }
+        this.rewind(saved)
+        r
+    }
+
+    ; ── the source file ─────────────────────────────────────────────────────
+
+    procedure parse_source_file(this) returns pointer[AstNode]
+    {
+        this.next_token()
+
+        let pos this.node_pos()
+        let statements AstNode.new_node_list(host)
+
+        while token <> KindEndOfFile
+        {
+            if this.is_unported()
+                return null
+            let s this.parse_statement()
+            if s = null
+                return null
+            statements.add(s)
+        }
+
+        if this.is_unported()
+            return null
+
+        let end_jsdoc this.jsdoc_scanner_info()
+        let eof this.parse_token_node()
+        if this.with_jsdoc(eof, end_jsdoc) = null
+            return null
+
+        this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(statements, eof))), pos)
+    }
+
+    ; ── statements ──────────────────────────────────────────────────────────
+    ;
+    ; The reference's parseStatement switch, arm for arm. The arms this slice
+    ; does not implement are named individually rather than caught by a default,
+    ; so that adding one is a matter of removing it from the list below.
+
+    procedure parse_statement(this) returns pointer[AstNode]
+    {
+        if token = KindSemicolonToken
+            return this.parse_empty_statement()
+
+        if token = KindOpenBraceToken
+            return this.parse_block()
+
+        if token = KindVarKeyword
+            return this.parse_variable_statement()
+
+        if token = KindLetKeyword
+        {
+            ; In ES6 `let` starts a lexical declaration only when an identifier,
+            ; `{` or `[` follows; otherwise it is an ordinary identifier and the
+            ; reference falls through to the expression statement.
+            if this.is_let_declaration()
+                return this.parse_variable_statement()
+        }
+
+        if statement_start_is_unported(token)
+            return this.unported()
+
+        this.parse_expression_or_labeled_statement()
+    }
+
+    ; The arms of the reference's parseStatement that this slice does not have.
+    ; Split in two for the reason the header gives — a forty-arm `else if` chain
+    ; nests forty planner levels; a run of independent tests nests none.
+    function statement_start_is_unported(k: int) returns bool
+    {
+        ; ... reached through parseStatement's own cases
+        if k = KindAwaitKeyword
+            return true
+        if k = KindUsingKeyword
+            return true
+        if k = KindFunctionKeyword
+            return true
+        if k = KindClassKeyword
+            return true
+        if k = KindIfKeyword
+            return true
+        if k = KindDoKeyword
+            return true
+        if k = KindWhileKeyword
+            return true
+        if k = KindForKeyword
+            return true
+        if k = KindContinueKeyword
+            return true
+        if k = KindBreakKeyword
+            return true
+        if k = KindReturnKeyword
+            return true
+        if k = KindWithKeyword
+            return true
+        if k = KindSwitchKeyword
+            return true
+        if k = KindThrowKeyword
+            return true
+        if k = KindTryKeyword
+            return true
+        if k = KindCatchKeyword
+            return true
+        if k = KindFinallyKeyword
+            return true
+        if k = KindDebuggerKeyword
+            return true
+        if k = KindAtToken
+            return true
+        statement_start_is_unported_declaration(k)
+    }
+
+    ; ... and the keywords that route to parseDeclaration when isStartOfDeclaration
+    ; says so. The whole modifier path is unported, so they are unconditional
+    ; here — which is CONSERVATIVE in the right direction: a contextual keyword
+    ; used as a plain identifier (`type` as a variable name) is reported as
+    ; unported rather than parsed differently from the reference.
+    function statement_start_is_unported_declaration(k: int) returns bool
+    {
+        if k = KindAsyncKeyword
+            return true
+        if k = KindInterfaceKeyword
+            return true
+        if k = KindTypeKeyword
+            return true
+        if k = KindModuleKeyword
+            return true
+        if k = KindNamespaceKeyword
+            return true
+        if k = KindDeclareKeyword
+            return true
+        if k = KindConstKeyword
+            return true
+        if k = KindEnumKeyword
+            return true
+        if k = KindExportKeyword
+            return true
+        if k = KindImportKeyword
+            return true
+        if k = KindPrivateKeyword
+            return true
+        if k = KindProtectedKeyword
+            return true
+        if k = KindPublicKeyword
+            return true
+        if k = KindAbstractKeyword
+            return true
+        if k = KindAccessorKeyword
+            return true
+        if k = KindStaticKeyword
+            return true
+        if k = KindReadonlyKeyword
+            return true
+        if k = KindGlobalKeyword
+            return true
+        false
+    }
+
+    procedure parse_empty_statement(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+        if this.parse_expected(KindSemicolonToken) = false
+            return null
+        let result this.finish_node(this.new_node(KindEmptyStatement, NodeData.EmptyStatement(EmptyStatementData())), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    procedure parse_block(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+        if this.parse_expected(KindOpenBraceToken) = false
+            return null
+
+        let statements AstNode.new_node_list(host)
+        while true
+        {
+            if token = KindCloseBraceToken
+                break
+            if token = KindEndOfFile
+                break
+            if this.is_unported()
+                return null
+            let s this.parse_statement()
+            if s = null
+                return null
+            statements.add(s)
+        }
+
+        if this.parse_expected(KindCloseBraceToken) = false
+            return null
+
+        let result this.finish_node(this.new_node(KindBlock, NodeData.Block(BlockData(statements))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    procedure parse_variable_statement(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+        let list this.parse_variable_declaration_list()
+        if list = null
+            return null
+        if this.parse_semicolon() = false
+            return null
+        let result this.finish_node(this.new_node(KindVariableStatement, NodeData.VariableStatement(VariableStatementData(list))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    procedure parse_variable_declaration_list(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+
+        var flags NodeFlagsNone
+        if token = KindLetKeyword
+            set flags: NodeFlagsLet
+        if token = KindConstKeyword
+            set flags: NodeFlagsConst
+        if token = KindUsingKeyword
+            set flags: NodeFlagsUsing
+
+        this.next_token()
+
+        ; The reference's `for (let of X)` look-ahead produces an EMPTY
+        ; declaration list; the for statement is unported, so the shape cannot
+        ; be reached from here.
+        let declarations AstNode.new_node_list(host)
+        while true
+        {
+            if this.is_unported()
+                return null
+            let d this.parse_variable_declaration()
+            if d = null
+                return null
+            declarations.add(d)
+            if token <> KindCommaToken
+                break
+            this.next_token()
+        }
+
+        let n this.new_node(KindVariableDeclarationList, NodeData.VariableDeclarationList(VariableDeclarationListData(declarations)))
+        set n.flags: n.flags | flags
+        this.finish_node(n, pos)
+    }
+
+    procedure parse_variable_declaration(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+
+        ; parseIdentifierOrPattern: `[` and `{` start a binding pattern, which is
+        ; unported.
+        if token = KindOpenBracketToken
+            return this.unported()
+        if token = KindOpenBraceToken
+            return this.unported()
+
+        let name this.parse_binding_identifier()
+        if name = null
+            return null
+
+        ; The declaration list is always parsed with allowExclamation here — the
+        ; only caller that passes false is the for-statement initializer, which
+        ; is unported.
+        var exclamation_token null as pointer[AstNode]
+        if token = KindExclamationToken
+        {
+            if this.has_preceding_line_break() = false
+            {
+                set exclamation_token: this.parse_token_node()
+                if exclamation_token = null
+                    return null
+            }
+        }
+
+        ; parseTypeAnnotation. There is no type parser yet.
+        if token = KindColonToken
+            return this.unported()
+
+        var initializer null as pointer[AstNode]
+        if token <> KindInKeyword
+        {
+            if token <> KindOfKeyword
+            {
+                if this.parse_optional(KindEqualsToken)
+                {
+                    set initializer: this.parse_assignment_expression_or_higher()
+                    if initializer = null
+                        return null
+                }
+            }
+        }
+
+        let result this.finish_node(this.new_node(KindVariableDeclaration, NodeData.VariableDeclaration(VariableDeclarationData(name, exclamation_token, null, initializer))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    procedure parse_binding_identifier(this) returns pointer[AstNode]
+    {
+        if this.is_binding_identifier() = false
+            return this.unported()
+        this.parse_identifier_node()
+    }
+
+    procedure parse_identifier_node(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        ; The reference takes scanner.TokenValue() here and interns it. Our
+        ; scanner keeps no tokenValue yet, and no node in this slice reads one.
+        this.next_token()
+        this.finish_node(this.new_node(KindIdentifier, NodeData.Identifier(IdentifierData())), pos)
+    }
+
+    ; The reference's canParseSemicolon/tryParseSemicolon — automatic semicolon
+    ; insertion. parseSemicolon's fallback reports a diagnostic, so it is the
+    ; unported edge here.
+    procedure parse_semicolon(this) returns bool
+    {
+        if token = KindSemicolonToken
+        {
+            this.next_token()
+            return true
+        }
+        if token = KindCloseBraceToken
+            return true
+        if token = KindEndOfFile
+            return true
+        if this.has_preceding_line_break()
+            return true
+        this.unported()
+        false
+    }
+
+    procedure parse_expression_or_labeled_statement(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        ; The reference clears HasJSDoc again when the expression started with
+        ; `(`. A parenthesized expression is unported, so that arm cannot run
+        ; and is left out rather than carried untested.
+        let jsdoc this.jsdoc_scanner_info()
+        let expression this.parse_expression()
+        if expression = null
+            return null
+
+        ; A labeled statement is `Identifier :` — unported, since its body is a
+        ; statement and the label node is not in this slice.
+        if AstNode.kind_of(expression) = KindIdentifier
+        {
+            if token = KindColonToken
+                return this.unported()
+        }
+
+        if this.parse_semicolon() = false
+            return null
+
+        let result this.finish_node(this.new_node(KindExpressionStatement, NodeData.ExpressionStatement(ExpressionStatementData(expression))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    ; ── expressions ─────────────────────────────────────────────────────────
+    ;
+    ; The reference's ladder is parseExpression -> parseAssignmentExpressionOrHigher
+    ; -> parseBinaryExpressionOrHigher -> parseUnaryExpressionOrHigher ->
+    ; parseUpdateExpression -> parseLeftHandSideExpressionOrHigher ->
+    ; parseMemberExpressionOrHigher -> parsePrimaryExpression. This slice has the
+    ; two ends of it and nothing between: anything that is not a primary
+    ; expression standing alone is unported.
+
+    procedure parse_expression(this) returns pointer[AstNode]
+    {
+        let e this.parse_assignment_expression_or_higher()
+        if e = null
+            return null
+        ; The comma operator builds a BinaryExpression chain.
+        if token = KindCommaToken
+            return this.unported()
+        e
+    }
+
+    procedure parse_assignment_expression_or_higher(this) returns pointer[AstNode]
+    {
+        let e this.parse_primary_expression()
+        if e = null
+            return null
+
+        ; Everything the ladder would do above a primary expression: a binary or
+        ; assignment operator, a call, a member access, a template tag, `as`,
+        ; the conditional operator. Each would change the tree, so each stops
+        ; the port here rather than being dropped.
+        if continues_expression(token)
+            return this.unported()
+        e
+    }
+
+    ; True for a token that would keep the reference's expression ladder going.
+    ; The test is a RANGE plus the few punctuators outside it, taken from the
+    ; Kind table's contiguous runs: every binary operator (which includes every
+    ; assignment operator) lies in FirstBinaryOperator..LastBinaryOperator.
+    function continues_expression(k: int) returns bool
+    {
+        if (k >= KindFirstBinaryOperator) and (k <= KindLastBinaryOperator)
+            return true
+        if k = KindDotToken
+            return true
+        if k = KindQuestionDotToken
+            return true
+        if k = KindOpenParenToken
+            return true
+        if k = KindOpenBracketToken
+            return true
+        if k = KindQuestionToken
+            return true
+        if k = KindExclamationToken
+            return true
+        if k = KindPlusPlusToken
+            return true
+        if k = KindMinusMinusToken
+            return true
+        if k = KindAsKeyword
+            return true
+        if k = KindSatisfiesKeyword
+            return true
+        if k = KindInstanceOfKeyword
+            return true
+        if k = KindNoSubstitutionTemplateLiteral
+            return true
+        if k = KindTemplateHead
+            return true
+        false
+    }
+
+    procedure parse_primary_expression(this) returns pointer[AstNode]
+    {
+        if token = KindNumericLiteral
+            return this.parse_literal_expression(KindNumericLiteral)
+        if token = KindBigIntLiteral
+            return this.parse_literal_expression(KindBigIntLiteral)
+        if token = KindStringLiteral
+            return this.parse_literal_expression(KindStringLiteral)
+
+        if token = KindThisKeyword
+            return this.parse_token_node()
+        if token = KindSuperKeyword
+            return this.parse_token_node()
+        if token = KindNullKeyword
+            return this.parse_token_node()
+        if token = KindTrueKeyword
+            return this.parse_token_node()
+        if token = KindFalseKeyword
+            return this.parse_token_node()
+
+        if this.is_identifier()
+            return this.parse_identifier_node()
+
+        ; parenthesized, array and object literals, templates, regular
+        ; expressions, function/class expressions, `new`, decorators, private
+        ; names — all unported. So is the reference's fallback, which reports
+        ; "Expression expected" and synthesizes a missing identifier.
+        this.unported()
+    }
+
+    procedure parse_literal_expression(this, kind: int) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+
+        ; The reference takes TokenValue() and the token flags here; the flags
+        ; ride on the token rather than on the node, and no node in this slice
+        ; reads either.
+        this.next_token()
+
+        if kind = KindNumericLiteral
+            return this.finish_node(this.new_node(kind, NodeData.NumericLiteral(LiteralData())), pos)
+        if kind = KindBigIntLiteral
+            return this.finish_node(this.new_node(kind, NodeData.BigIntLiteral(LiteralData())), pos)
+        this.finish_node(this.new_node(kind, NodeData.StringLiteral(LiteralData())), pos)
+    }
+}

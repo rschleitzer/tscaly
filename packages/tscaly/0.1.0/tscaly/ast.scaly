@@ -1,0 +1,299 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; Node — the syntax tree, ported from the reference's internal/ast/ast.go and
+; ast_generated.go.
+;
+; ── The shape, and why it is this one (CLAUDE.md §3.1) ──────────────────────
+;
+; The reference's Node is a tag-struct with an INTERFACE payload:
+;
+;     type Node struct { Kind Kind; Flags NodeFlags; Loc TextRange; data nodeData }
+;
+; where `nodeData` has ~20 methods and 168 concrete implementations. Here the
+; interface becomes a SUM TYPE — `NodeData union` — and every dispatch is a
+; `choose`. The reason is not taste: a trait object makes the callee unknown at
+; compile time, and purity, escape and parallelism analysis all stop at that
+; point. Upstream says the same thing from the other side at Node.IterChildren
+; ("an interface call is opaque to escape analysis").
+;
+; The SPLIT is kept exactly as the reference has it — kind/flags/pos/end beside
+; the payload, not folded into the union. That is load-bearing rather than
+; imitative: many KINDS share one payload. Every punctuation and keyword token
+; node is a `Token` with no fields at all, so a union arm per kind would be 100+
+; empty arms and the kind would still have to be stored to tell them apart.
+;
+; ★ ORDER-OF-DECLARATION AUFLAGE, inherited from dazzle's `Insn union`: the tag
+; IS the jump-table index, and AArch64's MinimumJumpTableEntries is 13 — a
+; dispatch level needs >= 14 CONTIGUOUS tags or LLVM lowers a compare chain
+; instead. That does not bite yet (this slice has twelve arms and every choose
+; over them is cold), but the union only grows, and the arms that end up on the
+; hot path must be contiguous when it does. Do not reorder for tidiness.
+;
+; ── What this slice carries ─────────────────────────────────────────────────
+;
+; Twelve node types: SourceFile, the bare Token, Identifier, the three literal
+; kinds, and the statements a file of declarations and expressions is made of.
+; Everything else is not a missing arm here — it is a construct the parser
+; reports as unported before it ever gets to build a node.
+;
+; NOT carried, and each omission is a decision rather than an oversight:
+;
+;   - `Parent`. The reference sets it in a pass AFTER ParseSourceFile
+;     (setParentFromContext), so there is nothing to compare and nothing to port
+;     yet. Under RBMM the back-pointer costs nothing when it comes — a cycle
+;     inside one region is freed with the region.
+;   - The node ID. It is assigned deterministically at parse time here, not
+;     lazily by CAS into the shared tree (CLAUDE.md §3.10) — but nothing reads
+;     one yet, so the field waits for its first reader.
+;   - The identifier/literal TEXT. The reference stores scanner.TokenValue().
+;     Our scanner keeps no tokenValue (its own header says why), and the
+;     yardstick compares spans rather than text, so the field is deferred to the
+;     slice that first needs it — which is the one that has to tell `let` used
+;     as a keyword from `let` used as a name.
+
+use scaly.memory.Page
+use scaly.containers.Array
+
+; ── per-kind payload records ────────────────────────────────────────────────
+;
+; One record per reference struct, named for it. A record with no fields is not
+; a placeholder: the reference's Token and EmptyStatement have none either.
+
+define TokenData ()
+define IdentifierData ()
+define LiteralData ()
+define EmptyStatementData ()
+
+define SourceFileData
+(
+    statements: pointer[Array[pointer[AstNode]]]
+    end_of_file_token: pointer[AstNode]
+)
+
+define BlockData (statements: pointer[Array[pointer[AstNode]]])
+
+define ExpressionStatementData (expression: pointer[AstNode])
+
+define VariableStatementData (declaration_list: pointer[AstNode])
+
+define VariableDeclarationListData (declarations: pointer[Array[pointer[AstNode]]])
+
+define VariableDeclarationData
+(
+    name: pointer[AstNode]
+    exclamation_token: pointer[AstNode]
+    type_node: pointer[AstNode]
+    initializer: pointer[AstNode]
+)
+
+define NodeData union
+(
+    Token: TokenData
+    Identifier: IdentifierData
+    StringLiteral: LiteralData
+    NumericLiteral: LiteralData
+    BigIntLiteral: LiteralData
+    SourceFile: SourceFileData
+    Block: BlockData
+    EmptyStatement: EmptyStatementData
+    ExpressionStatement: ExpressionStatementData
+    VariableStatement: VariableStatementData
+    VariableDeclarationList: VariableDeclarationListData
+    VariableDeclaration: VariableDeclarationData
+)
+
+define AstNode
+(
+    kind: int
+    flags: int
+
+    ; The reference's core.TextRange, spelled out. `pos` is the FULL start —
+    ; leading trivia included — and `end` is where the token ended. Keeping them
+    ; two ints rather than a nested by-value struct is deliberate: a by-value
+    ; struct nested in a struct is not laid out in a root that never declared it
+    ; (exit 16), and this type is read from a program root.
+    pos: int
+    end: int
+
+    data: NodeData
+)
+{
+    function alloc(host: pointer[Page]) returns pointer[AstNode]
+        host.allocate(sizeof AstNode, alignof AstNode) as pointer[AstNode]
+
+    ; The reference's NodeList. It carries its own TextRange, which this port
+    ; does not keep yet — nothing reads a list's extent, and the AST yardstick
+    ; cannot see one either (ForEachChild visits a list's ELEMENTS, never the
+    ; list). Stated because a hidden distinction hides every bug in it.
+    function new_node_list(host: pointer[Page]) returns pointer[Array[pointer[AstNode]]]
+    {
+        let a host.allocate(sizeof Array[pointer[AstNode]], alignof Array[pointer[AstNode]]) as pointer[Array[pointer[AstNode]]]
+        set *a: Array[pointer[AstNode]]()
+        a
+    }
+
+    ; ── accessors ───────────────────────────────────────────────────────────
+    ;
+    ; Statics taking the node by pointer, not `this` methods: a user program
+    ; calling a CROSS-PACKAGE free function with a concept-pointer parameter
+    ; fails resolution, while a concept STATIC resolves (root CLAUDE.md). The
+    ; dumper is such a program.
+
+    function kind_of(n: pointer[AstNode]) returns int
+        n.kind
+
+    function flags_of(n: pointer[AstNode]) returns int
+        n.flags
+
+    function pos_of(n: pointer[AstNode]) returns int
+        n.pos
+
+    function end_of(n: pointer[AstNode]) returns int
+        n.end
+
+    ; ── children ────────────────────────────────────────────────────────────
+    ;
+    ; The reference's ForEachChild(v Visitor), as an index pair. The mapping is a
+    ; deliberate one and belongs in the vocabulary: ForEachChild takes a
+    ; CALLBACK, and Scaly's only escaping-closure form is `return \x: …` — a
+    ; recursive walk that builds a fresh closure per level is exactly the shape
+    ; the escape checker exists to reject. An index pair needs no callback, and
+    ; it lets the walk live in the caller, where the recursion is plain.
+    ;
+    ; ★ THE ORDER IS PART OF WHAT THE YARDSTICK COMPARES. Each arm below lists
+    ; its slots in the reference's own ForEachChild order; a port that visits a
+    ; node's children in a different order is a different tree and the dump says
+    ; so. The slot lists are transcribed from ast_generated.go, not inferred.
+    ;
+    ; Null slots are SKIPPED, exactly as `visit(v, node.X)` skips a nil — so the
+    ; i-th child is the i-th PRESENT one, and `child_count` is where the skipping
+    ; stops. Both functions walk the same slot list for that reason: two
+    ; independent switches would be two places to get the order wrong.
+
+    function child_count(n: pointer[AstNode]) returns int
+    {
+        var i 0
+        while child_at(n, i) <> null
+            set i: i + 1
+        i
+    }
+
+    function child_at(n: pointer[AstNode], i: int) returns pointer[AstNode]
+    {
+        choose n.data
+
+            ; SourceFile: statements, then the end-of-file token.
+            when f: SourceFile
+            {
+                var k i
+                let a f.statements
+                if a <> null
+                {
+                    let len a.get_length() as int
+                    if k < len
+                        return *(a.get_buffer() + k)
+                    set k: k - len
+                }
+                if f.end_of_file_token <> null
+                {
+                    if k = 0
+                        return f.end_of_file_token
+                    set k: k - 1
+                }
+                return null
+            }
+
+            when b: Block
+            {
+                let a b.statements
+                if a <> null
+                {
+                    if i < a.get_length() as int
+                        return *(a.get_buffer() + i)
+                }
+                return null
+            }
+
+            when e: ExpressionStatement
+            {
+                if e.expression <> null
+                {
+                    if i = 0
+                        return e.expression
+                }
+                return null
+            }
+
+            ; VariableStatement: modifiers, then the declaration list. Modifiers
+            ; are unported in this slice — a statement that has any is reported
+            ; before a node is built — so the slot is absent rather than empty.
+            when v: VariableStatement
+            {
+                if v.declaration_list <> null
+                {
+                    if i = 0
+                        return v.declaration_list
+                }
+                return null
+            }
+
+            when l: VariableDeclarationList
+            {
+                let a l.declarations
+                if a <> null
+                {
+                    if i < a.get_length() as int
+                        return *(a.get_buffer() + i)
+                }
+                return null
+            }
+
+            ; name, exclamationToken, type, initializer — in that order.
+            when d: VariableDeclaration
+            {
+                var k i
+                if d.name <> null
+                {
+                    if k = 0
+                        return d.name
+                    set k: k - 1
+                }
+                if d.exclamation_token <> null
+                {
+                    if k = 0
+                        return d.exclamation_token
+                    set k: k - 1
+                }
+                if d.type_node <> null
+                {
+                    if k = 0
+                        return d.type_node
+                    set k: k - 1
+                }
+                if d.initializer <> null
+                {
+                    if k = 0
+                        return d.initializer
+                    set k: k - 1
+                }
+                return null
+            }
+
+            ; The leaves. The reference gives none of these a ForEachChild, so
+            ; they inherit NodeDefault's `return false` — no children at all.
+            when t: Token
+                return null
+            when d: Identifier
+                return null
+            when s: StringLiteral
+                return null
+            when nu: NumericLiteral
+                return null
+            when bi: BigIntLiteral
+                return null
+            when em: EmptyStatement
+                return null
+
+        null
+    }
+}
