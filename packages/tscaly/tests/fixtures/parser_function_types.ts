@@ -1,0 +1,20 @@
+type A = () => void;
+type B = (x: string) => number;
+type C = (x: string, y?: number) => void;
+type D = (...rest: string[]) => void;
+type E = <T>(x: T) => T;
+type F = new () => string;
+type G = new (x: string) => string;
+type H = abstract new () => string;
+type I = (this: string) => void;
+type J = (() => void)[];
+type K = (() => void) | string;
+type L = () => () => void;
+type M = (x: string) => x is string;
+type N = () => asserts x is string;
+type O = (a, b) => void;
+type P = (x: () => void) => void;
+type Q = Array<() => void>;
+type R = [() => void, string];
+var f: (x: string) => void;
+function g(h: new () => string): (x: number) => number { return null; }

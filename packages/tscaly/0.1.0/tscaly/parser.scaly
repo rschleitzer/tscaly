@@ -2,7 +2,8 @@
 ;
 ; parser — ported from the reference's internal/parser/parser.go.
 ;
-; SLICES 1–3. The spine, the declaration router, and the TYPE surface. Anything
+; SLICES 1–4. The spine, the declaration router, the TYPE surface and the
+; SIGNATURE — parameters, return types, function declarations. Anything
 ; outside them reports its own POSITION as unported rather than building a
 ; plausible tree that quietly disagrees with the reference — the same mechanism
 ; the scanner carries, and for the same reason.
@@ -19,6 +20,9 @@
 ;            anyone knows what they modify
 ;   slice 3  the type parser (see the TYPES banner far below), the type ALIAS
 ;            declaration, and `: T` type annotations
+;   slice 4  the SIGNATURE (see the SIGNATURES banner): parameter lists, return
+;            types and type predicates, the function declaration, and the
+;            function and constructor TYPES the type parser was waiting on
 ;
 ; ── What it deliberately does not, each stated rather than left to be noticed ─
 ;
@@ -40,10 +44,12 @@
 ;
 ; ★ EXPRESSIONS. The ladder above a primary expression — binary operators,
 ;   calls, member access, `as`, the conditional operator — is unported. It is
-;   the largest remaining block, and note which way the dependency runs: the
-;   TYPE side is complete enough that a type parses on its own, while several
-;   type-side facts (a postfix `[` after a line break, `type` used as a name)
-;   cannot be TESTED until an expression can be parsed beside them.
+;   the largest remaining block by a wide margin: 40.1 % of first blockers after
+;   slice 4, against 17.8 % for the next one. Note which way the dependency
+;   runs: the TYPE and SIGNATURE sides are complete enough to parse on their
+;   own, while several facts on both (a postfix `[` after a line break, `type`
+;   used as a name, `yield` inside a generator) cannot be TESTED until an
+;   expression can be parsed beside them.
 ;
 ; ★ ERROR RECOVERY. The reference parses lists through parsing CONTEXTS with
 ;   per-context element and terminator predicates and a token-skipping recovery.
@@ -84,6 +90,8 @@ use tscaly.ast.ExpressionStatementData
 use tscaly.ast.VariableStatementData
 use tscaly.ast.VariableDeclarationListData
 use tscaly.ast.VariableDeclarationData
+use tscaly.ast.ReturnStatementData
+use tscaly.ast.IfStatementData
 use tscaly.ast.WrappedTypeData
 use tscaly.ast.TypeListData
 use tscaly.ast.QualifiedNameData
@@ -95,12 +103,16 @@ use tscaly.ast.TypePredicateData
 use tscaly.ast.NamedTupleMemberData
 use tscaly.ast.TypeParameterData
 use tscaly.ast.TypeAliasDeclarationData
+use tscaly.ast.ParameterData
+use tscaly.ast.FunctionDeclarationData
+use tscaly.ast.FunctionTypeData
+use tscaly.ast.ConstructorTypeData
 
 ; The reference's jsdocScannerInfo — what the scanner noticed about the JSDoc
 ; comment preceding the token the parser is about to consume. It is captured at
 ; the START of a construct, because by the time the node is finished the token
 ; carrying the flags is long gone.
-; The reference's ParsingContext, for the three delimited lists this slice
+; The reference's ParsingContext, for the four delimited lists this slice
 ; needs. Upstream uses these as BIT POSITIONS in `parsingContexts`, a set it
 ; consults during error recovery to decide whether an enclosing list could
 ; consume the token it is stuck on. This slice has no recovery, so the values
@@ -110,6 +122,16 @@ use tscaly.ast.TypeAliasDeclarationData
 define PCTypeArguments:     int 0
 define PCTypeParameters:    int 1
 define PCTupleElementTypes: int 2
+define PCParameters:        int 3
+
+; The reference's ParseFlags — the signature context a parameter list and a
+; function body are parsed in. Only the three this slice can REACH are declared:
+; ParseFlagsJSDoc belongs to the JSDoc parser, and ParseFlagsIgnoreMissingOpenBrace
+; is set at exactly one call site (an arrow function's body), which is unported.
+define ParseFlagsNone:  int 0
+define ParseFlagsYield: int 1 << 0
+define ParseFlagsAwait: int 1 << 1
+define ParseFlagsType:  int 1 << 2
 
 define JsdocInfoNone:         int 0
 define JsdocInfoHasJsdoc:     int 1 << 0
@@ -157,6 +179,19 @@ define Parser
     unported_pos: int
     unported_tag: pointer[const_char]
     unported_detail: int
+
+    ; The await context a parameter list was entered FROM. The reference reads
+    ; it out of a closure — parseParametersWorker captures it before it changes
+    ; the context flags, and the per-element callback uses it for the parameter's
+    ; DECORATORS, which are parsed in the outer context while the rest of the
+    ; parameter is parsed in the function's.
+    ;
+    ; Here the list's element callback is a static arm of parse_list_element
+    ; (§3.9d/§3.9e — a func value that would have to escape becomes a method or,
+    ; as here, a piece of state), so the captured value travels as a field. It is
+    ; live only for the duration of one parse_delimited_list(PCParameters) call
+    ; and is saved and restored around it, exactly as a capture would be.
+    parameter_outer_await_context: bool
 )
 {
     init(host: pointer[Page], scanner: pointer[Scanner])
@@ -166,6 +201,7 @@ define Parser
         set this.token: KindUnknown
         set this.context_flags: NodeFlagsNone
         set this.has_parse_error: false
+        set this.parameter_outer_await_context: false
         set this.unported_pos: 0 - 1
         set this.unported_tag: null
         set this.unported_detail: 0
@@ -408,23 +444,45 @@ define Parser
     function is_keyword(k: int) returns bool
         (k >= KindFirstKeyword) and (k <= KindLastKeyword)
 
-    ; The reference's isIdentifier(). The yield/await context arms are omitted
-    ; because neither context can be entered in this slice — there is no
-    ; generator and no async function to enter one — and an arm that cannot run
-    ; is better absent than present and untested.
+    ; The reference's isIdentifier(). ★ The yield/await arms were OMITTED through
+    ; slice 3 with the note that neither context could be entered — and slice 4
+    ; is what makes them reachable: `function*` enters the yield context and an
+    ; `async function` the await context, both through the signature flags. They
+    ; are not decoration, either: inside a generator `yield` stops being a name,
+    ; so a parameter called `yield` parses one way in `function f(yield)` and
+    ; another in `function* f(yield)`.
     function is_identifier(this) returns bool
     {
         if token = KindIdentifier
             return true
+        if token = KindYieldKeyword
+        {
+            if this.in_yield_context()
+                return false
+        }
+        if token = KindAwaitKeyword
+        {
+            if this.in_await_context()
+                return false
+        }
         token > KindLastReservedWord
     }
 
+    ; The reference's own comment: `let await` / `let yield` in those contexts
+    ; are allowed HERE and rejected in the binder, so this one has no context
+    ; arms and is not an oversight.
     function is_binding_identifier(this) returns bool
     {
         if token = KindIdentifier
             return true
         token > KindLastReservedWord
     }
+
+    function in_yield_context(this) returns bool
+        (context_flags & NodeFlagsYieldContext) <> 0
+
+    function in_await_context(this) returns bool
+        (context_flags & NodeFlagsAwaitContext) <> 0
 
     ; ── speculation ─────────────────────────────────────────────────────────
 
@@ -516,6 +574,15 @@ define Parser
                 return this.parse_variable_statement(this.node_pos(), this.jsdoc_scanner_info(), null)
         }
 
+        if token = KindFunctionKeyword
+            return this.parse_function_declaration(this.node_pos(), this.jsdoc_scanner_info(), null)
+
+        if token = KindIfKeyword
+            return this.parse_if_statement()
+
+        if token = KindReturnKeyword
+            return this.parse_return_statement()
+
         if statement_start_is_unported(token)
             return this.unported("statement", token)
 
@@ -542,11 +609,7 @@ define Parser
             return true
         if k = KindUsingKeyword
             return true
-        if k = KindFunctionKeyword
-            return true
         if k = KindClassKeyword
-            return true
-        if k = KindIfKeyword
             return true
         if k = KindDoKeyword
             return true
@@ -557,8 +620,6 @@ define Parser
         if k = KindContinueKeyword
             return true
         if k = KindBreakKeyword
-            return true
-        if k = KindReturnKeyword
             return true
         if k = KindWithKeyword
             return true
@@ -645,7 +706,7 @@ define Parser
         ; `declare` makes the whole declaration ambient, and the flag reaches
         ; the modifier nodes too — they were finished before the context flag
         ; was set, so they are marked by hand, exactly as the reference does.
-        if has_declare_modifier(modifiers)
+        if has_modifier(modifiers, KindDeclareKeyword)
         {
             let len modifiers.get_length() as int
             var i 0
@@ -665,7 +726,12 @@ define Parser
         this.parse_declaration_worker(pos, jsdoc, modifiers)
     }
 
-    function has_declare_modifier(modifiers: pointer[Array[pointer[AstNode]]]) returns bool
+    ; The reference keeps a ModifierList carrying a precomputed ModifierFlags
+    ; bit set; here the list is a plain Array of Token nodes and the question is
+    ; asked of it directly. Same answer — ModifiersToFlags is a fold over exactly
+    ; these kinds — and it keeps the port from needing a second flag table whose
+    ; only job is to mirror the Kind table.
+    function has_modifier(modifiers: pointer[Array[pointer[AstNode]]], kind: int) returns bool
     {
         if modifiers = null
             return false
@@ -674,7 +740,7 @@ define Parser
         while i < len
         {
             let m *(modifiers.get_buffer() + i)
-            if AstNode.kind_of(m) = KindDeclareKeyword
+            if AstNode.kind_of(m) = kind
                 return true
             set i: i + 1
         }
@@ -691,6 +757,8 @@ define Parser
             return this.parse_variable_statement(pos, jsdoc, modifiers)
         if token = KindUsingKeyword
             return this.parse_variable_statement(pos, jsdoc, modifiers)
+        if token = KindFunctionKeyword
+            return this.parse_function_declaration(pos, jsdoc, modifiers)
         if token = KindTypeKeyword
             return this.parse_type_alias_declaration(pos, jsdoc, modifiers)
 
@@ -1273,6 +1341,72 @@ define Parser
         this.with_jsdoc(result, jsdoc)
     }
 
+    ; ── the two statements a function BODY needs ────────────────────────────
+    ;
+    ; They land with slice 4 rather than with the statement spine because that is
+    ; when they became reachable: before a function declaration parsed, no
+    ; `return` in the corpus was ever looked at, and the unported histogram said
+    ; so — `return` and `if` were absent from it entirely and went straight to
+    ; third and fourth place the moment function bodies started parsing.
+    ;
+    ; ★ The reference's parseExpectedMatchingBrackets(`(`, `)`, …) is a
+    ; parse_expected here: its whole extra job is to attach a "the parser
+    ; expected to find a `)` to match the `(` here" note to a diagnostic, and on
+    ; the path where the bracket IS there the two are the same call.
+
+    procedure parse_if_statement(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+        if this.parse_expected(KindIfKeyword) = false
+            return null
+        if this.parse_expected(KindOpenParenToken) = false
+            return null
+        let expression this.parse_expression_allow_in()
+        if expression = null
+            return null
+        if this.parse_expected(KindCloseParenToken) = false
+            return null
+
+        let then_statement this.parse_statement()
+        if then_statement = null
+            return null
+
+        var else_statement null as pointer[AstNode]
+        if this.parse_optional(KindElseKeyword)
+        {
+            set else_statement: this.parse_statement()
+            if else_statement = null
+                return null
+        }
+
+        let result this.finish_node(this.new_node(KindIfStatement, NodeData.IfStatement(IfStatementData(expression, then_statement, else_statement))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    procedure parse_return_statement(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+        if this.parse_expected(KindReturnKeyword) = false
+            return null
+
+        ; A bare `return;` — or a `return` that ASI ends — carries no expression.
+        var expression null as pointer[AstNode]
+        if this.can_parse_semicolon() = false
+        {
+            set expression: this.parse_expression_allow_in()
+            if expression = null
+                return null
+        }
+
+        if this.parse_semicolon() = false
+            return null
+
+        let result this.finish_node(this.new_node(KindReturnStatement, NodeData.ReturnStatement(ReturnStatementData(expression))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
     procedure parse_variable_statement(this, pos: int, jsdoc: int, modifiers: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
     {
         let list this.parse_variable_declaration_list()
@@ -1418,22 +1552,33 @@ define Parser
         this.create_identifier(true)
     }
 
-    ; The reference's canParseSemicolon/tryParseSemicolon — automatic semicolon
-    ; insertion. parseSemicolon's fallback reports a diagnostic, so it is the
-    ; unported edge here.
-    procedure parse_semicolon(this) returns bool
+    ; The reference's canParseSemicolon/tryParseSemicolon/parseSemicolon —
+    ; automatic semicolon insertion. parseSemicolon's fallback reports a
+    ; diagnostic, so it is the unported edge here.
+    ;
+    ; The two halves are split apart since slice 4, because a caller needs the
+    ; QUESTION on its own: a body-less overload signature is exactly
+    ; "a function head that can_parse_semicolon()".
+    function can_parse_semicolon(this) returns bool
     {
         if token = KindSemicolonToken
-        {
-            this.next_token()
             return true
-        }
         if token = KindCloseBraceToken
             return true
         if token = KindEndOfFile
             return true
-        if this.has_preceding_line_break()
+        this.has_preceding_line_break()
+    }
+
+    procedure parse_semicolon(this) returns bool
+    {
+        if this.can_parse_semicolon()
+        {
+            ; Consume it only if it was written; ASI inserts nothing.
+            if token = KindSemicolonToken
+                this.next_token()
             return true
+        }
         this.unported("semicolon", token)
         false
     }
@@ -1482,6 +1627,18 @@ define Parser
         if token = KindCommaToken
             return this.unported("comma-operator", token)
         e
+    }
+
+    ; doInContext(DisallowIn, false, parseExpression) — the shape every
+    ; parenthesized head and every `return` operand is parsed in, where a bare
+    ; `in` is an ordinary relational operator again.
+    procedure parse_expression_allow_in(this) returns pointer[AstNode]
+    {
+        let saved context_flags
+        this.set_context_flags(NodeFlagsDisallowInContext, false)
+        let result this.parse_expression()
+        set context_flags: saved
+        result
     }
 
     procedure parse_assignment_expression_or_higher(this) returns pointer[AstNode]
@@ -1605,7 +1762,8 @@ define Parser
     ;
     ; ── What is NOT ported, each because it is the head of another slice ────
     ;
-    ;   function and constructor types   they need parseParameters
+    ;   (function and constructor types were this list's first entry and landed
+    ;    with slice 4 — see the SIGNATURES banner)
     ;   the object type literal `{ … }`  it needs parseTypeMember — which is the
     ;                                    interface-member slice, and a mapped
     ;                                    type shares the tag because both stop
@@ -1683,7 +1841,7 @@ define Parser
     procedure parse_type_worker(this) returns pointer[AstNode]
     {
         if this.is_start_of_function_type_or_constructor_type()
-            return this.unported("function-type", token)
+            return this.parse_function_or_constructor_type()
 
         let pos this.node_pos()
         let type_node this.parse_union_type_or_higher()
@@ -2466,6 +2624,386 @@ define Parser
         this.with_jsdoc(result, jsdoc)
     }
 
+    ; ════════════════════════════════════════════════════════════════════════
+    ; SIGNATURES — parser slice 4
+    ; ════════════════════════════════════════════════════════════════════════
+    ;
+    ; parseParameters and everything that cannot exist without it. The slice was
+    ; chosen off the unported histogram, and by the same DEPENDENCY argument that
+    ; chose the type surface before it: `function` was the largest single entry,
+    ; but the thing five of those entries are actually waiting on is the
+    ; parameter list — a function declaration, a function TYPE, a constructor
+    ; type, a method signature and a call signature all call parseParameters, and
+    ; only one of them has the word "function" in its tag.
+    ;
+    ; ── What is here ────────────────────────────────────────────────────────
+    ;
+    ;   parseParameters / parseParametersWorker / parseParameterEx
+    ;   parseNameOfParameter
+    ;   parseReturnType / shouldParseReturnType / parseTypeOrTypePredicate
+    ;   parseFunctionDeclaration
+    ;   parseFunctionBlockOrSemicolon / parseFunctionBlock
+    ;   parseFunctionOrConstructorType / parseModifiersForConstructorType
+    ;
+    ; ── and what is deliberately not, each with its reason ──────────────────
+    ;
+    ; ★ `allowAmbiguity`. parseParametersWorker takes it, and every call this
+    ;   slice can reach passes TRUE — the only `false` comes from the arrow
+    ;   function's speculative re-parse, which is unported. The parameter is left
+    ;   out rather than carried: its arm answers a NULL parameter mid-list, which
+    ;   this port's list loop reads as failure, so porting it untested would put
+    ;   a wrong reading of null into the one place it cannot be noticed.
+    ;
+    ; ★ The ParseFlagsType arm of parseFunctionBlockOrSemicolon (a signature in a
+    ;   type literal, terminated by a comma) — its callers are parseTypeMember
+    ;   and the accessor, both of which are the interface-member slice.
+    ;
+    ; ★ checkJSSyntax, which the reference calls on every parameter and on the
+    ;   function declaration. It returns immediately unless the node carries
+    ;   NodeFlagsJavaScriptFile, and this port never sets that flag (the corpus is
+    ;   .ts and the file name decides). So it is not skipped work — it is work
+    ;   that provably does nothing here, and a port of it would be a body that
+    ;   cannot be reached.
+
+    ; ── parameters ──────────────────────────────────────────────────────────
+
+    procedure parse_parameters(this, flags: int) returns pointer[Array[pointer[AstNode]]]
+    {
+        ; The reference answers createMissingList() when the `(` is missing; that
+        ; is preceded by a diagnostic, so it is the unported edge here.
+        if this.parse_expected(KindOpenParenToken) = false
+            return null
+        let parameters this.parse_parameters_worker(flags)
+        if parameters = null
+            return null
+        if this.parse_expected(KindCloseParenToken) = false
+            return null
+        parameters
+    }
+
+    procedure parse_parameters_worker(this, flags: int) returns pointer[Array[pointer[AstNode]]]
+    {
+        ; Captured BEFORE the flags move — this is the context the parameter's
+        ; decorators belong to. See the field's comment for why it travels as
+        ; state rather than in a closure.
+        let saved_outer parameter_outer_await_context
+        set parameter_outer_await_context: this.in_await_context()
+
+        let saved context_flags
+        this.set_context_flags(NodeFlagsYieldContext, (flags & ParseFlagsYield) <> 0)
+        this.set_context_flags(NodeFlagsAwaitContext, (flags & ParseFlagsAwait) <> 0)
+        let parameters this.parse_delimited_list(PCParameters)
+        set context_flags: saved
+        set parameter_outer_await_context: saved_outer
+        parameters
+    }
+
+    procedure parse_parameter_ex(this, in_outer_await_context: bool) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+
+        let saved context_flags
+        this.set_context_flags(NodeFlagsAwaitContext, in_outer_await_context)
+        let modifiers this.parse_modifiers(true, false, false)
+        set context_flags: saved
+        if this.is_unported()
+            return null
+
+        ; A `this` parameter. It takes no dot-dot-dot, no `?` and no initializer,
+        ; and its name is built through createIdentifier directly — `this` is a
+        ; reserved word, so parse_identifier would refuse it.
+        if token = KindThisKeyword
+        {
+            let this_name this.create_identifier(true)
+            if this_name = null
+                return null
+
+            var this_type null as pointer[AstNode]
+            if token = KindColonToken
+            {
+                set this_type: this.parse_type_annotation()
+                if this_type = null
+                    return null
+            }
+
+            ; The reference reports Neither_decorators_nor_modifiers_may_be_applied_to_this_parameters
+            ; and builds the node anyway, so the tree is the same and only the
+            ; diagnostic differs — which is the case this port must not paper
+            ; over.
+            if modifiers <> null
+                return this.unported("this-parameter-modifiers", token)
+
+            let this_result this.finish_node(this.new_node(KindParameter, NodeData.Parameter(ParameterData(modifiers, null, this_name, null, this_type, null))), pos)
+            return this.with_jsdoc(this_result, jsdoc)
+        }
+
+        let dot_dot_dot_token this.parse_optional_token(KindDotDotDotToken)
+        if this.is_unported()
+            return null
+
+        let name this.parse_name_of_parameter(modifiers)
+        if name = null
+            return null
+
+        let question_token this.parse_optional_token(KindQuestionToken)
+        if this.is_unported()
+            return null
+
+        var type_node null as pointer[AstNode]
+        if token = KindColonToken
+        {
+            set type_node: this.parse_type_annotation()
+            if type_node = null
+                return null
+        }
+
+        var initializer null as pointer[AstNode]
+        if this.parse_optional(KindEqualsToken)
+        {
+            set initializer: this.parse_assignment_expression_or_higher()
+            if initializer = null
+                return null
+        }
+
+        let result this.finish_node(this.new_node(KindParameter, NodeData.Parameter(ParameterData(modifiers, dot_dot_dot_token, name, question_token, type_node, initializer))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    procedure parse_name_of_parameter(this, modifiers: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
+    {
+        ; parseIdentifierOrPattern: `[` and `{` start a binding pattern.
+        if token = KindOpenBracketToken
+            return this.unported("binding-pattern", token)
+        if token = KindOpenBraceToken
+            return this.unported("binding-pattern", token)
+
+        ; The reference follows this with a recovery arm for a name that came
+        ; back MISSING (zero-width) while the token is still a modifier keyword —
+        ; `function foo(static)` in strict mode — where it advances one token so
+        ; the enclosing list cannot spin forever. A missing name is a diagnostic
+        ; and therefore already unported, so the arm cannot be reached from here;
+        ; note that its PURPOSE, not looping, is served instead by
+        ; parse_binding_identifier reporting and the list aborting.
+        this.parse_binding_identifier()
+    }
+
+    ; ── the return type ─────────────────────────────────────────────────────
+
+    procedure parse_return_type(this, return_token: int, is_type: bool) returns pointer[AstNode]
+    {
+        if this.should_parse_return_type(return_token, is_type) = false
+            return null
+        ; doInContext(DisallowConditionalTypes, false, parseTypeOrTypePredicate).
+        let saved context_flags
+        this.set_context_flags(NodeFlagsDisallowConditionalTypesContext, false)
+        let result this.parse_type_or_type_predicate()
+        set context_flags: saved
+        result
+    }
+
+    procedure should_parse_return_type(this, return_token: int, is_type: bool) returns bool
+    {
+        if return_token = KindEqualsGreaterThanToken
+        {
+            if this.parse_expected(return_token) = false
+                return false
+            return true
+        }
+        if this.parse_optional(KindColonToken)
+            return true
+        ; The reference's third arm: `is_type` and a `=>` where a `:` was meant.
+        ; It reports "':' expected", consumes the arrow and parses the type
+        ; anyway — a diagnostic, hence unported. Both callers in this slice pass
+        ; is_type FALSE, so the arm is unreachable today; it is written out
+        ; rather than omitted because the next caller (a method signature) is the
+        ; one that passes true, and a silent `false` here would send it down the
+        ; no-return-type path.
+        if is_type
+        {
+            if token = KindEqualsGreaterThanToken
+                return this.unported_bool("return-type-arrow")
+        }
+        false
+    }
+
+    ; `x is T` — a type predicate on a plain parameter name. `this is T` has its
+    ; own entry point in the type parser, since `this` is not an identifier.
+    procedure parse_type_or_type_predicate(this) returns pointer[AstNode]
+    {
+        if this.is_identifier()
+        {
+            let saved this.mark()
+            let pos this.node_pos()
+            let id this.parse_identifier()
+            if id = null
+                return null
+            if token = KindIsKeyword
+            {
+                if this.has_preceding_line_break() = false
+                {
+                    this.next_token()
+                    let t this.parse_type()
+                    if t = null
+                        return null
+                    return this.finish_node(this.new_node(KindTypePredicate, NodeData.TypePredicate(TypePredicateData(null, id, t))), pos)
+                }
+            }
+            this.rewind(saved)
+        }
+        this.parse_type()
+    }
+
+    ; ── the function declaration ────────────────────────────────────────────
+    ;
+    ; ★ context_flags is saved once and restored at the SINGLE exit, exactly as
+    ; the reference does. Every early return between the two is an unported
+    ; bail-out — each of the calls there answers null only after reporting — and
+    ; the parse is over at that point, so there is nothing left to restore for.
+
+    procedure parse_function_declaration(this, pos: int, jsdoc: int, modifiers: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
+    {
+        if this.parse_expected(KindFunctionKeyword) = false
+            return null
+
+        let asterisk_token this.parse_optional_token(KindAsteriskToken)
+        if this.is_unported()
+            return null
+
+        ; `export default function () {}` is the one form with no name. The
+        ; reference reads ModifierFlagsDefault off the precomputed flag set; the
+        ; list is asked directly here (see has_modifier).
+        var want_name true
+        if has_modifier(modifiers, KindDefaultKeyword)
+        {
+            if this.is_binding_identifier() = false
+                set want_name: false
+        }
+        var name null as pointer[AstNode]
+        if want_name
+        {
+            set name: this.parse_binding_identifier()
+            if name = null
+                return null
+        }
+
+        ; The signature flags decide the yield/await context the PARAMETERS and
+        ; the BODY are parsed in, which is what makes `yield` a name in one
+        ; function and a keyword in the next.
+        var signature_flags ParseFlagsNone
+        if asterisk_token <> null
+            set signature_flags: signature_flags | ParseFlagsYield
+        if has_modifier(modifiers, KindAsyncKeyword)
+            set signature_flags: signature_flags | ParseFlagsAwait
+
+        let type_parameters this.parse_type_parameters()
+        if this.is_unported()
+            return null
+
+        let saved context_flags
+        if has_modifier(modifiers, KindExportKeyword)
+            this.set_context_flags(NodeFlagsAwaitContext, true)
+
+        let parameters this.parse_parameters(signature_flags)
+        if parameters = null
+            return null
+
+        var return_type null as pointer[AstNode]
+        if token = KindColonToken
+        {
+            set return_type: this.parse_return_type(KindColonToken, false)
+            if return_type = null
+                return null
+        }
+
+        ; NULL here is a legitimate answer — an overload signature has no body —
+        ; so the test is is_unported(), not the result. Same shape as the
+        ; optional type-parameter list above.
+        let body this.parse_function_block_or_semicolon(signature_flags)
+        set context_flags: saved
+        if this.is_unported()
+            return null
+
+        let result this.finish_node(this.new_node(KindFunctionDeclaration, NodeData.FunctionDeclaration(FunctionDeclarationData(modifiers, asterisk_token, name, type_parameters, parameters, return_type, body))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    ; Answers the body, or null for a body-less overload signature. See above.
+    procedure parse_function_block_or_semicolon(this, flags: int) returns pointer[AstNode]
+    {
+        if token <> KindOpenBraceToken
+        {
+            if this.can_parse_semicolon()
+            {
+                this.parse_semicolon()
+                return null
+            }
+        }
+        this.parse_function_block(flags)
+    }
+
+    procedure parse_function_block(this, flags: int) returns pointer[AstNode]
+    {
+        let saved context_flags
+        this.set_context_flags(NodeFlagsYieldContext, (flags & ParseFlagsYield) <> 0)
+        this.set_context_flags(NodeFlagsAwaitContext, (flags & ParseFlagsAwait) <> 0)
+        ; A function expression or arrow function may itself be parsed in a
+        ; decorator context; its BODY never is.
+        this.set_context_flags(NodeFlagsDecoratorContext, false)
+        let block this.parse_block()
+        set context_flags: saved
+        block
+    }
+
+    ; ── the function and constructor TYPES ──────────────────────────────────
+
+    procedure parse_function_or_constructor_type(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+        let modifiers this.parse_modifiers_for_constructor_type()
+        if this.is_unported()
+            return null
+        ; The reference asserts that modifiers imply a constructor type; the
+        ; assertion holds by construction, since the only modifier accepted above
+        ; is `abstract` and isStartOfFunctionOrConstructorType only admits it
+        ; when `new` follows.
+        let is_constructor_type this.parse_optional(KindNewKeyword)
+
+        let type_parameters this.parse_type_parameters()
+        if this.is_unported()
+            return null
+        let parameters this.parse_parameters(ParseFlagsType)
+        if parameters = null
+            return null
+        let return_type this.parse_return_type(KindEqualsGreaterThanToken, false)
+        if return_type = null
+            return null
+
+        var result null as pointer[AstNode]
+        if is_constructor_type
+            set result: this.new_node(KindConstructorType, NodeData.ConstructorType(ConstructorTypeData(modifiers, type_parameters, parameters, return_type)))
+        else
+            set result: this.new_node(KindFunctionType, NodeData.FunctionType(FunctionTypeData(type_parameters, parameters, return_type)))
+
+        this.with_jsdoc(this.finish_node(result, pos), jsdoc)
+    }
+
+    procedure parse_modifiers_for_constructor_type(this) returns pointer[Array[pointer[AstNode]]]
+    {
+        if token <> KindAbstractKeyword
+            return null
+        let pos this.node_pos()
+        let kind token
+        this.next_token()
+        let m this.finish_node(this.new_node(kind, NodeData.Token(TokenData())), pos)
+        if m = null
+            return null
+        let list AstNode.new_node_list(host)
+        list.add(m)
+        list
+    }
+
     ; ── delimited lists ─────────────────────────────────────────────────────
     ;
     ; parseBracketedList / parseDelimitedList for the three contexts above. The
@@ -2523,11 +3061,15 @@ define Parser
             return this.parse_type_parameter()
         if ctx = PCTupleElementTypes
             return this.parse_tuple_element_name_or_tuple_element_type()
+        if ctx = PCParameters
+            return this.parse_parameter_ex(parameter_outer_await_context)
         this.parse_type()
     }
 
     procedure is_list_element(this, ctx: int) returns bool
     {
+        if ctx = PCParameters
+            return this.is_start_of_parameter(false)
         if ctx = PCTypeParameters
         {
             ; `in` and `const` are variance/modifier keywords on a type
@@ -2564,6 +3106,15 @@ define Parser
         }
         if ctx = PCTupleElementTypes
             return token = KindCloseBracketToken
+        if ctx = PCParameters
+        {
+            ; `]` is here for an index signature's parameter list, and — like the
+            ; recovery tokens on PCTypeParameters — it is ported because leaving
+            ; it out would loop where the reference stops.
+            if token = KindCloseParenToken
+                return true
+            return token = KindCloseBracketToken
+        }
         ; PCTypeArguments: anything but a comma ends the list.
         token <> KindCommaToken
     }
