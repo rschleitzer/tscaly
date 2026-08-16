@@ -111,11 +111,21 @@ define Parser
     context_flags: int
     has_parse_error: bool
 
-    ; Position of the first construct this slice does not implement, or -1.
-    ; NOT part of the reference. It also carries the SCANNER's own omission up:
-    ; a scan that could not proceed makes every span after it meaningless, so
-    ; the parser must not report a tree built on one.
+    ; Position of the first construct this slice does not implement, or -1,
+    ; plus WHAT it was: a short tag and the token kind it applied to.
+    ;
+    ; NOT part of the reference. The position alone was the first draft and it
+    ; is not enough to plan by — 316 cases reporting a byte offset says how many
+    ; are left, never which construct to port next. With the tag the runner's
+    ; unported column becomes a histogram, and the next slice is READ off it
+    ; rather than guessed.
+    ;
+    ; It also carries the SCANNER's own omission up: a scan that could not
+    ; proceed makes every span after it meaningless, so the parser must not
+    ; report a tree built on one.
     unported_pos: int
+    unported_tag: pointer[const_char]
+    unported_detail: int
 )
 {
     init(host: pointer[Page], scanner: pointer[Scanner])
@@ -126,6 +136,8 @@ define Parser
         set this.context_flags: NodeFlagsNone
         set this.has_parse_error: false
         set this.unported_pos: 0 - 1
+        set this.unported_tag: null
+        set this.unported_detail: 0
     }
 
     ; ── the entry point ─────────────────────────────────────────────────────
@@ -139,7 +151,7 @@ define Parser
     ;
     ; The result is the SourceFile node, or null when nothing could be parsed.
     ; A non-negative `out_unported` invalidates the tree: read it FIRST.
-    function parse(host: pointer[Page], source: String, out_unported: pointer[int]) returns pointer[AstNode]
+    function parse(host: pointer[Page], source: String, out_unported: pointer[int], out_tag: pointer[pointer[const_char]], out_detail: pointer[int]) returns pointer[AstNode]
     {
         let sc host.allocate(sizeof Scanner, alignof Scanner) as pointer[Scanner]
         set *sc: Scanner(source)
@@ -149,18 +161,34 @@ define Parser
 
         let file p.parse_source_file()
         set *out_unported: p.unported_at()
+        set *out_tag: p.unported_tag_at()
+        set *out_detail: p.unported_detail_at()
         file
     }
 
     function unported_at(this) returns int
         unported_pos
 
-    ; Record the first unported position and answer null, so a bail-out is one
-    ; statement at the call site: `return this.unported()`.
-    procedure unported(this) returns pointer[AstNode]
+    function unported_tag_at(this) returns pointer[const_char]
+        unported_tag
+
+    function unported_detail_at(this) returns int
+        unported_detail
+
+    ; Record the first unported construct and answer null, so a bail-out is one
+    ; statement at the call site: `return this.unported("tag", token)`.
+    ;
+    ; `tag` names the construct, `detail` is the token kind it applied to (0
+    ; where the kind adds nothing). Only the FIRST is kept — everything after it
+    ; is parsed in a state the port already knows is wrong.
+    procedure unported(this, tag: pointer[const_char], detail: int) returns pointer[AstNode]
     {
         if unported_pos < 0
+        {
             set unported_pos: scanner.token_full_start()
+            set unported_tag: tag
+            set unported_detail: detail
+        }
         null
     }
 
@@ -241,7 +269,7 @@ define Parser
         if (info & JsdocInfoHasDeprecated) <> 0
             set n.flags: n.flags | NodeFlagsPossiblyContainsDeprecatedTag
         if (info & JsdocInfoHasSeeOrLink) <> 0
-            return this.unported()
+            return this.unported("jsdoc-see-or-link", 0)
         n
     }
 
@@ -253,16 +281,38 @@ define Parser
         if is_keyword(token)
         {
             if scanner.has_unicode_escape() or scanner.has_extended_unicode_escape()
-                this.unported()
+                this.unported("keyword-escape", token)
         }
         set token: scanner.scan()
+
+        ; ★ A token the SCANNER found fault with means the reference emitted a
+        ; diagnostic — `"unterminated` reports Unterminated_string_literal and
+        ; marks the node ThisNodeHasError. This slice has no diagnostics, so such
+        ; a token is where the port stops.
+        ;
+        ; The test is the token FLAGS, and it is deliberately PARTIAL: our
+        ; scanner sets a flag at the string, template, escape and numeric error
+        ; sites, but the reference also reports where no flag is set at all — an
+        ; unterminated block comment, a missing hex digit after `0x`, an invalid
+        ; character, a conflict marker. Those are not covered here and they are
+        ; not hidden either: with no diagnostic on our side they come out as an
+        ; UNEXPLAINED difference, never as a silent match. The complete answer is
+        ; the scanner error hook, which belongs with the diagnostics slice —
+        ; this test is the conservative stand-in until then, and it errs only
+        ; towards reporting MORE unported, never fewer.
+        if (scanner.token_flags() & (TokenFlagsIsInvalid | TokenFlagsUnterminated)) <> 0
+            this.unported("scan-error", token)
 
         ; Carry the scanner's own omission up. Every span after an unscannable
         ; construct is meaningless, so the tree must not be reported.
         if scanner.unported_at() >= 0
         {
             if unported_pos < 0
+            {
                 set unported_pos: scanner.unported_at()
+                set unported_tag: "scanner"
+                set unported_detail: 0
+            }
         }
         token
     }
@@ -286,7 +336,7 @@ define Parser
             this.next_token()
             return true
         }
-        this.unported()
+        this.unported("expected", kind)
         false
     }
 
@@ -410,7 +460,7 @@ define Parser
             return this.parse_block()
 
         if token = KindVarKeyword
-            return this.parse_variable_statement()
+            return this.parse_variable_statement(this.node_pos(), this.jsdoc_scanner_info(), null)
 
         if token = KindLetKeyword
         {
@@ -418,11 +468,21 @@ define Parser
             ; `{` or `[` follows; otherwise it is an ordinary identifier and the
             ; reference falls through to the expression statement.
             if this.is_let_declaration()
-                return this.parse_variable_statement()
+                return this.parse_variable_statement(this.node_pos(), this.jsdoc_scanner_info(), null)
         }
 
         if statement_start_is_unported(token)
-            return this.unported()
+            return this.unported("statement", token)
+
+        ; The reference's last switch group: a contextual keyword that MAY start
+        ; a declaration and may equally be an ordinary identifier. Only the
+        ; look-ahead can tell (`type` is a variable name as often as it is a type
+        ; alias), which is why this is a question and not a token test.
+        if statement_start_is_declaration_keyword(token)
+        {
+            if this.is_start_of_declaration()
+                return this.parse_declaration()
+        }
 
         this.parse_expression_or_labeled_statement()
     }
@@ -469,17 +529,17 @@ define Parser
             return true
         if k = KindDebuggerKeyword
             return true
+        ; A decorator starts parseDeclaration in the reference; the decorator
+        ; itself is unported, so the whole shape is.
         if k = KindAtToken
             return true
-        statement_start_is_unported_declaration(k)
+        false
     }
 
-    ; ... and the keywords that route to parseDeclaration when isStartOfDeclaration
-    ; says so. The whole modifier path is unported, so they are unconditional
-    ; here — which is CONSERVATIVE in the right direction: a contextual keyword
-    ; used as a plain identifier (`type` as a variable name) is reported as
-    ; unported rather than parsed differently from the reference.
-    function statement_start_is_unported_declaration(k: int) returns bool
+    ; ... and the keywords that route to parseDeclaration when
+    ; isStartOfDeclaration says so. Being on this list is not a verdict: every
+    ; one of them is a legal identifier, so the look-ahead decides.
+    function statement_start_is_declaration_keyword(k: int) returns bool
     {
         if k = KindAsyncKeyword
             return true
@@ -518,6 +578,613 @@ define Parser
         if k = KindGlobalKeyword
             return true
         false
+    }
+
+    ; ── the declaration router ──────────────────────────────────────────────
+    ;
+    ; Every declaration form goes through here, because every one of them can
+    ; carry modifiers and the modifiers are parsed before anyone knows what they
+    ; modify. Only the variable-statement arm is ported; the rest report
+    ; themselves, so this slice buys the ROUTE rather than the destinations —
+    ; which is the point, since the route is what the 49 % of corpus cases
+    ; blocked on `export`, `const` and `declare` were stopped by.
+
+    procedure parse_declaration(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+        let modifiers this.parse_modifiers(true, false, false)
+        if this.is_unported()
+            return null
+
+        ; `declare` makes the whole declaration ambient, and the flag reaches
+        ; the modifier nodes too — they were finished before the context flag
+        ; was set, so they are marked by hand, exactly as the reference does.
+        if has_declare_modifier(modifiers)
+        {
+            let len modifiers.get_length() as int
+            var i 0
+            while i < len
+            {
+                let m *(modifiers.get_buffer() + i)
+                set m.flags: m.flags | NodeFlagsAmbient
+                set i: i + 1
+            }
+            let saved context_flags
+            set context_flags: context_flags | NodeFlagsAmbient
+            let result this.parse_declaration_worker(pos, jsdoc, modifiers)
+            set context_flags: saved
+            return result
+        }
+
+        this.parse_declaration_worker(pos, jsdoc, modifiers)
+    }
+
+    function has_declare_modifier(modifiers: pointer[Array[pointer[AstNode]]]) returns bool
+    {
+        if modifiers = null
+            return false
+        let len modifiers.get_length() as int
+        var i 0
+        while i < len
+        {
+            let m *(modifiers.get_buffer() + i)
+            if AstNode.kind_of(m) = KindDeclareKeyword
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    procedure parse_declaration_worker(this, pos: int, jsdoc: int, modifiers: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
+    {
+        if token = KindVarKeyword
+            return this.parse_variable_statement(pos, jsdoc, modifiers)
+        if token = KindLetKeyword
+            return this.parse_variable_statement(pos, jsdoc, modifiers)
+        if token = KindConstKeyword
+            return this.parse_variable_statement(pos, jsdoc, modifiers)
+        if token = KindUsingKeyword
+            return this.parse_variable_statement(pos, jsdoc, modifiers)
+
+        ; The reference's remaining arms. Each is a whole declaration form and a
+        ; slice of its own; the tag says which one stopped the case, so the
+        ; unported histogram keeps naming the next one to build.
+        ;
+        ; The reference's own fallthrough — modifiers with no declaration behind
+        ; them — reports Declaration_expected and synthesizes a
+        ; MissingDeclaration. That is a diagnostic, so it is unported too, and
+        ; the same tag covers it.
+        this.unported("declaration", token)
+    }
+
+    ; ── modifiers ───────────────────────────────────────────────────────────
+    ;
+    ; parseModifiersEx. Answers the list, or null when there is none — the
+    ; reference returns a nil ModifierList in that case and ForEachChild then
+    ; visits no modifier at all, which is what keeps `var x;` a one-child
+    ; statement.
+
+    procedure parse_modifiers(this, allow_decorators: bool, permit_const_as_modifier: bool, stop_on_start_of_class_static_block: bool) returns pointer[Array[pointer[AstNode]]]
+    {
+        let list AstNode.new_node_list(host)
+        var has_static_modifier false
+
+        while true
+        {
+            ; A decorator is a leading `@expr`, and its expression is the whole
+            ; left-hand-side ladder. Unported.
+            if allow_decorators
+            {
+                if token = KindAtToken
+                {
+                    this.unported("decorator", token)
+                    return null
+                }
+            }
+
+            let m this.try_parse_modifier(has_static_modifier, permit_const_as_modifier, stop_on_start_of_class_static_block)
+            if m = null
+                break
+            if AstNode.kind_of(m) = KindStaticKeyword
+                set has_static_modifier: true
+            list.add(m)
+        }
+
+        if list.get_length() as int = 0
+            return null
+        list
+    }
+
+    procedure try_parse_modifier(this, has_seen_static_modifier: bool, permit_const_as_modifier: bool, stop_on_start_of_class_static_block: bool) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let kind token
+
+        if token = KindConstKeyword
+        {
+            if permit_const_as_modifier
+            {
+                ; Any following modifier must be on the same line, so that a
+                ; standalone `const` declaration is not mistaken for one.
+                if this.look_ahead_next_token_is_on_same_line_and_can_follow_modifier() = false
+                    return null
+                this.next_token()
+                return this.finish_node(this.new_node(kind, NodeData.Token(TokenData())), pos)
+            }
+        }
+
+        if stop_on_start_of_class_static_block
+        {
+            if token = KindStaticKeyword
+            {
+                if this.look_ahead_next_token_is_open_brace()
+                    return null
+            }
+        }
+
+        if has_seen_static_modifier
+        {
+            if token = KindStaticKeyword
+                return null
+        }
+
+        if this.parse_any_contextual_modifier() = false
+            return null
+
+        this.finish_node(this.new_node(kind, NodeData.Token(TokenData())), pos)
+    }
+
+    procedure parse_any_contextual_modifier(this) returns bool
+    {
+        let saved this.mark()
+        if is_modifier_kind(token)
+        {
+            if this.next_token_can_follow_modifier()
+                return true
+        }
+        this.rewind(saved)
+        false
+    }
+
+    procedure next_token_can_follow_modifier(this) returns bool
+    {
+        ; `const` is a modifier only in `const enum`.
+        if token = KindConstKeyword
+            return this.next_token() = KindEnumKeyword
+
+        if token = KindExportKeyword
+        {
+            this.next_token()
+            if token = KindDefaultKeyword
+                return this.look_ahead_next_token_can_follow_default_keyword()
+            if token = KindTypeKeyword
+                return this.look_ahead_next_token_can_follow_export_modifier()
+            return this.can_follow_export_modifier()
+        }
+
+        if token = KindDefaultKeyword
+            return this.next_token_can_follow_default_keyword()
+
+        if token = KindStaticKeyword
+        {
+            this.next_token()
+            return this.can_follow_modifier()
+        }
+
+        if token = KindGetKeyword
+        {
+            this.next_token()
+            return this.can_follow_get_or_set_keyword()
+        }
+        if token = KindSetKeyword
+        {
+            this.next_token()
+            return this.can_follow_get_or_set_keyword()
+        }
+
+        this.next_token_is_on_same_line_and_can_follow_modifier()
+    }
+
+    procedure next_token_can_follow_default_keyword(this) returns bool
+    {
+        this.next_token()
+        if token = KindClassKeyword
+            return true
+        if token = KindFunctionKeyword
+            return true
+        if token = KindInterfaceKeyword
+            return true
+        if token = KindAtToken
+            return true
+        if token = KindAbstractKeyword
+            return this.look_ahead_next_token_is_class_keyword_on_same_line()
+        if token = KindAsyncKeyword
+            return this.look_ahead_next_token_is_function_keyword_on_same_line()
+        false
+    }
+
+    procedure next_token_can_follow_export_modifier(this) returns bool
+    {
+        this.next_token()
+        this.can_follow_export_modifier()
+    }
+
+    function can_follow_export_modifier(this) returns bool
+    {
+        if token = KindAtToken
+            return true
+        if token = KindAsteriskToken
+            return false
+        if token = KindAsKeyword
+            return false
+        if token = KindOpenBraceToken
+            return false
+        this.can_follow_modifier()
+    }
+
+    function can_follow_modifier(this) returns bool
+    {
+        if token = KindOpenBracketToken
+            return true
+        if token = KindOpenBraceToken
+            return true
+        if token = KindAsteriskToken
+            return true
+        if token = KindDotDotDotToken
+            return true
+        this.is_literal_property_name()
+    }
+
+    function can_follow_get_or_set_keyword(this) returns bool
+    {
+        if token = KindOpenBracketToken
+            return true
+        this.is_literal_property_name()
+    }
+
+    procedure next_token_is_on_same_line_and_can_follow_modifier(this) returns bool
+    {
+        this.next_token()
+        if this.has_preceding_line_break()
+            return false
+        this.can_follow_modifier()
+    }
+
+    function is_literal_property_name(this) returns bool
+    {
+        if token_is_identifier_or_keyword(token)
+            return true
+        if token = KindStringLiteral
+            return true
+        if token = KindNumericLiteral
+            return true
+        token = KindBigIntLiteral
+    }
+
+    ; Ported from internal/parser/utilities.go: identifiers and every keyword sit
+    ; ABOVE KindIdentifier in one contiguous run, so the test is a single >=.
+    function token_is_identifier_or_keyword(k: int) returns bool
+        k >= KindIdentifier
+
+    ; ast.IsModifierKind.
+    function is_modifier_kind(k: int) returns bool
+    {
+        if k = KindAbstractKeyword
+            return true
+        if k = KindAccessorKeyword
+            return true
+        if k = KindAsyncKeyword
+            return true
+        if k = KindConstKeyword
+            return true
+        if k = KindDeclareKeyword
+            return true
+        if k = KindDefaultKeyword
+            return true
+        if k = KindExportKeyword
+            return true
+        if k = KindInKeyword
+            return true
+        if k = KindPrivateKeyword
+            return true
+        if k = KindProtectedKeyword
+            return true
+        if k = KindPublicKeyword
+            return true
+        if k = KindReadonlyKeyword
+            return true
+        if k = KindOutKeyword
+            return true
+        if k = KindOverrideKeyword
+            return true
+        k = KindStaticKeyword
+    }
+
+    ; ── isStartOfDeclaration ────────────────────────────────────────────────
+    ;
+    ; The one question that decides whether a contextual keyword starts a
+    ; declaration or is just a name. It is a look-ahead LOOP: `export declare
+    ; const` walks three tokens before it can answer.
+
+    procedure is_start_of_declaration(this) returns bool
+    {
+        let saved this.mark()
+        let r this.scan_start_of_declaration()
+        this.rewind(saved)
+        r
+    }
+
+    procedure scan_start_of_declaration(this) returns bool
+    {
+        while true
+        {
+            if token = KindVarKeyword
+                return true
+            if token = KindLetKeyword
+                return true
+            if token = KindConstKeyword
+                return true
+            if token = KindFunctionKeyword
+                return true
+            if token = KindClassKeyword
+                return true
+            if token = KindEnumKeyword
+                return true
+
+            if token = KindUsingKeyword
+                return this.is_using_declaration()
+            if token = KindAwaitKeyword
+                return this.is_await_using_declaration()
+
+            ; `declare`, `module`, `namespace`, `interface` and `type` are all
+            ; legal identifiers — but an identifier cannot be followed by another
+            ; identifier on the SAME LINE, and that is what tells the two apart.
+            if token = KindInterfaceKeyword
+                return this.next_token_is_identifier_on_same_line()
+            if token = KindTypeKeyword
+                return this.next_token_is_identifier_on_same_line()
+            if token = KindDeferKeyword
+                return this.next_token_is_identifier_on_same_line()
+
+            if token = KindModuleKeyword
+                return this.next_token_is_identifier_or_string_literal_on_same_line()
+            if token = KindNamespaceKeyword
+                return this.next_token_is_identifier_or_string_literal_on_same_line()
+
+            if token = KindGlobalKeyword
+            {
+                this.next_token()
+                if token = KindOpenBraceToken
+                    return true
+                if token = KindIdentifier
+                    return true
+                return token = KindExportKeyword
+            }
+
+            if token = KindImportKeyword
+            {
+                this.next_token()
+                if token = KindDeferKeyword
+                    return true
+                if token = KindStringLiteral
+                    return true
+                if token = KindAsteriskToken
+                    return true
+                if token = KindOpenBraceToken
+                    return true
+                return token_is_identifier_or_keyword(token)
+            }
+
+            if token = KindExportKeyword
+            {
+                this.next_token()
+                if token = KindEqualsToken
+                    return true
+                if token = KindAsteriskToken
+                    return true
+                if token = KindOpenBraceToken
+                    return true
+                if token = KindDefaultKeyword
+                    return true
+                if token = KindAsKeyword
+                    return true
+                if token = KindAtToken
+                    return true
+                if token = KindTypeKeyword
+                {
+                    this.next_token()
+                    if token = KindAsteriskToken
+                        return true
+                    if token = KindOpenBraceToken
+                        return true
+                    if this.is_identifier()
+                        return this.has_preceding_line_break() = false
+                    return false
+                }
+                continue
+            }
+
+            if token = KindStaticKeyword
+            {
+                this.next_token()
+                continue
+            }
+
+            ; The modifier keywords, which loop: ASI applies to each of them, and
+            ; `declare type` commits to a type alias regardless.
+            if this.token_is_loopable_modifier()
+            {
+                let previous token
+                this.next_token()
+                if this.has_preceding_line_break()
+                    return false
+                if previous = KindDeclareKeyword
+                {
+                    if token = KindTypeKeyword
+                        return true
+                }
+                continue
+            }
+
+            return false
+        }
+        false
+    }
+
+    function token_is_loopable_modifier(this) returns bool
+    {
+        if token = KindAbstractKeyword
+            return true
+        if token = KindAccessorKeyword
+            return true
+        if token = KindAsyncKeyword
+            return true
+        if token = KindDeclareKeyword
+            return true
+        if token = KindPrivateKeyword
+            return true
+        if token = KindProtectedKeyword
+            return true
+        if token = KindPublicKeyword
+            return true
+        token = KindReadonlyKeyword
+    }
+
+    procedure next_token_is_identifier_on_same_line(this) returns bool
+    {
+        this.next_token()
+        if this.is_identifier() = false
+            return false
+        this.has_preceding_line_break() = false
+    }
+
+    procedure next_token_is_identifier_or_string_literal_on_same_line(this) returns bool
+    {
+        this.next_token()
+        var ok this.is_identifier()
+        if ok = false
+        {
+            if token = KindStringLiteral
+                set ok: true
+        }
+        if ok = false
+            return false
+        this.has_preceding_line_break() = false
+    }
+
+    procedure is_using_declaration(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_token_is_binding_identifier_or_start_of_destructuring_on_same_line(false)
+        this.rewind(saved)
+        r
+    }
+
+    procedure is_await_using_declaration(this) returns bool
+    {
+        let saved this.mark()
+        var r false
+        if this.next_token() = KindUsingKeyword
+            set r: this.next_token_is_binding_identifier_or_start_of_destructuring_on_same_line(false)
+        this.rewind(saved)
+        r
+    }
+
+    procedure next_token_is_binding_identifier_or_start_of_destructuring_on_same_line(this, disallow_of: bool) returns bool
+    {
+        this.next_token()
+        if disallow_of
+        {
+            if token = KindOfKeyword
+                return this.look_ahead_next_token_is_equals_or_semicolon_or_colon_token()
+        }
+        var ok this.is_binding_identifier()
+        if ok = false
+        {
+            if token = KindOpenBraceToken
+                set ok: true
+        }
+        if ok = false
+            return false
+        this.has_preceding_line_break() = false
+    }
+
+    ; ── the look-ahead wrappers ─────────────────────────────────────────────
+    ;
+    ; One per call site, each marking and rewinding around a single question.
+    ; See CLAUDE.md §3.9e for why the reference's `lookAhead(callback)` does not
+    ; survive as a callback.
+
+    procedure look_ahead_next_token_is_open_brace(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_token() = KindOpenBraceToken
+        this.rewind(saved)
+        r
+    }
+
+    procedure look_ahead_next_token_is_class_keyword_on_same_line(this) returns bool
+    {
+        let saved this.mark()
+        var r this.next_token() = KindClassKeyword
+        if r
+            set r: this.has_preceding_line_break() = false
+        this.rewind(saved)
+        r
+    }
+
+    procedure look_ahead_next_token_is_function_keyword_on_same_line(this) returns bool
+    {
+        let saved this.mark()
+        var r this.next_token() = KindFunctionKeyword
+        if r
+            set r: this.has_preceding_line_break() = false
+        this.rewind(saved)
+        r
+    }
+
+    procedure look_ahead_next_token_can_follow_default_keyword(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_token_can_follow_default_keyword()
+        this.rewind(saved)
+        r
+    }
+
+    procedure look_ahead_next_token_can_follow_export_modifier(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_token_can_follow_export_modifier()
+        this.rewind(saved)
+        r
+    }
+
+    procedure look_ahead_next_token_is_on_same_line_and_can_follow_modifier(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_token_is_on_same_line_and_can_follow_modifier()
+        this.rewind(saved)
+        r
+    }
+
+    procedure look_ahead_next_token_is_equals_or_semicolon_or_colon_token(this) returns bool
+    {
+        let saved this.mark()
+        this.next_token()
+        var r token = KindEqualsToken
+        if r = false
+        {
+            if token = KindSemicolonToken
+                set r: true
+        }
+        if r = false
+        {
+            if token = KindColonToken
+                set r: true
+        }
+        this.rewind(saved)
+        r
     }
 
     procedure parse_empty_statement(this) returns pointer[AstNode]
@@ -559,16 +1226,14 @@ define Parser
         this.with_jsdoc(result, jsdoc)
     }
 
-    procedure parse_variable_statement(this) returns pointer[AstNode]
+    procedure parse_variable_statement(this, pos: int, jsdoc: int, modifiers: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
     {
-        let pos this.node_pos()
-        let jsdoc this.jsdoc_scanner_info()
         let list this.parse_variable_declaration_list()
         if list = null
             return null
         if this.parse_semicolon() = false
             return null
-        let result this.finish_node(this.new_node(KindVariableStatement, NodeData.VariableStatement(VariableStatementData(list))), pos)
+        let result this.finish_node(this.new_node(KindVariableStatement, NodeData.VariableStatement(VariableStatementData(modifiers, list))), pos)
         this.with_jsdoc(result, jsdoc)
     }
 
@@ -616,9 +1281,9 @@ define Parser
         ; parseIdentifierOrPattern: `[` and `{` start a binding pattern, which is
         ; unported.
         if token = KindOpenBracketToken
-            return this.unported()
+            return this.unported("binding-pattern", token)
         if token = KindOpenBraceToken
-            return this.unported()
+            return this.unported("binding-pattern", token)
 
         let name this.parse_binding_identifier()
         if name = null
@@ -640,7 +1305,7 @@ define Parser
 
         ; parseTypeAnnotation. There is no type parser yet.
         if token = KindColonToken
-            return this.unported()
+            return this.unported("type-annotation", token)
 
         var initializer null as pointer[AstNode]
         if token <> KindInKeyword
@@ -663,7 +1328,7 @@ define Parser
     procedure parse_binding_identifier(this) returns pointer[AstNode]
     {
         if this.is_binding_identifier() = false
-            return this.unported()
+            return this.unported("binding-identifier", token)
         this.parse_identifier_node()
     }
 
@@ -692,7 +1357,7 @@ define Parser
             return true
         if this.has_preceding_line_break()
             return true
-        this.unported()
+        this.unported("semicolon", token)
         false
     }
 
@@ -712,7 +1377,7 @@ define Parser
         if AstNode.kind_of(expression) = KindIdentifier
         {
             if token = KindColonToken
-                return this.unported()
+                return this.unported("labeled-statement", token)
         }
 
         if this.parse_semicolon() = false
@@ -738,7 +1403,7 @@ define Parser
             return null
         ; The comma operator builds a BinaryExpression chain.
         if token = KindCommaToken
-            return this.unported()
+            return this.unported("comma-operator", token)
         e
     }
 
@@ -753,7 +1418,7 @@ define Parser
         ; the conditional operator. Each would change the tree, so each stops
         ; the port here rather than being dropped.
         if continues_expression(token)
-            return this.unported()
+            return this.unported("expression-continues", token)
         e
     }
 
@@ -821,7 +1486,7 @@ define Parser
         ; expressions, function/class expressions, `new`, decorators, private
         ; names — all unported. So is the reference's fallback, which reports
         ; "Expression expected" and synthesizes a missing identifier.
-        this.unported()
+        this.unported("primary-expression", token)
     }
 
     procedure parse_literal_expression(this, kind: int) returns pointer[AstNode]
