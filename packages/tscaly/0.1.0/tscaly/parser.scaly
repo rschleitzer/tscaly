@@ -149,6 +149,13 @@ use tscaly.ast.ConstructorDeclarationData
 use tscaly.ast.AccessorDeclarationData
 use tscaly.ast.ClassStaticBlockDeclarationData
 use tscaly.ast.IndexSignatureDeclarationData
+use tscaly.ast.TypeLiteralData
+use tscaly.ast.SignatureDeclarationData
+use tscaly.ast.MethodSignatureData
+use tscaly.ast.EnumDeclarationData
+use tscaly.ast.EnumMemberData
+use tscaly.ast.ModuleDeclarationData
+use tscaly.ast.MappedTypeData
 
 ; The reference's jsdocScannerInfo — what the scanner noticed about the JSDoc
 ; comment preceding the token the parser is about to consume. It is captured at
@@ -172,6 +179,9 @@ define PCObjectLiteralMembers: int 6
 define PCClassMembers:        int 7
 define PCHeritageClauses:     int 8
 define PCHeritageClauseElement: int 9
+define PCTypeMembers:         int 10
+define PCEnumMembers:         int 11
+define PCBlockStatements:     int 12
 
 ; ── operator precedence, ported from internal/ast/precedence.go ─────────────
 ;
@@ -1090,6 +1100,19 @@ define Parser
             return this.parse_type_alias_declaration(pos, jsdoc, modifiers)
         if token = KindClassKeyword
             return this.parse_class_declaration(pos, jsdoc, modifiers)
+        if token = KindInterfaceKeyword
+            return this.parse_interface_declaration(pos, jsdoc, modifiers)
+        if token = KindEnumKeyword
+            return this.parse_enum_declaration(pos, jsdoc, modifiers)
+        ; The reference gives these three one case arm, and so does the routine
+        ; they call: `global`, `module` and `namespace` all produce a
+        ; KindModuleDeclaration and differ only in the keyword it records.
+        if token = KindGlobalKeyword
+            return this.parse_module_declaration(pos, jsdoc, modifiers)
+        if token = KindModuleKeyword
+            return this.parse_module_declaration(pos, jsdoc, modifiers)
+        if token = KindNamespaceKeyword
+            return this.parse_module_declaration(pos, jsdoc, modifiers)
 
         ; The reference's remaining arms. Each is a whole declaration form and a
         ; slice of its own; the tag says which one stopped the case, so the
@@ -4726,12 +4749,16 @@ define Parser
             return this.parse_type_query()
         }
 
-        ; `{` opens an object type literal or a mapped type. Both are unported
-        ; and they share the tag: telling them apart costs a look-ahead whose
-        ; answer changes nothing here, and the histogram entry would be split
-        ; between two constructs that are one slice.
+        ; `{` opens an object type literal or a mapped type, and only this
+        ; look-ahead separates them. Both landed with slice 7; while they were
+        ; unported they shared one tag, for the reason the histogram bore out —
+        ; they are one slice.
         if token = KindOpenBraceToken
-            return this.unported("type-literal", token)
+        {
+            if this.look_ahead_next_is_start_of_mapped_type()
+                return this.parse_mapped_type()
+            return this.parse_type_literal()
+        }
 
         if token = KindOpenBracketToken
             return this.parse_tuple_type()
@@ -5568,6 +5595,16 @@ define Parser
     {
         if token <> KindOpenBraceToken
         {
+            ; ★ The ParseFlagsType arm, which slice 4 left out because its only
+            ; callers are the two this slice builds. A signature member is
+            ; terminated by a COMMA as readily as by a semicolon, so it cannot
+            ; go through can_parse_semicolon — `interface I { get a(), b: T }`
+            ; would stop at the comma.
+            if (flags & ParseFlagsType) <> 0
+            {
+                this.parse_type_member_semicolon()
+                return null
+            }
             if this.can_parse_semicolon()
             {
                 this.parse_semicolon()
@@ -6418,6 +6455,600 @@ define Parser
         this.parse_semicolon()
     }
 
+    ; ════════════════════════════════════════════════════════════════════════
+    ; TYPE MEMBERS — parser slice 7
+    ; ════════════════════════════════════════════════════════════════════════
+    ;
+    ; ★★★ THE SLICE IS ONE PRODUCTION SEEN FROM TWO PLACES. An interface BODY
+    ; and an object TYPE LITERAL both call parseObjectTypeMembers, which calls
+    ; parseTypeMember — so the unported histogram's top two corpus rows,
+    ; `interface`/`namespace`/`enum` at 26.4 % and the object type literal `{`
+    ; at 18.1 %, are not competing candidates. Together they are 44.5 % of
+    ; corpus first blockers, the largest slice the histogram has ever named,
+    ; and slice 3 predicted it in as many words ("the `{` row was two slices
+    ; under one character; the type half is still the interface-member slice").
+    ;
+    ; ── What is here ────────────────────────────────────────────────────────
+    ;
+    ;   parseTypeMember and its five member forms
+    ;     parseSignatureMember       (call and construct signatures)
+    ;     parseAccessorDeclaration   (already built by slice 6, with the
+    ;                                 ParseFlagsType arm it was waiting for)
+    ;     parseIndexSignatureDeclaration        (likewise slice 6)
+    ;     parsePropertyOrMethodSignature
+    ;   parseObjectTypeMembers / parseTypeLiteral
+    ;   parseMappedType / parseMappedTypeParameter — because the `{` arm of
+    ;     parseNonArrayType dispatches to one or the other, and building only
+    ;     half of that arm would leave the tag naming a construct that is now
+    ;     two different things
+    ;   parseInterfaceDeclaration
+    ;   parseEnumDeclaration / parseEnumMember
+    ;   parseModuleDeclaration and the three routines under it
+    ;
+    ; ── and what is deliberately not ────────────────────────────────────────
+    ;
+    ; ★ `import(…)` types and import/export DECLARATIONS. `import` and `export`
+    ;   are 19.2 % of corpus first blockers between them and are a slice of
+    ;   their own; nothing here needs them.
+    ;
+    ; ★ checkJSSyntax, for the reason slice 4 recorded: it returns immediately
+    ;   unless the node carries NodeFlagsJavaScriptFile, which this port never
+    ;   sets.
+
+    ; ── the list-element predicate ──────────────────────────────────────────
+
+    procedure look_ahead_scan_type_member_start(this) returns bool
+    {
+        let saved this.mark()
+        let r this.scan_type_member_start()
+        this.rewind(saved)
+        r
+    }
+
+    ; scanTypeMemberStart. `id_token` is not "an identifier was seen" — it is
+    ; "something property-LIKE was seen", and a modifier keyword sets it too,
+    ; because `readonly` alone is a legal property name. That is why the final
+    ; test is on what FOLLOWS rather than on what was consumed.
+    procedure scan_type_member_start(this) returns bool
+    {
+        ; A signature member starts here and needs no name at all.
+        if token = KindOpenParenToken
+            return true
+        if token = KindLessThanToken
+            return true
+        if token = KindGetKeyword
+            return true
+        if token = KindSetKeyword
+            return true
+
+        var id_token false
+        while is_modifier_kind(token)
+        {
+            set id_token: true
+            this.next_token()
+        }
+
+        ; An index signature and a computed property name both start with `[`.
+        if token = KindOpenBracketToken
+            return true
+
+        if this.is_literal_property_name()
+        {
+            set id_token: true
+            this.next_token()
+        }
+
+        if id_token
+        {
+            if token = KindOpenParenToken
+                return true
+            if token = KindLessThanToken
+                return true
+            if token = KindQuestionToken
+                return true
+            if token = KindColonToken
+                return true
+            if token = KindCommaToken
+                return true
+            return this.can_parse_semicolon()
+        }
+        false
+    }
+
+    ; ── the member router ───────────────────────────────────────────────────
+
+    procedure parse_type_member(this) returns pointer[AstNode]
+    {
+        if token = KindOpenParenToken
+            return this.parse_signature_member(KindCallSignature)
+        if token = KindLessThanToken
+            return this.parse_signature_member(KindCallSignature)
+        if token = KindNewKeyword
+        {
+            ; `new` is also a legal property name, so only what follows
+            ; separates a construct signature from a property called `new`.
+            if this.look_ahead_next_token_is_open_paren_or_less_than()
+                return this.parse_signature_member(KindConstructSignature)
+        }
+
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+        let modifiers this.parse_modifiers(false, false, false)
+        if this.is_unported()
+            return null
+
+        if this.parse_contextual_modifier(KindGetKeyword)
+            return this.parse_accessor_declaration(pos, jsdoc, modifiers, KindGetAccessor, ParseFlagsType)
+        if this.parse_contextual_modifier(KindSetKeyword)
+            return this.parse_accessor_declaration(pos, jsdoc, modifiers, KindSetAccessor, ParseFlagsType)
+        if this.is_index_signature()
+            return this.parse_index_signature_declaration(pos, jsdoc, modifiers)
+        this.parse_property_or_method_signature(pos, jsdoc, modifiers)
+    }
+
+    ; CallSignature and ConstructSignature. The `new` is CONSUMED rather than
+    ; kept: the reference stores no token for it and the node's own kind is
+    ; what tells the two apart.
+    procedure parse_signature_member(this, kind: int) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+        if kind = KindConstructSignature
+        {
+            if this.parse_expected(KindNewKeyword) = false
+                return null
+        }
+
+        let type_parameters this.parse_type_parameters()
+        if this.is_unported()
+            return null
+        let parameters this.parse_parameters(ParseFlagsType)
+        if parameters = null
+            return null
+
+        ; ★ Called UNCONDITIONALLY, and the failure test is is_unported() rather
+        ; than a null result — a signature with no return type is legitimate
+        ; (§3.5h), and the `=>`-where-a-`:`-was-meant arm of
+        ; should_parse_return_type only reports itself through that flag.
+        let type_node this.parse_return_type(KindColonToken, true)
+        if this.is_unported()
+            return null
+
+        ; The separator is consumed BEFORE finish_node, so the node's end
+        ; covers it. Order, not tidiness — reversing the two lines moves every
+        ; signature member's end and the dump says so.
+        if this.parse_type_member_semicolon() = false
+            return null
+
+        var result null as pointer[AstNode]
+        if kind = KindCallSignature
+            set result: this.new_node(KindCallSignature, NodeData.CallSignature(SignatureDeclarationData(type_parameters, parameters, type_node)))
+        else
+            set result: this.new_node(KindConstructSignature, NodeData.ConstructSignature(SignatureDeclarationData(type_parameters, parameters, type_node)))
+
+        this.with_jsdoc(this.finish_node(result, pos), jsdoc)
+    }
+
+    procedure parse_property_or_method_signature(this, pos: int, jsdoc: int, modifiers: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
+    {
+        let name this.parse_property_name()
+        if name = null
+            return null
+        let question_token this.parse_optional_token(KindQuestionToken)
+
+        var is_method false
+        if token = KindOpenParenToken
+            set is_method: true
+        if token = KindLessThanToken
+            set is_method: true
+
+        var result null as pointer[AstNode]
+        if is_method
+        {
+            ; Method signatures do not exist in expression contexts, so they
+            ; carry neither [Yield] nor [Await] — which is why nothing is saved
+            ; and restored around this branch.
+            let type_parameters this.parse_type_parameters()
+            if this.is_unported()
+                return null
+            let parameters this.parse_parameters(ParseFlagsType)
+            if parameters = null
+                return null
+            let return_type this.parse_return_type(KindColonToken, true)
+            if this.is_unported()
+                return null
+            set result: this.new_node(KindMethodSignature, NodeData.MethodSignature(MethodSignatureData(modifiers, name, question_token, type_parameters, parameters, return_type)))
+        }
+        else
+        {
+            var type_node null as pointer[AstNode]
+            if token = KindColonToken
+            {
+                set type_node: this.parse_type_annotation()
+                if type_node = null
+                    return null
+            }
+
+            ; ★ A type-literal or interface property cannot HAVE an
+            ; initializer. One is parsed anyway, so that the CHECKER can report
+            ; it — dropping this would make `interface I { a = 1 }` a parse
+            ; failure where the reference produces a tree.
+            var initializer null as pointer[AstNode]
+            if token = KindEqualsToken
+            {
+                set initializer: this.parse_initializer()
+                if initializer = null
+                    return null
+            }
+            set result: this.new_node(KindPropertySignature, NodeData.PropertySignature(PropertyDeclarationData(modifiers, name, question_token, type_node, initializer)))
+        }
+
+        if this.parse_type_member_semicolon() = false
+            return null
+        this.with_jsdoc(this.finish_node(result, pos), jsdoc)
+    }
+
+    ; ── the object type literal ─────────────────────────────────────────────
+
+    procedure parse_object_type_members(this) returns pointer[Array[pointer[AstNode]]]
+    {
+        ; A missing `{` is a diagnostic — the reference answers
+        ; createMissingList() and carries on — so it is where this port stops.
+        if this.parse_expected(KindOpenBraceToken) = false
+            return null
+        let members this.parse_list(PCTypeMembers)
+        if members = null
+            return null
+        if this.parse_expected(KindCloseBraceToken) = false
+            return null
+        members
+    }
+
+    procedure parse_type_literal(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let members this.parse_object_type_members()
+        if members = null
+            return null
+        this.finish_node(this.new_node(KindTypeLiteral, NodeData.TypeLiteral(TypeLiteralData(members))), pos)
+    }
+
+    ; ── the mapped type ─────────────────────────────────────────────────────
+    ;
+    ; `{ [K in T]: U }`. It shares the `{` with the type literal, and only this
+    ; look-ahead separates them.
+
+    procedure look_ahead_next_is_start_of_mapped_type(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_is_start_of_mapped_type()
+        this.rewind(saved)
+        r
+    }
+
+    procedure next_is_start_of_mapped_type(this) returns bool
+    {
+        this.next_token()
+        if token = KindPlusToken
+            return this.next_token() = KindReadonlyKeyword
+        if token = KindMinusToken
+            return this.next_token() = KindReadonlyKeyword
+        if token = KindReadonlyKeyword
+            this.next_token()
+        ; The reference's `&&` chain, and its SHORT-CIRCUIT is load-bearing:
+        ; without a `[` here nothing further is consumed, so a plain type
+        ; literal is not scanned past by the look-ahead that rejected it.
+        if token <> KindOpenBracketToken
+            return false
+        if this.next_token_is_identifier() = false
+            return false
+        this.next_token() = KindInKeyword
+    }
+
+    procedure next_token_is_identifier(this) returns bool
+    {
+        this.next_token()
+        this.is_identifier()
+    }
+
+    procedure parse_mapped_type(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        if this.parse_expected(KindOpenBraceToken) = false
+            return null
+
+        ; `readonly`, `+readonly` or `-readonly`. The token node is built from
+        ; whichever of the three was seen, and a `+`/`-` then REQUIRES the
+        ; `readonly` after it.
+        var readonly_token null as pointer[AstNode]
+        var has_readonly false
+        if token = KindReadonlyKeyword
+            set has_readonly: true
+        if token = KindPlusToken
+            set has_readonly: true
+        if token = KindMinusToken
+            set has_readonly: true
+        if has_readonly
+        {
+            set readonly_token: this.parse_token_node()
+            if AstNode.kind_of(readonly_token) <> KindReadonlyKeyword
+            {
+                if this.parse_expected(KindReadonlyKeyword) = false
+                    return null
+            }
+        }
+
+        if this.parse_expected(KindOpenBracketToken) = false
+            return null
+        let type_parameter this.parse_mapped_type_parameter()
+        if type_parameter = null
+            return null
+
+        var name_type null as pointer[AstNode]
+        if this.parse_optional(KindAsKeyword)
+        {
+            set name_type: this.parse_type()
+            if name_type = null
+                return null
+        }
+        if this.parse_expected(KindCloseBracketToken) = false
+            return null
+
+        ; `?`, `+?` or `-?`, read exactly as the readonly token above.
+        var question_token null as pointer[AstNode]
+        var has_question false
+        if token = KindQuestionToken
+            set has_question: true
+        if token = KindPlusToken
+            set has_question: true
+        if token = KindMinusToken
+            set has_question: true
+        if has_question
+        {
+            set question_token: this.parse_token_node()
+            if AstNode.kind_of(question_token) <> KindQuestionToken
+            {
+                if this.parse_expected(KindQuestionToken) = false
+                    return null
+            }
+        }
+
+        var type_node null as pointer[AstNode]
+        if token = KindColonToken
+        {
+            set type_node: this.parse_type_annotation()
+            if type_node = null
+                return null
+        }
+        if this.parse_semicolon() = false
+            return null
+
+        ; ★ A mapped type has a MEMBER LIST after its one mapped member. It is
+        ; always empty in well-formed source — the grammar allows nothing there
+        ; — and the reference parses one anyway so that `{ [K in T]: U; a: V }`
+        ; produces a tree the checker can complain about.
+        let members this.parse_list(PCTypeMembers)
+        if members = null
+            return null
+        if this.parse_expected(KindCloseBraceToken) = false
+            return null
+
+        this.finish_node(this.new_node(KindMappedType, NodeData.MappedType(MappedTypeData(readonly_token, type_parameter, name_type, question_token, type_node, members))), pos)
+    }
+
+    ; The mapped type's `K in T` is a TypeParameter node whose CONSTRAINT is the
+    ; type after `in` — not a node of its own.
+    procedure parse_mapped_type_parameter(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let name this.parse_identifier_name()
+        if name = null
+            return null
+        if this.parse_expected(KindInKeyword) = false
+            return null
+        let type_node this.parse_type()
+        if type_node = null
+            return null
+        this.finish_node(this.new_node(KindTypeParameter, NodeData.TypeParameter(TypeParameterData(null, name, type_node, null, null))), pos)
+    }
+
+    ; ── the interface declaration ───────────────────────────────────────────
+
+    procedure parse_interface_declaration(this, pos: int, jsdoc: int, modifiers: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
+    {
+        if this.parse_expected(KindInterfaceKeyword) = false
+            return null
+        let name this.parse_identifier()
+        if name = null
+            return null
+        let type_parameters this.parse_type_parameters()
+        if this.is_unported()
+            return null
+        let heritage_clauses this.parse_heritage_clauses()
+        if this.is_unported()
+            return null
+        let members this.parse_object_type_members()
+        if members = null
+            return null
+
+        ; ★ No await-context handling and no statement_has_await_identifier
+        ; save/restore, unlike the class, the enum and the module. That is the
+        ; reference, not an omission: parseInterfaceDeclaration has neither, and
+        ; it cannot need them — an interface body holds only types, and the
+        ; three sites that DO save the flag each hold a statement or an
+        ; initializer that could use `await` as a name.
+        let result this.finish_node(this.new_node(KindInterfaceDeclaration, NodeData.InterfaceDeclaration(ClassLikeData(modifiers, name, type_parameters, heritage_clauses, members))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    ; ── the enum declaration ────────────────────────────────────────────────
+
+    procedure parse_enum_declaration(this, pos: int, jsdoc: int, modifiers: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
+    {
+        let saved_await_identifier statement_has_await_identifier
+        if this.parse_expected(KindEnumKeyword) = false
+            return null
+        let name this.parse_identifier()
+        if name = null
+            return null
+
+        ; A missing `{` is a diagnostic — createMissingList again — so it is
+        ; where this port stops.
+        if this.parse_expected(KindOpenBraceToken) = false
+            return null
+        let saved context_flags
+        this.set_context_flags(NodeFlagsYieldContext, false)
+        this.set_context_flags(NodeFlagsAwaitContext, false)
+        let members this.parse_delimited_list(PCEnumMembers)
+        set context_flags: saved
+        if members = null
+            return null
+        if this.parse_expected(KindCloseBraceToken) = false
+            return null
+
+        let result this.with_jsdoc(this.finish_node(this.new_node(KindEnumDeclaration, NodeData.EnumDeclaration(EnumDeclarationData(modifiers, name, members))), pos), jsdoc)
+        ; An `await` used as a name inside an enum body says nothing about the
+        ; enclosing top-level statement — one more of the sites §3.5l names.
+        set statement_has_await_identifier: saved_await_identifier
+        result
+    }
+
+    procedure parse_enum_member(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+        let name this.parse_property_name()
+        if name = null
+            return null
+
+        ; doInContext(DisallowIn, false, parseInitializer). A null initializer
+        ; is the ordinary `enum E { A, B }`, so the failure test is
+        ; is_unported() rather than the result.
+        let saved context_flags
+        this.set_context_flags(NodeFlagsDisallowInContext, false)
+        let initializer this.parse_initializer()
+        set context_flags: saved
+        if this.is_unported()
+            return null
+
+        let result this.finish_node(this.new_node(KindEnumMember, NodeData.EnumMember(EnumMemberData(name, initializer))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    ; ── the module and namespace declarations ───────────────────────────────
+    ;
+    ; `namespace A {}`, `module A {}`, `declare module "x" {}` and
+    ; `declare global {}` are ONE node kind — KindModuleDeclaration — and the
+    ; word that declared it rides as a field.
+
+    procedure parse_module_declaration(this, pos: int, jsdoc: int, modifiers: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
+    {
+        var keyword: int KindModuleKeyword
+        if token = KindGlobalKeyword
+            return this.parse_ambient_external_module_declaration(pos, jsdoc, modifiers)
+        if this.parse_optional(KindNamespaceKeyword)
+            set keyword: KindNamespaceKeyword
+        else
+        {
+            if this.parse_expected(KindModuleKeyword) = false
+                return null
+            ; `module "foo" { … }` names an EXTERNAL module, which is a
+            ; different production from `module Foo { … }`.
+            if token = KindStringLiteral
+                return this.parse_ambient_external_module_declaration(pos, jsdoc, modifiers)
+        }
+        this.parse_module_or_namespace_declaration(pos, jsdoc, modifiers, false, keyword)
+    }
+
+    procedure parse_ambient_external_module_declaration(this, pos: int, jsdoc: int, modifiers: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
+    {
+        let saved_await_identifier statement_has_await_identifier
+        var name null as pointer[AstNode]
+        var keyword: int KindModuleKeyword
+        if token = KindGlobalKeyword
+        {
+            ; `global` is parsed as the NAME of the global scope augmentation,
+            ; not as a keyword token.
+            set name: this.parse_identifier()
+            set keyword: KindGlobalKeyword
+        }
+        else
+            set name: this.parse_literal_expression(KindStringLiteral)
+        if name = null
+            return null
+
+        var body null as pointer[AstNode]
+        if token = KindOpenBraceToken
+        {
+            set body: this.parse_module_block()
+            if body = null
+                return null
+        }
+        else
+        {
+            if this.parse_semicolon() = false
+                return null
+        }
+
+        let result this.with_jsdoc(this.finish_node(this.new_node(KindModuleDeclaration, NodeData.ModuleDeclaration(ModuleDeclarationData(modifiers, keyword, name, body))), pos), jsdoc)
+        set statement_has_await_identifier: saved_await_identifier
+        result
+    }
+
+    procedure parse_module_block(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        if this.parse_expected(KindOpenBraceToken) = false
+            return null
+        let statements this.parse_list(PCBlockStatements)
+        if statements = null
+            return null
+        if this.parse_expected(KindCloseBraceToken) = false
+            return null
+        this.finish_node(this.new_node(KindModuleBlock, NodeData.ModuleBlock(BlockData(statements))), pos)
+    }
+
+    procedure parse_module_or_namespace_declaration(this, pos: int, jsdoc: int, modifiers: pointer[Array[pointer[AstNode]]], nested: bool, keyword: int) returns pointer[AstNode]
+    {
+        let saved_await_identifier statement_has_await_identifier
+        var name null as pointer[AstNode]
+        if nested
+            set name: this.parse_identifier_name()
+        else
+            set name: this.parse_identifier()
+        if name = null
+            return null
+
+        var body null as pointer[AstNode]
+        if this.parse_optional(KindDotToken)
+        {
+            ; ★★ `namespace A.B {}` IS `namespace A { export namespace B {} }`,
+            ; and the reference SYNTHESIZES that `export`: a zero-width token at
+            ; the current position, flagged Reparsed. It is a real child and the
+            ; dump shows it, so three things are exact here — it is built at
+            ; nodePos() with pos = end, its flags are ASSIGNED rather than or'ed
+            ; (it never goes through finish_node, so the context flags must NOT
+            ; join), and the nested declaration starts at that same position
+            ; rather than at the dot.
+            let nested_pos this.node_pos()
+            let implicit_export this.new_node(KindExportKeyword, NodeData.Token(TokenData()))
+            set implicit_export.pos: nested_pos
+            set implicit_export.end: nested_pos
+            set implicit_export.flags: NodeFlagsReparsed
+            let implicit_modifiers AstNode.new_node_list(host)
+            implicit_modifiers.add(implicit_export)
+            set body: this.parse_module_or_namespace_declaration(nested_pos, 0, implicit_modifiers, true, keyword)
+        }
+        else
+            set body: this.parse_module_block()
+        if body = null
+            return null
+
+        let result this.with_jsdoc(this.finish_node(this.new_node(KindModuleDeclaration, NodeData.ModuleDeclaration(ModuleDeclarationData(modifiers, keyword, name, body))), pos), jsdoc)
+        set statement_has_await_identifier: saved_await_identifier
+        result
+    }
+
     ; ── the two look-aheads this slice adds ─────────────────────────────────
 
     procedure look_ahead_next_token_is_identifier_or_keyword(this) returns bool
@@ -6551,6 +7182,12 @@ define Parser
             return this.parse_heritage_clause()
         if ctx = PCHeritageClauseElement
             return this.parse_expression_with_type_arguments()
+        if ctx = PCTypeMembers
+            return this.parse_type_member()
+        if ctx = PCEnumMembers
+            return this.parse_enum_member()
+        if ctx = PCBlockStatements
+            return this.parse_statement()
         this.parse_type()
     }
 
@@ -6623,6 +7260,25 @@ define Parser
                 return false
             return this.is_heritage_clause_extends_or_implements_keyword() = false
         }
+        if ctx = PCTypeMembers
+            return this.look_ahead_scan_type_member_start()
+        if ctx = PCEnumMembers
+        {
+            ; A computed property name is admitted, which technically also lets
+            ; an indexer in — the reference names that as a candidate for
+            ; better error reporting rather than a rule.
+            if token = KindOpenBracketToken
+                return true
+            return this.is_literal_property_name()
+        }
+        if ctx = PCBlockStatements
+        {
+            ; The reference additionally refuses a bare `;` during error
+            ; RECOVERY, so that a stray semicolon in a broken block does not
+            ; read as a statement. This port has no recovery, so the question
+            ; never arises — the same note PCClassMembers carries.
+            return this.is_start_of_statement()
+        }
         ; PCTypeArguments and PCTupleElementTypes share one arm upstream too.
         if token = KindCommaToken
             return true
@@ -6689,6 +7345,14 @@ define Parser
                 return true
             return token = KindCloseBracketToken
         }
+        ; The three contexts that live inside braces. They share one arm
+        ; upstream, together with PCClassMembers above.
+        if ctx = PCTypeMembers
+            return token = KindCloseBraceToken
+        if ctx = PCEnumMembers
+            return token = KindCloseBraceToken
+        if ctx = PCBlockStatements
+            return token = KindCloseBraceToken
         ; PCTypeArguments: anything but a comma ends the list.
         token <> KindCommaToken
     }
