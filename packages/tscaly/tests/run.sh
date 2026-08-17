@@ -306,6 +306,17 @@ compare_one() {
     VERDICT=FAIL; return
   fi
 
+  # ★★★ `no-tree` is NOT an honest unported report. It is the parser answering
+  # NULL with no unported record — a port defect wearing the unported column's
+  # clothes, and the state is never correct. Slice 13c produced five of them in
+  # one afternoon by letting seventeen callers keep reading a result that had
+  # stopped failing (CLAUDE.md §3.5ae), and the only thing that told them apart
+  # from a real report was this tag. So the tag is a hard failure here.
+  if grep -q '^UNPORTED 0 no-tree ' "$work/$art.ours"; then
+    failures+=("$art/$name: no-tree — the parser answered null with NO unported record, which is a port defect and not an unported construct")
+    VERDICT=FAIL; return
+  fi
+
   if grep -q '^UNPORTED ' "$work/$art.ours"; then
     VERDICT=UNPORTED; return
   fi

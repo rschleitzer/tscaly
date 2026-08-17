@@ -139,6 +139,51 @@ def emit(entries):
     out.append("    KindIdentifier")
     out.append("}")
     out.append("")
+
+    # ── the viable keyword suggestions ──────────────────────────────────────
+    #
+    # GetViableKeywordSuggestions(): every key of textToKeyword longer than two
+    # characters. The reference builds it by ranging over the MAP, so its order
+    # is random — which is sound there because GetSpellingSuggestion's answer is
+    # order-independent (minimum distance, ties broken lexicographically). It is
+    # emitted sorted here so that the generated file is stable across runs.
+    #
+    # Two accessors rather than an array of Strings: a `define X: T[]` global is
+    # a VALUE, not a pointer, and cannot be handed to a pointer parameter (root
+    # CLAUDE.md), while a cstring literal per index costs nothing and is what
+    # kw_eq already compares against.
+    viable = sorted(t for t, _ in entries if len(t) > 2)
+    out.append(
+        "; The reference's GetViableKeywordSuggestions — every keyword longer"
+    )
+    out.append(
+        "; than two characters, which is the candidate set"
+    )
+    out.append(
+        "; parseErrorForMissingSemicolonAfter spell-checks an identifier against."
+    )
+    out.append(
+        "; Sorted, which the reference's map range is not; the answer does not"
+    )
+    out.append("; depend on the order (see the generator).")
+    out.append("define KEYWORD_SUGGESTION_COUNT: int %d" % len(viable))
+    out.append("")
+    out.append("function viable_keyword_suggestion(i: int) returns pointer[const_char]")
+    out.append("{")
+    for n, text in enumerate(viable):
+        out.append("    if i = %d" % n)
+        out.append('        return "%s"' % text)
+    out.append('    ""')
+    out.append("}")
+    out.append("")
+    out.append("function viable_keyword_suggestion_length(i: int) returns int")
+    out.append("{")
+    for n, text in enumerate(viable):
+        out.append("    if i = %d" % n)
+        out.append("        return %d" % len(text))
+    out.append("    0")
+    out.append("}")
+    out.append("")
     return "\n".join(out)
 
 
@@ -156,8 +201,12 @@ def main():
         f.write(emit(entries))
 
     print(
-        "genkeywords: %d keywords -> %s"
-        % (len(entries), os.path.relpath(DST, REPO))
+        "genkeywords: %d keywords (%d suggestible) -> %s"
+        % (
+            len(entries),
+            len([t for t, _ in entries if len(t) > 2]),
+            os.path.relpath(DST, REPO),
+        )
     )
 
 
