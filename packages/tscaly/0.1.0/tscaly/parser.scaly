@@ -2,8 +2,9 @@
 ;
 ; parser — ported from the reference's internal/parser/parser.go.
 ;
-; SLICES 1–6. The spine, the declaration router, the TYPE surface, the
-; SIGNATURE, the EXPRESSION ladder and the CLASS family. Anything outside them reports its own
+; SLICES 1–8. The spine, the declaration router, the TYPE surface, the
+; SIGNATURE, the EXPRESSION ladder, the CLASS family, the TYPE-MEMBER surface
+; and the IMPORT/EXPORT declarations. Anything outside them reports its own
 ; POSITION as unported rather than building a plausible tree that quietly
 ; disagrees with the reference — the same mechanism the scanner carries, and for
 ; the same reason.
@@ -37,6 +38,13 @@
 ;            object literal, so `{ m() {} }` and `{ get p() {} }` land here too;
 ;            and the private name `#x` comes with them, because a private name
 ;            exists only inside a class body
+;   slice 7  the TYPE-MEMBER surface (see the TYPE MEMBERS banner): the object
+;            type literal and the five member forms an interface body is made
+;            of, the mapped type, and the interface, enum and module
+;            declarations — one production seen from two places
+;   slice 8  the IMPORT and EXPORT declarations (see the IMPORTS AND EXPORTS
+;            banner), which are parseDeclarationWorker's last two arms: with
+;            them the declaration ROUTER slice 2 bought is complete
 ;
 ; ── What it deliberately does not, each stated rather than left to be noticed ─
 ;
@@ -56,14 +64,16 @@
 ;   real (unported is not a pass), but they are not equally strong, and
 ;   CLAUDE.md's control table says which each one is.
 ;
-; ★ THE CLASS FAMILY IS IN (slice 6), and what is left is one surface with two
-;   names. `interface`, `namespace` and `enum` are 26.4 % of corpus first
-;   blockers and the object TYPE literal another 18.1 % — but an interface BODY
-;   and a type literal are the same production (parseTypeMember), so those two
-;   rows are ONE slice and together they are 44.5 %. After them come the
-;   `export`/`import` declarations at 19.2 % and the diagnostics slice, which
-;   shows up as `semicolon KindColonToken` at 10.4 %. What the ladder itself
-;   still omits is named at the EXPRESSIONS banner, one line per construct.
+; ★ THE DECLARATION ROUTER IS COMPLETE (slice 8), and what the histogram names
+;   next is no longer a declaration form at all. Of 92 corpus first blockers:
+;   the DIAGNOSTICS slice is 27 (`semicolon KindColonToken`, 29 %) and needs a
+;   decision rather than a port, since it is the one place where this port
+;   bails and the reference RECOVERS; the loop and branch STATEMENTS —
+;   `for`, `switch`, `throw`, `while`, `do`, `try` — are 19 (21 %); the BINDING
+;   PATTERN is 14 (15 %); the TEMPLATE family is 11 (12 %) and all three of its
+;   tags wait on one scanner entry point, ReScanTemplateToken; DECORATORS are
+;   10 (11 %). What the ladder itself still omits is named at the EXPRESSIONS
+;   banner, one line per construct.
 ;
 ; ★ ERROR RECOVERY. The reference parses lists through parsing CONTEXTS with
 ;   per-context element and terminator predicates and a token-skipping recovery.
@@ -156,6 +166,15 @@ use tscaly.ast.EnumDeclarationData
 use tscaly.ast.EnumMemberData
 use tscaly.ast.ModuleDeclarationData
 use tscaly.ast.MappedTypeData
+use tscaly.ast.ImportDeclarationData
+use tscaly.ast.ImportEqualsDeclarationData
+use tscaly.ast.ImportClauseData
+use tscaly.ast.ImportOrExportSpecifierData
+use tscaly.ast.ImportAttributesData
+use tscaly.ast.ImportAttributeData
+use tscaly.ast.ExportAssignmentData
+use tscaly.ast.NamespaceExportDeclarationData
+use tscaly.ast.ExportDeclarationData
 
 ; The reference's jsdocScannerInfo — what the scanner noticed about the JSDoc
 ; comment preceding the token the parser is about to consume. It is captured at
@@ -182,6 +201,8 @@ define PCHeritageClauseElement: int 9
 define PCTypeMembers:         int 10
 define PCEnumMembers:         int 11
 define PCBlockStatements:     int 12
+define PCImportOrExportSpecifiers: int 13
+define PCImportAttributes:    int 14
 
 ; ── operator precedence, ported from internal/ast/precedence.go ─────────────
 ;
@@ -352,6 +373,16 @@ define Parser
     ; is false only inside the speculative half of an arrow-function parse.
     parameter_allow_ambiguity: bool
 
+    ; Which of the two specifier parsers PCImportOrExportSpecifiers dispatches
+    ; to. The reference passes the func VALUE to parseBracketedList —
+    ; parseImportSpecifier for `import { a }`, parseExportSpecifier for
+    ; `export { a }` — over ONE parsing context, and §3.5e is exactly this
+    ; case: both call sites are static, so the value carries no information a
+    ; flag does not. Set immediately before the call and restored after it, as
+    ; the two parameter-list fields above are; a specifier list cannot nest, so
+    ; the discipline is cheap insurance rather than a live hazard.
+    specifier_is_import: bool
+
     ; The reference's `notParenthesizedArrow` — the set of token positions at
     ; which a speculative arrow-function parse has already failed, so the same
     ; text is never speculated over twice. It is a pure MEMO: the reference adds
@@ -386,6 +417,7 @@ define Parser
         set this.has_parse_error: false
         set this.parameter_outer_await_context: false
         set this.parameter_allow_ambiguity: true
+        set this.specifier_is_import: true
         set this.not_parenthesized_arrow: null
         set this.statement_has_await_identifier: false
         set this.has_possible_await_span: false
@@ -823,14 +855,21 @@ define Parser
     ; assignment, an export declaration, an `import x = require(…)`, or an
     ; `import.meta` anywhere in the tree.
     ;
-    ; ★ Every one of those but the FIRST is a construct this slice reports as
-    ; unported, so a file that parsed to the end can only be a module by the
-    ; export-modifier arm — which is why one test suffices here and is not a
-    ; simplification. (`IsDeclarationFile` is the `.d.ts` name test; the pinned
-    ; corpus has no such case, as the oracle's own header records.)
+    ; ★★★ THIS FUNCTION IS WHERE SLICE 8 PAID §3.5l. Through slice 7 it tested
+    ; the export MODIFIER and nothing else, and the comment standing here said
+    ; so with a reason: "every one of those but the FIRST is a construct this
+    ; slice reports as unported, so a file that parsed to the end can only be a
+    ; module by the export-modifier arm". That reason was true and it EXPIRED
+    ; the moment import and export declarations started parsing — three of the
+    ; five remaining arms are exactly what this slice built. A condition whose
+    ; correctness rests on another part of the port being incomplete has to be
+    ; re-read by the slice that completes it.
     ;
-    ; This condition was NOT in the first version of this check, and the control
-    ; that found it is worth keeping in mind: removing the detection altogether
+    ; (`IsDeclarationFile` is the `.d.ts` name test; the pinned corpus has no
+    ; such case, as the oracle's own header records.)
+    ;
+    ; The detection itself was NOT in the first version of this check, and the
+    ; control that found it is worth keeping in mind: removing it altogether
     ; turned two corpus cases red and the fixture MATCHED — which can only mean
     ; the fixture was being reported for something the reference does not do. It
     ; had no export, so it was never a module.
@@ -842,10 +881,37 @@ define Parser
         var i 0
         while i < len
         {
-            if statement_has_export_modifier(*(statements.get_buffer() + i))
+            if statement_is_external_module_indicator(*(statements.get_buffer() + i))
                 return true
             set i: i + 1
         }
+        false
+    }
+
+    ; isAnExternalModuleIndicatorNode, arm for arm.
+    ;
+    ; ★ The last arm of the reference's own indicator — `import.meta` ANYWHERE
+    ; in the tree, found by a walk under the PossiblyContainsImportMeta flag —
+    ; is still absent, and for the reason the whole function's old comment gave:
+    ; `import.meta` is reported as unported (`import-expression`) before a tree
+    ; exists to walk. That claim is dated the same way the old one was, so the
+    ; slice that ports the import EXPRESSION owns this line.
+    function statement_is_external_module_indicator(n: pointer[AstNode]) returns bool
+    {
+        if statement_has_export_modifier(n)
+            return true
+        let k AstNode.kind_of(n)
+        if k = KindImportDeclaration
+            return true
+        if k = KindExportAssignment
+            return true
+        if k = KindExportDeclaration
+            return true
+        ; ★ An import EQUALS declaration counts only when its module reference
+        ; is `require("…")`: `import A = B.C` is an alias inside this file and
+        ; says nothing about the file being a module.
+        if k = KindImportEqualsDeclaration
+            return AstNode.import_equals_reference_kind(n) = KindExternalModuleReference
         false
     }
 
@@ -1114,9 +1180,30 @@ define Parser
         if token = KindNamespaceKeyword
             return this.parse_module_declaration(pos, jsdoc, modifiers)
 
-        ; The reference's remaining arms. Each is a whole declaration form and a
-        ; slice of its own; the tag says which one stopped the case, so the
-        ; unported histogram keeps naming the next one to build.
+        if token = KindImportKeyword
+            return this.parse_import_declaration_or_import_equals_declaration(pos, jsdoc, modifiers)
+
+        ; The export arm is the one that decides between four productions on
+        ; the token AFTER the keyword, which is why it consumes it here rather
+        ; than in the routines below.
+        if token = KindExportKeyword
+        {
+            this.next_token()
+            if token = KindDefaultKeyword
+                return this.parse_export_assignment(pos, jsdoc, modifiers)
+            if token = KindEqualsToken
+                return this.parse_export_assignment(pos, jsdoc, modifiers)
+            if token = KindAsKeyword
+                return this.parse_namespace_export_declaration(pos, jsdoc, modifiers)
+            return this.parse_export_declaration(pos, jsdoc, modifiers)
+        }
+
+        ; ★ ONE reference arm of this switch is deliberately still absent:
+        ; `case KindAwaitKeyword: if p.isAwaitUsingDeclaration() { … }`, i.e.
+        ; an `await using` declaration carrying MODIFIERS (`export await using
+        ; x = f()`). parse_statement already routes the bare form; this one is
+        ; reachable only with a modifier in front, no corpus case reaches it,
+        ; and the honest report is better than a path nothing measures.
         ;
         ; The reference's own fallthrough — modifiers with no declaration behind
         ; them — reports Declaration_expected and synthesizes a
@@ -4391,11 +4478,18 @@ define Parser
     ;     (is_list_element / is_list_terminator); the recovery is not, because
     ;     it only runs after a diagnostic, and a diagnostic is already unported.
     ;
-    ; (3) `unported` is STICKY and speculation does NOT undo it (§3.9e). So a
-    ;     look-ahead that walks into an unported construct stops the whole parse
-    ;     even if the reference would have discarded that branch. That
-    ;     over-reports and never under-reports, which is the direction this
-    ;     harness is built to err in.
+    ; (3) ★ THIS PARAGRAPH WAS TRUE WHEN SLICE 3 WROTE IT AND SLICE 5 REVERSED
+    ;     IT; it is corrected here rather than deleted, because the reasoning it
+    ;     records is the reasoning the `unanswerable` record now carries alone.
+    ;     It said `unported` is STICKY and a speculation does not undo it, so a
+    ;     look-ahead walking into an unported construct stops the whole parse
+    ;     even where the reference would discard the branch — over-reporting,
+    ;     which is the direction this harness errs in. What slice 5 measured is
+    ;     that the reference's own `rewind` TRUNCATES its diagnostics, so a
+    ;     discarded speculation reports nothing upstream and a sticky record
+    ;     made `a << b` unparsable. Since then a rewind restores `unported` and
+    ;     only `unanswerable` — one site, skip_parameter_start — survives one.
+    ;     See the ParserState header, where the argument lives.
 
     ; ── context flags ───────────────────────────────────────────────────────
     ;
@@ -7049,6 +7143,811 @@ define Parser
         result
     }
 
+    ; ════════════════════════════════════════════════════════════════════════
+    ; IMPORTS AND EXPORTS — parser slice 8
+    ; ════════════════════════════════════════════════════════════════════════
+    ;
+    ; parseDeclarationWorker's last two arms, and with them the router is
+    ; complete. They are ONE slice rather than two adjacent histogram rows
+    ; (`export` 21.3 %, `import` 19.9 %, 41.2 % of corpus first blockers
+    ; between them): parseImportOrExportSpecifier builds `{ a as b }` for both
+    ; sides, parseModuleSpecifier reads the `"mod"` for both, and
+    ; parseImportAttributes reads the `with { … }` for both. Building one of
+    ; them would have built most of the other.
+    ;
+    ; ── What is here ────────────────────────────────────────────────────────
+    ;
+    ;   parseImportDeclarationOrImportEqualsDeclaration and everything under it
+    ;     parseImportEqualsDeclaration / parseModuleReference /
+    ;       parseExternalModuleReference
+    ;     tryParseImportClause / parseImportClause / parseNamespaceImport /
+    ;       parseNamedImports / parseImportSpecifier
+    ;     parseModuleSpecifier
+    ;     tryParseImportAttributes / parseImportAttributes / parseImportAttribute
+    ;   parseExportAssignment, parseNamespaceExportDeclaration
+    ;   parseExportDeclaration / parseNamespaceExport / parseNamedExports /
+    ;       parseExportSpecifier
+    ;   parseImportOrExportSpecifier / parseModuleExportName, shared by both
+    ;
+    ; ── and what is deliberately not ────────────────────────────────────────
+    ;
+    ; ★ `import(…)` TYPES and the import EXPRESSION (`import.meta`,
+    ;   `import("m")`). They share the keyword and nothing else: both set flags
+    ;   on the SOURCE FILE node, which this port does not model, so parsing
+    ;   them would produce a file whose flags disagree with the reference's.
+    ;   Both were already reported before this slice and still are.
+    ;
+    ; ★ The `assert { … }` form of import attributes. The reference reports
+    ;   Import_assertions_have_been_replaced_by_import_attributes and parses
+    ;   the clause anyway — a diagnostic, so it is where this port stops. Only
+    ;   `with { … }` gets a tree here.
+    ;
+    ; ── The TEXT question, and how it is answered without any text ──────────
+    ;
+    ; ★★★ The reference asks `identifier.Text() == "type"` and `== "defer"` in
+    ; three places here, and this port stores no identifier text (ast.scaly's
+    ; header says why, and this is the slice that would have had to add it).
+    ; It does not need to: `type` and `defer` are CONTEXTUAL KEYWORDS, so the
+    ; scanner has already mapped exactly those two spellings — and no others —
+    ; to KindTypeKeyword and KindDeferKeyword. The token kind CAPTURED BEFORE
+    ; the identifier is parsed IS the text test, not an approximation of it.
+    ;
+    ; ★ It stays exact under the one shape that could break it: an escaped
+    ; spelling (`type`) scans to the same kind with the escape flag set,
+    ; and next_token reports THAT as unported before any of this runs. So there
+    ; is no text this port can see that the kind disagrees with.
+
+    procedure parse_import_declaration_or_import_equals_declaration(this, pos: int, jsdoc: int, modifiers: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
+    {
+        if this.parse_expected(KindImportKeyword) = false
+            return null
+        let after_import_pos this.node_pos()
+
+        ; ★ The whole head of an import is parsed in the OUTER await context —
+        ; the reference's comment says it reports the grammar error in the
+        ; checker instead — so whatever `await`-as-a-name it saw is put back
+        ; before the statement's own record is decided.
+        let saved_await_identifier statement_has_await_identifier
+
+        var identifier null as pointer[AstNode]
+        var identifier_kind: int KindUnknown
+        if this.is_identifier()
+        {
+            set identifier_kind: token
+            set identifier: this.parse_identifier()
+            if identifier = null
+                return null
+        }
+
+        ; `import type X from "m"` / `import defer * as ns from "m"`: the word
+        ; just parsed as an identifier turns out to be a PHASE MODIFIER, and
+        ; the name — if there is one at all — is the next word.
+        var phase_modifier: int KindUnknown
+        var is_phase false
+        if identifier_kind = KindTypeKeyword
+        {
+            if this.import_type_phase_follows()
+            {
+                set phase_modifier: KindTypeKeyword
+                set is_phase: true
+            }
+        }
+        if identifier_kind = KindDeferKeyword
+        {
+            if this.import_defer_phase_follows()
+            {
+                set phase_modifier: KindDeferKeyword
+                set is_phase: true
+            }
+        }
+        if is_phase
+        {
+            ; The name is OPTIONAL after a phase modifier (`import type * as ns
+            ; from "m"` has none), so the failure test is is_unported().
+            set identifier: null
+            if this.is_identifier()
+            {
+                set identifier: this.parse_identifier()
+                if identifier = null
+                    return null
+            }
+        }
+
+        ; `import A = …` — a name, nothing that commits to an import
+        ; DECLARATION after it, and no `defer` phase.
+        var take_import_equals false
+        if identifier <> null
+        {
+            if token_after_imported_identifier_definitely_produces_import_declaration(token) = false
+            {
+                if phase_modifier <> KindDeferKeyword
+                    set take_import_equals: true
+            }
+        }
+        if take_import_equals
+        {
+            let is_type_only phase_modifier = KindTypeKeyword
+            let import_equals this.parse_import_equals_declaration(pos, jsdoc, modifiers, identifier, is_type_only)
+            set statement_has_await_identifier: saved_await_identifier
+            return import_equals
+        }
+
+        ; A null clause is `import "m";`, which is legitimate — the failure
+        ; test is the flag, not the result (§3.5h).
+        let import_clause this.try_parse_import_clause(identifier, after_import_pos, phase_modifier)
+        if this.is_unported()
+            return null
+        set statement_has_await_identifier: saved_await_identifier
+
+        let module_specifier this.parse_module_specifier()
+        if module_specifier = null
+            return null
+        ; ... and a null attributes clause is the ordinary import.
+        let attributes this.try_parse_import_attributes()
+        if this.is_unported()
+            return null
+        if this.parse_semicolon() = false
+            return null
+
+        let result this.finish_node(this.new_node(KindImportDeclaration, NodeData.ImportDeclaration(ImportDeclarationData(modifiers, import_clause, module_specifier, attributes))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    ; The `type` test's two remaining halves, minus the text comparison the
+    ; caller has already made. Split out because the reference writes it as one
+    ; three-line boolean, and a boolean that long is exactly where a port loses
+    ; a clause without noticing.
+    procedure import_type_phase_follows(this) returns bool
+    {
+        ; `import type from "m"` is a DEFAULT import named `type`; only what
+        ; follows the `from` can say which reading is meant.
+        if token = KindFromKeyword
+        {
+            if this.is_identifier() = false
+                return false
+            if this.look_ahead_next_token_is_from_keyword_or_equals_token() = false
+                return false
+        }
+        if this.is_identifier()
+            return true
+        token_after_import_definitely_produces_import_declaration(token)
+    }
+
+    procedure import_defer_phase_follows(this) returns bool
+    {
+        ; `import defer from "m"` — a default import named `defer` — versus
+        ; `import defer from from "m"`, where the first `from` is the name.
+        if token = KindFromKeyword
+            return this.look_ahead_next_token_is_token_string_literal() = false
+        if token = KindCommaToken
+            return false
+        token <> KindEqualsToken
+    }
+
+    procedure next_token_is_from_keyword_or_equals_token(this) returns bool
+    {
+        this.next_token()
+        if token = KindFromKeyword
+            return true
+        token = KindEqualsToken
+    }
+
+    procedure look_ahead_next_token_is_from_keyword_or_equals_token(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_token_is_from_keyword_or_equals_token()
+        this.rewind(saved)
+        r
+    }
+
+    procedure next_token_is_token_string_literal(this) returns bool
+    {
+        this.next_token() = KindStringLiteral
+    }
+
+    procedure look_ahead_next_token_is_token_string_literal(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_token_is_token_string_literal()
+        this.rewind(saved)
+        r
+    }
+
+    ; In `import ___`, these two say what the token can no longer be. A `*` or
+    ; a `{` cannot be a name, so an import DECLARATION is certain; a `,` or a
+    ; `from` after a name means the name was an imported binding rather than
+    ; the left-hand side of an `import x = …`.
+    function token_after_import_definitely_produces_import_declaration(k: int) returns bool
+    {
+        if k = KindAsteriskToken
+            return true
+        k = KindOpenBraceToken
+    }
+
+    function token_after_imported_identifier_definitely_produces_import_declaration(k: int) returns bool
+    {
+        if k = KindCommaToken
+            return true
+        k = KindFromKeyword
+    }
+
+    procedure parse_import_equals_declaration(this, pos: int, jsdoc: int, modifiers: pointer[Array[pointer[AstNode]]], identifier: pointer[AstNode], is_type_only: bool) returns pointer[AstNode]
+    {
+        if this.parse_expected(KindEqualsToken) = false
+            return null
+        let module_reference this.parse_module_reference()
+        if module_reference = null
+            return null
+        if this.parse_semicolon() = false
+            return null
+        let result this.finish_node(this.new_node(KindImportEqualsDeclaration, NodeData.ImportEqualsDeclaration(ImportEqualsDeclarationData(modifiers, is_type_only, identifier, module_reference))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    procedure parse_module_reference(this) returns pointer[AstNode]
+    {
+        ; `require` is a contextual keyword, so it is a legal name too:
+        ; `import A = require` is an alias and only the `(` separates them.
+        if token = KindRequireKeyword
+        {
+            if this.look_ahead_next_token_is_open_paren()
+                return this.parse_external_module_reference()
+        }
+        this.parse_entity_name(false)
+    }
+
+    procedure parse_external_module_reference(this) returns pointer[AstNode]
+    {
+        ; ★ This restore is a REDUNDANCY in the reference, ported because the
+        ; reference has it and measured so that the next reader does not spend
+        ; an hour trying to gate it: the only route here is
+        ; parse_import_equals_declaration, and its caller restores the same
+        ; field again on return, so removing this line changes nothing on any
+        ; case. Unreachable-in-effect, not uncovered — the distinction slice 7
+        ; drew for the enum member's DisallowIn clear.
+        let saved_await_identifier statement_has_await_identifier
+        let pos this.node_pos()
+        if this.parse_expected(KindRequireKeyword) = false
+            return null
+        if this.parse_expected(KindOpenParenToken) = false
+            return null
+        let expression this.parse_module_specifier()
+        if expression = null
+            return null
+        if this.parse_expected(KindCloseParenToken) = false
+            return null
+        let result this.finish_node(this.new_node(KindExternalModuleReference, NodeData.ExternalModuleReference(WrappedTypeData(expression))), pos)
+        set statement_has_await_identifier: saved_await_identifier
+        result
+    }
+
+    ; ★ The grammar allows a string literal and nothing else. The reference
+    ; parses an arbitrary EXPRESSION anyway and lets the checker say so — so
+    ; `import x from y;` produces a tree here rather than a parse failure, and
+    ; dropping that would be a different parser, not a smaller one.
+    ;
+    ; (The reference additionally INTERNS the literal's text; this port keeps
+    ; no text, so there is nothing to intern.)
+    procedure parse_module_specifier(this) returns pointer[AstNode]
+    {
+        if token = KindStringLiteral
+            return this.parse_literal_expression(KindStringLiteral)
+        this.parse_expression()
+    }
+
+    ; ★ The reference's skipJSDocLeadingAsterisks parameter is dropped: it is
+    ; true only where the JSDoc parser calls in, and false at the one call site
+    ; on the parse path. Left out rather than carried as a parameter that can
+    ; never be anything but false — the same treatment
+    ; ParseFlagsIgnoreMissingOpenBrace gets at the top of this file.
+    procedure try_parse_import_clause(this, identifier: pointer[AstNode], pos: int, phase_modifier: int) returns pointer[AstNode]
+    {
+        var has_clause false
+        if identifier <> null
+            set has_clause: true
+        if token = KindAsteriskToken
+            set has_clause: true
+        if token = KindOpenBraceToken
+            set has_clause: true
+        if has_clause = false
+            return null
+
+        let import_clause this.parse_import_clause(identifier, pos, phase_modifier)
+        if import_clause = null
+            return null
+        if this.parse_expected(KindFromKeyword) = false
+            return null
+        import_clause
+    }
+
+    procedure parse_import_clause(this, identifier: pointer[AstNode], pos: int, phase_modifier: int) returns pointer[AstNode]
+    {
+        let saved_await_identifier statement_has_await_identifier
+        var named_bindings null as pointer[AstNode]
+
+        ; `identifier == nil || p.parseOptional(Comma)`, and the SHORT-CIRCUIT
+        ; is load-bearing: with no default binding there is no comma to
+        ; consume, and consuming one would eat the `,` of something else.
+        var parse_bindings false
+        if identifier = null
+            set parse_bindings: true
+        else
+        {
+            if this.parse_optional(KindCommaToken)
+                set parse_bindings: true
+        }
+        if parse_bindings
+        {
+            if token = KindAsteriskToken
+                set named_bindings: this.parse_namespace_import()
+            else
+                set named_bindings: this.parse_named_imports()
+            if named_bindings = null
+                return null
+        }
+
+        let result this.finish_node(this.new_node(KindImportClause, NodeData.ImportClause(ImportClauseData(phase_modifier, identifier, named_bindings))), pos)
+        set statement_has_await_identifier: saved_await_identifier
+        result
+    }
+
+    procedure parse_namespace_import(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        if this.parse_expected(KindAsteriskToken) = false
+            return null
+        if this.parse_expected(KindAsKeyword) = false
+            return null
+        let name this.parse_identifier()
+        if name = null
+            return null
+        this.finish_node(this.new_node(KindNamespaceImport, NodeData.NamespaceImport(WrappedTypeData(name))), pos)
+    }
+
+    procedure parse_named_imports(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let saved specifier_is_import
+        set specifier_is_import: true
+        let imports this.parse_bracketed_list(PCImportOrExportSpecifiers, KindOpenBraceToken, KindCloseBraceToken)
+        set specifier_is_import: saved
+        if imports = null
+            return null
+        this.finish_node(this.new_node(KindNamedImports, NodeData.NamedImports(ElementListData(imports))), pos)
+    }
+
+    procedure parse_import_specifier(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        var is_type_only false
+        var property_name null as pointer[AstNode]
+        let name this.parse_import_or_export_specifier(KindImportSpecifier, &is_type_only, &property_name)
+        if name = null
+            return null
+
+        ; ★ An import specifier's NAME is the binding it introduces, so it must
+        ; be an identifier: `import { "a" } from "m"` is legal ES only with an
+        ; `as`. The reference reports Identifier_expected and synthesizes an
+        ; EMPTY identifier — a diagnostic plus a missing node, so it is where
+        ; this port stops. (The property-name half may be a string literal, and
+        ; that is what parse_import_or_export_specifier has already allowed.)
+        if AstNode.kind_of(name) <> KindIdentifier
+            return this.unported("identifier-expected", token)
+
+        this.finish_node(this.new_node(KindImportSpecifier, NodeData.ImportSpecifier(ImportOrExportSpecifierData(is_type_only, property_name, name))), pos)
+    }
+
+    ; ★★★ parseImportOrExportSpecifier, and the four readings of `type` are the
+    ; whole of it. The reference's own table, which is the clearest statement
+    ; of why this cannot be simplified:
+    ;
+    ;   import { type }              isTypeOnly false  name type
+    ;   import { type as }           isTypeOnly TRUE   name as
+    ;   import { type as as }        isTypeOnly false  name as    property type
+    ;   import { type as as as }     isTypeOnly TRUE   name as    property as
+    ;
+    ; The two answers this port cannot return through a `return` — the type-only
+    ; flag and the property name — travel as out-parameters. Both are scalars
+    ; or pointers, which is the safe direction: an out-parameter carrying a
+    ; String-bearing struct is the live dangling class in this repo.
+    procedure parse_import_or_export_specifier(this, kind: int, out_is_type_only: pointer[bool], out_property_name: pointer[pointer[AstNode]]) returns pointer[AstNode]
+    {
+        set *out_is_type_only: false
+        set *out_property_name: null
+
+        var can_parse_as_keyword true
+        let disallow_keywords kind = KindImportSpecifier
+        var name_ok true
+
+        ; The kind BEFORE the name is parsed — the text test again.
+        let first_kind token
+        var name null as pointer[AstNode]
+        set name: this.parse_module_export_name(disallow_keywords, &name_ok)
+        if name = null
+            return null
+
+        if first_kind = KindTypeKeyword
+        {
+            if token = KindAsKeyword
+            {
+                let first_as this.parse_identifier_name()
+                if first_as = null
+                    return null
+                if token = KindAsKeyword
+                {
+                    let second_as this.parse_identifier_name()
+                    if second_as = null
+                        return null
+                    if this.can_parse_module_export_name()
+                    {
+                        ; { type as as something }
+                        set *out_is_type_only: true
+                        set *out_property_name: first_as
+                        set name: this.parse_module_export_name(disallow_keywords, &name_ok)
+                        if name = null
+                            return null
+                        set can_parse_as_keyword: false
+                    }
+                    else
+                    {
+                        ; { type as as }
+                        set *out_property_name: name
+                        set name: second_as
+                        set can_parse_as_keyword: false
+                    }
+                }
+                else
+                {
+                    if this.can_parse_module_export_name()
+                    {
+                        ; { type as something }
+                        set *out_property_name: name
+                        set can_parse_as_keyword: false
+                        set name: this.parse_module_export_name(disallow_keywords, &name_ok)
+                        if name = null
+                            return null
+                    }
+                    else
+                    {
+                        ; { type as }
+                        set *out_is_type_only: true
+                        set name: first_as
+                    }
+                }
+            }
+            else
+            {
+                if this.can_parse_module_export_name()
+                {
+                    ; { type something }
+                    set *out_is_type_only: true
+                    set name: this.parse_module_export_name(disallow_keywords, &name_ok)
+                    if name = null
+                        return null
+                }
+            }
+        }
+
+        if can_parse_as_keyword
+        {
+            if token = KindAsKeyword
+            {
+                set *out_property_name: name
+                if this.parse_expected(KindAsKeyword) = false
+                    return null
+                set name: this.parse_module_export_name(disallow_keywords, &name_ok)
+                if name = null
+                    return null
+            }
+        }
+
+        ; parseErrorAtRange(Identifier_expected). Reported HERE, where the
+        ; reference reports it, and not where it was noticed — see
+        ; parse_module_export_name for why the difference is observable.
+        if name_ok = false
+            return this.unported("identifier-expected", token)
+        name
+    }
+
+    function can_parse_module_export_name(this) returns bool
+    {
+        if token_is_identifier_or_keyword(token)
+            return true
+        token = KindStringLiteral
+    }
+
+    procedure parse_module_export_name(this, disallow_keywords: bool, out_ok: pointer[bool]) returns pointer[AstNode]
+    {
+        ; ★ `nameOk` is ASSIGNED at every call in the reference, never
+        ; accumulated — so a name refused here and then demoted to a PROPERTY
+        ; name by a following `as` leaves no error behind. `import { if as x }`
+        ; is legal for exactly that reason, and a flag that only ever went
+        ; false would refuse it.
+        set *out_ok: true
+
+        ; An "arbitrary module namespace identifier" — `export { x as "a-b" }`.
+        if token = KindStringLiteral
+            return this.parse_literal_expression(KindStringLiteral)
+
+        ; An import specifier's name binds, so a reserved word is refused
+        ; there; an export specifier's does not, and may be one.
+        if disallow_keywords
+        {
+            if is_keyword(token)
+            {
+                if this.is_identifier() = false
+                    set *out_ok: false
+            }
+        }
+        this.parse_identifier_name()
+    }
+
+    ; ── import attributes ───────────────────────────────────────────────────
+
+    procedure try_parse_import_attributes(this) returns pointer[AstNode]
+    {
+        if token = KindWithKeyword
+            return this.parse_import_attributes(KindWithKeyword, false)
+        if token = KindAssertKeyword
+        {
+            ; The deprecated spelling. The reference reports
+            ; Import_assertions_have_been_replaced_by_import_attributes and
+            ; parses the clause anyway — a diagnostic, so it is the edge here.
+            ; A line break before it makes it an ordinary identifier instead,
+            ; and then there are no attributes at all.
+            if this.has_preceding_line_break() = false
+                return this.unported("import-assertion", token)
+        }
+        null
+    }
+
+    ; `skip_keyword` is the reference's, and it is false at both call sites in
+    ; this slice. The true one is `parseImportTypeNode` — the `import("m", {
+    ; with: { … } })` TYPE, which reads the keyword and the colon itself before
+    ; handing the brace over — and that node is unported. Kept as a parameter
+    ; because it is the reference's shape and the routine reads correctly with
+    ; it; contrast skipJSDocLeadingAsterisks above, which was dropped because
+    ; carrying it would have meant carrying its BEHAVIOUR too.
+    procedure parse_import_attributes(this, tok: int, skip_keyword: bool) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        if skip_keyword = false
+        {
+            if this.parse_expected(tok) = false
+                return null
+        }
+        ; Both brace arms are diagnostics in the reference — a missing `{`
+        ; answers an empty list and carries on, and a missing `}` attaches
+        ; related information pointing back at the `{` — so both are where this
+        ; port stops.
+        if this.parse_expected(KindOpenBraceToken) = false
+            return null
+        let elements this.parse_delimited_list(PCImportAttributes)
+        if elements = null
+            return null
+        if this.parse_expected(KindCloseBraceToken) = false
+            return null
+        this.finish_node(this.new_node(KindImportAttributes, NodeData.ImportAttributes(ImportAttributesData(tok, elements))), pos)
+    }
+
+    procedure parse_import_attribute(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        var name null as pointer[AstNode]
+        if token_is_identifier_or_keyword(token)
+            set name: this.parse_identifier_name()
+        else
+        {
+            if token = KindStringLiteral
+                set name: this.parse_literal_expression(KindStringLiteral)
+        }
+        ; The reference's else arm reports Identifier_or_string_literal_expected
+        ; and parses the VALUE anyway.
+        if name = null
+            return this.unported("import-attribute-name", token)
+        if this.parse_expected(KindColonToken) = false
+            return null
+        let value this.parse_assignment_expression_or_higher()
+        if value = null
+            return null
+        this.finish_node(this.new_node(KindImportAttribute, NodeData.ImportAttribute(ImportAttributeData(name, value))), pos)
+    }
+
+    ; isImportAttributeName. The same test can_parse_module_export_name makes,
+    ; under the reference's other name for it — kept as two functions because
+    ; they answer two different questions that happen to agree, and collapsing
+    ; them would put one list context's predicate in the other's routine.
+    function is_import_attribute_name(this) returns bool
+    {
+        if token_is_identifier_or_keyword(token)
+            return true
+        token = KindStringLiteral
+    }
+
+    ; ── the export declarations ─────────────────────────────────────────────
+
+    procedure parse_export_assignment(this, pos: int, jsdoc: int, modifiers: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
+    {
+        let saved context_flags
+        let saved_await_identifier statement_has_await_identifier
+        this.set_context_flags(NodeFlagsAwaitContext, true)
+
+        var is_export_equals false
+        if this.parse_optional(KindEqualsToken)
+            set is_export_equals: true
+        else
+        {
+            if this.parse_expected(KindDefaultKeyword) = false
+                return null
+        }
+
+        let expression this.parse_assignment_expression_or_higher()
+        if expression = null
+            return null
+        if this.parse_semicolon() = false
+            return null
+
+        ; ★ The flags are restored BEFORE finish_node, which is where they join
+        ; the node — so the ExportAssignment itself does NOT carry AwaitContext
+        ; while everything parsed inside it does. Swapping these two lines
+        ; changes one flag on one node, and the dump says so.
+        set context_flags: saved
+        set statement_has_await_identifier: saved_await_identifier
+        let result this.finish_node(this.new_node(KindExportAssignment, NodeData.ExportAssignment(ExportAssignmentData(modifiers, is_export_equals, expression))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    ; `export as namespace N;` — a UMD global declaration. The reference
+    ; attaches the modifiers although the node may not have any, so that the
+    ; grammar checker can report them.
+    procedure parse_namespace_export_declaration(this, pos: int, jsdoc: int, modifiers: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
+    {
+        if this.parse_expected(KindAsKeyword) = false
+            return null
+        if this.parse_expected(KindNamespaceKeyword) = false
+            return null
+        let saved_await_identifier statement_has_await_identifier
+        let name this.parse_identifier()
+        if name = null
+            return null
+        set statement_has_await_identifier: saved_await_identifier
+        if this.parse_semicolon() = false
+            return null
+        let result this.finish_node(this.new_node(KindNamespaceExportDeclaration, NodeData.NamespaceExportDeclaration(NamespaceExportDeclarationData(modifiers, name))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    procedure parse_export_declaration(this, pos: int, jsdoc: int, modifiers: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
+    {
+        let saved context_flags
+        let saved_await_identifier statement_has_await_identifier
+        this.set_context_flags(NodeFlagsAwaitContext, true)
+
+        var export_clause null as pointer[AstNode]
+        var module_specifier null as pointer[AstNode]
+        var attributes null as pointer[AstNode]
+        let is_type_only this.parse_optional(KindTypeKeyword)
+
+        ; The namespace export's own position is taken BEFORE the `*`, so
+        ; `export * as ns from "m"` gives the NamespaceExport a range that
+        ; starts at the asterisk rather than at the `as`.
+        let namespace_export_pos this.node_pos()
+        if this.parse_optional(KindAsteriskToken)
+        {
+            if this.parse_optional(KindAsKeyword)
+            {
+                set export_clause: this.parse_namespace_export(namespace_export_pos)
+                if export_clause = null
+                    return null
+            }
+            if this.parse_expected(KindFromKeyword) = false
+                return null
+            set module_specifier: this.parse_module_specifier()
+            if module_specifier = null
+                return null
+        }
+        else
+        {
+            set export_clause: this.parse_named_exports()
+            if export_clause = null
+                return null
+
+            ; ★ A missing `from` is common enough to be worth recovering from,
+            ; and the reference's rule is that a STRING LITERAL on the same
+            ; line commits to a module specifier anyway — which is what keeps
+            ; `export { from "mod";` reporting one error rather than parsing as
+            ; something else entirely.
+            var has_from false
+            if token = KindFromKeyword
+                set has_from: true
+            if token = KindStringLiteral
+            {
+                if this.has_preceding_line_break() = false
+                    set has_from: true
+            }
+            if has_from
+            {
+                if this.parse_expected(KindFromKeyword) = false
+                    return null
+                set module_specifier: this.parse_module_specifier()
+                if module_specifier = null
+                    return null
+            }
+        }
+
+        ; Attributes only after a module specifier — `export { a } with { … }`
+        ; has nothing to attach them to.
+        if module_specifier <> null
+        {
+            var has_attributes false
+            if token = KindWithKeyword
+                set has_attributes: true
+            if token = KindAssertKeyword
+                set has_attributes: true
+            if has_attributes
+            {
+                if this.has_preceding_line_break() = false
+                {
+                    if token = KindAssertKeyword
+                        return this.unported("import-assertion", token)
+                    set attributes: this.parse_import_attributes(token, false)
+                    if attributes = null
+                        return null
+                }
+            }
+        }
+
+        if this.parse_semicolon() = false
+            return null
+
+        ; Restored before finish_node, exactly as in parse_export_assignment
+        ; and for the same reason.
+        set context_flags: saved
+        set statement_has_await_identifier: saved_await_identifier
+        let result this.finish_node(this.new_node(KindExportDeclaration, NodeData.ExportDeclaration(ExportDeclarationData(modifiers, is_type_only, export_clause, module_specifier, attributes))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
+    ; ★ The reference discards this call's `nameOk` (`exportName, _ :=`), and
+    ; that is sound rather than sloppy: keywords are ALLOWED here, and only the
+    ; disallowing side can answer false.
+    procedure parse_namespace_export(this, pos: int) returns pointer[AstNode]
+    {
+        var ok true
+        let export_name this.parse_module_export_name(false, &ok)
+        if export_name = null
+            return null
+        this.finish_node(this.new_node(KindNamespaceExport, NodeData.NamespaceExport(WrappedTypeData(export_name))), pos)
+    }
+
+    procedure parse_named_exports(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let saved specifier_is_import
+        set specifier_is_import: false
+        let exports this.parse_bracketed_list(PCImportOrExportSpecifiers, KindOpenBraceToken, KindCloseBraceToken)
+        set specifier_is_import: saved
+        if exports = null
+            return null
+        this.finish_node(this.new_node(KindNamedExports, NodeData.NamedExports(ElementListData(exports))), pos)
+    }
+
+    ; ★ The export specifier carries JSDoc and the import specifier does not —
+    ; the reference's two routines differ in exactly that and in the kind, and
+    ; this port keeps the difference rather than folding them into one.
+    procedure parse_export_specifier(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let jsdoc this.jsdoc_scanner_info()
+        var is_type_only false
+        var property_name null as pointer[AstNode]
+        let name this.parse_import_or_export_specifier(KindExportSpecifier, &is_type_only, &property_name)
+        if name = null
+            return null
+        let result this.finish_node(this.new_node(KindExportSpecifier, NodeData.ExportSpecifier(ImportOrExportSpecifierData(is_type_only, property_name, name))), pos)
+        this.with_jsdoc(result, jsdoc)
+    }
+
     ; ── the two look-aheads this slice adds ─────────────────────────────────
 
     procedure look_ahead_next_token_is_identifier_or_keyword(this) returns bool
@@ -7188,6 +8087,19 @@ define Parser
             return this.parse_enum_member()
         if ctx = PCBlockStatements
             return this.parse_statement()
+        ; ★ ONE reference context, TWO element parsers — parseImportSpecifier
+        ; and parseExportSpecifier — which upstream passes as a func value.
+        ; §3.5e: both call sites are static, so the value carries no
+        ; information the flag does not, and the flag is what a static arm can
+        ; read. The context stays one, as it is upstream.
+        if ctx = PCImportOrExportSpecifiers
+        {
+            if specifier_is_import
+                return this.parse_import_specifier()
+            return this.parse_export_specifier()
+        }
+        if ctx = PCImportAttributes
+            return this.parse_import_attribute()
         this.parse_type()
     }
 
@@ -7279,6 +8191,24 @@ define Parser
             ; never arises — the same note PCClassMembers carries.
             return this.is_start_of_statement()
         }
+        if ctx = PCImportOrExportSpecifiers
+        {
+            ; ★ `import { from "mod"` — an unterminated clause where the `from`
+            ; was meant as the keyword. Bailing out here rather than reading
+            ; `from` as a specifier is what lets the reference say "'}'
+            ; expected" instead of a worse error further on.
+            if token = KindFromKeyword
+            {
+                if this.look_ahead_next_token_is_token_string_literal()
+                    return false
+            }
+            ; A string literal is an "arbitrary module namespace identifier".
+            if token = KindStringLiteral
+                return true
+            return token_is_identifier_or_keyword(token)
+        }
+        if ctx = PCImportAttributes
+            return this.is_import_attribute_name()
         ; PCTypeArguments and PCTupleElementTypes share one arm upstream too.
         if token = KindCommaToken
             return true
@@ -7345,13 +8275,17 @@ define Parser
                 return true
             return token = KindCloseBracketToken
         }
-        ; The three contexts that live inside braces. They share one arm
-        ; upstream, together with PCClassMembers above.
+        ; The contexts that live inside braces. They share one arm upstream,
+        ; together with PCClassMembers above.
         if ctx = PCTypeMembers
             return token = KindCloseBraceToken
         if ctx = PCEnumMembers
             return token = KindCloseBraceToken
         if ctx = PCBlockStatements
+            return token = KindCloseBraceToken
+        if ctx = PCImportOrExportSpecifiers
+            return token = KindCloseBraceToken
+        if ctx = PCImportAttributes
             return token = KindCloseBraceToken
         ; PCTypeArguments: anything but a comma ends the list.
         token <> KindCommaToken
