@@ -17,11 +17,25 @@
 # around the oracle build (materialize in, build, remove, verify clean on both
 # sides). One copy of that is one place to get it right.
 #
-# Three outcomes per case per yardstick, and the third is the point:
+# ★★★ THE UNIT OF COMPARISON IS A UNIT, NOT A CASE. A corpus case is a SCRIPT
+# for the reference's test harness — `// @option: value` lines configure the
+# compile and `// @Filename: path` starts a new file — so 145 of the 296 cases
+# hold several files, and not all of them are TypeScript. A third oracle,
+# `split`, runs the reference's OWN splitter over each case and writes the units
+# out; both yardsticks then run per unit. See tests/oracle/split.go for the
+# measurement that forced this: feeding the whole case file to a TypeScript
+# parser meant 209 of the 241 syntactic diagnostics the reference produced over
+# the corpus came out of package.json and tsconfig.json bodies read as
+# TypeScript, which is a document the reference's own runner never parses.
+#
+# A single-file case yields exactly one unit, so its case key is unchanged; a
+# multi-file case's units are keyed `<case>@<unit path>`.
+#
+# Three outcomes per UNIT per yardstick, and the third is the point:
 #
 #   MATCH      identical output
 #   UNPORTED   our side met a construct this slice does not implement and said
-#              so; no claim is made about the case
+#              so; no claim is made about the unit
 #   FAIL       the outputs differ, and no accepted.txt entry explains it
 #
 # UNPORTED is not a pass. It is counted, printed, and the totals show it — an
@@ -119,11 +133,13 @@ if [ -n "$SUB_GITDIR" ] && [ -d "$SUB_GITDIR/info" ]; then
     || echo '/oracle/' >> "$SUB_GITDIR/info/exclude"
 fi
 
-mkdir -p "$SUB/oracle/tokens" "$SUB/oracle/ast"
+mkdir -p "$SUB/oracle/tokens" "$SUB/oracle/ast" "$SUB/oracle/split"
 cp "$PKG/tests/oracle/tokens.go" "$SUB/oracle/tokens/main.go"
 cp "$PKG/tests/oracle/ast.go"    "$SUB/oracle/ast/main.go"
+cp "$PKG/tests/oracle/split.go"  "$SUB/oracle/split/main.go"
 ( cd "$SUB" && go build -o "$REPO/$OUT/oracle_tokens" ./oracle/tokens \
-            && go build -o "$REPO/$OUT/oracle_ast"    ./oracle/ast ) \
+            && go build -o "$REPO/$OUT/oracle_ast"    ./oracle/ast \
+            && go build -o "$REPO/$OUT/oracle_split"  ./oracle/split ) \
   > "$OUT/oracle-build.log" 2>&1
 orc=$?
 rm -rf "$SUB/oracle"
@@ -204,6 +220,68 @@ matched_ast=0;    unported_ast=0;    failed_ast=0;    accepted_ast=0;    stale_a
 failures=()
 stales=()
 
+# Units the yardsticks do not compare, counted by REASON. Both oracles force
+# ScriptKindTS — the only script kind this port implements — so a unit the
+# reference's harness would parse under a different kind is measuring a parse
+# neither side intends. That is the same argument that excludes .tsx at case
+# discovery, applied one level down; each count is printed, because a
+# measurement that silently shrinks is the failure mode this whole suite is
+# organized against.
+cases_seen=0
+skip_json=0; skip_dts=0; skip_jsx=0; skip_other=0
+# Compared, but not under the kind the reference's harness would choose — see
+# classify_unit's .js arm. Counted so the report states it rather than implying
+# that every compared unit is a faithful one.
+js_compared=0
+
+UNIT_SKIP=
+classify_unit() {
+  local low
+  low=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+  case $low in
+    # ★★ A declaration file sets NodeFlagsAmbient (1 << 23) from its NAME —
+    # `IsDeclarationFileName` is consulted before parsing, so the SourceFile node
+    # carries it too — and this port models no file-level context, so the flags
+    # column differs for a reason that has nothing to do with the construct under
+    # test. Skipped rather than accepted, because an accepted deviation on 56
+    # units would be a standing excuse rather than an argued exception.
+    #
+    # ★ Measured rather than assumed, and the measurement makes it a small ITEM
+    # rather than a limitation: on compiler_invocationErrorRecovery's foo.d.ts the
+    # entire difference is ONE line, the SourceFile's flags, because everything
+    # inside it is individually `declare`d and our port propagates that correctly.
+    # A .d.ts whose members are not would diverge more widely. Making these live
+    # is a one-flag change — thread the unit name into Parser.parse and set the
+    # context flag when the name ends in .d.ts — and it is the first thing the
+    # split EXPOSED: TESTPLAN.md's note that "the pinned corpus contains no .d.ts
+    # case, so the path is unexercised on both sides" was true of whole cases and
+    # false of sections.
+    *.d.ts|*.d.mts|*.d.cts) UNIT_SKIP=declaration ;;
+    *.ts|*.mts|*.cts)       UNIT_SKIP= ;;
+    *.tsx|*.jsx)            UNIT_SKIP=jsx ;;
+    # ★★★ A .js unit IS compared, as TypeScript on BOTH sides, and the reasoning
+    # is worth having because the first draft skipped it. The reference's harness
+    # would parse it under ScriptKindJS, where JSDoc is syntax — so this is not
+    # the parse the reference RUNS. It is still a well-defined comparison of the
+    # component being ported (our TypeScript parser against the reference's, over
+    # that text), because the oracle is TOLD which kind to use, and JSDoc is just
+    # a comment under ScriptKindTS.
+    #
+    # Skipping them was measured and cost 60 corpus cases that MATCH — the whole
+    # jsdoc/salsa/cjs part of the corpus, previously compared as part of the
+    # concatenated case text. The .json exclusion below earns its keep by VALUE
+    # (25 cases blocked behind the error recovery of a document that is not a
+    # program, for no information); this one would have subtracted 60 matching
+    # comparisons and bought nothing. They move to ScriptKindJS when the port has
+    # one, and that slice is what makes them faithful rather than merely valid.
+    *.js|*.cjs|*.mjs)       UNIT_SKIP= ;;
+    # ScriptKindJSON is a different grammar (parseJsonText). This is the class
+    # that made the split worth building.
+    *.json)                 UNIT_SKIP=json ;;
+    *)                      UNIT_SKIP=other ;;
+  esac
+}
+
 # Compare one artifact of one case and leave the verdict in VERDICT, so the
 # caller can bump its own counters. $1 case name, $2 artifact (tokens|ast),
 # $3 the number of oracle fields to keep, $4 our binary, $5 the oracle,
@@ -265,27 +343,74 @@ for case_file in "${cases[@]}"; do
   name=${name%.ts}
   name=${name//\//_}
   [ -n "$FILTER" ] && case "$name" in *"$FILTER"*) ;; *) continue ;; esac
+  cases_seen=$((cases_seen + 1))
 
-  work="$OUT/cases/$name"
-  rm -rf "$work"; mkdir -p "$work"
+  case_work="$OUT/cases/$name"
+  rm -rf "$case_work"; mkdir -p "$case_work"
 
-  compare_one "$name" tokens 4 "$OUT/tscaly_tokens" "$OUT/oracle_tokens" "$case_file" "$work"
-  case $VERDICT in
-    MATCH)    matched_tokens=$((matched_tokens + 1)) ;;
-    STALE)    matched_tokens=$((matched_tokens + 1)); stale_tokens=$((stale_tokens + 1)) ;;
-    UNPORTED) unported_tokens=$((unported_tokens + 1)) ;;
-    ACCEPTED) accepted_tokens=$((accepted_tokens + 1)) ;;
-    FAIL)     failed_tokens=$((failed_tokens + 1)) ;;
-  esac
+  # The reference's own splitter. No pipeline: its exit code is read.
+  "$OUT/oracle_split" "$case_file" "$case_work/units" \
+    > "$case_work/units.manifest" 2> "$case_work/units.err"
+  if [ $? -ne 0 ]; then
+    failures+=("split/$name: $(head -1 "$case_work/units.err" 2>/dev/null)")
+    failed_tokens=$((failed_tokens + 1)); failed_ast=$((failed_ast + 1))
+    continue
+  fi
 
-  compare_one "$name" ast 5 "$OUT/tscaly_ast" "$OUT/oracle_ast" "$case_file" "$work"
-  case $VERDICT in
-    MATCH)    matched_ast=$((matched_ast + 1)) ;;
-    STALE)    matched_ast=$((matched_ast + 1)); stale_ast=$((stale_ast + 1)) ;;
-    UNPORTED) unported_ast=$((unported_ast + 1)) ;;
-    ACCEPTED) accepted_ast=$((accepted_ast + 1)) ;;
-    FAIL)     failed_ast=$((failed_ast + 1)) ;;
-  esac
+  unit_count=$(grep -c . "$case_work/units.manifest")
+
+  while read -r idx written unit_name; do
+    [ -n "$written" ] || continue
+
+    classify_unit "$unit_name"
+    if [ -n "$UNIT_SKIP" ]; then
+      case $UNIT_SKIP in
+        json)        skip_json=$((skip_json + 1)) ;;
+        declaration) skip_dts=$((skip_dts + 1)) ;;
+        jsx)         skip_jsx=$((skip_jsx + 1)) ;;
+        *)           skip_other=$((skip_other + 1)) ;;
+      esac
+      continue
+    fi
+
+    # ★ A single-unit case keeps its own key, so every existing accepted.txt
+    # entry, every fixture name and every number in CLAUDE.md's tables still
+    # refers to the same thing. Only a genuinely multi-file case gains a suffix,
+    # and the suffix is the unit's own PATH — unique within the case and stable
+    # across a pin bump, where an index would not be.
+    if [ "$unit_count" = 1 ]; then
+      key=$name
+    else
+      suffix=${unit_name#/}
+      suffix=${suffix//\//_}
+      key="$name@$suffix"
+    fi
+
+    case $(printf '%s' "$unit_name" | tr 'A-Z' 'a-z') in
+      *.js|*.cjs|*.mjs) js_compared=$((js_compared + 1)) ;;
+    esac
+
+    work="$case_work/$idx"
+    mkdir -p "$work"
+
+    compare_one "$key" tokens 4 "$OUT/tscaly_tokens" "$OUT/oracle_tokens" "$written" "$work"
+    case $VERDICT in
+      MATCH)    matched_tokens=$((matched_tokens + 1)) ;;
+      STALE)    matched_tokens=$((matched_tokens + 1)); stale_tokens=$((stale_tokens + 1)) ;;
+      UNPORTED) unported_tokens=$((unported_tokens + 1)) ;;
+      ACCEPTED) accepted_tokens=$((accepted_tokens + 1)) ;;
+      FAIL)     failed_tokens=$((failed_tokens + 1)) ;;
+    esac
+
+    compare_one "$key" ast 5 "$OUT/tscaly_ast" "$OUT/oracle_ast" "$written" "$work"
+    case $VERDICT in
+      MATCH)    matched_ast=$((matched_ast + 1)) ;;
+      STALE)    matched_ast=$((matched_ast + 1)); stale_ast=$((stale_ast + 1)) ;;
+      UNPORTED) unported_ast=$((unported_ast + 1)) ;;
+      ACCEPTED) accepted_ast=$((accepted_ast + 1)) ;;
+      FAIL)     failed_ast=$((failed_ast + 1)) ;;
+    esac
+  done < "$case_work/units.manifest"
 done
 
 # ── report ───────────────────────────────────────────────────────────────────
@@ -294,7 +419,7 @@ report() {
   local title=$1 m=$2 u=$3 a=$4 f=$5
   local total=$(( m + u + a + f ))
   echo
-  echo "$title — $total cases"
+  echo "$title — $total units (from $cases_seen cases)"
   echo "  matched            $m"
   echo "  unported           $u   (this slice does not implement the construct)"
   echo "  accepted deviation $a"
@@ -303,6 +428,25 @@ report() {
 
 report "scanner yardstick" $matched_tokens $unported_tokens $accepted_tokens $failed_tokens
 report "parser yardstick"  $matched_ast    $unported_ast    $accepted_ast    $failed_ast
+
+skipped=$(( skip_json + skip_dts + skip_jsx + skip_other ))
+if [ $skipped -ne 0 ]; then
+  echo
+  echo "units not compared — $skipped, each for a reason of its own"
+  echo "  .json          $skip_json   a different GRAMMAR (parseJsonText), and the class the split was built for"
+  echo "  .d.ts family   $skip_dts   the file NAME sets NodeFlagsAmbient; a one-flag port item, see classify_unit"
+  echo "  .tsx/.jsx      $skip_jsx   the JSX language VARIANT, which changes what < and { mean"
+  echo "  other          $skip_other"
+  echo
+  echo "$js_compared .js/.cjs/.mjs units ARE compared, as TypeScript on both sides —"
+  echo "  which is a well-defined comparison of our parser but NOT the kind the"
+  echo "  reference harness would choose (ScriptKindJS: JSDoc is syntax there)."
+  echo "  Skipping them was measured and cost 60 matching corpus cases for no"
+  echo "  information; classify_unit has the argument."
+  echo
+  echo "  Each count is printed rather than folded away: a yardstick that shrinks in"
+  echo "  silence is the failure mode this suite exists to prevent."
+fi
 
 total_stale=$(( stale_tokens + stale_ast ))
 total_failed=$(( failed_tokens + failed_ast ))
