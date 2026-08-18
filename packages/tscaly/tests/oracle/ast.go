@@ -76,10 +76,16 @@ func main() {
 	// have built.
 	//
 	// The name is not decoration: IsDeclarationFileName(".d.ts") sets
-	// NodeFlagsAmbient on everything parsed. The pinned corpus contains no
-	// .d.ts case, so that path is unexercised on both sides — but a pin bump
-	// that adds one would make the flag column diverge, and this is where the
-	// reason would be.
+	// NodeFlagsAmbient on everything parsed, and since slice 14 our own dumper
+	// takes the same path as its argument and asks the same question of it
+	// (tscaly/tspath.scaly). 56 corpus units and five fixtures depend on the two
+	// sides agreeing here.
+	//
+	// ★ The sentence that stood here — "the pinned corpus contains no .d.ts
+	// case, so that path is unexercised on both sides" — was true of whole CASES
+	// and false of the sections they split into, which is the same expiry
+	// TESTPLAN.md records for its own version of it. A claim scoped to the unit
+	// of measurement expires when the unit changes.
 	cwd, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

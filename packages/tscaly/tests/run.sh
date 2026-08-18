@@ -228,7 +228,7 @@ stales=()
 # measurement that silently shrinks is the failure mode this whole suite is
 # organized against.
 cases_seen=0
-skip_json=0; skip_dts=0; skip_jsx=0; skip_other=0
+skip_json=0; skip_jsx=0; skip_other=0
 # Compared, but not under the kind the reference's harness would choose — see
 # classify_unit's .js arm. Counted so the report states it rather than implying
 # that every compared unit is a faithful one.
@@ -239,24 +239,22 @@ classify_unit() {
   local low
   low=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
   case $low in
-    # ★★ A declaration file sets NodeFlagsAmbient (1 << 23) from its NAME —
-    # `IsDeclarationFileName` is consulted before parsing, so the SourceFile node
-    # carries it too — and this port models no file-level context, so the flags
-    # column differs for a reason that has nothing to do with the construct under
-    # test. Skipped rather than accepted, because an accepted deviation on 56
-    # units would be a standing excuse rather than an argued exception.
+    # ★★ A declaration unit is COMPARED since slice 14, and it is the only class
+    # the split exposed that has since been closed rather than argued. The name
+    # is what makes it ambient: `IsDeclarationFileName` is consulted before
+    # parsing and sets NodeFlagsAmbient as a CONTEXT flag, so the SourceFile node
+    # carries it too. Our dumper takes the same path as its argument and
+    # tscaly/tspath.scaly asks the same question of it.
     #
-    # ★ Measured rather than assumed, and the measurement makes it a small ITEM
-    # rather than a limitation: on compiler_invocationErrorRecovery's foo.d.ts the
-    # entire difference is ONE line, the SourceFile's flags, because everything
-    # inside it is individually `declare`d and our port propagates that correctly.
-    # A .d.ts whose members are not would diverge more widely. Making these live
-    # is a one-flag change — thread the unit name into Parser.parse and set the
-    # context flag when the name ends in .d.ts — and it is the first thing the
-    # split EXPOSED: TESTPLAN.md's note that "the pinned corpus contains no .d.ts
-    # case, so the path is unexercised on both sides" was true of whole cases and
-    # false of sections.
-    *.d.ts|*.d.mts|*.d.cts) UNIT_SKIP=declaration ;;
+    # ★ Measured before it was ported and again after: all 56 units differed from
+    # the reference by that ONE BIT and by nothing else — same node count, same
+    # kinds, same spans, same diagnostics — and all 56 match now.
+    #
+    # ★ The line that stood here said "the entire difference is ONE line, the
+    # SourceFile's flags", from one unit. That was the right CAUSE and the wrong
+    # SIZE: the flag reaches every node not already under a `declare`, which on
+    # these units is 1 to 41 lines apiece. A cause generalises from one
+    # measurement; a magnitude does not.
     *.ts|*.mts|*.cts)       UNIT_SKIP= ;;
     *.tsx|*.jsx)            UNIT_SKIP=jsx ;;
     # ★★★ A .js unit IS compared, as TypeScript on BOTH sides, and the reasoning
@@ -377,7 +375,6 @@ for case_file in "${cases[@]}"; do
     if [ -n "$UNIT_SKIP" ]; then
       case $UNIT_SKIP in
         json)        skip_json=$((skip_json + 1)) ;;
-        declaration) skip_dts=$((skip_dts + 1)) ;;
         jsx)         skip_jsx=$((skip_jsx + 1)) ;;
         *)           skip_other=$((skip_other + 1)) ;;
       esac
@@ -440,12 +437,11 @@ report() {
 report "scanner yardstick" $matched_tokens $unported_tokens $accepted_tokens $failed_tokens
 report "parser yardstick"  $matched_ast    $unported_ast    $accepted_ast    $failed_ast
 
-skipped=$(( skip_json + skip_dts + skip_jsx + skip_other ))
+skipped=$(( skip_json + skip_jsx + skip_other ))
 if [ $skipped -ne 0 ]; then
   echo
   echo "units not compared — $skipped, each for a reason of its own"
   echo "  .json          $skip_json   a different GRAMMAR (parseJsonText), and the class the split was built for"
-  echo "  .d.ts family   $skip_dts   the file NAME sets NodeFlagsAmbient; a one-flag port item, see classify_unit"
   echo "  .tsx/.jsx      $skip_jsx   the JSX language VARIANT, which changes what < and { mean"
   echo "  other          $skip_other"
   echo
