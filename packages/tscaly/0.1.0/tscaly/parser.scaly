@@ -248,6 +248,8 @@ use tscaly.ast.BindingElementData
 use tscaly.ast.TemplateLiteralData
 use tscaly.ast.TemplateSpanData
 use tscaly.ast.TaggedTemplateData
+use tscaly.ast.MetaPropertyData
+use tscaly.ast.ImportTypeData
 
 ; The reference's jsdocScannerInfo — what the scanner noticed about the JSDoc
 ; comment preceding the token the parser is about to consume. It is captured at
@@ -579,6 +581,23 @@ define Parser
     ; lifetime question, and this one would be paid on every parse to keep a
     ; value read at its start.
     is_declaration_file: bool
+
+    ; ★★★ The reference's `p.sourceFlags` — flags that belong to the FILE and are
+    ; discovered while parsing something deep inside it. Two bits reach it, both
+    ; from the import expression and the import type:
+    ; PossiblyContainsDynamicImport and PossiblyContainsImportMeta. They are OR'd
+    ; into the SourceFile node at the end (`result.Flags |= p.sourceFlags` in
+    ; finishSourceFile) and into no other node, which is why they cannot travel as
+    ; a CONTEXT flag: finish_node ORs those into every node it finishes.
+    ;
+    ; ★★★ A rewind does NOT restore this, and that is the reference's own shape
+    ; rather than an omission — ParserState carries eight fields and this is not
+    ; one of them. So a speculation that consumed an `import(` and was thrown
+    ; away still leaves the file marked, and the flag genuinely says "possibly
+    ; contains", which is what makes that sound. §3.5i's rule read from the other
+    ; side: give a mechanism the reference's lifetime, and here the reference's
+    ; lifetime is the whole parse.
+    source_flags: int
 )
 {
     init(host: pointer[Page], scanner: pointer[Scanner])
@@ -603,6 +622,7 @@ define Parser
         set this.possible_await_spans: pas
         set this.top_level_statement_index: 0
         set this.is_declaration_file: false
+        set this.source_flags: NodeFlagsNone
         set this.unported_pos: 0 - 1
         set this.unported_tag: null
         set this.unported_detail: 0
@@ -1124,6 +1144,15 @@ define Parser
         ; builds it too, and for its own additional reason: finishSourceFile
         ; computes the external-module indicator the decision below reads.
         let file this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(statements, eof, diagnostics))), pos)
+        if file = null
+            return null
+
+        ; finishSourceFile's `result.Flags |= p.sourceFlags`, on the FILE node and
+        ; on no other — see the source_flags field. It has to happen HERE rather
+        ; than after the reparse decision, because the decision READS the flag:
+        ; the external-module indicator's last arm walks the tree for
+        ; `import.meta` and only bothers when PossiblyContainsImportMeta is set.
+        set file.flags: file.flags | source_flags
 
         ; Now the whole file is in hand, which is when the reference decides
         ; whether to re-parse — see parse_top_level_statement.
@@ -1137,7 +1166,7 @@ define Parser
         {
             if is_declaration_file = false
             {
-                if file_is_external_module(statements)
+                if file_is_external_module(file, statements)
                 {
                     let reparsed this.reparse_top_level_await(statements)
                     if reparsed = null
@@ -1151,7 +1180,16 @@ define Parser
                     ; (ast.scaly's new_node_list says so). The `end` is right
                     ; regardless: the last rewind put the scanner back at the end
                     ; of the file, so node_pos() answers what it answered above.
-                    return this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(reparsed, eof, diagnostics))), pos)
+                    let reparsed_file this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(reparsed, eof, diagnostics))), pos)
+                    if reparsed_file = null
+                        return null
+                    ; finishSourceFile runs a SECOND time on the reparse result,
+                    ; so the flag is applied again — and it is read again rather
+                    ; than copied, because the second pass may have set a bit the
+                    ; first did not (an `import.meta` inside a statement the
+                    ; reparse rewrote).
+                    set reparsed_file.flags: reparsed_file.flags | source_flags
+                    return reparsed_file
                 }
             }
         }
@@ -1441,7 +1479,7 @@ define Parser
     ; turned two corpus cases red and the fixture MATCHED — which can only mean
     ; the fixture was being reported for something the reference does not do. It
     ; had no export, so it was never a module.
-    function file_is_external_module(statements: pointer[Array[pointer[AstNode]]]) returns bool
+    function file_is_external_module(file: pointer[AstNode], statements: pointer[Array[pointer[AstNode]]]) returns bool
     {
         if statements = null
             return false
@@ -1453,17 +1491,84 @@ define Parser
                 return true
             set i: i + 1
         }
+        ; getImportMetaIfNecessary — the arm the comment above named as the one
+        ; still absent, and slice 18 is the slice it said would own it.
+        import_meta_if_necessary(file)
+    }
+
+    ; getImportMetaIfNecessary. The GUARD is the whole point of the reference's
+    ; own comment on it: a full tree walk is what finding `import.meta` costs, so
+    ; the flag exists to skip it, and the parser sets that flag exactly where it
+    ; builds the node. Answering the question without the flag would be correct
+    ; and would walk every tree; answering it with the flag and no node would be
+    ; the flag lying, which is why it says POSSIBLY contains.
+    function import_meta_if_necessary(file: pointer[AstNode]) returns bool
+    {
+        if file = null
+            return false
+        if (file.flags & NodeFlagsPossiblyContainsImportMeta) = 0
+            return false
+        find_import_meta(file)
+    }
+
+    ; findChildNode(root, IsImportMeta), which checks the ROOT first and then
+    ; recurses through ForEachChild. The reference answers the NODE and this
+    ; answers whether there is one, because the only caller asks `!= nil` — the
+    ; indicator node itself is stored on the SourceFile upstream and nothing in
+    ; this port reads it (§3.5q: carry the ANSWER, not the value, where the value
+    ; is asked one question).
+    function find_import_meta(n: pointer[AstNode]) returns bool
+    {
+        if n = null
+            return false
+        if is_import_meta(n)
+            return true
+        var i 0
+        var c AstNode.child_at(n, i)
+        while c <> null
+        {
+            if find_import_meta(c)
+                return true
+            set i: i + 1
+            set c: AstNode.child_at(n, i)
+        }
         false
     }
 
-    ; isAnExternalModuleIndicatorNode, arm for arm.
+    ; IsImportMeta: a MetaProperty built from the `import` keyword whose name is
+    ; literally `meta`. BOTH halves need a field this port added for them —
+    ; the keyword token (slice 18) and the identifier's text (slice 17) — which
+    ; is why the arm could not be written earlier even though the walk could:
+    ; without the keyword `new.target` answers yes, and without the text
+    ; `import.anything` does.
+    function is_import_meta(n: pointer[AstNode]) returns bool
+    {
+        if n.kind <> KindMetaProperty
+            return false
+        choose n.data
+            when mp: MetaProperty
+            {
+                if mp.keyword_token <> KindImportKeyword
+                    return false
+                if mp.name = null
+                    return false
+                choose mp.name.data
+                    when id: Identifier
+                        return text_matches(id.text, id.text_len, "meta")
+                return false
+            }
+        false
+    }
+
+    ; isAnExternalModuleIndicatorNode, arm for arm — the five STATEMENT arms.
     ;
-    ; ★ The last arm of the reference's own indicator — `import.meta` ANYWHERE
-    ; in the tree, found by a walk under the PossiblyContainsImportMeta flag —
-    ; is still absent, and for the reason the whole function's old comment gave:
-    ; `import.meta` is reported as unported (`import-expression`) before a tree
-    ; exists to walk. That claim is dated the same way the old one was, so the
-    ; slice that ports the import EXPRESSION owns this line.
+    ; ★ The reference's indicator has a sixth arm which is not a statement test at
+    ; all: `import.meta` ANYWHERE in the tree, found by a walk under the
+    ; PossiblyContainsImportMeta flag. It stood here as absent through four
+    ; slices, with a claim dated to "the slice that ports the import EXPRESSION",
+    ; and slice 18 is that slice — it lives at import_meta_if_necessary, called
+    ; from file_is_external_module after this loop, exactly where
+    ; isFileProbablyExternalModule calls it.
     function statement_is_external_module_indicator(n: pointer[AstNode]) returns bool
     {
         if statement_has_export_modifier(n)
@@ -3603,12 +3708,10 @@ define Parser
     ;   regular expression literals      they need ReScanSlashToken
     ;   class expressions                the class slice
     ;   private identifiers `#x`         they need a node and an intern table
-    ;   `import(…)` and `import.meta`    both set SOURCE FILE flags
-    ;                                    (PossiblyContainsDynamicImport /
-    ;                                    …ImportMeta), which this port does not
-    ;                                    model — so parsing them would produce a
-    ;                                    SourceFile whose flags disagree, which
-    ;                                    the yardstick compares
+    ;   (`import(…)` and `import.meta` were this list's longest-standing entry —
+    ;    "both set SOURCE FILE flags this port does not model" — and landed with
+    ;    slice 18, which is where the file's own flags arrived; see the arm in
+    ;    parse_left_hand_side_expression_or_higher)
     ;   object literal methods and       they are parseMethodDeclaration and
     ;     accessors                      parseAccessorDeclaration, i.e. the class
     ;                                    member slice under another name
@@ -3618,9 +3721,17 @@ define Parser
     ; ── Three faithfulness notes ────────────────────────────────────────────
     ;
     ; (1) More reference nodes carry a field the dump cannot see: the OPERATOR of
-    ;     a PrefixUnaryExpression and a PostfixUnaryExpression, the keyword of a
-    ;     MetaProperty, the `MultiLine` flag of an array or object literal. They
-    ;     are not stored, and that is a gap rather than a saving — see ast.scaly.
+    ;     a PrefixUnaryExpression and a PostfixUnaryExpression, and the
+    ;     `MultiLine` flag of an array or object literal. They are not stored, and
+    ;     that is a gap rather than a saving — see ast.scaly.
+    ;
+    ;     ★★★ The keyword of a MetaProperty WAS on this list and is stored since
+    ;     slice 18, and how it left is the transferable part (§3.5as): the reader
+    ;     that made it observable was not the yardstick but the PORT — the
+    ;     external-module indicator's `IsImportMeta` arm, which decides whether
+    ;     the file is a module, which decides whether slice 15's reparse runs,
+    ;     which changes the TREE. An invisible field two mechanisms from a visible
+    ;     one. Read the rest of this list as fields waiting for such a reader.
     ;
     ; (2) `checkJSSyntax`, which the reference calls on most of these nodes,
     ;     returns immediately unless the node is in a JavaScript file. This port
@@ -4273,15 +4384,69 @@ define Parser
         var expression null as pointer[AstNode]
         if token = KindImportKeyword
         {
-            ; Both `import(…)` and `import.meta` set a flag on the SOURCE FILE,
-            ; which this port does not model — so parsing them would produce a
-            ; file node whose flags disagree with the reference's, which is
-            ; exactly what the yardstick compares. Reported rather than parsed.
+            ; ★ The look-ahead is what keeps `import * as x from "m"` a
+            ; STATEMENT: the keyword is only an expression when a `(` or a `<`
+            ; follows it, and the reference's comment names exactly that hazard.
             if this.look_ahead_next_token_is_open_paren_or_less_than()
-                return this.unported("import-expression", token)
-            if this.look_ahead_next_token_is_dot()
-                return this.unported("import-expression", token)
-            set expression: this.parse_member_expression_or_higher()
+            {
+                set source_flags: source_flags | NodeFlagsPossiblyContainsDynamicImport
+                ; The node is the KEYWORD alone — parse_call_expression_rest below
+                ; reads the `(…)` and builds the CallExpression over it, which is
+                ; why `import("m")` is a call whose callee is an ImportKeyword
+                ; node rather than a node kind of its own.
+                set expression: this.parse_token_node()
+            }
+            else
+            {
+                if this.look_ahead_next_token_is_dot()
+                {
+                    ; `import.<name>` — a MetaProperty. Both tokens are consumed
+                    ; here rather than through parse_expected, exactly as the
+                    ; reference does it: whatever follows the dot is read as an
+                    ; identifier NAME, so `import.anything` parses and the
+                    ; checker is the one that refuses a name that is not `meta`.
+                    this.next_token()
+                    this.next_token()
+                    let meta_name this.parse_identifier_name()
+                    if meta_name = null
+                        return null
+                    let mp this.finish_node(this.new_node(KindMetaProperty, NodeData.MetaProperty(MetaPropertyData(KindImportKeyword, meta_name))), pos)
+                    if mp = null
+                        return null
+                    set expression: mp
+
+                    ; ★★★ `import.defer(…)` is a dynamic import, not an
+                    ; `import.meta`, and the two flags are different bits — so
+                    ; the WORD decides, and only when a call or a type-argument
+                    ; list follows it. Everything else marks the file as
+                    ; possibly containing `import.meta`, INCLUDING a misspelled
+                    ; `import.metal`: the flag only gates the walk that then
+                    ; asks the precise question (is_import_meta), so a false
+                    ; positive here costs a walk and never an answer.
+                    ;
+                    ; ★ The reference asks `expression.Text() == "defer"`, i.e.
+                    ; the DECODED name — not the token kind. `defer` is a
+                    ; contextual keyword and the import DECLARATION reads it as
+                    ; one (see the IMPORTS banner's TEXT question), but here the
+                    ; name went through parse_identifier_name, which accepts any
+                    ; keyword as a name, so the kind was already spent. The
+                    ; stored text from slice 17 is what answers it.
+                    if meta_property_name_is_defer(meta_name)
+                    {
+                        if token = KindOpenParenToken
+                            set source_flags: source_flags | NodeFlagsPossiblyContainsDynamicImport
+                        else
+                        {
+                            if token = KindLessThanToken
+                                set source_flags: source_flags | NodeFlagsPossiblyContainsDynamicImport
+                        }
+                    }
+                    else
+                        set source_flags: source_flags | NodeFlagsPossiblyContainsImportMeta
+                }
+                else
+                    set expression: this.parse_member_expression_or_higher()
+            }
         }
         else
         {
@@ -4294,6 +4459,22 @@ define Parser
             return null
 
         this.parse_call_expression_rest(pos, expression)
+    }
+
+    ; The reference's `expression.Text() == "defer"`, where `expression` is the
+    ; finished MetaProperty and `Node.Text()` on one of those is
+    ; `Name().Text()` — so this asks the name, which is the same question one
+    ; hop earlier. Kept as its own function because the shape recurs
+    ; (is_import_meta asks the same pair) and because a bare `choose` inline
+    ; would put two nested chooses in the middle of the arm.
+    function meta_property_name_is_defer(name: pointer[AstNode]) returns bool
+    {
+        if name = null
+            return false
+        choose name.data
+            when id: Identifier
+                return text_matches(id.text, id.text_len, "defer")
+        false
     }
 
     procedure parse_super_expression(this) returns pointer[AstNode]
@@ -5169,14 +5350,17 @@ define Parser
         let pos this.node_pos()
         this.parse_expected(KindNewKeyword)
 
-        ; `new.target`. The reference's MetaProperty additionally stores WHICH
-        ; keyword it was built from, a field the dump cannot see.
+        ; `new.target`. ★ The keyword token IS stored since slice 18 — it is what
+        ; tells this node from `import.meta`, and the external-module indicator
+        ; asks exactly that (is_import_meta). Before it, the two were the same
+        ; node with the same children and only their SOURCE told them apart,
+        ; which is a distinction the yardstick cannot see either.
         if this.parse_optional(KindDotToken)
         {
             let meta_name this.parse_identifier_name()
             if meta_name = null
                 return null
-            return this.finish_node(this.new_node(KindMetaProperty, NodeData.MetaProperty(WrappedTypeData(meta_name))), pos)
+            return this.finish_node(this.new_node(KindMetaProperty, NodeData.MetaProperty(MetaPropertyData(KindNewKeyword, meta_name))), pos)
         }
 
         ; ★ allowOptionalChain is FALSE here: `new a?.b()` is invalid, and the
@@ -6230,7 +6414,10 @@ define Parser
     ;                                    interface-member slice, and a mapped
     ;                                    type shares the tag because both stop
     ;                                    at the same `{`
-    ;   `import(…)` types                they need the import machinery
+    ;   (`import(…)` types were this list's entry for the import machinery and
+    ;    landed with slice 18 — see parse_import_type below, which is in the
+    ;    import slice's company rather than here because what held it up was the
+    ;    SOURCE FILE flag, not the type ladder)
     ;   (template literal types were this list's entry for ReScanTemplateToken
     ;    and landed with slice 11 — see the TEMPLATES block below)
     ;   the JSDoc prefix forms `*`, `??` they need two more re-scan entry points
@@ -6238,11 +6425,18 @@ define Parser
     ; ── Three faithfulness notes, each one a thing that is easy to lose ─────
     ;
     ; (1) Some reference nodes carry a field the dump cannot see — the OPERATOR
-    ;     of a TypeOperatorNode, the operator of a PrefixUnaryExpression, the
-    ;     `IsTypeOf` flag of an ImportTypeNode. They are not stored here, and
-    ;     that is a real gap rather than a saving: the yardstick compares kind,
-    ;     range and flags, so it would not notice one being wrong. Stated so
-    ;     that the slice which first READS such a field knows to add it.
+    ;     of a TypeOperatorNode and the operator of a PrefixUnaryExpression. They
+    ;     are not stored here, and that is a real gap rather than a saving: the
+    ;     yardstick compares kind, range and flags, so it would not notice one
+    ;     being wrong. Stated so that the slice which first READS such a field
+    ;     knows to add it.
+    ;
+    ;     ★ The `IsTypeOf` flag of an ImportTypeNode was the third entry and IS
+    ;     stored since slice 18 — not because a reader arrived (none has; the
+    ;     reader would be the checker) but because without it `typeof import("m")`
+    ;     and `import("m")` are the same node, which is the argument
+    ;     ImportEqualsDeclarationData's `is_type_only` already carries. It is the
+    ;     §3.5ao report and one of slice 18's three UNGATED controls.
     ;
     ; (2) The reference's list parsing goes through parsing CONTEXTS with a
     ;     per-context element predicate, terminator predicate and token-skipping
@@ -6629,7 +6823,7 @@ define Parser
         if token = KindTypeOfKeyword
         {
             if this.look_ahead_next_is_start_of_type_of_import_type()
-                return this.unported("import-type", token)
+                return this.parse_import_type()
             return this.parse_type_query()
         }
 
@@ -6649,7 +6843,7 @@ define Parser
         if token = KindOpenParenToken
             return this.parse_parenthesized_type()
         if token = KindImportKeyword
-            return this.unported("import-type", token)
+            return this.parse_import_type()
 
         if token = KindAssertsKeyword
         {
@@ -6942,7 +7136,7 @@ define Parser
     procedure parse_type_reference(this) returns pointer[AstNode]
     {
         let pos this.node_pos()
-        let name this.parse_entity_name(true)
+        let name this.parse_entity_name_of_type_reference()
         if name = null
             return null
         let args this.parse_type_arguments_of_type_reference()
@@ -6951,14 +7145,30 @@ define Parser
         this.finish_node(this.new_node(KindTypeReference, NodeData.TypeReference(TypeReferenceData(name, args))), pos)
     }
 
+    ; parseEntityNameOfTypeReference — `parseEntityName(true, Type_expected)`.
+    ;
+    ; ★★★ The DIAGNOSTIC is what distinguishes it from the bare call, and this
+    ; port did not carry the parameter until slice 18: `type A = ;` reported
+    ; Identifier_expected (1003) where the reference says Type_expected (1110).
+    ; A wrong code, not an over-report, and invisible to the corpus — it was
+    ; found by a slice-18 fixture (`type B = import(;`), because a qualifier is
+    ; the reference's fourth caller of this routine and the third to want the
+    ; message. Two call sites take it; the other two pass none, exactly as
+    ; upstream's four do.
+    procedure parse_entity_name_of_type_reference(this) returns pointer[AstNode]
+        this.parse_entity_name_with_diagnostic(true, DiagType_expected)
+
     procedure parse_entity_name(this, allow_reserved_words: bool) returns pointer[AstNode]
+        this.parse_entity_name_with_diagnostic(allow_reserved_words, 0)
+
+    procedure parse_entity_name_with_diagnostic(this, allow_reserved_words: bool, code: int) returns pointer[AstNode]
     {
         let pos this.node_pos()
         var entity null as pointer[AstNode]
         if allow_reserved_words
-            set entity: this.parse_identifier_name()
+            set entity: this.parse_identifier_name_with_diagnostic(code)
         else
-            set entity: this.parse_identifier()
+            set entity: this.parse_identifier_with_diagnostic(code, 0)
         if entity = null
             return null
 
@@ -7127,6 +7337,81 @@ define Parser
         }
 
         this.finish_node(this.new_node(KindTypeQuery, NodeData.TypeQuery(TypeQueryData(entity_name, type_arguments))), pos)
+    }
+
+    ; ── the import type (parser slice 18) ───────────────────────────────────
+    ;
+    ; `import("m")`, `typeof import("m")`, `import("m").A<T>` and
+    ; `import("m", { with: { type: "json" } })`. It is the reference's
+    ; parseImportType, and it is in THIS slice rather than in slice 3 with the
+    ; rest of the type ladder for the reason both `import-type` sites gave: it
+    ; sets a flag on the SOURCE FILE, and nothing carried one until now.
+    ;
+    ; ★ Everything under it already existed. parse_import_attributes has been
+    ; here since slice 8 and has carried `skip_keyword` unused since then, with
+    ; a comment naming THIS routine as the one true caller — a §3.5p claim with
+    ; an expiry date, and this is where it expires: the `with`/`assert` keyword
+    ; and its colon are read HERE, because inside `import(…)` the attribute
+    ; clause is `, with: { … }` and not `with { … }`.
+    procedure parse_import_type(this) returns pointer[AstNode]
+    {
+        set source_flags: source_flags | NodeFlagsPossiblyContainsDynamicImport
+        let pos this.node_pos()
+        let is_type_of this.parse_optional(KindTypeOfKeyword)
+        this.parse_expected(KindImportKeyword)
+        this.parse_expected(KindOpenParenToken)
+        let argument this.parse_type()
+        if argument = null
+            return null
+
+        var attributes null as pointer[AstNode]
+        if this.parse_optional(KindCommaToken)
+        {
+            this.parse_expected(KindOpenBraceToken)
+            ; ★ The keyword is captured BEFORE it is consumed, because it is what
+            ; the ImportAttributes node stores — and the reference passes the
+            ; token it FOUND, even on the arm where it found neither word: an
+            ; `import("m", { oops: … })` builds an ImportAttributes whose token is
+            ; whatever stood there. Transcribed rather than tidied.
+            let current token
+            if token = KindWithKeyword
+                this.next_token()
+            else
+            {
+                if token = KindAssertKeyword
+                {
+                    this.parse_error_at_current_token(DiagImport_assertions_have_been_replaced_by_import_attributes_Use_with_instead_of_assert)
+                    this.next_token()
+                }
+                else
+                    this.parse_error_at_current_token(DiagX_0_expected)
+            }
+            this.parse_expected(KindColonToken)
+            set attributes: this.parse_import_attributes(current, true)
+            if attributes = null
+                return null
+            this.parse_optional(KindCommaToken)
+            ; The reference follows a missing `}` with RELATED INFORMATION pointing
+            ; back at the `{`. Not ported, and stated rather than silent: the
+            ; yardstick compares a diagnostic's code and span, so a related note
+            ; is invisible to it either way — the same reading
+            ; parse_import_attributes already carries for its own copy of this.
+            this.parse_expected(KindCloseBraceToken)
+        }
+        this.parse_expected(KindCloseParenToken)
+
+        var qualifier null as pointer[AstNode]
+        if this.parse_optional(KindDotToken)
+        {
+            set qualifier: this.parse_entity_name_of_type_reference()
+            if qualifier = null
+                return null
+        }
+        let type_arguments this.parse_type_arguments_of_type_reference()
+        if this.is_unported()
+            return null
+
+        this.finish_node(this.new_node(KindImportType, NodeData.ImportType(ImportTypeData(is_type_of, argument, attributes, qualifier, type_arguments))), pos)
     }
 
     ; ── tuples ──────────────────────────────────────────────────────────────
@@ -9069,7 +9354,9 @@ define Parser
     ;
     ; ★ `import(…)` types and import/export DECLARATIONS. `import` and `export`
     ;   are 19.2 % of corpus first blockers between them and are a slice of
-    ;   their own; nothing here needs them.
+    ;   their own; nothing here needs them. (The declarations landed with slice 8
+    ;   and the types with slice 18 — recorded here because the sentence was a
+    ;   statement about THIS slice's scope and is still an accurate one.)
     ;
     ; ★ checkJSSyntax, for the reason slice 4 recorded: it returns immediately
     ;   unless the node carries NodeFlagsJavaScriptFile, which this port never
@@ -9638,10 +9925,15 @@ define Parser
     ; ── and what is deliberately not ────────────────────────────────────────
     ;
     ; ★ `import(…)` TYPES and the import EXPRESSION (`import.meta`,
-    ;   `import("m")`). They share the keyword and nothing else: both set flags
-    ;   on the SOURCE FILE node, which this port does not model, so parsing
-    ;   them would produce a file whose flags disagree with the reference's.
-    ;   Both were already reported before this slice and still are.
+    ;   `import("m")`) — LANDED WITH SLICE 18, and this entry is kept because its
+    ;   reasoning is what decided that slice's SHAPE. It said the two "share the
+    ;   keyword and nothing else: both set flags on the SOURCE FILE node, which
+    ;   this port does not model". The first half turned out to be wrong and the
+    ;   second is exactly why they are ONE slice: the shared flag IS the
+    ;   mechanism, so building either meant building it, and then the other cost
+    ;   a routine. parse_import_type also became the caller that
+    ;   parse_import_attributes' unused `skip_keyword` had been waiting for
+    ;   (§3.5ar), which is where the parameter's own §3.5p claim expired.
     ;
     ;   (The `assert { … }` form of import attributes was the third entry here
     ;   through slice 12 and is ported: the reference reports
@@ -10181,15 +10473,33 @@ define Parser
         {
             this.parse_expected(tok)
         }
-        ; Both brace arms are diagnostics in the reference — a missing `{`
-        ; answers an empty list and carries on, and a missing `}` attaches
-        ; related information pointing back at the `{` — so both are where this
-        ; port stops.
-        this.parse_expected(KindOpenBraceToken)
-        let elements this.parse_delimited_list(PCImportAttributes)
-        if elements = null
-            return null
-        this.parse_expected(KindCloseBraceToken)
+        ; ★★★ THE `{` IS A BRANCH, not an expectation — and slice 18 is what made
+        ; that observable. When it is missing, the reference does NOT parse a
+        ; list: it hands the node the MISSING-list sentinel and carries on, so the
+        ; ImportAttributes node comes out EMPTY at pos = end and the text after it
+        ; is read as statements. This port parsed the list either way, which is
+        ; the same tree for every caller slice 8 had — `with { … }` after a module
+        ; specifier, where a missing `{` needs the recovery to reach a statement
+        ; boundary anyway — and a DIFFERENT tree for parse_import_type's caller,
+        ; where the brace was already consumed one level up:
+        ; `import("m", { oops: 1 })` reads `oops: 1` as an attribute here and as a
+        ; LABELED STATEMENT upstream. Measured against the reference before it was
+        ; written; the fixture is parser_import_type_no_keyword.ts.
+        ;
+        ; ★ The reference also attaches RELATED INFORMATION to a missing `}`,
+        ; pointing back at the `{`. Not ported, and stated rather than silent: the
+        ; yardstick compares a diagnostic's code and span and cannot see a related
+        ; note, so this is a gap no measurement here can close.
+        var elements null as pointer[Array[pointer[AstNode]]]
+        if this.parse_expected(KindOpenBraceToken)
+        {
+            set elements: this.parse_delimited_list(PCImportAttributes)
+            if elements = null
+                return null
+            this.parse_expected(KindCloseBraceToken)
+        }
+        else
+            set elements: this.create_missing_list()
         this.finish_node(this.new_node(KindImportAttributes, NodeData.ImportAttributes(ImportAttributesData(tok, elements))), pos)
     }
 
