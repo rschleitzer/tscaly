@@ -67,6 +67,14 @@
 ;            abortParsingListOrMoveToNextToken and parsingContextErrors' 18
 ;            arms. The scanner's remaining numeric reports come with it, because
 ;            an UNDER-report is an UNEXPLAINED failure once the rest is compared
+;   slice 14 the DECLARATION-FILE flag: a file's NAME is an input to its parse,
+;            so IsDeclarationFileName makes the whole file AMBIENT before the
+;            first token. Its sliver of internal/tspath is tspath.scaly
+;   slice 15 the top-level-await REPARSE — the reference's SECOND PASS. Slice 5
+;            ported the CONDITION and reported the construct; this parses the
+;            recorded statements again with AwaitContext on, re-slicing the
+;            diagnostics around them and rewinding after each span. It is the
+;            last construct in this port that had a route behind it
 ;
 ; ── What it deliberately does not, each stated rather than left to be noticed ─
 ;
@@ -108,8 +116,10 @@
 ;   say "replacing the whole `unported` mechanism", which is wrong. The sites
 ;   standing in for p.diagnostics become diagnostics; the ~40 standing for a
 ;   construct nobody built stay unported (regex, JSDoc, JSX, import-expression,
-;   toplevel-await-reparse, list-comma). What the ladder itself still omits is
-;   named at the EXPRESSIONS banner, one line per construct.
+;   list-comma). What the ladder itself still omits is named at the EXPRESSIONS
+;   banner, one line per construct. ★`toplevel-await-reparse` stood in that list
+;   until slice 15 built it — an entry naming a construct nobody has built is a
+;   claim with an expiry date, and the slice that builds it owns the line.
 ;
 ; ★ ERROR RECOVERY IS PORTED (slice 13c). Every list — the source file's own
 ;   statement list included — runs through parse_list/parse_delimited_list with
@@ -151,6 +161,7 @@ use scaly.containers.String
 use tscaly.scanner.Scanner
 use tscaly.scanner.ScannerState
 use tscaly.Diagnostics.DiagnosticList
+use tscaly.Diagnostics.Diagnostic
 use tscaly.ast.AstNode
 use tscaly.ast.NodeData
 use tscaly.ast.TokenData
@@ -534,17 +545,28 @@ define Parser
     ; now being parsed contain an identifier literally named `await`, outside any
     ; await context? Upstream uses it to decide which statements to RE-PARSE with
     ; AwaitContext on, after the whole file has been parsed once
-    ; (reparseTopLevelAwait). This port has the detection and not the reparse, so
-    ; a statement that would be re-parsed is reported as unported instead — see
-    ; parse_source_file. It is saved and restored by mark/rewind, exactly as the
-    ; reference saves it.
+    ; (reparseTopLevelAwait), which slice 15 ported — through slice 14 this port
+    ; had the detection alone and reported the construct here. It is saved and
+    ; restored by mark/rewind, exactly as the reference saves it.
     statement_has_await_identifier: bool
 
-    ; ... and the file-level half of it: did ANY top-level statement record such
-    ; a span? The reference keeps the spans themselves (possibleAwaitSpans),
-    ; because it re-parses exactly those statements; this port only has to know
-    ; that there was one.
-    has_possible_await_span: bool
+    ; ... and the file-level half of it: the reference's `possibleAwaitSpans`,
+    ; which is what it re-parses. A flat list of INDICES into the top-level
+    ; statement list, paired — [start, end) per span — and MERGED when the next
+    ; recording statement is the one after the last, so a run of them is one
+    ; span rather than several. Through slice 14 this was a bool, because the
+    ; port had the detection and not the reparse; the pairs are what
+    ; reparse_top_level_await walks.
+    possible_await_spans: pointer[Array[int]]
+
+    ; parseToplevelStatement's parameter `i`, travelling as state for the reason
+    ; §3.5k gives: the reference hands parseListIndex a func value taking the
+    ; index, and parse_list_element dispatches statically on the parsing CONTEXT,
+    ; so there is nowhere but a field to put it. Written by parse_list for
+    ; PCSourceElements only — the one context the reference uses parseListIndex
+    ; for — and read by parse_top_level_statement BEFORE it parses anything,
+    ; because a nested list would otherwise overwrite it mid-statement.
+    top_level_statement_index: int
 
     ; The reference's `isDeclarationFile`, which it derives in the worker from
     ; `p.opts.FileName`. Here the NAME is not carried and the ANSWER is, because
@@ -572,7 +594,10 @@ define Parser
         set this.variable_declaration_allow_exclamation: true
         set this.not_parenthesized_arrow: null
         set this.statement_has_await_identifier: false
-        set this.has_possible_await_span: false
+        let pas host.allocate(sizeof Array[int], alignof Array[int]) as pointer[Array[int]]
+        set *pas: Array[int]()
+        set this.possible_await_spans: pas
+        set this.top_level_statement_index: 0
         set this.is_declaration_file: false
         set this.unported_pos: 0 - 1
         set this.unported_tag: null
@@ -1082,59 +1107,304 @@ define Parser
         if statements = null
             return null
 
+        let end_jsdoc this.jsdoc_scanner_info()
+        let eof this.parse_token_node()
+        if this.with_jsdoc(eof, end_jsdoc) = null
+            return null
+
+        ; ★ The FIRST SourceFile is built and finished whatever happens next, and
+        ; that is not bookkeeping. finish_node CONSUMES `diagnostics.has_error` —
+        ; it stamps ThisNodeHasError and clears the flag — so a port that skipped
+        ; this node when it is about to reparse would carry a stale flag into the
+        ; reparse and stamp it on a node the reference does not. The reference
+        ; builds it too, and for its own additional reason: finishSourceFile
+        ; computes the external-module indicator the decision below reads.
+        let file this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(statements, eof, diagnostics))), pos)
+
         ; Now the whole file is in hand, which is when the reference decides
         ; whether to re-parse — see parse_top_level_statement.
         ; !result.IsDeclarationFile && ExternalModuleIndicator != nil &&
         ; len(possibleAwaitSpans) > 0 — all three, and the first was written into
         ; the comment at file_is_external_module four slices before there was a
         ; declaration file to test it against (§3.5p). A .d.ts is never
-        ; re-parsed, so reporting one here would be an over-report on a file the
-        ; port otherwise gets exactly right.
-        if has_possible_await_span
+        ; re-parsed, so a declaration file keeps the tree it already has.
+        let span_count possible_await_spans.get_length() as int
+        if span_count > 0
         {
             if is_declaration_file = false
             {
                 if file_is_external_module(statements)
-                    return this.unported("toplevel-await-reparse", 0)
+                {
+                    let reparsed this.reparse_top_level_await(statements)
+                    if reparsed = null
+                        return null
+                    ; NewSourceFile(..., newNodeList(sourceFile.Statements.Loc,
+                    ; statements), sourceFile.EndOfFileToken), finished at the
+                    ; same `pos` as the first — a fresh node over a new statement
+                    ; list and the SAME end-of-file token. The list's own extent
+                    ; is the one thing not carried, because this port keeps no
+                    ; NodeList range and the walk visits a list's ELEMENTS
+                    ; (ast.scaly's new_node_list says so). The `end` is right
+                    ; regardless: the last rewind put the scanner back at the end
+                    ; of the file, so node_pos() answers what it answered above.
+                    return this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(reparsed, eof, diagnostics))), pos)
+                }
             }
         }
-
-        let end_jsdoc this.jsdoc_scanner_info()
-        let eof this.parse_token_node()
-        if this.with_jsdoc(eof, end_jsdoc) = null
-            return null
-
-        this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(statements, eof, diagnostics))), pos)
+        file
     }
 
-    ; ★★★ parseToplevelStatement, minus the half this port does not have.
+    ; ★★★ reparseTopLevelAwait — the reference's SECOND PASS over the statement
+    ; list, and the last construct in this port with a route behind it.
+    ;
+    ; The problem it solves: `await` is an identifier in a script and an operator
+    ; in a module, and whether a file is a module is not known until the whole
+    ; file has been read (an `export` anywhere decides it). So the reference
+    ; parses once with AwaitContext off, notes which top-level statements used
+    ; `await` as a name, and then — if the file turned out to be a module —
+    ; re-parses exactly those statements with the flag on. `const foo = await {
+    ; bar: 42 }` is an identifier followed by an object literal on the first pass
+    ; and an AwaitExpression on the second: a different TREE, not a different
+    ; flag, which is why the detection alone could never have matched.
+    ;
+    ; Three things travel together and each is easy to drop:
+    ;
+    ;   the STATEMENTS   copied through unchanged outside the spans, re-parsed
+    ;                    inside them
+    ;   the DIAGNOSTICS  re-sliced, not re-run: the ones reported over a copied
+    ;                    range are copied with it, the ones over a re-parsed
+    ;                    range are DISCARDED and replaced by whatever the second
+    ;                    pass reports
+    ;   the SCANNER      rewound after each span, so the file ends where it ended
+    ;
+    ; Answers the new statement list, or null if the reparse met something this
+    ; port cannot handle (which the first pass, by definition, did not).
+    procedure reparse_top_level_await(this, source_statements: pointer[Array[pointer[AstNode]]]) returns pointer[Array[pointer[AstNode]]]
+    {
+        let statements AstNode.new_node_list(host)
+
+        ; savedParseDiagnostics := p.diagnostics; p.diagnostics = []
+        ; See Diagnostics.snapshot for why this is a copy-and-truncate rather
+        ; than a second list: the scanner holds a pointer to this one.
+        let saved diagnostics.snapshot(host)
+        diagnostics.truncate(0)
+
+        let n_statements source_statements.get_length() as int
+        let n_spans possible_await_spans.get_length() as int
+        var after_await_statement 0
+        var i 0
+        while i < n_spans
+        {
+            let next_await_statement *(possible_await_spans.get_buffer() + i)
+
+            ; Everything between the last span and this one is kept as parsed.
+            let prev_statement *(source_statements.get_buffer() + after_await_statement)
+            let next_statement *(source_statements.get_buffer() + next_await_statement)
+            var k after_await_statement
+            while k < next_await_statement
+            {
+                statements.add(*(source_statements.get_buffer() + k))
+                set k: k + 1
+            }
+            this.copy_saved_diagnostics(saved, prev_statement.pos, next_statement.pos, true)
+
+            var state this.mark()
+            set context_flags: context_flags | NodeFlagsAwaitContext
+            scanner.reset_pos(next_statement.pos)
+            this.next_token()
+
+            set after_await_statement: *(possible_await_spans.get_buffer() + (i + 1))
+            while token <> KindEndOfFile
+            {
+                let start_pos scanner.token_full_start()
+                let statement this.parse_statement()
+                if statement = null
+                    return null
+                statements.add(statement)
+                ; ★ The zero-progress guard, the same one parse_list rests on: a
+                ; statement that consumed nothing would spin here forever.
+                if start_pos = scanner.token_full_start()
+                    this.next_token()
+
+                if after_await_statement < n_statements
+                {
+                    ; ★★ The span is bounded by the END of the last statement it
+                    ; covered, never by a count — because the second pass does not
+                    ; have to agree with the first about where statements divide.
+                    ; `await {x}` is TWO statements on the first pass and ONE on
+                    ; the second, so landing exactly on that end means done, and
+                    ; overshooting it means this re-parse has eaten into the next
+                    ; span, which is then absorbed rather than re-parsed again.
+                    let last_await_statement *(source_statements.get_buffer() + (after_await_statement - 1))
+                    if statement.end = last_await_statement.end
+                        break
+                    if statement.end > last_await_statement.end
+                    {
+                        set i: i + 2
+                        if i < n_spans
+                            set after_await_statement: *(possible_await_spans.get_buffer() + (i + 1))
+                        else
+                            set after_await_statement: n_statements
+                    }
+                }
+            }
+
+            ; state.diagnosticsLen = len(p.diagnostics); p.rewind(state)
+            ;
+            ; ★★★ A rewind that KEEPS what the speculation reported, which is the
+            ; opposite of every other rewind in this file — the mark is being used
+            ; to restore the scanner and the context flags, not to discard a
+            ; branch. Raising the saved length to the current one is the
+            ; reference's own way of saying so, and the unported record is raised
+            ; with it for exactly the reason §3.5i gives: that record has the
+            ; DIAGNOSTICS' lifetime, so wherever they survive a rewind it must
+            ; too. Restoring it here would silently un-report a construct the
+            ; second pass just met and the first never reached.
+            set state.diagnostics_len: diagnostics.length()
+            set state.unported_pos: unported_pos
+            set state.unported_tag: unported_tag
+            set state.unported_detail: unported_detail
+            this.rewind(state)
+
+            set i: i + 2
+        }
+
+        ; ... and everything after the last span, statements and diagnostics
+        ; alike, with no upper bound to stop at.
+        if after_await_statement < n_statements
+        {
+            let prev_statement *(source_statements.get_buffer() + after_await_statement)
+            var k after_await_statement
+            while k < n_statements
+            {
+                statements.add(*(source_statements.get_buffer() + k))
+                set k: k + 1
+            }
+            this.copy_saved_diagnostics(saved, prev_statement.pos, 0, false)
+        }
+
+        statements
+    }
+
+    ; The reference's two FindIndex calls over the saved list, which pick the
+    ; diagnostics belonging to a copied range: from the first whose position
+    ; reaches `from_pos`, up to (excluding) the first at-or-after that one whose
+    ; position reaches `to_pos`. With `bounded` false there is no upper bound and
+    ; the rest of the list is copied.
+    ;
+    ; ★ Ported as a scan rather than as two searches because the list is in
+    ; position order and short; what is NOT collapsed is the two-stage shape —
+    ; the upper bound is sought FROM the lower one, so a diagnostic before
+    ; `from_pos` can never end the range even if it is at-or-after `to_pos`.
+    procedure copy_saved_diagnostics(this, saved: pointer[Array[Diagnostic]], from_pos: int, to_pos: int, bounded: bool)
+    {
+        let n saved.get_length() as int
+        var i 0
+        var started false
+        while i < n
+        {
+            let d *(saved.get_buffer() + i)
+            if started = false
+            {
+                if d.pos >= from_pos
+                    set started: true
+            }
+            if started
+            {
+                if bounded
+                {
+                    if d.pos >= to_pos
+                        return
+                }
+                diagnostics.add_saved(d.pos, d.end, d.code)
+            }
+            set i: i + 1
+        }
+    }
+
+    ; ★★★ parseToplevelStatement — the RECORDING half of the top-level-await
+    ; reparse, whose acting half is reparse_top_level_await above.
     ;
     ; Upstream parses the file ONCE, notes which top-level statements used
     ; `await` as an identifier while not in an await context, and then RE-PARSES
     ; exactly those statements with AwaitContext on (reparseTopLevelAwait) —
     ; re-positioning the scanner, re-slicing the diagnostics, and replacing the
-    ; statements in place. It is a second pass over the source, and it is a slice
-    ; of its own.
+    ; statements in place.
     ;
-    ; The DETECTION half is ported, because it is what decides whether the tree
-    ; this port produced is the tree the reference produced: when the answer is
-    ; yes, every node of that statement carries AwaitContext on the reference's
-    ; side and none of them do here. So the condition is reported rather than the
-    ; difference being left to surface as an unexplained failure — which is
-    ; exactly how it DID surface, on two corpus cases, the moment member access
-    ; started parsing and `M.await(1)` became reachable.
+    ; ★ Slice 5 ported the DETECTION alone and reported the construct, on the
+    ; argument that detection is what decides whether the tree this port produced
+    ; is the tree the reference produced — when the answer is yes, every node of
+    ; that statement carries AwaitContext upstream and none of them do here. That
+    ; was right, and it is worth knowing how it was found: the difference DID
+    ; surface as an unexplained failure on two corpus cases, the moment member
+    ; access started parsing and `M.await(1)` became reachable. Slice 15 makes
+    ; the record act instead of report.
     procedure parse_top_level_statement(this) returns pointer[AstNode]
     {
+        ; ★ Read the index FIRST, because parse_list publishes it just before
+        ; this call and parse_statement below opens lists of its own. It is
+        ; belt-and-braces rather than a live hazard, and the distinction is
+        ; measured rather than assumed: parse_list writes the field only for
+        ; PCSourceElements, and that context has exactly ONE call site (this
+        ; file's parse_source_file), so no nested list can reach the write. The
+        ; reference has the index as a parameter and cannot make the mistake at
+        ; all; a field can, the day a second source-element list appears.
+        let i top_level_statement_index
         set statement_has_await_identifier: false
         let statement this.parse_statement()
         if statement = null
             return null
-        ; The reference records a SPAN here (possibleAwaitSpans) and does nothing
-        ; with it yet; whether it re-parses is decided at the end of the file.
+
+        ; possibleAwaitSpans, whole:
+        ;
+        ;     if len(spans) == 0 || spans[len(spans)-1] != i {
+        ;         spans = append(spans, i, i+1)
+        ;     } else {
+        ;         spans[len(spans)-1] = i + 1
+        ;     }
+        ;
+        ; i.e. EXTEND the open span when this statement directly follows the last
+        ; recorded one, and start a new pair otherwise. The reference's own
+        ; `i += len(p.reparseList)` is dropped rather than ported: reparseList
+        ; holds the nodes JSDoc `@typedef` reparsing inserts ahead of a
+        ; statement, and this port has no JSDoc, so the term is zero at every
+        ; call. Stated because the line is visibly missing next to the reference.
+        ;
+        ; ★★ The MERGE is ported and is UNGATED, and the verdict is the one slice
+        ; 8 called a REDUNDANCY IN THE REFERENCE rather than any of §3.5v's four
+        ; rows: splitting a merged run into one span per statement produces the
+        ; same tree and the same diagnostics, because the OVERSHOOT branch in
+        ; reparse_top_level_await already absorbs a following span whenever a
+        ; re-parse eats past its own. Measured on both shapes that looked likely
+        ; — consecutive plain recorders, and a recorder whose re-parse absorbs
+        ; the statement after it — and they converge. Ported anyway, because the
+        ; reference has it; recorded so the next reader does not spend an hour
+        ; building a fixture for it. What could still separate the two, and what
+        ; I did not manage to construct, is a first re-parse that absorbs a LATER
+        ; member of the same merged run while a subsequent statement ends exactly
+        ; on an earlier boundary — so this row is carried by the argument, not by
+        ; the suite, and it says so.
         if statement_has_await_identifier
         {
             if (statement.flags & NodeFlagsAwaitContext) = 0
-                set has_possible_await_span: true
+            {
+                let spans possible_await_spans
+                let n spans.get_length() as int
+                var extended false
+                if n > 0
+                {
+                    if *(spans.get_buffer() + (n - 1)) = i
+                    {
+                        spans.put((n - 1) as size_t, i + 1)
+                        set extended: true
+                    }
+                }
+                if extended = false
+                {
+                    spans.add(i)
+                    spans.add(i + 1)
+                }
+            }
         }
         statement
     }
@@ -10162,6 +10432,14 @@ define Parser
         {
             if this.is_list_element(ctx, false)
             {
+                ; parseListIndex's `parseElement(p, len(list))`. The reference has
+                ; two entry points — parseList and parseListIndex — and uses the
+                ; indexed one for PCSourceElements alone; one loop carries both
+                ; here, with the index published only for that context so a
+                ; nested block cannot overwrite the top level's. See the
+                ; top_level_statement_index field (§3.5k).
+                if ctx = PCSourceElements
+                    set top_level_statement_index: list.get_length() as int
                 let element this.parse_list_element(ctx)
                 if element = null
                 {
