@@ -26,12 +26,13 @@ import (
 	"os"
 
 	"github.com/microsoft/typescript-go/internal/ast"
+	"github.com/microsoft/typescript-go/internal/core"
 	"github.com/microsoft/typescript-go/internal/scanner"
 )
 
 func main() {
 	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: tokens <file.ts>")
+		fmt.Fprintln(os.Stderr, "usage: tokens <file>")
 		os.Exit(2)
 	}
 
@@ -41,8 +42,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	// ★★★ The LANGUAGE VARIANT, which a token dump needs for the same reason the
+	// parse does and which the file's NAME decides. `getLanguageVariant` is not
+	// exported, so its rule is spelled here: it answers JSX for TSX, JSX, JS —
+	// and for JSON. The clamp is the ast oracle's (only .json leaves TS), applied
+	// FIRST, so a .js unit is scanned Standard here exactly as it is parsed as
+	// TypeScript there. Under the JSX variant `</` is one token, which is the
+	// whole of the difference at scan time.
+	variant := core.LanguageVariantStandard
+	if core.GetScriptKindFromFileName(os.Args[1]) == core.ScriptKindJSON {
+		variant = core.LanguageVariantJSX
+	}
+
 	s := scanner.NewScanner()
 	s.SetText(string(text))
+	s.SetLanguageVariant(variant)
 
 	out := os.Stdout
 	for {

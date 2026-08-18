@@ -28,6 +28,10 @@
 # the corpus came out of package.json and tsconfig.json bodies read as
 # TypeScript, which is a document the reference's own runner never parses.
 #
+# ★ Since slice 19 those bodies ARE parsed — as JSON, by the second grammar, with
+# the kind derived from each unit's own name on both sides. The split is what
+# made that possible and the measurement above is what it was for.
+#
 # A single-file case yields exactly one unit, so its case key is unchanged; a
 # multi-file case's units are keyed `<case>@<unit path>`.
 #
@@ -220,15 +224,20 @@ matched_ast=0;    unported_ast=0;    failed_ast=0;    accepted_ast=0;    stale_a
 failures=()
 stales=()
 
-# Units the yardsticks do not compare, counted by REASON. Both oracles force
-# ScriptKindTS — the only script kind this port implements — so a unit the
-# reference's harness would parse under a different kind is measuring a parse
-# neither side intends. That is the same argument that excludes .tsx at case
-# discovery, applied one level down; each count is printed, because a
-# measurement that silently shrinks is the failure mode this whole suite is
-# organized against.
+# Units the yardsticks do not compare, counted by REASON. Both sides derive the
+# script kind from the unit's NAME and clamp it to the two kinds this port
+# implements — TS and, since slice 19, JSON — so a unit the reference's harness
+# would parse under a THIRD kind is measuring a parse neither side intends. That
+# is the same argument that excludes .tsx at case discovery, applied one level
+# down; each count is printed, because a measurement that silently shrinks is the
+# failure mode this whole suite is organized against.
 cases_seen=0
-skip_json=0; skip_jsx=0; skip_other=0
+skip_jsx=0; skip_other=0
+
+# Compared under ScriptKindJSON on both sides — counted, not skipped, and named
+# in the report so the second grammar's coverage is a number rather than an
+# inference from a total.
+json_compared=0
 # Compared, but not under the kind the reference's harness would choose — see
 # classify_unit's .js arm. Counted so the report states it rather than implying
 # that every compared unit is a faithful one.
@@ -273,9 +282,15 @@ classify_unit() {
     # comparisons and bought nothing. They move to ScriptKindJS when the port has
     # one, and that slice is what makes them faithful rather than merely valid.
     *.js|*.cjs|*.mjs)       UNIT_SKIP= ;;
-    # ScriptKindJSON is a different grammar (parseJsonText). This is the class
-    # that made the split worth building.
-    *.json)                 UNIT_SKIP=json ;;
+    # ★★★ A .json unit IS compared since slice 19, under ScriptKindJSON on both
+    # sides — the second GRAMMAR (parseJsonText), which is the class the split
+    # was built for and the only one it exposed that is now closed by porting
+    # rather than by argument. Three things follow the kind and all three are
+    # visible here: the parse dispatches to a different entry point, every node
+    # carries JavaScriptFile|JsonFile as context flags, and the SCANNER runs
+    # under the JSX language variant, which is what upstream's own
+    # getLanguageVariant answers for JSON.
+    *.json)                 UNIT_SKIP= ;;
     *)                      UNIT_SKIP=other ;;
   esac
 }
@@ -374,7 +389,6 @@ for case_file in "${cases[@]}"; do
     classify_unit "$unit_name"
     if [ -n "$UNIT_SKIP" ]; then
       case $UNIT_SKIP in
-        json)        skip_json=$((skip_json + 1)) ;;
         jsx)         skip_jsx=$((skip_jsx + 1)) ;;
         *)           skip_other=$((skip_other + 1)) ;;
       esac
@@ -396,6 +410,7 @@ for case_file in "${cases[@]}"; do
 
     case $(printf '%s' "$unit_name" | tr 'A-Z' 'a-z') in
       *.js|*.cjs|*.mjs) js_compared=$((js_compared + 1)) ;;
+      *.json)           json_compared=$((json_compared + 1)) ;;
     esac
 
     work="$case_work/$idx"
@@ -437,11 +452,17 @@ report() {
 report "scanner yardstick" $matched_tokens $unported_tokens $accepted_tokens $failed_tokens
 report "parser yardstick"  $matched_ast    $unported_ast    $accepted_ast    $failed_ast
 
-skipped=$(( skip_json + skip_jsx + skip_other ))
+echo
+echo "$json_compared .json units ARE compared, under ScriptKindJSON on both sides —"
+echo "  the second grammar (parseJsonText), ported in slice 19. The kind is derived"
+echo "  from the unit's NAME on both sides and decides three things at once: the"
+echo "  entry point, the context flags (JavaScriptFile|JsonFile on every node) and"
+echo "  the scanner's language variant (JSX — upstream's own answer for JSON)."
+
+skipped=$(( skip_jsx + skip_other ))
 if [ $skipped -ne 0 ]; then
   echo
   echo "units not compared — $skipped, each for a reason of its own"
-  echo "  .json          $skip_json   a different GRAMMAR (parseJsonText), and the class the split was built for"
   echo "  .tsx/.jsx      $skip_jsx   the JSX language VARIANT, which changes what < and { mean"
   echo "  other          $skip_other"
   echo

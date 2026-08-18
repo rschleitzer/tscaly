@@ -59,7 +59,7 @@ func walk(out *os.File, n *ast.Node, depth int) {
 
 func main() {
 	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: ast <file.ts>")
+		fmt.Fprintln(os.Stderr, "usage: ast <file>")
 		os.Exit(2)
 	}
 
@@ -93,14 +93,32 @@ func main() {
 	}
 	fileName := tspath.GetNormalizedAbsolutePath(os.Args[1], cwd)
 
-	// ScriptKindTS, not the extension-derived kind: .tsx would select the JSX
-	// language variant, which changes what `<` means, and neither side selects
-	// it. The runner excludes .tsx for the same reason.
+	// ★★★ The extension-derived kind, CLAMPED to the two kinds our port
+	// implements — the reference's own GetScriptKindFromFileName, then TS for
+	// anything that is not JSON. Both halves are deliberate.
+	//
+	// JSON must come through, because it is a different GRAMMAR (parseJSONText,
+	// reached from ParseSourceFile before parseSourceFileWorker) with different
+	// context flags and a different language variant. Comparing a .json unit as
+	// TypeScript measured a document the reference never parses that way, which
+	// is what split.go exists to say.
+	//
+	// Everything else is clamped to TS: .tsx and .jsx would select the JSX
+	// language variant, which changes what `<` and `{` mean; .js would select
+	// ScriptKindJS, where JSDoc is SYNTAX. Our port has neither grammar, so
+	// asking for those kinds here would compare against a parse it cannot
+	// produce — see classify_unit's .js arm for the measurement. Our side spells
+	// the same two arms in Parser.supported_script_kind.
+	scriptKind := core.GetScriptKindFromFileName(fileName)
+	if scriptKind != core.ScriptKindJSON {
+		scriptKind = core.ScriptKindTS
+	}
+
 	opts := ast.SourceFileParseOptions{
 		FileName: fileName,
 		Path:     tspath.ToPath(fileName, cwd, true),
 	}
-	sf := parser.ParseSourceFile(opts, string(text), core.ScriptKindTS)
+	sf := parser.ParseSourceFile(opts, string(text), scriptKind)
 
 	out := os.Stdout
 	walk(out, sf.AsNode(), 0)
