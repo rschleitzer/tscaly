@@ -192,14 +192,18 @@ done
 # ★ conformance/ is NESTED — a flat glob finds 2 of its 19 cases and the run
 # looks complete. Both trees are walked recursively.
 #
-# .tsx is deliberately excluded: those cases are scanned under the JSX language
-# variant, which changes what `<` and `{` mean, and neither our port nor these
-# oracles select it. Comparing them would measure a parse neither side intends.
+# ★★★ .tsx CASES JOINED IN SLICE 20, and until then their exclusion was the
+# largest block this runner did not see: 20 case files, where the .tsx UNITS
+# inside .ts cases numbered one. The line that stood here said comparing them
+# "would measure a parse neither side intends", which was true while neither side
+# selected the JSX variant and expired the moment both do — the same shape as the
+# .json exclusion slice 19 closed. Both sides now derive the kind from the unit's
+# NAME and clamp it, and .tsx clamps to itself.
 cases=()
 while IFS= read -r f; do cases+=("$f"); done < <(
-  find "$PKG/tests/fixtures" -name '*.ts' 2>/dev/null | sort
+  find "$PKG/tests/fixtures" -name '*.ts' -o -name '*.tsx' 2>/dev/null | sort
   find "$SUB/testdata/tests/cases/compiler" "$SUB/testdata/tests/cases/conformance" \
-    -name '*.ts' 2>/dev/null | sort
+    \( -name '*.ts' -o -name '*.tsx' \) 2>/dev/null | sort
 )
 
 # accepted.txt is <case>\t<artifact>\t<reason> — the artifact column is what
@@ -242,6 +246,11 @@ json_compared=0
 # classify_unit's .js arm. Counted so the report states it rather than implying
 # that every compared unit is a faithful one.
 js_compared=0
+# Compared under ScriptKindTSX on both sides — the JSX grammar, slice 20. Split in
+# two because only the first half is the kind the reference's harness would
+# choose; see classify_unit.
+tsx_compared=0
+jsx_compared=0
 
 UNIT_SKIP=
 classify_unit() {
@@ -265,7 +274,15 @@ classify_unit() {
     # these units is 1 to 41 lines apiece. A cause generalises from one
     # measurement; a magnitude does not.
     *.ts|*.mts|*.cts)       UNIT_SKIP= ;;
-    *.tsx|*.jsx)            UNIT_SKIP=jsx ;;
+    # ★★★ COMPARED since slice 20, under ScriptKindTSX on both sides — the JSX
+    # grammar. A .jsx unit is compared under that same kind rather than under
+    # ScriptKindJSX, and the distinction is the .js one all over again: the two
+    # kinds select the identical GRAMMAR, and JSX additionally carries
+    # NodeFlagsJavaScriptFile, i.e. checkJSSyntax and the JSDoc reparse. So a .jsx
+    # unit is a valid comparison of the JSX parser and not the kind the reference's
+    # harness would choose; it is counted with the .js units below for that reason.
+    *.tsx)                  UNIT_SKIP= ;;
+    *.jsx)                  UNIT_SKIP= ;;
     # ★★★ A .js unit IS compared, as TypeScript on BOTH sides, and the reasoning
     # is worth having because the first draft skipped it. The reference's harness
     # would parse it under ScriptKindJS, where JSDoc is syntax — so this is not
@@ -410,6 +427,8 @@ for case_file in "${cases[@]}"; do
 
     case $(printf '%s' "$unit_name" | tr 'A-Z' 'a-z') in
       *.js|*.cjs|*.mjs) js_compared=$((js_compared + 1)) ;;
+      *.jsx)            jsx_compared=$((jsx_compared + 1)) ;;
+      *.tsx)            tsx_compared=$((tsx_compared + 1)) ;;
       *.json)           json_compared=$((json_compared + 1)) ;;
     esac
 
@@ -459,22 +478,34 @@ echo "  from the unit's NAME on both sides and decides three things at once: the
 echo "  entry point, the context flags (JavaScriptFile|JsonFile on every node) and"
 echo "  the scanner's language variant (JSX — upstream's own answer for JSON)."
 
+echo
+echo "$tsx_compared .tsx units ARE compared, under ScriptKindTSX on both sides —"
+echo "  the JSX grammar, ported in slice 20. The kind decides the same three things"
+echo "  the JSON kind does, and one more: the four JSX TOKEN SCANNERS, which the"
+echo "  PARSER drives. No token dump reaches them, so the scanner yardstick sees"
+echo "  only the variant's one bit (\`</\` as one token) and the parser yardstick is"
+echo "  the whole witness for this grammar."
+
 skipped=$(( skip_jsx + skip_other ))
 if [ $skipped -ne 0 ]; then
   echo
   echo "units not compared — $skipped, each for a reason of its own"
-  echo "  .tsx/.jsx      $skip_jsx   the JSX language VARIANT, which changes what < and { mean"
+  if [ $skip_jsx -ne 0 ]; then
+    echo "  .tsx/.jsx      $skip_jsx   should be 0 since slice 20 — classify_unit no longer skips these"
+  fi
   echo "  other          $skip_other"
-  echo
-  echo "$js_compared .js/.cjs/.mjs units ARE compared, as TypeScript on both sides —"
-  echo "  which is a well-defined comparison of our parser but NOT the kind the"
-  echo "  reference harness would choose (ScriptKindJS: JSDoc is syntax there)."
-  echo "  Skipping them was measured and cost 60 matching corpus cases for no"
-  echo "  information; classify_unit has the argument."
-  echo
-  echo "  Each count is printed rather than folded away: a yardstick that shrinks in"
-  echo "  silence is the failure mode this suite exists to prevent."
 fi
+
+echo
+echo "$js_compared .js/.cjs/.mjs units ARE compared, as TypeScript on both sides, and"
+echo "  $jsx_compared .jsx units as TSX — well-defined comparisons of our parser, but NOT"
+echo "  the kind the reference harness would choose (ScriptKindJS / ScriptKindJSX:"
+echo "  JSDoc is syntax there and checkJSSyntax runs). Skipping the .js ones was"
+echo "  measured and cost 60 matching corpus cases for no information;"
+echo "  classify_unit has the argument."
+echo
+echo "  Each count is printed rather than folded away: a yardstick that shrinks in"
+echo "  silence is the failure mode this suite exists to prevent."
 
 total_stale=$(( stale_tokens + stale_ast ))
 total_failed=$(( failed_tokens + failed_ast ))

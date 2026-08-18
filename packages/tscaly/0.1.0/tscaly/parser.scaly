@@ -251,6 +251,13 @@ use tscaly.ast.TemplateSpanData
 use tscaly.ast.TaggedTemplateData
 use tscaly.ast.MetaPropertyData
 use tscaly.ast.ImportTypeData
+use tscaly.ast.JsxElementData
+use tscaly.ast.JsxOpeningElementData
+use tscaly.ast.JsxFragmentData
+use tscaly.ast.JsxTextData
+use tscaly.ast.JsxExpressionData
+use tscaly.ast.JsxAttributeData
+use tscaly.ast.JsxNamespacedNameData
 
 ; The reference's jsdocScannerInfo — what the scanner noticed about the JSDoc
 ; comment preceding the token the parser is about to consume. It is captured at
@@ -302,9 +309,18 @@ define PCObjectBindingElements: int 18
 define PCArrayBindingElements: int 19
 define PCSourceElements:      int 20
 
+; Slice 20. PCJsxChildren is the odd one: parse_jsx_children does NOT go through
+; parse_list — it has its own loop, because every child needs a JSX RE-SCAN
+; before it can be recognised. The context is still entered, and that is what it
+; is for: is_in_some_parsing_context asks every OPEN list about the token an inner
+; list has choked on, so a `</` inside a nested construct terminates the child
+; list rather than being skipped.
+define PCJsxAttributes:       int 21
+define PCJsxChildren:         int 22
+
 ; The reference's PCCount — the loop bound of is_in_some_parsing_context, which
 ; is the only reason the values have to be dense.
-define PCCount:               int 21
+define PCCount:               int 23
 
 ; ── operator precedence, ported from internal/ast/precedence.go ─────────────
 ;
@@ -609,6 +625,17 @@ define Parser
     ; the scanner's LANGUAGE VARIANT, and which of the two GRAMMARS the entry
     ; point dispatches to.
     script_kind: int
+
+    ; ★★★ The reference's `languageVariant core.LanguageVariant`, and slice 20 is
+    ; what gives the PARSER a copy of what slice 19 gave the scanner. It is read
+    ; at four places, all of them about `<`: the update expression (a JSX element
+    ; is a primary expression), the simple unary (`+<foo>bar` must not be a type
+    ; assertion), the arrow-function tristate (a `<` there is a type parameter
+    ; list only under a much narrower test), and the type-assertion assert.
+    ;
+    ; A bool for the reason the scanner's is one: the reference's enum has two
+    ; members and every read is `== LanguageVariantJSX`.
+    language_variant_jsx: bool
 )
 {
     init(host: pointer[Page], scanner: pointer[Scanner])
@@ -635,6 +662,7 @@ define Parser
         set this.is_declaration_file: false
         set this.source_flags: NodeFlagsNone
         set this.script_kind: ScriptKindTS
+        set this.language_variant_jsx: false
         set this.unported_pos: 0 - 1
         set this.unported_tag: null
         set this.unported_detail: 0
@@ -691,7 +719,10 @@ define Parser
 
         ; initializeState's last line, and the one whose ANSWER is a surprise:
         ; getLanguageVariant says JSX for ScriptKindJSON. See the scanner's
-        ; `jsx_variant`.
+        ; `jsx_variant`. The parser keeps the same answer for itself — upstream's
+        ; `p.languageVariant = getLanguageVariant(p.scriptKind)` is one line
+        ; ABOVE the setter, and the two must not be allowed to disagree.
+        set p.language_variant_jsx: language_variant_is_jsx(script_kind)
         sc.set_language_variant_jsx(language_variant_is_jsx(script_kind))
 
         ; ★ ParseSourceFile's own body, which is three lines: advance to the
@@ -720,21 +751,37 @@ define Parser
     ; one, and §3.5a's rule is to export the QUESTION.
     ;
     ; The clamp is a statement about the port, not about the test harness, and it
-    ; has two arms:
+    ; has three arms:
     ;
     ;   .json                 → ScriptKindJSON, the second grammar (slice 19)
+    ;   .tsx, .jsx            → ScriptKindTSX, the JSX grammar (slice 20)
     ;   everything else       → ScriptKindTS
     ;
     ; So a `.js` file is parsed as TypeScript here, which is exactly what the
     ; yardstick's classify_unit already says in prose: under ScriptKindJS the
     ; reference reads JSDoc as SYNTAX, and this port has no JSDoc grammar, so
-    ; asking for that kind would compare against a parse we cannot produce. The
-    ; `.tsx`/`.jsx` variant is the same argument. Both are named in one place
-    ; here rather than being implied by two oracles that hardcode a kind.
+    ; asking for that kind would compare against a parse we cannot produce.
+    ;
+    ; ★★★ `.jsx` maps to TSX and NOT to ScriptKindJSX, and the reason is the same
+    ; one that keeps `.js` on TS: ScriptKindJSX carries NodeFlagsJavaScriptFile,
+    ; which turns on checkJSSyntax and the JSDoc reparse — the whole `.js`
+    ; question — while the GRAMMAR the two kinds select is identical. So a `.jsx`
+    ; unit is compared under the JSX grammar with the JavaScript bit off, which is
+    ; a well-defined comparison of the part being ported and not the kind the
+    ; reference's harness would choose. It moves to JSX when the port has JSDoc.
+    ; The one place that distinction IS visible from here is the type-argument test
+    ; in parse_jsx_opening_or_self_closing_element_or_opening_fragment, which asks
+    ; the context flag: `<Foo<T> …>` parses its type arguments under TSX and would
+    ; not under JSX.
     function supported_script_kind(file_name: String) returns int
     {
-        if script_kind_from_file_name(file_name) = ScriptKindJSON
+        let k script_kind_from_file_name(file_name)
+        if k = ScriptKindJSON
             return ScriptKindJSON
+        if k = ScriptKindTSX
+            return ScriptKindTSX
+        if k = ScriptKindJSX
+            return ScriptKindTSX
         ScriptKindTS
     }
 
@@ -819,6 +866,26 @@ define Parser
             return null
         set n.pos: pos
         set n.end: this.node_pos()
+        set n.flags: n.flags | context_flags
+        if diagnostics.has_error
+        {
+            set n.flags: n.flags | NodeFlagsThisNodeHasError
+            set diagnostics.has_error: false
+        }
+        n
+    }
+
+    ; The reference's finishNodeWithEnd: the same thing with the end given rather
+    ; than taken from the scanner. Its callers are the ones that SYNTHESIZE a node
+    ; at a position the parser has already left — slice 20's jsx recovery places a
+    ; zero-width closing tag at the end of a child list — so `node_pos()` would
+    ; answer the wrong place.
+    procedure finish_node_with_end(this, n: pointer[AstNode], pos: int, end: int) returns pointer[AstNode]
+    {
+        if n = null
+            return null
+        set n.pos: pos
+        set n.end: end
         set n.flags: n.flags | context_flags
         if diagnostics.has_error
         {
@@ -3975,6 +4042,24 @@ define Parser
     procedure parse_identifier_name_with_diagnostic(this, code: int) returns pointer[AstNode]
         this.create_identifier_with_diagnostic(token_is_identifier_or_keyword(token), code, 0)
 
+    ; ★★★ Slice 20. Same identifier, one extra REPORT: a JSX tag name, attribute
+    ; name or namespace half may not be spelled with a unicode escape. The
+    ; identifier is still built — the report is additive, so `<a\u0062>` parses as
+    ; the tag `ab` and carries 17021 — which is what makes this the third
+    ; parameter of parse_right_side_of_dot rather than a refusal.
+    ;
+    ; Both flags are asked because the two spellings are separate bits: `\u0062`
+    ; sets UnicodeEscape and `\u{62}` sets ExtendedUnicodeEscape.
+    procedure parse_identifier_name_error_on_unicode_escape_sequence(this) returns pointer[AstNode]
+    {
+        var escaped scanner.has_unicode_escape()
+        if scanner.has_extended_unicode_escape()
+            set escaped: true
+        if escaped
+            this.parse_error_at_current_token(DiagUnicode_escape_sequence_cannot_appear_here)
+        this.create_identifier(token_is_identifier_or_keyword(token))
+    }
+
     ; ★ A BINDING named `await` does not count towards the top-level-await
     ; reparse — `let await = 1` declares a variable, it does not use one — so the
     ; flag is saved and restored around it. Three more sites do the same
@@ -4657,9 +4742,11 @@ define Parser
         if token = KindAwaitKeyword
             return false
         ; `<` is an update expression only under the JSX variant, where it opens
-        ; an element. Here it opens a type assertion, which is a unary form.
+        ; an element; without it the `<` opens a type assertion, which is a unary
+        ; form. Slice 20 made this the variant question the reference asks —
+        ; before it, the answer was hardcoded to the Standard variant's.
         if token = KindLessThanToken
-            return false
+            return language_variant_jsx
         true
     }
 
@@ -4685,6 +4772,19 @@ define Parser
             return this.finish_node(this.new_node(KindPrefixUnaryExpression, NodeData.PrefixUnaryExpression(PrefixUnaryExpressionData(op, operand))), pos)
         }
 
+        ; The reference's `else if` on the branch above: a JSX element is part of
+        ; primaryExpression, so this is where `<div/>` enters the grammar. The
+        ; lookahead is what keeps `a < b` a comparison — under the JSX variant a
+        ; `<` followed by anything that is not a name or `>` is still an operator.
+        if language_variant_jsx
+        {
+            if token = KindLessThanToken
+            {
+                if this.look_ahead_next_token_is_identifier_or_keyword_or_greater_than()
+                    return this.parse_jsx_element_or_self_closing_element_or_fragment(true, 0 - 1, null, false)
+            }
+        }
+
         let expression this.parse_left_hand_side_expression_or_higher()
         if expression = null
             return null
@@ -4707,6 +4807,619 @@ define Parser
         expression
     }
 
+    ; ── the JSX grammar ─────────────────────────────────────────────────────
+    ;
+    ; Slice 20. Sixteen parse routines and three scanner drivers, and the shape
+    ; to hold on to is that LAST part: this grammar is the one place where the
+    ; parser tokenizes. Every routine that finishes a tag ends by choosing
+    ; between `next_token()` and `scan_jsx_text()` — the same source position,
+    ; two different tokenizations — because whether what follows is document text
+    ; or an expression is a question only the parser can answer. So the ordinary
+    ; scan loop is bypassed here, and the token yardstick, which calls scan() in a
+    ; loop, cannot see any of this. The parse yardstick is the only witness.
+
+    procedure parse_jsx_element_or_self_closing_element_or_fragment(this, in_expression_context: bool, top_invalid_node_position: int, opening_tag: pointer[AstNode], must_be_unary: bool) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let opening this.parse_jsx_opening_or_self_closing_element_or_opening_fragment(in_expression_context)
+        if opening = null
+            return null
+
+        var result null as pointer[AstNode]
+
+        if opening.kind = KindJsxOpeningElement
+        {
+            var children_end 0
+            var children this.parse_jsx_children(opening, &children_end)
+            var closing_element null as pointer[AstNode]
+
+            ; core.LastOrNil.
+            var last_child null as pointer[AstNode]
+            if children <> null
+            {
+                let n children.get_length() as int
+                if n > 0
+                    set last_child: *(children.get_buffer() + (n - 1))
+            }
+
+            ; ★★★ THE RESTRUCTURING PATH: `<div>(...<span>...</div>)`. The inner
+            ; `<span>` was never closed, so it consumed its PARENT's `</div>` as
+            ; its own closing tag; parse_jsx_children stopped right there for
+            ; exactly this reason. The repair hands the `</div>` back to the outer
+            ; element and gives the inner one a zero-width MISSING closing tag at
+            ; the end of its own children — so the tree is `(<div>(...<span>...</>)</div>)`
+            ; and nothing is reported here, because the parent's own mismatch test
+            ; will report it.
+            var restructured false
+            if last_child <> null
+            {
+                if last_child.kind = KindJsxElement
+                {
+                    let lc_open AstNode.jsx_element_opening_of(last_child)
+                    let lc_close AstNode.jsx_element_closing_of(last_child)
+                    if not AstNode.tag_names_are_equivalent(AstNode.jsx_tag_name_of(lc_open), AstNode.jsx_tag_name_of(lc_close))
+                    {
+                        if AstNode.tag_names_are_equivalent(AstNode.jsx_tag_name_of(opening), AstNode.jsx_tag_name_of(lc_close))
+                            set restructured: true
+                    }
+                }
+            }
+
+            if restructured
+            {
+                ; The reference's `lastChild.Children().End()` — the extent of the
+                ; INNER element's own child list, which is why JsxElementData
+                ; carries it (see that record).
+                let end AstNode.jsx_element_children_end_of(last_child)
+                let missing_identifier this.finish_node_with_end(this.new_node(KindIdentifier, NodeData.Identifier(IdentifierData(null, 0))), end, end)
+                let new_closing_element this.finish_node_with_end(this.new_node(KindJsxClosingElement, NodeData.JsxClosingElement(WrappedTypeData(missing_identifier))), end, end)
+                let lc_open AstNode.jsx_element_opening_of(last_child)
+                let new_last this.finish_node_with_end(this.new_node(KindJsxElement, NodeData.JsxElement(JsxElementData(lc_open, AstNode.jsx_element_children_of(last_child), new_closing_element, end))), lc_open.pos, end)
+                ; `append(children.Nodes[0:len-1], newLast)` — the same list with
+                ; its last element replaced, which an Array does in place.
+                children.put((children.get_length() - 1 as size_t), new_last)
+                ; The reference REPLACES the list here, with a range whose end is
+                ; `newLast.End()` — so the outer element's own children_end moves
+                ; too. ★ It is UNOBSERVABLE, and the argument is short enough to
+                ; keep: the only reader of children_end is this same restructure,
+                ; on a LAST CHILD whose tags MISMATCH, and a restructured element
+                ; always ends up with matching tags (its closing tag is the one the
+                ; condition just proved equal to its opening tag). So a restructured
+                ; element can never trigger its parent's restructure. Kept faithful
+                ; rather than left to differ.
+                set children_end: end
+                set closing_element: AstNode.jsx_element_closing_of(last_child)
+            }
+            else
+            {
+                set closing_element: this.parse_jsx_closing_element(opening, in_expression_context)
+                if closing_element = null
+                    return null
+                if not AstNode.tag_names_are_equivalent(AstNode.jsx_tag_name_of(opening), AstNode.jsx_tag_name_of(closing_element))
+                {
+                    ; Which of the two tags carries the report depends on whose
+                    ; fault it is: if the CLOSING tag matches our PARENT's opening
+                    ; tag, then it is our opening tag that is unclosed, so the
+                    ; report goes there.
+                    var blame_opening false
+                    if opening_tag <> null
+                    {
+                        if opening_tag.kind = KindJsxOpeningElement
+                        {
+                            if AstNode.tag_names_are_equivalent(AstNode.jsx_tag_name_of(closing_element), AstNode.jsx_tag_name_of(opening_tag))
+                                set blame_opening: true
+                        }
+                    }
+                    ; The message takes the tag's TEXT as its argument; the code
+                    ; and the span are what the yardstick compares, so the text is
+                    ; not carried (the same reading create_identifier is under).
+                    if blame_opening
+                    {
+                        let tn AstNode.jsx_tag_name_of(opening)
+                        this.parse_error_at(tn.pos, tn.end, DiagJSX_element_0_has_no_corresponding_closing_tag)
+                    }
+                    else
+                    {
+                        let tn AstNode.jsx_tag_name_of(closing_element)
+                        this.parse_error_at(tn.pos, tn.end, DiagExpected_corresponding_JSX_closing_tag_for_0)
+                    }
+                }
+            }
+            set result: this.finish_node(this.new_node(KindJsxElement, NodeData.JsxElement(JsxElementData(opening, children, closing_element, children_end))), pos)
+        }
+        else
+        {
+            if opening.kind = KindJsxOpeningFragment
+            {
+                var children_end 0
+                let children this.parse_jsx_children(opening, &children_end)
+                let closing this.parse_jsx_closing_fragment(in_expression_context)
+                if closing = null
+                    return null
+                set result: this.finish_node(this.new_node(KindJsxFragment, NodeData.JsxFragment(JsxFragmentData(opening, children, closing))), pos)
+            }
+            else
+            {
+                ; KindJsxSelfClosingElement — nothing else to do.
+                set result: opening
+            }
+        }
+        if result = null
+            return null
+
+        ; ★★ `<div></div><div></div>` in an expression context. The second `<` is
+        ; not an operator anything could use, so rather than leaving the rest as
+        ; garbage the reference SPECULATIVELY parses another element and wraps the
+        ; two in a synthetic comma BinaryExpression, whose only purpose is to keep
+        ; the formatter and the error message sane. The operator token is
+        ; zero-width, at the second element's own start.
+        if must_be_unary
+            return result
+        if in_expression_context = false
+            return result
+        if token <> KindLessThanToken
+            return result
+
+        var top_bad_pos top_invalid_node_position
+        if top_bad_pos < 0
+            set top_bad_pos: result.pos
+        let invalid_element this.parse_jsx_element_or_self_closing_element_or_fragment(true, top_bad_pos, null, false)
+        if invalid_element = null
+            return null
+        let operator_token this.finish_node_with_end(this.new_node(KindCommaToken, NodeData.Token(TokenData())), invalid_element.pos, invalid_element.pos)
+        this.parse_error_at(this.skip_range_trivia_pos(top_bad_pos), invalid_element.end, DiagJSX_expressions_must_have_one_parent_element)
+        ; ★ The reference's NewBinaryExpression takes FIVE arguments — modifiers
+        ; and a typeNode besides — and this port's record has the three slots that
+        ; ForEachChild visits, because the other two exist for the JSDoc reparser
+        ; (§3.5n's rule applied to a node that HAS extra slots this port does not
+        ; keep). Passing five here is what the very first draft did, and it is
+        ; worth the line: rather than a diagnostic it fell through to the
+        ; positional-tuple path and CRASHED the emitter (see §3.5ay).
+        this.finish_node(this.new_node(KindBinaryExpression, NodeData.BinaryExpression(BinaryExpressionData(result, operator_token, invalid_element))), pos)
+    }
+
+    ; The reference's parseJsxChildren, and it is NOT a parse_list call: every
+    ; child has to be preceded by a JSX RE-SCAN, because the token the ordinary
+    ; scanner left behind is the wrong tokenization of this position. The context
+    ; is still entered — see PCJsxChildren.
+    ;
+    ; `out_end` is the reference's NodeList TextRange end, handed back because a
+    ; JsxElement stores it (§3.6's out-parameter answer for a multi-return, and
+    ; the scalar direction, which is the safe one).
+    procedure parse_jsx_children(this, opening_tag: pointer[AstNode], out_end: pointer[int]) returns pointer[Array[pointer[AstNode]]]
+    {
+        let saved_contexts parsing_contexts
+        set parsing_contexts: parsing_contexts | (1 << PCJsxChildren)
+
+        let list AstNode.new_node_list(host)
+        repeat
+        {
+            let current_token this.re_scan_jsx_token(true)
+            let child this.parse_jsx_child(opening_tag, current_token)
+            if child = null
+                break
+            list.add(child)
+
+            ; Stop after a MISMATCHED child, so the `</div>` it wrongly took can
+            ; be reattached one level up — the restructuring path in the caller.
+            if opening_tag.kind = KindJsxOpeningElement
+            {
+                if child.kind = KindJsxElement
+                {
+                    let c_open AstNode.jsx_element_opening_of(child)
+                    let c_close AstNode.jsx_element_closing_of(child)
+                    if not AstNode.tag_names_are_equivalent(AstNode.jsx_tag_name_of(c_open), AstNode.jsx_tag_name_of(c_close))
+                    {
+                        if AstNode.tag_names_are_equivalent(AstNode.jsx_tag_name_of(opening_tag), AstNode.jsx_tag_name_of(c_close))
+                            break
+                    }
+                }
+            }
+        }
+
+        set parsing_contexts: saved_contexts
+        ; The reference's `newNodeList(NewTextRange(pos, p.nodePos()), list)`. Only
+        ; the END is handed back: the list's POS has no reader here, while its end
+        ; has exactly one (see JsxElementData.children_end).
+        set *out_end: this.node_pos()
+        list
+    }
+
+    procedure parse_jsx_child(this, opening_tag: pointer[AstNode], tok: int) returns pointer[AstNode]
+    {
+        if tok = KindEndOfFile
+        {
+            ; ★ The report goes at the TAG that lacks a closing element, not at
+            ; the end of the file, which the reference calls useless — and for an
+            ; element it covers only the tag NAME.
+            if opening_tag.kind = KindJsxOpeningFragment
+                this.parse_error_at(opening_tag.pos, opening_tag.end, DiagJSX_fragment_has_no_corresponding_closing_tag)
+            else
+            {
+                let tag AstNode.jsx_tag_name_of(opening_tag)
+                var start this.skip_range_trivia_pos(tag.pos)
+                if tag.end < start
+                    set start: tag.end
+                this.parse_error_at(start, tag.end, DiagJSX_element_0_has_no_corresponding_closing_tag)
+            }
+            return null
+        }
+        if tok = KindLessThanSlashToken
+            return null
+        if tok = KindConflictMarkerTrivia
+            return null
+        if tok = KindJsxText
+            return this.parse_jsx_text()
+        if tok = KindJsxTextAllWhiteSpaces
+            return this.parse_jsx_text()
+        if tok = KindOpenBraceToken
+            return this.parse_jsx_expression(false)
+        if tok = KindLessThanToken
+            return this.parse_jsx_element_or_self_closing_element_or_fragment(false, 0 - 1, opening_tag, false)
+        ; The reference PANICS here, and a panic is not something to reproduce —
+        ; the established answer in this port is an unported report, which
+        ; invalidates the tree rather than letting a wrong one through. It is
+        ; unreachable rather than lenient: re_scan_jsx_token can answer only
+        ; EndOfFile, LessThanSlash, ConflictMarkerTrivia, JsxText,
+        ; JsxTextAllWhiteSpaces, LessThan and OpenBrace, and all seven have an arm
+        ; above.
+        this.unported("jsx-child-token", tok)
+    }
+
+    procedure parse_jsx_text(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        ; ★ The node is built BEFORE the scan advances, because both of its
+        ; inputs — the text and whether the token was the all-whitespace kind —
+        ; belong to the token the parser is on. The kind stored is JsxText for
+        ; BOTH tokens; see JsxTextData.
+        let all_whitespace token = KindJsxTextAllWhiteSpaces
+        let result this.new_node(KindJsxText, NodeData.JsxText(JsxTextData(all_whitespace)))
+        this.scan_jsx_text()
+        this.finish_node(result, pos)
+    }
+
+    procedure parse_jsx_expression(this, in_expression_context: bool) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        if this.parse_expected(KindOpenBraceToken) = false
+            return null
+
+        var dot_dot_dot_token null as pointer[AstNode]
+        var expression null as pointer[AstNode]
+        if token <> KindCloseBraceToken
+        {
+            ; `{...children}` is a spread only in CHILD position; in an attribute
+            ; value the braces are just a delimiter.
+            if in_expression_context = false
+                set dot_dot_dot_token: this.parse_optional_token(KindDotDotDotToken)
+            ; Only an AssignmentExpression is valid per the JSX spec; the
+            ; reference reads a comma sequence anyway so the grammar checker can
+            ; give a better message.
+            set expression: this.parse_expression()
+            if expression = null
+                return null
+        }
+
+        ; ★★ The two exits differ in TOKENIZATION, not in what they accept: in an
+        ; expression context the `}` is consumed by the ordinary scanner, and in a
+        ; child context it must be followed by JSX text.
+        if in_expression_context
+            this.parse_expected(KindCloseBraceToken)
+        else
+        {
+            if this.parse_expected_without_advancing(KindCloseBraceToken)
+                this.scan_jsx_text()
+        }
+        this.finish_node(this.new_node(KindJsxExpression, NodeData.JsxExpression(JsxExpressionData(dot_dot_dot_token, expression))), pos)
+    }
+
+    ; ── the three scanner drivers ───────────────────────────────────────────
+    ;
+    ; Each is the reference's own one-line wrapper: ask the scanner for a
+    ; DIFFERENT tokenization of the position it is already at, and keep the
+    ; answer in p.token.
+
+    procedure scan_jsx_text(this) returns int
+    {
+        set token: scanner.scan_jsx_token()
+        token
+    }
+
+    procedure scan_jsx_identifier(this) returns int
+    {
+        set token: scanner.scan_jsx_identifier()
+        token
+    }
+
+    procedure scan_jsx_attribute_value(this) returns int
+    {
+        set token: scanner.scan_jsx_attribute_value()
+        token
+    }
+
+    procedure re_scan_jsx_token(this, allow_multiline: bool) returns int
+    {
+        set token: scanner.re_scan_jsx_token(allow_multiline)
+        token
+    }
+
+    procedure parse_jsx_closing_element(this, open: pointer[AstNode], in_expression_context: bool) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        this.parse_expected(KindLessThanSlashToken)
+        let tag_name this.parse_jsx_element_name()
+        if tag_name = null
+            return null
+        if this.parse_expected_with_diagnostic(KindGreaterThanToken, 0, false)
+        {
+            ; ★ The scanner is advanced BY HAND, and which way depends on whether
+            ; more JSX follows: a closing tag that matches its own opening tag and
+            ; is not at the top of an expression is inside another element, so what
+            ; comes next is that element's text.
+            var as_text false
+            if in_expression_context = false
+            {
+                if AstNode.tag_names_are_equivalent(AstNode.jsx_tag_name_of(open), tag_name)
+                    set as_text: true
+            }
+            if as_text
+                this.scan_jsx_text()
+            else
+                this.next_token()
+        }
+        this.finish_node(this.new_node(KindJsxClosingElement, NodeData.JsxClosingElement(WrappedTypeData(tag_name))), pos)
+    }
+
+    procedure parse_jsx_opening_or_self_closing_element_or_opening_fragment(this, in_expression_context: bool) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        this.parse_expected(KindLessThanToken)
+
+        if token = KindGreaterThanToken
+        {
+            ; `<>` — the opening fragment. The scan_jsx_text is the same decision
+            ; the closing `>` of a tag makes below.
+            this.scan_jsx_text()
+            return this.finish_node(this.new_node(KindJsxOpeningFragment, NodeData.Token(TokenData())), pos)
+        }
+
+        let tag_name this.parse_jsx_element_name()
+        if tag_name = null
+            return null
+
+        ; ★ Type arguments on a tag (`<Foo<T> …>`) are TypeScript only: in a
+        ; JavaScript file the `<` after the name is not read as a type argument
+        ; list at all. This is asked of the CONTEXT flag rather than of the script
+        ; kind, which is the reference's own spelling.
+        var type_arguments null as pointer[Array[pointer[AstNode]]]
+        if (context_flags & NodeFlagsJavaScriptFile) = 0
+            set type_arguments: this.parse_type_arguments()
+
+        let attributes this.parse_jsx_attributes()
+        if attributes = null
+            return null
+
+        if token = KindGreaterThanToken
+        {
+            ; The tag closes, so what follows is document text — scanned as JSX so
+            ; that a character like `#` is content and not a scan error.
+            this.scan_jsx_text()
+            return this.finish_node(this.new_node(KindJsxOpeningElement, NodeData.JsxOpeningElement(JsxOpeningElementData(tag_name, type_arguments, attributes))), pos)
+        }
+
+        this.parse_expected(KindSlashToken)
+        if this.parse_expected_without_advancing(KindGreaterThanToken)
+        {
+            if in_expression_context
+                this.next_token()
+            else
+                this.scan_jsx_text()
+        }
+        this.finish_node(this.new_node(KindJsxSelfClosingElement, NodeData.JsxSelfClosingElement(JsxOpeningElementData(tag_name, type_arguments, attributes))), pos)
+    }
+
+    ; A tag name is `a`, `a.b.c`, `this` or `a:b` — deliberately NOT
+    ; parse_left_hand_side_expression_or_higher, which would read `class` and
+    ; `function` as keywords.
+    procedure parse_jsx_element_name(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let initial_expression this.parse_jsx_tag_name()
+        if initial_expression = null
+            return null
+        ; `a:b.c` is invalid syntax: once a NAMESPACED name is read the dot is not
+        ; even looked for, so that parse_jsx_attribute reports the `:` instead.
+        if initial_expression.kind = KindJsxNamespacedName
+            return initial_expression
+
+        var expression initial_expression
+        while this.parse_optional(KindDotToken)
+        {
+            ; ★ FALSE for the unicode-escape parameter, and this is the only
+            ; caller in the whole reference that passes it — see
+            ; parse_right_side_of_dot.
+            let right this.parse_right_side_of_dot(true, false, false)
+            if right = null
+                return null
+            set expression: this.finish_node(this.new_node(KindPropertyAccessExpression, NodeData.PropertyAccessExpression(PropertyAccessData(expression, null, right))), pos)
+        }
+        expression
+    }
+
+    procedure parse_jsx_tag_name(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        this.scan_jsx_identifier()
+        ; Read BEFORE the identifier is consumed: `<this>` is a keyword
+        ; expression, not an identifier named `this`.
+        let is_this token = KindThisKeyword
+        let tag_name this.parse_identifier_name_error_on_unicode_escape_sequence()
+        if tag_name = null
+            return null
+        if this.parse_optional(KindColonToken)
+        {
+            this.scan_jsx_identifier()
+            let second this.parse_identifier_name_error_on_unicode_escape_sequence()
+            if second = null
+                return null
+            return this.finish_node(this.new_node(KindJsxNamespacedName, NodeData.JsxNamespacedName(JsxNamespacedNameData(tag_name, second))), pos)
+        }
+        if is_this
+            return this.finish_node(this.new_node(KindThisKeyword, NodeData.Token(TokenData())), pos)
+        tag_name
+    }
+
+    procedure parse_jsx_attributes(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let list this.parse_list(PCJsxAttributes)
+        if list = null
+            return null
+        this.finish_node(this.new_node(KindJsxAttributes, NodeData.JsxAttributes(ElementListData(list))), pos)
+    }
+
+    procedure parse_jsx_attribute(this) returns pointer[AstNode]
+    {
+        if token = KindOpenBraceToken
+            return this.parse_jsx_spread_attribute()
+        let pos this.node_pos()
+        let name this.parse_jsx_attribute_name()
+        if name = null
+            return null
+        let value this.parse_jsx_attribute_value()
+        this.finish_node(this.new_node(KindJsxAttribute, NodeData.JsxAttribute(JsxAttributeData(name, value))), pos)
+    }
+
+    procedure parse_jsx_spread_attribute(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        this.parse_expected(KindOpenBraceToken)
+        this.parse_expected(KindDotDotDotToken)
+        let expression this.parse_expression()
+        if expression = null
+            return null
+        this.parse_expected(KindCloseBraceToken)
+        this.finish_node(this.new_node(KindJsxSpreadAttribute, NodeData.JsxSpreadAttribute(WrappedTypeData(expression))), pos)
+    }
+
+    procedure parse_jsx_attribute_name(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        this.scan_jsx_identifier()
+        let attr_name this.parse_identifier_name_error_on_unicode_escape_sequence()
+        if attr_name = null
+            return null
+        if this.parse_optional(KindColonToken)
+        {
+            this.scan_jsx_identifier()
+            let second this.parse_identifier_name_error_on_unicode_escape_sequence()
+            if second = null
+                return null
+            return this.finish_node(this.new_node(KindJsxNamespacedName, NodeData.JsxNamespacedName(JsxNamespacedNameData(attr_name, second))), pos)
+        }
+        attr_name
+    }
+
+    ; Answers NULL for a valueless attribute (`<a disabled/>`), which is a real
+    ; null in the reference too and is what the Initializer slot being Optional
+    ; means.
+    procedure parse_jsx_attribute_value(this) returns pointer[AstNode]
+    {
+        if token <> KindEqualsToken
+            return null
+        ; ★ The scanner is asked for the value's tokenization, and a STRING is the
+        ; one it answers itself — as a JSX attribute string, where a backslash is
+        ; ordinary and a newline does not terminate.
+        if this.scan_jsx_attribute_value() = KindStringLiteral
+            return this.parse_literal_expression(KindStringLiteral)
+        if token = KindOpenBraceToken
+            return this.parse_jsx_expression(true)
+        if token = KindLessThanToken
+            return this.parse_jsx_element_or_self_closing_element_or_fragment(true, 0 - 1, null, false)
+        this.parse_error_at_current_token(DiagX_or_JSX_element_expected)
+        null
+    }
+
+    procedure parse_jsx_closing_fragment(this, in_expression_context: bool) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        this.parse_expected(KindLessThanSlashToken)
+        if this.parse_expected_with_diagnostic(KindGreaterThanToken, DiagExpected_corresponding_closing_tag_for_JSX_fragment, false)
+        {
+            if in_expression_context
+                this.next_token()
+            else
+                this.scan_jsx_text()
+        }
+        this.finish_node(this.new_node(KindJsxClosingFragment, NodeData.Token(TokenData())), pos)
+    }
+
+    ; ── the look-aheads this slice adds ─────────────────────────────────────
+
+    procedure look_ahead_next_token_is_slash(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_token_is_slash()
+        this.rewind(saved)
+        r
+    }
+
+    procedure next_token_is_slash(this) returns bool
+    {
+        this.next_token()
+        token = KindSlashToken
+    }
+
+    procedure look_ahead_next_token_is_identifier_or_keyword_or_greater_than(this) returns bool
+    {
+        let saved this.mark()
+        let r this.next_token_is_identifier_or_keyword_or_greater_than()
+        this.rewind(saved)
+        r
+    }
+
+    procedure next_token_is_identifier_or_keyword_or_greater_than(this) returns bool
+    {
+        this.next_token()
+        if token = KindGreaterThanToken
+            return true
+        token_is_identifier_or_keyword(token)
+    }
+
+    ; The JSX override of the arrow-function tristate. Under the JSX variant a
+    ; `<` after which a type parameter list could stand is almost always an
+    ; element, so the reference demands one of three much narrower shapes:
+    ; `<T extends …>` (but not `<T extends =`, `>` or `/`, which are element
+    ; syntax), `<T,` or `<T =`.
+    procedure look_ahead_is_arrow_function_in_jsx(this) returns bool
+    {
+        let saved this.mark()
+        let r this.is_arrow_function_in_jsx()
+        this.rewind(saved)
+        r
+    }
+
+    procedure is_arrow_function_in_jsx(this) returns bool
+    {
+        this.parse_optional(KindConstKeyword)
+        let third this.next_token()
+        if third = KindExtendsKeyword
+        {
+            let fourth this.next_token()
+            if fourth = KindEqualsToken
+                return false
+            if fourth = KindGreaterThanToken
+                return false
+            if fourth = KindSlashToken
+                return false
+            return true
+        }
+        if third = KindCommaToken
+            return true
+        third = KindEqualsToken
+    }
+
     procedure parse_simple_unary_expression(this) returns pointer[AstNode]
     {
         if token = KindPlusToken
@@ -4725,8 +5438,18 @@ define Parser
         if token = KindVoidKeyword
             return this.parse_keyword_unary_expression(KindVoidExpression)
 
+        ; ★ Just as in parse_update_expression, a `<` under the JSX variant is an
+        ; element and never a type assertion — the reference's comment names the
+        ; shape it protects, `+ <foo> bar`. `must_be_unary` is TRUE here and only
+        ; here: the recovery at the end of the jsx routine builds a BINARY
+        ; expression, which is not a valid UnaryExpression and would break the
+        ; caller, so this call forbids it.
         if token = KindLessThanToken
+        {
+            if language_variant_jsx
+                return this.parse_jsx_element_or_self_closing_element_or_fragment(true, 0 - 1, null, true)
             return this.parse_type_assertion()
+        }
 
         if token = KindAwaitKeyword
         {
@@ -4786,6 +5509,13 @@ define Parser
 
     ; `<T>x`. The TYPE comes first here — the opposite of `x as T` — which is
     ; why the two do not share a record on the ast side.
+    ; ★ The reference opens this with a debug.Assert that the language variant is
+    ; NOT JSX — "type assertions should never be parsed in JSX; they should be
+    ; parsed as comparisons or JSX elements/fragments". It is not ported for the
+    ; reason no other assert in this file is: an assertion is a claim about the
+    ; two callers, and both of them now ask the variant question before they get
+    ; here (parse_simple_unary_expression and, through is_update_expression,
+    ; parse_unary_expression_or_higher).
     procedure parse_type_assertion(this) returns pointer[AstNode]
     {
         let pos this.node_pos()
@@ -4945,7 +5675,7 @@ define Parser
         ; private name will never work with `super`, but that is the checker's
         ; complaint, not this one's.
         this.parse_error_at_current_token(DiagX_super_must_be_followed_by_an_argument_list_or_member_access)
-        let name this.parse_right_side_of_dot(true, true)
+        let name this.parse_right_side_of_dot(true, true, true)
         if name = null
             return null
         this.finish_node(this.new_node(KindPropertyAccessExpression, NodeData.PropertyAccessExpression(PropertyAccessData(expr, null, name))), pos)
@@ -5082,7 +5812,7 @@ define Parser
 
     procedure parse_property_access_expression_rest(this, pos: int, expression: pointer[AstNode], question_dot_token: pointer[AstNode]) returns pointer[AstNode]
     {
-        let name this.parse_right_side_of_dot(true, true)
+        let name this.parse_right_side_of_dot(true, true, true)
         if name = null
             return null
 
@@ -5981,9 +6711,7 @@ define Parser
             return TristateFalse
         }
 
-        ; `first` is `<`, a generic arrow function's type parameter list. The
-        ; reference's JSX override belongs to the JSX variant, which is not
-        ; selected here.
+        ; `first` is `<`, a generic arrow function's type parameter list.
         var generic_start this.is_identifier()
         if generic_start = false
         {
@@ -5992,6 +6720,21 @@ define Parser
         }
         if generic_start = false
             return TristateFalse
+
+        ; ★★★ The JSX override, ported in slice 20. Under the JSX variant a `<`
+        ; followed by a name is an ELEMENT far more often than a type parameter
+        ; list, so the answer is not Unknown-and-try-both — it is decided here, and
+        ; the shapes that decide it for the arrow function are narrow:
+        ; `<T extends …>` (but not with `=`, `>` or `/` after `extends`, all three
+        ; of which are element syntax), `<T,` and `<T =`. Anything else is FALSE,
+        ; not Unknown — under this variant the speculative parse must not run,
+        ; because the `<` belongs to the element grammar.
+        if language_variant_jsx
+        {
+            if this.look_ahead_is_arrow_function_in_jsx()
+                return TristateTrue
+            return TristateFalse
+        }
         TristateUnknown
     }
 
@@ -7614,7 +8357,7 @@ define Parser
             ; consumed and stops here, reporting the gap in the checker.
             if token = KindLessThanToken
                 break
-            let right this.parse_right_side_of_dot(allow_reserved_words, false)
+            let right this.parse_right_side_of_dot(allow_reserved_words, false, true)
             if right = null
                 return null
             set entity: this.finish_node(this.new_node(KindQualifiedName, NodeData.QualifiedName(QualifiedNameData(entity, right))), pos)
@@ -7622,7 +8365,13 @@ define Parser
         entity
     }
 
-    procedure parse_right_side_of_dot(this, allow_identifier_names: bool, allow_private_identifiers: bool) returns pointer[AstNode]
+    ; ★★★ `allow_unicode_escape_sequence_in_identifier_name` arrived with slice
+    ; 20 and is the §3.5ar shape from the other side: the reference has carried
+    ; the parameter all along, every caller before this slice passes TRUE, and
+    ; the port had folded it into the `true` branch. parseJsxElementName is the
+    ; one caller that passes false, and it is the whole reason
+    ; `<a.\u0062>` reports 17021 upstream and reported nothing here.
+    procedure parse_right_side_of_dot(this, allow_identifier_names: bool, allow_private_identifiers: bool, allow_unicode_escape_in_name: bool) returns pointer[AstNode]
     {
         ; ★ The ASI guard: `name.` at the end of a line followed by an identifier
         ; on the NEXT line is two statements, not one member access. The report
@@ -7657,7 +8406,11 @@ define Parser
         ; use of the name and reaches the reparse; a dotted ENTITY name in a type
         ; does not, which is why the other branch puts the flag back.
         if allow_identifier_names
-            return this.parse_identifier_name()
+        {
+            if allow_unicode_escape_in_name
+                return this.parse_identifier_name()
+            return this.parse_identifier_name_error_on_unicode_escape_sequence()
+        }
         let saved_await_identifier statement_has_await_identifier
         let id this.parse_identifier()
         set statement_has_await_identifier: saved_await_identifier
@@ -11556,7 +12309,19 @@ define Parser
             return
         }
         if ctx = PCImportAttributes
+        {
             this.parse_error_at_current_token(DiagIdentifier_or_string_literal_expected)
+            return
+        }
+        ; Slice 20. Both JSX contexts share Identifier_expected upstream, in one
+        ; arm together with PCJSDocComment.
+        if ctx = PCJsxAttributes
+        {
+            this.parse_error_at_current_token(DiagIdentifier_expected)
+            return
+        }
+        if ctx = PCJsxChildren
+            this.parse_error_at_current_token(DiagIdentifier_expected)
     }
 
     procedure parse_list_element(this, ctx: int) returns pointer[AstNode]
@@ -11627,6 +12392,12 @@ define Parser
             return this.parse_array_binding_element()
         if ctx = PCObjectBindingElements
             return this.parse_object_binding_element()
+        ; Slice 20. PCJsxChildren has NO arm here, and its absence is the fact:
+        ; parse_jsx_children does not go through parse_list at all, because every
+        ; child has to be preceded by a JSX re-scan. The context exists for
+        ; is_in_some_parsing_context; see the constant's comment.
+        if ctx = PCJsxAttributes
+            return this.parse_jsx_attribute()
         this.parse_type()
     }
 
@@ -11823,6 +12594,17 @@ define Parser
                 return true
             return this.is_binding_identifier_or_private_identifier_or_pattern()
         }
+        ; Slice 20. An attribute starts with a name or with `{` (a spread); a
+        ; CHILD is anything at all, which is the reference's own `return true` and
+        ; is why the child list needs a terminator rather than a start test.
+        if ctx = PCJsxAttributes
+        {
+            if token_is_identifier_or_keyword(token)
+                return true
+            return token = KindOpenBraceToken
+        }
+        if ctx = PCJsxChildren
+            return true
         ; PCTypeArguments and PCTupleElementTypes share one arm upstream too.
         if token = KindCommaToken
             return true
@@ -11944,6 +12726,23 @@ define Parser
         ; is_list_element: a shared fall-through in Go is a distinct arm here.
         if ctx = PCSourceElements
             return false
+        ; Slice 20. The attribute list ends at `>` or at `/` — the two ways a tag
+        ; can close. A CHILD list ends at `</`, which is asked as `<` plus a
+        ; LOOKAHEAD rather than as the LessThanSlash token, because this predicate
+        ; is also reached from is_in_some_parsing_context with an ordinary token in
+        ; hand, where the JSX re-scan has not run.
+        if ctx = PCJsxAttributes
+        {
+            if token = KindGreaterThanToken
+                return true
+            return token = KindSlashToken
+        }
+        if ctx = PCJsxChildren
+        {
+            if token <> KindLessThanToken
+                return false
+            return this.look_ahead_next_token_is_slash()
+        }
         ; PCTypeArguments: anything but a comma ends the list.
         token <> KindCommaToken
     }

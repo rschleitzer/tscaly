@@ -103,14 +103,25 @@ func main() {
 	// TypeScript measured a document the reference never parses that way, which
 	// is what split.go exists to say.
 	//
-	// Everything else is clamped to TS: .tsx and .jsx would select the JSX
-	// language variant, which changes what `<` and `{` mean; .js would select
-	// ScriptKindJS, where JSDoc is SYNTAX. Our port has neither grammar, so
-	// asking for those kinds here would compare against a parse it cannot
-	// produce — see classify_unit's .js arm for the measurement. Our side spells
-	// the same two arms in Parser.supported_script_kind.
+	// ★★★ Since slice 20 TSX comes through too, for the same reason: it is the
+	// JSX grammar, a third entry into the expression ladder with its own token
+	// scanners and its own language variant.
+	//
+	// .jsx is clamped to TSX rather than passed as ScriptKindJSX, because the
+	// GRAMMAR the two kinds select is identical and JSX additionally carries
+	// NodeFlagsJavaScriptFile — checkJSSyntax and the JSDoc reparse, i.e. the
+	// whole .js question. .js stays on TS for that same reason: under
+	// ScriptKindJS JSDoc is SYNTAX and our port has no JSDoc grammar, so asking
+	// for that kind here would compare against a parse it cannot produce — see
+	// classify_unit's .js arm for the measurement. Our side spells the same three
+	// arms in Parser.supported_script_kind.
 	scriptKind := core.GetScriptKindFromFileName(fileName)
-	if scriptKind != core.ScriptKindJSON {
+	switch scriptKind {
+	case core.ScriptKindJSON:
+		// keep
+	case core.ScriptKindTSX, core.ScriptKindJSX:
+		scriptKind = core.ScriptKindTSX
+	default:
 		scriptKind = core.ScriptKindTS
 	}
 
