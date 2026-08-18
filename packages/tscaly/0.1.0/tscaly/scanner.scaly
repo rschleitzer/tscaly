@@ -90,17 +90,18 @@ define Scanner
     ; one that has to be noticed.
     ;
     ; Still outside this file, all of it parser-driven and with no caller yet:
-    ; the re-scan entry points ReScanSlashToken (regular expressions) and
-    ; ReScanAsteriskEqualsToken / ReScanQuestionToken (both JSDoc-only type
-    ; shapes); the JSX language
+    ; the re-scan entry points ReScanAsteriskEqualsToken / ReScanQuestionToken
+    ; (both JSDoc-only type shapes); the JSX language
     ; variant; comment directives
     ; (`@ts-ignore` — collected into a list, never a token); and JSDoc
     ; leading-asterisk skipping (inert while skipJSDocLeadingAsterisks is 0,
     ; which it is outside JSDoc).
     ;
     ; ReScanLessThanToken is ported — parser slice 3 gave it its first caller —
-    ; ReScanGreaterThanToken since slice 5, which is the ladder's, and
-    ; ReScanTemplateToken since slice 11, which is the template family's.
+    ; ReScanGreaterThanToken since slice 5, which is the ladder's,
+    ; ReScanTemplateToken since slice 11, which is the template family's, and
+    ; ReScanSlashToken since slice 16, which is the regular expression's. That
+    ; leaves no non-JSDoc, non-JSX re-scan unported.
     unported_pos: int
 
     ; The reference's ERROR CALLBACK, and since slice 13b it is the real thing
@@ -492,6 +493,17 @@ define Scanner
         if (c = 0x202F) or (c = 0x205F) or (c = 0x3000)
             return true
         c = 0xFEFF
+    }
+
+    ; The reference's stringutil.IsWhiteSpaceLike — the single-line set plus the
+    ; line terminators. Both halves are above; this is the union, named because
+    ; upstream names it, and its one caller is the trailing trim of
+    ; re_scan_slash_token.
+    function is_white_space_like(c: int) returns bool
+    {
+        if is_white_space_single_line(c)
+            return true
+        is_line_break_rune(c)
     }
 
     ; ── digit classification ────────────────────────────────────────────────
@@ -1325,6 +1337,38 @@ define Scanner
             set back: back + 1
         }
         0xFFFD
+    }
+
+    ; The SIZE of that same last rune. Go's DecodeLastRuneInString answers the
+    ; PAIR (rune, size) and Scaly answers a multi-return with an out-parameter or
+    ; a sibling (§3.6); a sibling here, because the older caller wants only the
+    ; rune. The two share one back-scan by shape and MUST move together — an
+    ; invalid tail is (RuneError, 1) upstream, so every refusal below answers 1.
+    function utf8_last_size_before(this, limit: int) returns int
+    {
+        if limit <= 0
+            return 1
+        let last *(buffer + limit - 1) as int
+        if last < 0x80
+            return 1
+        var back: int 1
+        while back <= 4
+        {
+            let p limit - back
+            if p < 0
+                return 1
+            let b *(buffer + p) as int
+            if b >= 0xC0
+            {
+                if this.utf8_size_at(p) = back
+                    return back
+                return 1
+            }
+            if b < 0x80
+                return 1
+            set back: back + 1
+        }
+        1
     }
 
     function is_conflict_marker(this, pos: int) returns bool
@@ -2520,6 +2564,218 @@ define Scanner
             return this.unported()
         set state.token: k
         k
+    }
+
+    ; The reference's ReScanSlashToken — parser slice 16, and the last re-scan
+    ; entry point outside JSDoc.
+    ;
+    ; A `/` opens a division operator or a regular expression, and nothing in the
+    ; token stream decides which: `a / b` and `/a/g` differ only in what preceded
+    ; them. So scan() always answers SlashToken (or SlashEqualsToken for `/=`)
+    ; and the parser asks for the re-read at the one place a regular expression
+    ; may begin — parsePrimaryExpression.
+    ;
+    ; ★★★ THE REFERENCE'S `reportErrors` PARAMETER IS NOT PORTED, AND WHICH
+    ; CALLER SETS IT IS THE REASON. Upstream it is variadic and false by default:
+    ; the parser calls `ReScanSlashToken()`, the CHECKER calls it with `true`.
+    ; Under the flag the body additionally runs `regExpParser` — a second grammar
+    ; of about a thousand lines that validates the pattern and its flags — and
+    ; those diagnostics belong to the checking pass, not to the parse. This port
+    ; has a parser, so the parameter would carry one value at its one call site;
+    ; it is left out rather than carried false, and this note is what stands in
+    ; for it. What comes back with the checker is the branch AND its parameter.
+    ;
+    ; ★★ Two reads here are BYTE reads although this scanner decodes runes
+    ; everywhere else, and both are ported as bytes on purpose: `ch :=
+    ; rune(s.text[p])` in the two scanning loops widens ONE BYTE, so U+2028 does
+    ; not terminate a regular expression body the way it terminates a line
+    ; elsewhere, and no `/` can hide inside a multi-byte character (every
+    ; continuation byte is >= 0x80). The trailing-trim loop below decodes
+    ; properly. The asymmetry is upstream's, not a simplification.
+    ;
+    ; ★ The `namedCaptureGroups` arm of the first loop is deliberately ABSENT,
+    ; and the argument is checkable rather than a judgement: the variable has
+    ; exactly one reader — the `regExpParser` built inside the `shouldReportErrors`
+    ; branch (`grep -rn namedCaptureGroups internal/scanner` answers regexp.go:391
+    ; and nothing else) — and the arm assigns nothing besides it. So omitting it
+    ; is observationally identical for every caller this port has. It returns
+    ; with the branch that reads it.
+    procedure re_scan_slash_token(this) returns int
+    {
+        if (state.token <> KindSlashToken) and (state.token <> KindSlashEqualsToken)
+            return state.token
+
+        ; Pass one: find the end of the body, so that the flags after it are
+        ; reachable. A `/` inside a character class does not close the literal —
+        ; but NESTED classes are deliberately not tracked here, or `/[[]/` would
+        ; consume past its own closing slash. The reference's comment cites the
+        ; specification section; what matters is that the shape is kept.
+        let start_of_body state.token_start + 1
+        var p: int start_of_body
+        var in_escape: bool false
+        var in_character_class: bool false
+        while true
+        {
+            ; End of file or a line break: unterminated. Report and keep what we
+            ; have — which is what makes the recovery pass below reachable.
+            if p >= end
+            {
+                set state.token_flags: state.token_flags | TokenFlagsUnterminated
+                break
+            }
+            let ch *(buffer + p) as int
+            if is_line_break_rune(ch)
+            {
+                set state.token_flags: state.token_flags | TokenFlagsUnterminated
+                break
+            }
+
+            ; The escape arm comes FIRST and swallows whatever follows — that
+            ; ordering is the reference's switch, and it is what makes `/\//` one
+            ; literal. Below it every arm tests a distinct character, so they are
+            ; independent `if`s ending in `continue` rather than a nested chain
+            ; (§3.9b).
+            if in_escape
+            {
+                set in_escape: false
+                set p: p + 1
+                continue
+            }
+            if (ch = ("/" as char) as int) and (not in_character_class)
+                break
+            if ch = ("[" as char) as int
+                set in_character_class: true
+            if ch = ("\\" as char) as int
+                set in_escape: true
+            if ch = ("]" as char) as int
+                set in_character_class: false
+            set p: p + 1
+        }
+
+        let end_of_body p
+        if (state.token_flags & TokenFlagsUnterminated) <> 0
+        {
+            ; Pass two, RECOVERY. The literal is invalid either way, so the
+            ; reference guesses its extent from the nearest unbalanced bracket —
+            ; and here it DOES count nested character classes, because this is a
+            ; best guess rather than a grammar. A `{n,m}` quantifier suppresses
+            ; the group arms, so a `}` inside one does not end the guess.
+            set p: start_of_body
+            set in_escape: false
+            var character_class_depth: int 0
+            var in_decimal_quantifier: bool false
+            var group_depth: int 0
+            while p < end_of_body
+            {
+                let ch *(buffer + p) as int
+                if in_escape
+                {
+                    set in_escape: false
+                    set p: p + 1
+                    continue
+                }
+                if ch = ("\\" as char) as int
+                {
+                    set in_escape: true
+                    set p: p + 1
+                    continue
+                }
+                if ch = ("[" as char) as int
+                {
+                    set character_class_depth: character_class_depth + 1
+                    set p: p + 1
+                    continue
+                }
+                if (ch = ("]" as char) as int) and (character_class_depth <> 0)
+                {
+                    set character_class_depth: character_class_depth - 1
+                    set p: p + 1
+                    continue
+                }
+                if character_class_depth = 0
+                {
+                    if ch = ("{" as char) as int
+                    {
+                        set in_decimal_quantifier: true
+                        set p: p + 1
+                        continue
+                    }
+                    if (ch = ("}" as char) as int) and in_decimal_quantifier
+                    {
+                        set in_decimal_quantifier: false
+                        set p: p + 1
+                        continue
+                    }
+                    if not in_decimal_quantifier
+                    {
+                        if ch = ("(" as char) as int
+                        {
+                            set group_depth: group_depth + 1
+                            set p: p + 1
+                            continue
+                        }
+                        if (ch = (")" as char) as int) and (group_depth <> 0)
+                        {
+                            set group_depth: group_depth - 1
+                            set p: p + 1
+                            continue
+                        }
+                        ; An unbalanced closer outside a character class: this
+                        ; position is the guessed end.
+                        if (ch = (")" as char) as int) or (ch = ("]" as char) as int) or (ch = ("}" as char) as int)
+                            break
+                    }
+                }
+                set p: p + 1
+            }
+
+            ; Whitespace and semicolons at the end are unlikely to belong to the
+            ; expression. This loop DECODES — it is the one place in this routine
+            ; that does — so the step back is the rune's own size.
+            while p > start_of_body
+            {
+                let ch this.utf8_decode_last_before(p)
+                if not is_white_space_like(ch)
+                {
+                    if ch <> (";" as char) as int
+                        break
+                }
+                set p: p - this.utf8_last_size_before(p)
+            }
+            this.error_at(DiagUnterminated_regular_expression_literal, state.token_start, p - state.token_start)
+        }
+        else
+        {
+            ; Consume the closing slash, then the flags. Validating them is the
+            ; `reportErrors` half (see the header note); what is left is finding
+            ; where they END.
+            ;
+            ; ★ The RuneError test is kept for fidelity and is MEASURED
+            ; redundant, which is worth stating so nobody deletes it as dead or
+            ; trusts it as load-bearing: the only rune the decode can answer that
+            ; is not literally in the text is U+FFFD, and UnicodeId's last
+            ; identifier-part range ends at 0xFFDC — so `is_identifier_part`
+            ; refuses it anyway and the two guards are extensionally equal. A
+            ; control that removes it is UNGATED even with a fixture that puts an
+            ; invalid byte exactly where a flag would go (slice 16, row 13:
+            ; indistinguishable, not uncovered).
+            set p: p + 1
+            while p < end
+            {
+                let ch this.utf8_decode_at(p)
+                if ch = 0xFFFD
+                    break
+                if not is_identifier_part(ch)
+                    break
+                set p: p + this.utf8_size_at(p)
+            }
+        }
+
+        set state.pos: p
+        ; The reference also stores tokenValue here. This port stores no token
+        ; text at all (§3.5q) and both yardsticks compare kind, span and flags.
+        set state.token: KindRegularExpressionLiteral
+        state.token
     }
 
     ; Split out exactly as the reference splits it, so the nesting reads against
