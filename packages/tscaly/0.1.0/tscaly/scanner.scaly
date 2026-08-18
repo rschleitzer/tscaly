@@ -33,12 +33,15 @@
 ;     exactly equivalent here: the reference's arms are disjoint by construction,
 ;     since each tests the same `ch` against a distinct literal.
 ;
-; ── One deliberate simplification, stated rather than hidden: this slice keeps
-; no `tokenValue`. The reference stores one so a literal's PARSED value (escapes
-; decoded) can differ from its source text. For every construct ported here the
-; two are equal, so the value is exactly text[token_start..pos] and the caller
-; can slice it. It comes back with the literals, which is where it starts to
-; carry information.
+; ── The `tokenValue` arrived with slice 17 and is a pointer and a length; see
+; ScannerState for why that pair is the faithful shape and not a shortcut. Every
+; kind whose value is decided by SLICING or by ESCAPE DECODING answers it —
+; identifiers and keywords (a keyword is looked up on the DECODED text, which is
+; why `\u0063onst` is `const`), private names, string literals, template chunks,
+; the regular expression. ★ The one kind that does NOT is the NUMERIC literal,
+; whose value upstream is the ECMAScript Number-to-String of the parsed double
+; rather than any span of the source; set_numeric_token_value states the
+; deferral, the measurement behind it, and why nothing here reads one yet.
 
 use scaly.containers.String
 use tscaly.Diagnostics.DiagnosticList
@@ -62,15 +65,34 @@ define ScannerState
     token_start: int
     token: int
     token_flags: int
+
+    ; The reference's `tokenValue string` — the token's PARSED value, which is
+    ; its source text only when no escape decoded to something else. Go's string
+    ; IS a pointer and a length, and `s.text[a:b]` shares the source bytes
+    ; without copying, so the pair below is the faithful shape rather than a
+    ; representation choice: a value that happens to be a slice of the source
+    ; costs nothing, and only a DECODED one is built.
+    ;
+    ; ★ It sits in ScannerState, not in Scanner, because the reference puts it
+    ; there — Mark()/Rewind() save and restore it with everything else, and that
+    ; is load-bearing: try_parse_constructor_declaration rewinds and its caller
+    ; then reads the same string literal's value WITHOUT re-scanning.
+    ;
+    ; ★ The bytes are never mutated once written, which is what makes the
+    ; struct COPY the whole of the save.
+    token_value: pointer[char]
+    token_value_len: int
 )
 {
-    init(p: int, fsp: int, ts: int, tk: int, tf: int)
+    init(p: int, fsp: int, ts: int, tk: int, tf: int, tv: pointer[char], tvl: int)
     {
         set pos: p
         set full_start_pos: fsp
         set token_start: ts
         set token: tk
         set token_flags: tf
+        set token_value: tv
+        set token_value_len: tvl
     }
 }
 
@@ -130,6 +152,27 @@ define Scanner
     ; four.
     diagnostics: pointer[DiagnosticList]
 
+    ; ── the value sink ──────────────────────────────────────────────────────
+    ;
+    ; The reference builds a decoded token value with a `strings.Builder` local
+    ; to whichever routine is scanning. Here it is three fields on the scanner,
+    ; for one reason: `scan_escape_sequence` is the routine that knows what an
+    ; escape DECODES to, and it is called from two loops that build a value and
+    ; from one pass that does not, so the sink has to reach it without becoming
+    ; a parameter on every arm.
+    ;
+    ; ★ While `value_buffer` is null every `value_put_*` is a NO-OP, and that is
+    ; the whole mechanism: the pass that only measures positions runs the same
+    ; code with the sink unarmed, exactly as the reference's callers discard the
+    ; string scanEscapeSequence returns.
+    ;
+    ; TRANSIENT, so NOT part of ScannerState: it is armed and committed inside
+    ; one scan, and what a mark must carry is the committed value, which lives
+    ; in the state.
+    value_buffer: pointer[char]
+    value_capacity: int
+    value_length: int
+
     state: ScannerState
 )
 {
@@ -140,7 +183,10 @@ define Scanner
         set skip_trivia: true
         set unported_pos: 0 - 1
         set diagnostics: null
-        set state: ScannerState(0, 0, 0, KindUnknown, TokenFlagsNone)
+        set value_buffer: null
+        set value_capacity: 0
+        set value_length: 0
+        set state: ScannerState(0, 0, 0, KindUnknown, TokenFlagsNone, null, 0)
     }
 
     ; ── character access ────────────────────────────────────────────────────
@@ -212,46 +258,211 @@ define Scanner
     function token_flags(this) returns int
         state.token_flags
 
-    ; ── the current token's RAW TEXT ────────────────────────────────────────
+    ; ── the current token's VALUE ───────────────────────────────────────────
     ;
-    ; The reference's parser asks TokenValue() — the DECODED value — in exactly
-    ; one place the parser slices reach: `class C { "constructor"() {} }`, where
-    ; a string literal spelled `constructor` builds a constructor and any other
-    ; string builds an ordinary member. This scanner keeps no tokenValue (see
-    ; the header for why), so these two answer questions about the SOURCE TEXT
-    ; instead, and the caller has to establish that text and value coincide
-    ; before trusting the comparison. They do coincide exactly when the literal
-    ; carries no backslash — which is the second function, and it is not
-    ; paranoia: `"\constructor"` decodes to `constructor`, because an
-    ; unrecognized escape yields the character itself.
+    ; The reference's TokenValue(). Two accessors rather than one because a Go
+    ; string is a pointer and a length and Scaly has no such pair as a value —
+    ; see ScannerState for why the pair, and not a String, is the faithful
+    ; shape.
+    ;
+    ; ★ What stood here until slice 17 was `token_text_equals` /
+    ; `token_text_has_backslash`, a pair that answered questions about the
+    ; SOURCE text and left the caller to establish that text and value coincide.
+    ; They are gone with the field they stood in for: the one caller asked
+    ; whether a string literal reads `constructor`, and that question now has its
+    ; own answer.
 
-    function token_text_equals(this, s: pointer[const_char]) returns bool
+    function token_value(this) returns pointer[char]
+        state.token_value
+
+    function token_value_length(this) returns int
+        state.token_value_len
+
+    ; The reference's `p.scanner.TokenValue() == "constructor"`, spelled against
+    ; a C string because that is what a literal is here.
+    function token_value_equals(this, t: pointer[const_char]) returns bool
     {
-        var i: int state.token_start
-        var j: int 0
-        while i < state.pos
+        var i: int 0
+        while i < state.token_value_len
         {
-            let c *(s + j) as int
+            let c *(t + i) as int
             if c = 0
                 return false
-            if (*(buffer + i) as int) <> c
+            if (*(state.token_value + i) as int) <> c
                 return false
             set i: i + 1
-            set j: j + 1
         }
-        (*(s + j) as int) = 0
+        (*(t + i) as int) = 0
     }
 
-    function token_text_has_backslash(this) returns bool
+    ; ── writing a value ─────────────────────────────────────────────────────
+    ;
+    ; `s.tokenValue = s.text[start:stop]` — a Go slice, so no copy.
+    procedure set_token_value_range(this, start: int, stop: int)
     {
-        var i: int state.token_start
-        while i < state.pos
+        set state.token_value: buffer + start
+        set state.token_value_len: stop - start
+    }
+
+    ; Arm the sink. `hint` is what the caller can prove about the length; the
+    ; buffer grows if it is wrong, so a caller that cannot know may guess.
+    ;
+    ; ★ Where the caller CAN prove it, the hint is exact, and the proof is worth
+    ; stating because it is the same one in every case: a decoded escape is
+    ; never longer than its source. The shortest escape that decodes to anything
+    ; is `\uXXXX` — six bytes for at most three — `\u{10FFFF}` is ten for four,
+    ; `\xDD` four for one, `\n` two for one, and an escaped multi-byte
+    ; character is its own bytes plus the backslash. So the decoded value of a
+    ; token never exceeds its source span.
+    procedure value_begin(this, hint: int)
+    {
+        var n hint
+        if n < 8
+            set n: 8
+        let s String^this(n as size_t)
+        set value_buffer: s.get_buffer()
+        set value_capacity: n
+        set value_length: 0
+    }
+
+    ; Hand the sink's bytes to the token value and disarm it.
+    procedure value_commit(this)
+    {
+        set state.token_value: value_buffer
+        set state.token_value_len: value_length
+        set value_buffer: null
+        set value_capacity: 0
+        set value_length: 0
+    }
+
+    ; Grow to at least `need` bytes. A page cannot resize in place, so this
+    ; allocates and copies — which is why the hint exists and why every caller
+    ; that can compute the exact length does.
+    procedure value_reserve(this, need: int)
+    {
+        if need <= value_capacity
+            return
+        var n value_capacity * 2
+        while n < need
+            set n: n * 2
+        let s String^this(n as size_t)
+        let b s.get_buffer()
+        var i: int 0
+        while i < value_length
         {
-            if (*(buffer + i) as int) = ("\\" as char) as int
-                return true
+            set *(b + i): *(value_buffer + i)
             set i: i + 1
         }
-        false
+        set value_buffer: b
+        set value_capacity: n
+    }
+
+    ; Every one of these is a NO-OP while the sink is unarmed — see the field.
+    procedure value_put_byte(this, b: int)
+    {
+        if value_buffer = null
+            return
+        this.value_reserve(value_length + 1)
+        set *(value_buffer + value_length): b as char
+        set value_length: value_length + 1
+    }
+
+    procedure value_put_range(this, start: int, stop: int)
+    {
+        if value_buffer = null
+            return
+        this.value_reserve(value_length + (stop - start))
+        var i start
+        while i < stop
+        {
+            set *(value_buffer + value_length): *(buffer + i)
+            set value_length: value_length + 1
+            set i: i + 1
+        }
+    }
+
+    ; Go's `string(rune)` for a code point, and stringutil.EncodeJSStringRune for
+    ; a lone surrogate — which is the SAME encoding, three bytes ED A0..BF
+    ; 80..BF, because the reference spells out what Go's conversion refuses to
+    ; do rather than choosing a different one. So one plain UTF-8 encoder covers
+    ; both, and the surrogate case needs no arm.
+    procedure value_put_codepoint(this, cp: int)
+    {
+        if value_buffer = null
+            return
+        if cp < 0x80
+        {
+            this.value_put_byte(cp)
+            return
+        }
+        if cp < 0x800
+        {
+            this.value_put_byte(0xC0 | (cp >> 6))
+            this.value_put_byte(0x80 | (cp & 0x3F))
+            return
+        }
+        if cp < 0x10000
+        {
+            this.value_put_byte(0xE0 | (cp >> 12))
+            this.value_put_byte(0x80 | ((cp >> 6) & 0x3F))
+            this.value_put_byte(0x80 | (cp & 0x3F))
+            return
+        }
+        this.value_put_byte(0xF0 | (cp >> 18))
+        this.value_put_byte(0x80 | ((cp >> 12) & 0x3F))
+        this.value_put_byte(0x80 | ((cp >> 6) & 0x3F))
+        this.value_put_byte(0x80 | (cp & 0x3F))
+    }
+
+    ; Arm the sink at the first byte a literal's body cannot simply share with
+    ; the source, back-filling the plain run that came before it.
+    ;
+    ; ★ LAZY, and that is the reference's own shape rather than an optimization
+    ; bolted on: scanString returns the source slice outright when the body holds
+    ; no backslash and only reaches for a strings.Builder otherwise, so a literal
+    ; without escapes allocates nothing on either side. Doing it eagerly would
+    ; also need a capacity nobody can compute — the body's end is not known until
+    ; the loop finds it.
+    procedure value_arm(this, chunk_start: int)
+    {
+        if value_buffer = null
+            this.value_begin((state.pos - chunk_start) + 16)
+        this.value_put_range(chunk_start, state.pos)
+    }
+
+    ; ★★★ THE NUMERIC TOKEN VALUE IS NOT ANSWERED, and this is the one place in
+    ; the scanner where the stored value is knowingly NOT the reference's.
+    ;
+    ; Upstream a numeric literal's value is NORMALIZED, not sliced: every arm
+    ; ends in `jsnum.FromString(s.tokenValue).String()`, the ECMAScript
+    ; Number-to-String algorithm over the parsed double. So `0x1F` is `31`,
+    ; `1e-2` is `0.01`, `1_000` is `1000`, `1.` is `1`, and
+    ; `9223372036854775807` is `9223372036854776000` — the value of a numeric
+    ; literal is a floating-point question, not a lexical one. Measured over the
+    ; corpus with the reference itself: 37 of its numeric tokens have a value
+    ; that differs from their source text, and every one of them differs for
+    ; that reason.
+    ;
+    ; ★ Porting jsnum is a slice of its own and nothing in this port reads a
+    ; numeric value: the parser asks TokenValue() for a string literal's
+    ; `constructor` test and for an identifier's text, and stores the rest into
+    ; node fields this port does not carry. The raw slice is therefore what is
+    ; stored — a stand-in with the reference's LIFETIME and not its MEANING
+    ; (§3.5i), named here rather than left to be met.
+    procedure set_numeric_token_value(this)
+        this.set_token_value_range(state.token_start, state.pos)
+
+    ; Close a literal body: the source slice when the sink was never armed, the
+    ; sink's bytes plus the last plain run when it was.
+    procedure value_finish_body(this, content_start: int, chunk_start: int, stop: int)
+    {
+        if value_buffer = null
+        {
+            this.set_token_value_range(content_start, stop)
+            return
+        }
+        this.value_put_range(chunk_start, stop)
+        this.value_commit()
     }
 
     ; The first position this slice could not scan, or -1.
@@ -383,11 +594,18 @@ define Scanner
     ; Byte length of the sequence at p — 1 for an invalid one, which is exactly
     ; how Go resynchronizes. The accept ranges reject overlong forms, the
     ; surrogate block and anything past U+10FFFF.
-    function utf8_size_at(this, p: int) returns int
+    ; ── UTF-8, over an arbitrary buffer ─────────────────────────────────────
+    ;
+    ; The pair below reads a rune at an offset into `base`, bounded by `limit`.
+    ; They grew that pair of parameters in slice 17: the keyword spell-checker
+    ; used to read the identifier out of the SOURCE and now reads the node's
+    ; stored TEXT, which is a decoded value living somewhere else entirely. The
+    ; `_at` forms are the same question asked of the source and are unchanged.
+    function utf8_size_in(this, base: pointer[char], limit: int, p: int) returns int
     {
-        if p >= end
+        if p >= limit
             return 1
-        let b0 *(buffer + p) as int
+        let b0 *(base + p) as int
         if b0 < 0x80
             return 1
         if b0 < 0xC2
@@ -418,15 +636,15 @@ define Scanner
                     set hi: 0x8F
             }
         }
-        if p + need >= end
+        if p + need >= limit
             return 1
-        let c1 *(buffer + p + 1) as int
+        let c1 *(base + p + 1) as int
         if (c1 < lo) or (c1 > hi)
             return 1
         var i: int 2
         while i <= need
         {
-            let c *(buffer + p + i) as int
+            let c *(base + p + i) as int
             if (c < 0x80) or (c > 0xBF)
                 return 1
             set i: i + 1
@@ -434,12 +652,15 @@ define Scanner
         need + 1
     }
 
-    function utf8_decode_at(this, p: int) returns int
+    function utf8_size_at(this, p: int) returns int
+        this.utf8_size_in(buffer, end, p)
+
+    function utf8_decode_in(this, base: pointer[char], limit: int, p: int) returns int
     {
-        let n this.utf8_size_at(p)
-        if p >= end
+        let n this.utf8_size_in(base, limit, p)
+        if p >= limit
             return 0 - 1
-        let b0 *(buffer + p) as int
+        let b0 *(base + p) as int
         if n = 1
         {
             if b0 < 0x80
@@ -460,11 +681,14 @@ define Scanner
         var i: int 1
         while i < n
         {
-            set cp: (cp << 6) | ((*(buffer + p + i) as int) & 0x3F)
+            set cp: (cp << 6) | ((*(base + p + i) as int) & 0x3F)
             set i: i + 1
         }
         cp
     }
+
+    function utf8_decode_at(this, p: int) returns int
+        this.utf8_decode_in(buffer, end, p)
 
     ; ── character classes over decoded runes ────────────────────────────────
 
@@ -985,8 +1209,34 @@ define Scanner
         0 - 1
     }
 
+    ; The digits of a legacy octal escape, read back for its VALUE. The
+    ; reference's strconv.ParseInt(text[start+1:pos], 8, 32).
+    function octal_value(this, start: int, stop: int) returns int
+    {
+        var v: int 0
+        var i start
+        while i < stop
+        {
+            set v: (v * 8) + ((*(buffer + i) as int) - (("0" as char) as int))
+            set i: i + 1
+        }
+        v
+    }
+
     ; `report_errors` is the reference's ReportInvalidEscapeErrors bit; see
     ; scan_unicode_escape above for why one bool covers the flag word here.
+    ;
+    ; ★★★ Since slice 17 this also WRITES the escape's decoded bytes into the
+    ; value sink, which is what the reference's `return "…"` does — its
+    ; scanEscapeSequence returns a string and every arm of it is a decoded
+    ; value. Until the sink existed those returns had nowhere to go, so the arms
+    ; that differ only in what they DECODE TO were folded into one ("any other
+    ; escaped ASCII character stands for itself"). ★ That fold was correct for
+    ; positions and wrong for values, and the two it hid are the ones a reader
+    ; would least expect: `\n` is the letter n and must decode to a LINE FEED,
+    ; and a backslash followed by an actual line terminator is a line
+    ; CONTINUATION and must decode to nothing at all. Both are the reference's
+    ; own arms and both are back.
     procedure scan_escape_sequence(this, report_errors: bool) returns bool
     {
         let start state.pos
@@ -1006,11 +1256,20 @@ define Scanner
         if ch = ("0" as char) as int
         {
             if not is_digit(this.char())
+            {
+                this.value_put_byte(0)
                 return true
+            }
         }
 
         ; Legacy octal escapes. `\0`-`\3` admit two more octal digits (the
         ; reference reaches the '4'..'7' arm by fallthrough), `\4`-`\7` only one.
+        ;
+        ; ★ The VALUE differs between the two flag settings, and that is the
+        ; reference's own asymmetry rather than a shortcut: with errors reported
+        ; the arm answers the DECODED character, without them it answers the raw
+        ; source of the escape. So a tagged template keeps `\47` and a string
+        ; literal turns it into `'`.
         if (ch >= ("0" as char) as int) and (ch <= ("3" as char) as int)
         {
             if is_octal_digit(this.char())
@@ -1019,7 +1278,12 @@ define Scanner
                 set state.pos: state.pos + 1
             set state.token_flags: state.token_flags | TokenFlagsContainsInvalidEscape
             if report_errors
+            {
                 this.error_at(DiagOctal_escape_sequences_are_not_allowed_Use_the_syntax_0, start, state.pos - start)
+                this.value_put_codepoint(this.octal_value(start + 1, state.pos))
+            }
+            else
+                this.value_put_range(start, state.pos)
             return true
         }
         if (ch >= ("4" as char) as int) and (ch <= ("7" as char) as int)
@@ -1028,14 +1292,24 @@ define Scanner
                 set state.pos: state.pos + 1
             set state.token_flags: state.token_flags | TokenFlagsContainsInvalidEscape
             if report_errors
+            {
                 this.error_at(DiagOctal_escape_sequences_are_not_allowed_Use_the_syntax_0, start, state.pos - start)
+                this.value_put_codepoint(this.octal_value(start + 1, state.pos))
+            }
+            else
+                this.value_put_range(start, state.pos)
             return true
         }
         if (ch = ("8" as char) as int) or (ch = ("9" as char) as int)
         {
             set state.token_flags: state.token_flags | TokenFlagsContainsInvalidEscape
             if report_errors
+            {
                 this.error_at(DiagEscape_sequence_0_is_not_allowed, start, state.pos - start)
+                this.value_put_byte(ch)
+            }
+            else
+                this.value_put_range(start, state.pos)
             return true
         }
 
@@ -1049,11 +1323,13 @@ define Scanner
                     set state.token_flags: state.token_flags | TokenFlagsContainsInvalidEscape
                     if report_errors
                         this.error(DiagHexadecimal_digit_expected)
+                    this.value_put_range(start, state.pos)
                     return true
                 }
                 set state.pos: state.pos + 1
             }
             set state.token_flags: state.token_flags | TokenFlagsHexEscape
+            this.value_put_codepoint(this.hex_value(start + 2, state.pos))
             return true
         }
 
@@ -1063,37 +1339,93 @@ define Scanner
             set state.pos: state.pos - 2
             let cp this.scan_unicode_escape(report_errors)
             if cp < 0
+            {
+                this.value_put_range(start, state.pos)
                 return true
+            }
+            ; ★ A high surrogate escape followed by a low one is ONE code point
+            ; in a string literal, exactly as the adjacent UTF-16 code units
+            ; would be in a JavaScript string. A lone surrogate survives as its
+            ; own three UTF-8 bytes — see value_put_codepoint for why that needs
+            ; no arm of its own.
             if is_high_surrogate(cp)
-                this.scan_low_surrogate_escape(cp)
+            {
+                let low this.scan_low_surrogate_escape(cp)
+                if low >= 0
+                {
+                    this.value_put_codepoint(0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00))
+                    return true
+                }
+            }
+            this.value_put_codepoint(cp)
             return true
         }
 
-        ; A line continuation: backslash then a line terminator.
+        ; The named single-character escapes. Each is one line in the reference
+        ; and each is a VALUE — the position is the same for all of them, which
+        ; is why they read as one arm until the sink existed.
+        if ch = ("b" as char) as int
+        {
+            this.value_put_byte(8)
+            return true
+        }
+        if ch = ("t" as char) as int
+        {
+            this.value_put_byte(9)
+            return true
+        }
+        if ch = ("n" as char) as int
+        {
+            this.value_put_byte(10)
+            return true
+        }
+        if ch = ("v" as char) as int
+        {
+            this.value_put_byte(11)
+            return true
+        }
+        if ch = ("f" as char) as int
+        {
+            this.value_put_byte(12)
+            return true
+        }
+        if ch = ("r" as char) as int
+        {
+            this.value_put_byte(13)
+            return true
+        }
+
+        ; A line continuation: backslash then a line terminator sequence, which
+        ; "is interpreted to be the empty code unit sequence". <CR><LF> counts as
+        ; ONE terminator, which is what the inner test is for.
         if ch = ("\r" as char) as int
         {
             if this.char() = ("\n" as char) as int
                 set state.pos: state.pos + 1
             return true
         }
+        if ch = ("\n" as char) as int
+            return true
 
         ; An escaped MULTI-BYTE character. The reference backs up over the
         ; single-byte advance and re-advances by the rune's real size; guessing
         ; one byte here would shift every span that follows.
-        ;
-        ; U+2028 and U+2029 are line continuations and every other rune stands
-        ; for itself — a distinction in the decoded VALUE only, with the same
-        ; position and no flag either way, so it costs nothing to omit until
-        ; tokenValue exists.
         if ch >= 128
         {
             set state.pos: state.pos - 1
+            let cp this.utf8_decode_at(state.pos)
             set state.pos: state.pos + this.utf8_size_at(state.pos)
+            ; U+2028 and U+2029 are line terminators, so escaping one is a line
+            ; continuation like the two above and decodes to nothing.
+            if (cp = 0x2028) or (cp = 0x2029)
+                return true
+            this.value_put_codepoint(cp)
             return true
         }
 
-        ; Any other escaped ASCII character stands for itself: \b \t \n \v \f \r
-        ; \' \" \\ and everything unlisted.
+        ; Any other escaped ASCII character stands for itself — `\'`, `\"`,
+        ; `\\`, `\``, and everything unlisted.
+        this.value_put_byte(ch)
         true
     }
 
@@ -1141,9 +1473,13 @@ define Scanner
     ; over it and starting there.
     ;
     ; Answers 1 for a plain identifier — its value is exactly the source bytes
-    ; [start, pos) — 2 for one that ends at a backslash and therefore has a
-    ; DECODED value that differs from its source, and 0 for "not an identifier",
-    ; with pos left at start + prefixLength as the reference leaves it.
+    ; [start, pos), and it SETS it, which is the reference's own
+    ; `s.tokenValue = s.text[start:s.pos]` — 2 for one that ends at a backslash
+    ; and therefore has a DECODED value that differs from its source, which the
+    ; caller gets by running scan_identifier_decoded, and 0 for "not an
+    ; identifier", with pos left at start + prefixLength as the reference leaves
+    ; it and with no value set (the reference leaves tokenValue alone too, and
+    ; its one caller assigns `"#"` over it).
     procedure scan_identifier(this, prefix_len: int) returns int
     {
         let start state.pos
@@ -1159,7 +1495,10 @@ define Scanner
             ; backslash; otherwise the reference rewinds and redoes the whole
             ; identifier through the unicode tables.
             if (after < 128) and (after <> ("\\" as char) as int)
+            {
+                this.set_token_value_range(start, state.pos)
                 return 1
+            }
             set state.pos: start + prefix_len
         }
 
@@ -1179,11 +1518,15 @@ define Scanner
         }
         if c = ("\\" as char) as int
             return 2
+        this.set_token_value_range(start, state.pos)
         1
     }
 
     ; Re-scan an identifier from `start` while DECODING it, and answer the Kind
-    ; its decoded text maps to.
+    ; its decoded text maps to. The decoded text is left as the token VALUE,
+    ; which is what the reference's
+    ; `s.tokenValue = string(s.scanUnicodeEscape(true)) + s.scanIdentifierParts()`
+    ; leaves behind before it asks GetIdentifierToken.
     ;
     ; ★ This exists because the keyword lookup is over the DECODED value, not the
     ; source: `const` is the keyword `const`. Nothing that reads raw source
@@ -1194,22 +1537,31 @@ define Scanner
     ; that actually contains an escape is scanned twice. The escape flags are set
     ; by OR, so setting them again on the second pass changes nothing.
     ;
-    ; ★ The decode buffer is SIXTEEN BYTES and that is exact, not a guess: the
-    ; keyword guard rejects anything longer than the table's longest keyword, so
-    ; a decoded identifier past that length cannot be a keyword whatever its
-    ; bytes are. The total length keeps counting after the buffer fills, which is
-    ; what makes the guard fire correctly on a long one.
-    procedure scan_identifier_decoded(this, start: int) returns int
+    ; ★ The decode buffer used to be SIXTEEN BYTES, sized by the keyword guard —
+    ; a decoded identifier longer than the table's longest keyword cannot be a
+    ; keyword whatever its bytes are, so only the LENGTH had to keep counting.
+    ; Slice 17 removed that ceiling with the reason for it: the bytes past it are
+    ; the identifier's VALUE and a node stores them now, so the sink is sized to
+    ; the source span instead (see value_begin for why that bound is exact where
+    ; the caller knows the end, and why growing is correct where it does not).
+    ; `prefix_len` is scan_identifier's, and it carries the same fact: a private
+    ; name's value INCLUDES its `#`, so the byte before `start` is copied
+    ; verbatim ahead of the decode — which is literally the reference's
+    ; `s.tokenValue = "#" + string(...) + s.scanIdentifierParts()`.
+    procedure scan_identifier_decoded(this, start: int, prefix_len: int) returns int
     {
+        ; The two callers that reach here after scan_identifier already know the
+        ; end, and for them this is the exact length. The two that come off a
+        ; leading backslash do not, and pass 0 — value_begin grows.
+        let hint (state.pos - start) + prefix_len
         set state.pos: start
-        var buf char[16]
-        var n: int 0
+        this.value_begin(hint)
+        this.value_put_range(start - prefix_len, start)
         var first: bool true
 
         repeat
         {
             var cp: int 0 - 1
-            var consumed: int 0
 
             if this.char() = ("\\" as char) as int
             {
@@ -1229,7 +1581,6 @@ define Scanner
                 ; Commit the escape for real — this is the call that sets the
                 ; UnicodeEscape / ContainsInvalidEscape flags.
                 set cp: this.scan_unicode_escape(true)
-                set consumed: 0
             }
             else
             {
@@ -1245,60 +1596,15 @@ define Scanner
                         break
                 }
                 set cp: c
-                set consumed: this.utf8_size_at(state.pos)
-                set state.pos: state.pos + consumed
+                set state.pos: state.pos + this.utf8_size_at(state.pos)
             }
 
             set first: false
-
-            ; Append cp as UTF-8, exactly as Go's string(rune) would, counting
-            ; every byte even once the buffer is full.
-            let w utf8_encode_into(buf, n, cp)
-            set n: n + w
+            this.value_put_codepoint(cp)
         }
 
-        get_identifier_token(buf, n)
-    }
-
-    ; Write cp's UTF-8 encoding at offset n of a 16-byte buffer when it fits, and
-    ; answer its byte length either way. The length is what the keyword guard
-    ; needs; the bytes only matter while the identifier is still short enough to
-    ; be a keyword.
-    function utf8_encode_into(buf: pointer[char], n: int, cp: int) returns int
-    {
-        if cp < 0x80
-        {
-            if n < 16
-                set *(buf + n): cp as char
-            return 1
-        }
-        if cp < 0x800
-        {
-            if n + 1 < 16
-            {
-                set *(buf + n): (0xC0 | (cp >> 6)) as char
-                set *(buf + n + 1): (0x80 | (cp & 0x3F)) as char
-            }
-            return 2
-        }
-        if cp < 0x10000
-        {
-            if n + 2 < 16
-            {
-                set *(buf + n): (0xE0 | (cp >> 12)) as char
-                set *(buf + n + 1): (0x80 | ((cp >> 6) & 0x3F)) as char
-                set *(buf + n + 2): (0x80 | (cp & 0x3F)) as char
-            }
-            return 3
-        }
-        if n + 3 < 16
-        {
-            set *(buf + n): (0xF0 | (cp >> 18)) as char
-            set *(buf + n + 1): (0x80 | ((cp >> 12) & 0x3F)) as char
-            set *(buf + n + 2): (0x80 | ((cp >> 6) & 0x3F)) as char
-            set *(buf + n + 3): (0x80 | (cp & 0x3F)) as char
-        }
-        4
+        this.value_commit()
+        get_identifier_token(state.token_value, state.token_value_len)
     }
 
     ; ── merge-conflict markers ──────────────────────────────────────────────
@@ -1449,27 +1755,6 @@ define Scanner
             set p: p + 1
         }
         p
-    }
-
-    ; True when the source bytes in [pos, end_pos) are exactly the ASCII literal
-    ; `word`. The parser needs it for parseErrorForMissingSemicolonAfter, which
-    ; is the one site that asks what an identifier SAYS; the text lives here, so
-    ; the comparison does too.
-    function text_equals(this, pos: int, end_pos: int, word: pointer[const_char]) returns bool
-    {
-        var i: int 0
-        var p: int pos
-        while p < end_pos
-        {
-            let w *(word + i) as int
-            if w = 0
-                return false
-            if (*(buffer + p) as int) <> w
-                return false
-            set i: i + 1
-            set p: p + 1
-        }
-        (*(word + i) as int) = 0
     }
 
     ; ── SkipTrivia, the standalone one ──────────────────────────────────────
@@ -1698,12 +1983,16 @@ define Scanner
         let started_with_backtick this.char() = ("\`" as char) as int
         set state.pos: state.pos + 1
 
+        let content_start state.pos
+        var chunk_start content_start
+
         repeat
         {
             let ch this.char()
 
             if (ch < 0) or (ch = ("\`" as char) as int)
             {
+                this.value_finish_body(content_start, chunk_start, state.pos)
                 if ch = ("\`" as char) as int
                     set state.pos: state.pos + 1
                 else
@@ -1718,6 +2007,7 @@ define Scanner
 
             if (ch = ("$" as char) as int) and (this.char_at(1) = ("{" as char) as int)
             {
+                this.value_finish_body(content_start, chunk_start, state.pos)
                 set state.pos: state.pos + 2
                 if started_with_backtick
                     return KindTemplateHead
@@ -1734,18 +2024,33 @@ define Scanner
                 ; parameter IS carried since slice 13b, and this is where it
                 ; matters: the scan loop passes false, an untagged re-scan passes
                 ; true. See the note at scan_template.
+                ;
+                ; ★ Since slice 17 it selects one more thing, and it is a VALUE
+                ; rather than a diagnostic: the legacy-octal arms answer the
+                ; decoded character when errors are reported and the raw escape
+                ; text when they are not. So a TAGGED template's chunk keeps
+                ; `\47` where a string literal turns it into `'` — which is the
+                ; reference's own arrangement and the reason its cooked text can
+                ; be nonsense while the raw text is what the tag function reads.
+                this.value_arm(chunk_start)
                 if not this.scan_escape_sequence(report_errors)
                     return 0 - 1
+                set chunk_start: state.pos
                 continue
             }
 
-            ; <CR> and <CR><LF> normalize to <LF> in a template VALUE. Only the
-            ; position matters here; the normalization is a tokenValue concern.
+            ; <CR> and <CR><LF> normalize to <LF> in a template VALUE — the
+            ; reference cites ECMAScript 11.8.6.1 for it. It is a value-only
+            ; rule: the position is the same either way, which is why it was one
+            ; comment and no code until the value existed.
             if ch = ("\r" as char) as int
             {
+                this.value_arm(chunk_start)
                 set state.pos: state.pos + 1
                 if this.char() = ("\n" as char) as int
                     set state.pos: state.pos + 1
+                this.value_put_byte(10)
+                set chunk_start: state.pos
                 continue
             }
 
@@ -1769,6 +2074,11 @@ define Scanner
             set state.token_flags: state.token_flags | TokenFlagsSingleQuote
         set state.pos: state.pos + 1
 
+        ; The body — the reference's `start`, and the beginning of the token
+        ; VALUE, which is the literal without its quotes.
+        let content_start state.pos
+        var chunk_start content_start
+
         repeat
         {
             let ch this.char()
@@ -1776,25 +2086,34 @@ define Scanner
             {
                 set state.token_flags: state.token_flags | TokenFlagsUnterminated
                 this.error(DiagUnterminated_string_literal)
+                this.value_finish_body(content_start, chunk_start, state.pos)
                 return true
             }
             if ch = quote
             {
+                this.value_finish_body(content_start, chunk_start, state.pos)
                 set state.pos: state.pos + 1
                 return true
             }
             if ch = ("\\" as char) as int
             {
                 ; A string literal always scans with ReportErrors set — that is
-                ; the whole asymmetry with a template (§3.5z).
+                ; the whole asymmetry with a template (§3.5z). It is also why the
+                ; value has to be built in ONE pass: the octal arms answer a
+                ; DIFFERENT value under the two settings, so a second decoding
+                ; pass with errors suppressed would build the tagged-template
+                ; value for a string.
+                this.value_arm(chunk_start)
                 if not this.scan_escape_sequence(true)
                     return false
+                set chunk_start: state.pos
                 continue
             }
             if is_line_break(ch)
             {
                 set state.token_flags: state.token_flags | TokenFlagsUnterminated
                 this.error(DiagUnterminated_string_literal)
+                this.value_finish_body(content_start, chunk_start, state.pos)
                 return true
             }
             set state.pos: state.pos + 1
@@ -2264,6 +2583,7 @@ define Scanner
                         this.error(DiagHexadecimal_digit_expected)
                     set state.token_flags: state.token_flags | TokenFlagsHexSpecifier
                     let k this.scan_big_int_suffix()
+                    this.set_numeric_token_value()
                     set state.token: k
                     return k
                 }
@@ -2275,6 +2595,7 @@ define Scanner
                         this.error(DiagBinary_digit_expected)
                     set state.token_flags: state.token_flags | TokenFlagsBinarySpecifier
                     let k this.scan_big_int_suffix()
+                    this.set_numeric_token_value()
                     set state.token: k
                     return k
                 }
@@ -2286,12 +2607,14 @@ define Scanner
                         this.error(DiagOctal_digit_expected)
                     set state.token_flags: state.token_flags | TokenFlagsOctalSpecifier
                     let k this.scan_big_int_suffix()
+                    this.set_numeric_token_value()
                     set state.token: k
                     return k
                 }
 
                 ; The reference falls through from '0' into the '1'..'9' arm.
                 let k this.scan_number()
+                this.set_numeric_token_value()
                 set state.token: k
                 return k
             }
@@ -2299,6 +2622,7 @@ define Scanner
             if is_digit(ch)
             {
                 let k this.scan_number()
+                this.set_numeric_token_value()
                 set state.token: k
                 return k
             }
@@ -2321,9 +2645,9 @@ define Scanner
                 let r this.scan_identifier(0)
                 var k: int KindIdentifier
                 if r = 2
-                    set k: this.scan_identifier_decoded(start)
+                    set k: this.scan_identifier_decoded(start, 0)
                 else
-                    set k: get_identifier_token(buffer + start, state.pos - start)
+                    set k: get_identifier_token(state.token_value, state.token_value_len)
                 set state.token: k
                 return k
             }
@@ -2376,7 +2700,7 @@ define Scanner
                     let cp this.peek_unicode_escape()
                     if (cp >= 0) and is_identifier_start(cp)
                     {
-                        this.scan_identifier_decoded(state.pos)
+                        this.scan_identifier_decoded(state.pos, 1)
                         set state.token: KindPrivateIdentifier
                         return KindPrivateIdentifier
                     }
@@ -2387,7 +2711,7 @@ define Scanner
                 ; identifier — a bare `#` is one that spans just the `#`.
                 let r this.scan_identifier(1)
                 if r = 2
-                    this.scan_identifier_decoded(state.token_start + 1)
+                    this.scan_identifier_decoded(state.token_start + 1, 1)
                 ; ★ ... but the reference reports Invalid_character for that bare
                 ; one, through the error CALLBACK and with no token flag, so the
                 ; token stream is identical and only the tree differs. It became
@@ -2403,8 +2727,15 @@ define Scanner
                 ; which IS the `#` and does not depend on where our own
                 ; scan_identifier leaves the cursor on failure. Measured against
                 ; the fixture: D 54 55.
+                ; ... and with it the reference's `s.tokenValue = "#"`, which is
+                ; the one place a value is written on a FAILED identifier scan.
+                ; It is the `#` itself, so the source has it and no decode is
+                ; needed.
                 if r = 0
+                {
                     this.error_at(DiagInvalid_character, state.token_start, 1)
+                    this.set_token_value_range(state.token_start, state.token_start + 1)
+                }
                 set state.token: KindPrivateIdentifier
                 return KindPrivateIdentifier
             }
@@ -2420,7 +2751,7 @@ define Scanner
                 let cp this.peek_unicode_escape()
                 if (cp >= 0) and is_identifier_start(cp)
                 {
-                    let k this.scan_identifier_decoded(state.pos)
+                    let k this.scan_identifier_decoded(state.pos, 0)
                     set state.token: k
                     return k
                 }
@@ -2442,9 +2773,9 @@ define Scanner
                 {
                     var k: int KindIdentifier
                     if r = 2
-                        set k: this.scan_identifier_decoded(id_start)
+                        set k: this.scan_identifier_decoded(id_start, 0)
                     else
-                        set k: get_identifier_token(buffer + id_start, state.pos - id_start)
+                        set k: get_identifier_token(state.token_value, state.token_value_len)
                     set state.token: k
                     return k
                 }
@@ -2772,8 +3103,10 @@ define Scanner
         }
 
         set state.pos: p
-        ; The reference also stores tokenValue here. This port stores no token
-        ; text at all (§3.5q) and both yardsticks compare kind, span and flags.
+        ; The reference's `s.tokenValue = s.text[s.tokenStart:s.pos]` — a regular
+        ; expression's value is its whole source including both slashes and the
+        ; flags, so it is a slice and needs no decode.
+        this.set_token_value_range(state.token_start, state.pos)
         set state.token: KindRegularExpressionLiteral
         state.token
     }
