@@ -164,7 +164,7 @@ if [ "${1:-}" = "--establish-baseline" ]; then
     exit 2
   fi
   fingerprint > "$TSCALY_BASELINE.fp"
-  grep -E '^(scanner|parser|jsdoc) yardstick' -A1 "$TSCALY_BASELINE" | sed 's/^/  /'
+  grep -E '^(scanner|parser|jsdoc|binder) yardstick' -A1 "$TSCALY_BASELINE" | sed 's/^/  /'
   exit 0
 fi
 
@@ -219,12 +219,13 @@ echo "  patching $FILE:$LINE"
 
 # ── baseline ─────────────────────────────────────────────────────────────────
 
-parse_counts() {   # a run.sh report -> nine numbers, three per yardstick
+parse_counts() {   # a run.sh report -> twelve numbers, three per yardstick
   python3 - "$1" <<'PY'
 import re, sys
 t = open(sys.argv[1]).read()
 out = []
-for name in ("scanner yardstick", "parser yardstick", "jsdoc yardstick"):
+for name in ("scanner yardstick", "parser yardstick", "jsdoc yardstick",
+             "binder yardstick"):
     i = t.find(name)
     if i < 0:
         out += ["?", "?", "?"]; continue
@@ -266,10 +267,10 @@ else
   fi
 fi
 
-read -r BM_T BU_T BF_T BM_A BU_A BF_A BM_J BU_J BF_J <<<"$(parse_counts "$BASE_LOG")"
-echo "  BASELINE BEFORE   scanner $BM_T/$BU_T/$BF_T   parser $BM_A/$BU_A/$BF_A   jsdoc $BM_J/$BU_J/$BF_J"
+read -r BM_T BU_T BF_T BM_A BU_A BF_A BM_J BU_J BF_J BM_S BU_S BF_S <<<"$(parse_counts "$BASE_LOG")"
+echo "  BASELINE BEFORE   scanner $BM_T/$BU_T/$BF_T   parser $BM_A/$BU_A/$BF_A   jsdoc $BM_J/$BU_J/$BF_J   binder $BM_S/$BU_S/$BF_S"
 
-if [ "$BF_T" != "0" ] || [ "$BF_A" != "0" ] || [ "$BF_J" != "0" ]; then
+if [ "$BF_T" != "0" ] || [ "$BF_A" != "0" ] || [ "$BF_J" != "0" ] || [ "$BF_S" != "0" ]; then
   red "the baseline is not clean — every number below would be meaningless."
   sed -n '/unexplained failures/,$p' "$BASE_LOG" | head -20
   exit 2
@@ -290,8 +291,8 @@ PY
 echo "  running the control ..."
 "$RUN" > "$WORK/ctl.log" 2>&1 </dev/null
 CTL_RC=$?
-read -r CM_T CU_T CF_T CM_A CU_A CF_A CM_J CU_J CF_J <<<"$(parse_counts "$WORK/ctl.log")"
-echo "  PATCHED           scanner $CM_T/$CU_T/$CF_T   parser $CM_A/$CU_A/$CF_A   jsdoc $CM_J/$CU_J/$CF_J   (rc $CTL_RC)"
+read -r CM_T CU_T CF_T CM_A CU_A CF_A CM_J CU_J CF_J CM_S CU_S CF_S <<<"$(parse_counts "$WORK/ctl.log")"
+echo "  PATCHED           scanner $CM_T/$CU_T/$CF_T   parser $CM_A/$CU_A/$CF_A   jsdoc $CM_J/$CU_J/$CF_J   binder $CM_S/$CU_S/$CF_S   (rc $CTL_RC)"
 
 cp "$WORK/orig" "$FILE"
 
@@ -326,12 +327,12 @@ echo "  RESTORE VERIFIED   $FILE byte-identical, and every other input unchanged
 # ── the verdict ──────────────────────────────────────────────────────────────
 
 echo
-if [ "$CF_A" != "0" ] || [ "$CF_T" != "0" ] || [ "$CF_J" != "0" ]; then
-  green "RED $CF_J (jsdoc)$([ "$CF_A" != 0 ] && echo " + $CF_A (parser)")$([ "$CF_T" != 0 ] && echo " + $CF_T (scanner)")"
+if [ "$CF_A" != "0" ] || [ "$CF_T" != "0" ] || [ "$CF_J" != "0" ] || [ "$CF_S" != "0" ]; then
+  green "RED $CF_J (jsdoc)$([ "$CF_A" != 0 ] && echo " + $CF_A (parser)")$([ "$CF_T" != 0 ] && echo " + $CF_T (scanner)")$([ "$CF_S" != 0 ] && echo " + $CF_S (binder)")"
   echo "  the units that differ:"
   sed -n '/unexplained failures/,$p' "$WORK/ctl.log" | sed -n '2,25p'
-elif [ "$CM_A" != "$BM_A" ] || [ "$CM_T" != "$BM_T" ] || [ "$CM_J" != "$BM_J" ]; then
-  green "MATCHED-COUNT GATE: parser $BM_A -> $CM_A, scanner $BM_T -> $CM_T, jsdoc $BM_J -> $CM_J"
+elif [ "$CM_A" != "$BM_A" ] || [ "$CM_T" != "$BM_T" ] || [ "$CM_J" != "$BM_J" ] || [ "$CM_S" != "$BM_S" ]; then
+  green "MATCHED-COUNT GATE: parser $BM_A -> $CM_A, scanner $BM_T -> $CM_T, jsdoc $BM_J -> $CM_J, binder $BM_S -> $CM_S"
   echo "  Real — unported is not a pass — but weaker than a red. This is what most"
   echo "  controls produce while the port bails where the reference recovers."
 else
@@ -345,7 +346,7 @@ fi
 
 if [ -f "$OUT/.built-from-patched-tree" ]; then
   echo
-  echo "  NOTE: $OUT/tscaly_{tokens,ast,jsdoc} were built from the PATCHED tree."
+  echo "  NOTE: $OUT/tscaly_{tokens,ast,jsdoc,symbols} were built from the PATCHED tree."
   echo "  The source is restored and verified; run.sh rebuilds unconditionally, so"
   echo "  the next run is clean. Do not read those binaries directly until then."
 fi

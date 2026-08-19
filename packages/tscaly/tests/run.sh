@@ -3,7 +3,7 @@
 #
 # run.sh — the tscaly yardsticks.
 #
-# THREE yardsticks over one corpus, all built from the pinned submodule, so
+# FOUR yardsticks over one corpus, all built from the pinned submodule, so
 # "green" means our port agrees with the TypeScript compiler's own output and
 # not with an expectation someone typed:
 #
@@ -15,6 +15,11 @@
 #             its own that sf.Diagnostics() does not include
 #   jsdoc     the JSDoc parse — for every node the parser walk has agreed on,
 #             the JSDoc trees hanging off it, in the same shape (slice 21)
+#   binder    the BIND — the symbol a declaration owns, the locals/members/
+#             exports tables with their entries, the merge structure (one
+#             symbol, several declarations), the file's symbol counter and
+#             classifiable names, and the BIND diagnostics, which live in a
+#             third list of their own (slice 26)
 #
 # ★★★ THE THIRD ONE IS NOT A SUBSET OF THE SECOND, and that is why it exists.
 # JSDoc nodes are not in the tree the parser yardstick walks: the reference hangs
@@ -207,8 +212,9 @@ submodule_dirty() {
 }
 
 oracle_stamp() {
-  shasum -a 256 "$PKG/tests/oracle/tokens.go" "$PKG/tests/oracle/ast.go" \
-                "$PKG/tests/oracle/jsdoc.go"  "$PKG/tests/oracle/split.go" \
+  shasum -a 256 "$PKG/tests/oracle/tokens.go"  "$PKG/tests/oracle/ast.go" \
+                "$PKG/tests/oracle/jsdoc.go"   "$PKG/tests/oracle/split.go" \
+                "$PKG/tests/oracle/symbols.go" \
     | awk '{print $1}'
   git -C "$SUB" rev-parse HEAD 2>/dev/null
   go version 2>/dev/null
@@ -240,24 +246,27 @@ HAVE=
 [ -f "$STAMP" ] && HAVE=$(cat "$STAMP")
 
 oracles_present() {
-  for o in oracle_tokens oracle_ast oracle_jsdoc oracle_split; do
+  for o in oracle_tokens oracle_ast oracle_jsdoc oracle_split oracle_symbols; do
     [ -x "$OUT/$o" ] || return 1
   done
 }
 
 if [ -z "${TSCALY_FORCE_ORACLE:-}" ] && [ "$WANT" = "$HAVE" ] && oracles_present; then
-  : # the four binaries already answer to this stamp
+  : # the five binaries already answer to this stamp
 else
   rm -f "$STAMP"
-  mkdir -p "$SUB/oracle/tokens" "$SUB/oracle/ast" "$SUB/oracle/jsdoc" "$SUB/oracle/split"
-  cp "$PKG/tests/oracle/tokens.go" "$SUB/oracle/tokens/main.go"
-  cp "$PKG/tests/oracle/ast.go"    "$SUB/oracle/ast/main.go"
-  cp "$PKG/tests/oracle/jsdoc.go"  "$SUB/oracle/jsdoc/main.go"
-  cp "$PKG/tests/oracle/split.go"  "$SUB/oracle/split/main.go"
-  ( cd "$SUB" && go build -o "$REPO/$OUT/oracle_tokens" ./oracle/tokens \
-              && go build -o "$REPO/$OUT/oracle_ast"    ./oracle/ast \
-              && go build -o "$REPO/$OUT/oracle_jsdoc"  ./oracle/jsdoc \
-              && go build -o "$REPO/$OUT/oracle_split"  ./oracle/split ) \
+  mkdir -p "$SUB/oracle/tokens" "$SUB/oracle/ast" "$SUB/oracle/jsdoc" \
+           "$SUB/oracle/split" "$SUB/oracle/symbols"
+  cp "$PKG/tests/oracle/tokens.go"  "$SUB/oracle/tokens/main.go"
+  cp "$PKG/tests/oracle/ast.go"     "$SUB/oracle/ast/main.go"
+  cp "$PKG/tests/oracle/jsdoc.go"   "$SUB/oracle/jsdoc/main.go"
+  cp "$PKG/tests/oracle/split.go"   "$SUB/oracle/split/main.go"
+  cp "$PKG/tests/oracle/symbols.go" "$SUB/oracle/symbols/main.go"
+  ( cd "$SUB" && go build -o "$REPO/$OUT/oracle_tokens"  ./oracle/tokens \
+              && go build -o "$REPO/$OUT/oracle_ast"     ./oracle/ast \
+              && go build -o "$REPO/$OUT/oracle_jsdoc"   ./oracle/jsdoc \
+              && go build -o "$REPO/$OUT/oracle_split"   ./oracle/split \
+              && go build -o "$REPO/$OUT/oracle_symbols" ./oracle/symbols ) \
     > "$OUT/oracle-build.log" 2>&1
   orc=$?
   rm -rf "$SUB/oracle"
@@ -288,7 +297,7 @@ if [ $? -ne 0 ]; then
   red "the tscaly package failed to compile:"; sed 's/^/    /' "$OUT/pkg-build.log"; exit 2
 fi
 
-for prog in tscaly_tokens tscaly_ast tscaly_jsdoc; do
+for prog in tscaly_tokens tscaly_ast tscaly_jsdoc tscaly_symbols; do
   "$SCALYC" -c -o "$OUT/$prog.o" "$PKG/0.1.0/$prog.scaly" > "$OUT/$prog-build.log" 2>&1
   if [ $? -ne 0 ]; then
     red "$prog failed to compile:"; sed 's/^/    /' "$OUT/$prog-build.log"; exit 2
@@ -419,6 +428,26 @@ report() {
 report "scanner yardstick" $matched_tokens $unported_tokens $accepted_tokens $failed_tokens
 report "parser yardstick"  $matched_ast    $unported_ast    $accepted_ast    $failed_ast
 report "jsdoc yardstick"   $matched_jsdoc  $unported_jsdoc  $accepted_jsdoc  $failed_jsdoc
+report "binder yardstick"  $matched_symbols $unported_symbols $accepted_symbols $failed_symbols
+
+echo
+echo "  of those, $symbol_bearing units actually CARRY a symbol, and $bind_diag_units carry a BIND"
+echo "  diagnostic ($bind_diag_lines of them). Printed for the reason the JSDoc-bearing count"
+echo "  is, and slice 26's control c1 is why it is not decoration: a dump of \`f 0 0\`"
+echo "  — no symbols, no tables, symbolCount 0 — MATCHED 44 of the 865 units,"
+echo "  because that is exactly what the reference produces for a unit that declares"
+echo "  nothing. A matched total on this yardstick therefore includes units where"
+echo "  both sides agree by producing nothing."
+
+echo
+echo "  The FOURTH yardstick (slice 26) compares the BINDER: the symbol a"
+echo "  declaration owns, the locals/members/exports tables, the symbol NAMES and"
+echo "  the merge structure (one symbol, several declarations), the file's own"
+echo "  symbol counter and classifiable names, and the BIND diagnostics — which"
+echo "  the reference keeps in a third list that neither Diagnostics() nor"
+echo "  JSDiagnostics() includes. None of it is in the tree the parser yardstick"
+echo "  walks, so without this artifact a port producing no symbols and a port"
+echo "  producing wrong ones compare exactly equal. See tests/oracle/symbols.go."
 
 echo
 echo "  of those, $jsdoc_bearing units actually CARRY JSDoc — the rest match by both"
@@ -477,9 +506,16 @@ echo
 echo "  Each count is printed rather than folded away: a yardstick that shrinks in"
 echo "  silence is the failure mode this suite exists to prevent."
 
-total_stale=$(( stale_tokens + stale_ast + stale_jsdoc ))
-total_failed=$(( failed_tokens + failed_ast + failed_jsdoc ))
-total_timeout=$(( timeout_tokens + timeout_ast + timeout_jsdoc ))
+# ★★★ THE FOURTH YARDSTICK'S COUNTERS BELONG IN THESE THREE SUMS, and leaving them
+# out is exactly the defect slice 26's control c4 found: with the binder oracle
+# patched to exit 3, the report printed **865 UNEXPLAINED** in its own column and
+# the run still said OK and listed no failures, because these sums named three
+# yardsticks and there were four. A column that cannot fail the run is a column
+# that is not measured — the same sentence this suite keeps writing about the
+# `unported` column, one level up.
+total_stale=$(( stale_tokens + stale_ast + stale_jsdoc + stale_symbols ))
+total_failed=$(( failed_tokens + failed_ast + failed_jsdoc + failed_symbols ))
+total_timeout=$(( timeout_tokens + timeout_ast + timeout_jsdoc + timeout_symbols ))
 
 # A timed-out dump is counted in UNEXPLAINED like any other failure — it IS one —
 # but it is also named separately, because "our dumper did not finish" and "our

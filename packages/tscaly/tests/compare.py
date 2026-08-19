@@ -186,7 +186,7 @@ def compare_one(ctx, name, art, keep, ours_bin, ref_bin, case_file, work):
     if _has_line_prefix(ours_out, b"UNPORTED "):
         return "UNPORTED", None
 
-    cut = cut_fields(ref_out, keep)
+    cut = cut_fields(ref_out, keep) if keep > 0 else ref_out
     with open(f"{work}/{art}.ref.cut", "wb") as fh:
         fh.write(cut)
 
@@ -221,7 +221,16 @@ def _first_line(path):
         return ""
 
 
-ARTIFACTS = (("tokens", 4), ("ast", 5), ("jsdoc", 5))
+# ★ THE SECOND FIELD IS THE `cut -d' ' -f1-<keep>` WIDTH, and 0 means NO CUT.
+# The first three oracles carry a trailing kind NAME for readability, which our
+# side does not emit — dropping it by field count is what makes the comparison
+# possible without a 386-entry name table here. The symbols dump carries no such
+# column, deliberately: its lines have different field counts (a symbol line has
+# nine, a declaration line five), so ONE keep width cannot mean "everything but
+# the name" for all of them, and a per-line rule would be a normalisation inside
+# the comparison. Numeric kinds are looked up in tscaly/Kind.scaly when a diff
+# has to be read.
+ARTIFACTS = (("tokens", 4), ("ast", 5), ("jsdoc", 5), ("symbols", 0))
 
 
 def main():
@@ -338,6 +347,17 @@ def main():
     # argument jsdoc_bearing rests on, one section over.
     counters["js_diag_units"] = 0
     counters["js_diag_lines"] = 0
+    # ★★★ Slice 26: how many units CARRY a symbol, and how many bind diagnostics
+    # the corpus holds. Both counted off the REFERENCE dump, and the first one is
+    # not decoration: control c1 answered a dump of `f 0 0` — no symbols, no tables,
+    # symbolCount 0 — for every unit, and **44 of 865 MATCHED**, because that is
+    # exactly what the reference produces for a unit with no declarations in it. So
+    # a matched total on this yardstick includes units where both sides agree by
+    # producing nothing, the same way the jsdoc one does, and the number has to be
+    # printed or it reads as coverage it does not have.
+    counters["symbol_bearing"] = 0
+    counters["bind_diag_units"] = 0
+    counters["bind_diag_lines"] = 0
     failures = []
     stales = []
 
@@ -463,6 +483,21 @@ def main():
                 if n:
                     counters["js_diag_units"] += 1
                     counters["js_diag_lines"] += n
+            except OSError:
+                pass
+            try:
+                syms = binds = 0
+                with open(f"{work}/symbols.ref", "rb") as fh:
+                    for line in fh:
+                        if line.startswith(b"s "):
+                            syms += 1
+                        elif line.startswith(b"B "):
+                            binds += 1
+                if syms:
+                    counters["symbol_bearing"] += 1
+                if binds:
+                    counters["bind_diag_units"] += 1
+                    counters["bind_diag_lines"] += binds
             except OSError:
                 pass
 

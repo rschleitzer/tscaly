@@ -45,8 +45,19 @@
 //     carries differs from (first element pos, last element end) for 15 of 15
 //     type-parameter lists and 2 of 105 modifier lists — so a port cannot derive
 //     what it does not store.
-//   - Node.Parent. It is set by a later pass (`setParentFromContext`), not by
-//     ParseSourceFile, so there is nothing to compare yet.
+//   - Node.Parent — and the reason is a MEASUREMENT that corrected this very
+//     line. What stood here said Parent "is set by a later pass
+//     (setParentFromContext), not by ParseSourceFile, so there is nothing to
+//     compare yet", and at this pin that is false in its first half and right in
+//     its conclusion for a different reason: `finishNodeWithEnd` ends in
+//     `overrideParentInImmediateChildren`, so every node's Parent is set DURING
+//     the parse. It still cannot be compared here — over the 12 444 files of the
+//     stage-2 corpus (1 467 387 nodes) and all 296 fixtures, every node's Parent
+//     is exactly its parent in THIS walk and only the SourceFile's is nil, so a
+//     parent column would compare a constant. The four "force reset" sites the
+//     reference carries (parser.go:609, :3661, :4766-4789, :5750) are what make
+//     that true rather than lucky. Parent is observable one phase later, through
+//     the symbols dump, as the table a declaration lands in.
 //   - The diagnostic MESSAGE. Only code and span are compared; the message text
 //     lives in a 2000-entry table this port has no reason to carry yet. A wrong
 //     message with a right code passes.

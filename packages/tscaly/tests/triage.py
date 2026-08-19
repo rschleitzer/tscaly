@@ -35,7 +35,22 @@ import collections
 import os
 import sys
 
-ARTS = ("tokens", "ast", "jsdoc")
+ARTS = ("tokens", "ast", "jsdoc", "symbols")
+
+# ★ The symbols dump has NO trailing name column, so "the last field" would answer
+# an escaped symbol NAME on some lines and a bare number on others — the very trap
+# kind_name's docstring records. Its records are self-naming instead: the first
+# field says which of them a line is.
+_SYMBOL_RECORDS = {
+    b"n": "node with a symbol or locals",
+    b"s": "symbol",
+    b"d": "declaration of a symbol",
+    b"x": "export symbol",
+    b"t": "symbol table",
+    b"e": "symbol table entry",
+    b"f": "file totals (symbolCount/classifiable)",
+    b"c": "classifiable name",
+}
 
 
 def read(path):
@@ -52,7 +67,7 @@ def lines(data):
     return data.split(b"\n")[:-1] if data.endswith(b"\n") else data.split(b"\n")
 
 
-def kind_name(ref_lines, i):
+def kind_name(ref_lines, i, art="ast"):
     """The reference's own name for whatever sits on its line i.
 
     The dump is `depth kind pos end flags name` for ast/jsdoc and
@@ -69,13 +84,18 @@ def kind_name(ref_lines, i):
     if i >= len(ref_lines):
         return "<past end of the reference dump>"
     parts = ref_lines[i].split(b" ")
+    if art == "symbols":
+        if parts and parts[0] == b"B":
+            code = parts[-1].decode("utf-8", "replace")
+            return f"bind diagnostic TS{code}"
+        return _SYMBOL_RECORDS.get(parts[0] if parts else b"", "<unknown record>")
     if parts and parts[0] == b"D":
         code = parts[-1].decode("utf-8", "replace")
         return f"diagnostic TS{code}"
     return parts[-1].decode("utf-8", "replace") if len(parts) >= 2 else "<no name column>"
 
 
-def first_difference(ref_cut, ours, ref):
+def first_difference(ref_cut, ours, ref, art="ast"):
     """A signature for the first line where the two dumps disagree.
 
     The DIRECTION is part of the signature and is the half that names the defect:
@@ -90,7 +110,7 @@ def first_difference(ref_cut, ours, ref):
     # back into the list it exists to summarise. The unit is in the examples.
     for i in range(n):
         if a[i] != b[i]:
-            name = kind_name(rl, i)
+            name = kind_name(rl, i, art)
             fa, fb = a[i].split(b" "), b[i].split(b" ")
             if len(fa) != len(fb):
                 return f"malformed line at {name} — {len(fb)} fields, expected {len(fa)}"
@@ -98,7 +118,7 @@ def first_difference(ref_cut, ours, ref):
                 return f"same node, different span or flags: {name}"
             return f"different node where the reference has {name}"
     if len(a) > len(b):
-        return f"ours ENDS EARLY — the reference continues with {kind_name(rl, n)}"
+        return f"ours ENDS EARLY — the reference continues with {kind_name(rl, n, art)}"
     if len(b) > len(a):
         return "ours has EXTRA lines past the reference's end"
     return "<no difference found — the runner and this script disagree, which is a bug>"
@@ -149,15 +169,15 @@ def main(argv):
     print("=" * 78)
     print("triage of", cases_dir)
     if counters:
-        print("  a run of {} cases: matched {}/{}/{}  unported {}/{}/{}  UNEXPLAINED {}/{}/{}"
-              "   (tokens/ast/jsdoc)".format(
+        print("  a run of {} cases: matched {}/{}/{}/{}  unported {}/{}/{}/{}"
+              "  UNEXPLAINED {}/{}/{}/{}   (tokens/ast/jsdoc/symbols)".format(
                   counters.get("cases_seen", 0),
                   counters.get("matched_tokens", 0), counters.get("matched_ast", 0),
-                  counters.get("matched_jsdoc", 0),
+                  counters.get("matched_jsdoc", 0), counters.get("matched_symbols", 0),
                   counters.get("unported_tokens", 0), counters.get("unported_ast", 0),
-                  counters.get("unported_jsdoc", 0),
+                  counters.get("unported_jsdoc", 0), counters.get("unported_symbols", 0),
                   counters.get("failed_tokens", 0), counters.get("failed_ast", 0),
-                  counters.get("failed_jsdoc", 0)))
+                  counters.get("failed_jsdoc", 0), counters.get("failed_symbols", 0)))
     print("=" * 78)
 
     unported = {a: collections.Counter() for a in ARTS}
@@ -194,7 +214,7 @@ def main(argv):
                     continue          # matched, accepted, or reported through failures.txt
                 ref_cut = read(os.path.join(udir, f"{art}.ref.cut"))
                 ref = read(os.path.join(udir, f"{art}.ref"))
-                sig = first_difference(ref_cut, ours, ref)
+                sig = first_difference(ref_cut, ours, ref, art)
                 mismatch[art][sig] += 1
                 mm_ex[art][sig].append(where)
 
