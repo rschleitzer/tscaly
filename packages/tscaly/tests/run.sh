@@ -122,9 +122,33 @@ mkdir -p "$OUT"
 #
 # Each oracle goes into its OWN directory under oracle/: two `package main`
 # files in one directory is not a Go package.
+#
+# ★★★ THE BUILD IS STAMPED, and the stamp is what makes a control battery
+# affordable: ctl.sh patches `.scaly` files exclusively, so across all 45 controls
+# the four Go binaries are bit-identical, and rebuilding them each time cost 6.2 s
+# a run — a quarter of the battery's whole wall time by the end. The stamp covers
+# everything a rebuild could depend on: the four oracle sources, the submodule's
+# pinned commit, and the Go toolchain's own version string. Anything else moving
+# is not something a rebuild would notice either.
+#
+# ★★★ WHAT THE STAMP SKIPS IS THE MATERIALISATION, NEVER THE CHECK. The submodule
+# is asked whether it is clean on both sides regardless, because that question is
+# about the CORPUS — the thing every comparison below is measured against — and
+# not about the copy-in. A stamp that also silenced the check would trade 6 s for
+# the possibility of measuring against a submodule someone had edited.
+#
+# `TSCALY_FORCE_ORACLE=1` rebuilds unconditionally.
 
 submodule_dirty() {
   [ -n "$(git -C "$SUB" status --porcelain 2>/dev/null)" ]
+}
+
+oracle_stamp() {
+  shasum -a 256 "$PKG/tests/oracle/tokens.go" "$PKG/tests/oracle/ast.go" \
+                "$PKG/tests/oracle/jsdoc.go"  "$PKG/tests/oracle/split.go" \
+    | awk '{print $1}'
+  git -C "$SUB" rev-parse HEAD 2>/dev/null
+  go version 2>/dev/null
 }
 
 if submodule_dirty; then
@@ -147,23 +171,40 @@ if [ -n "$SUB_GITDIR" ] && [ -d "$SUB_GITDIR/info" ]; then
     || echo '/oracle/' >> "$SUB_GITDIR/info/exclude"
 fi
 
-mkdir -p "$SUB/oracle/tokens" "$SUB/oracle/ast" "$SUB/oracle/jsdoc" "$SUB/oracle/split"
-cp "$PKG/tests/oracle/tokens.go" "$SUB/oracle/tokens/main.go"
-cp "$PKG/tests/oracle/ast.go"    "$SUB/oracle/ast/main.go"
-cp "$PKG/tests/oracle/jsdoc.go"  "$SUB/oracle/jsdoc/main.go"
-cp "$PKG/tests/oracle/split.go"  "$SUB/oracle/split/main.go"
-( cd "$SUB" && go build -o "$REPO/$OUT/oracle_tokens" ./oracle/tokens \
-            && go build -o "$REPO/$OUT/oracle_ast"    ./oracle/ast \
-            && go build -o "$REPO/$OUT/oracle_jsdoc"  ./oracle/jsdoc \
-            && go build -o "$REPO/$OUT/oracle_split"  ./oracle/split ) \
-  > "$OUT/oracle-build.log" 2>&1
-orc=$?
-rm -rf "$SUB/oracle"
+STAMP=$OUT/oracle.stamp
+WANT=$(oracle_stamp)
+HAVE=
+[ -f "$STAMP" ] && HAVE=$(cat "$STAMP")
 
-if [ $orc -ne 0 ]; then
-  red "an oracle failed to build:"
-  sed 's/^/    /' "$OUT/oracle-build.log"
-  exit 2
+oracles_present() {
+  for o in oracle_tokens oracle_ast oracle_jsdoc oracle_split; do
+    [ -x "$OUT/$o" ] || return 1
+  done
+}
+
+if [ -z "${TSCALY_FORCE_ORACLE:-}" ] && [ "$WANT" = "$HAVE" ] && oracles_present; then
+  : # the four binaries already answer to this stamp
+else
+  rm -f "$STAMP"
+  mkdir -p "$SUB/oracle/tokens" "$SUB/oracle/ast" "$SUB/oracle/jsdoc" "$SUB/oracle/split"
+  cp "$PKG/tests/oracle/tokens.go" "$SUB/oracle/tokens/main.go"
+  cp "$PKG/tests/oracle/ast.go"    "$SUB/oracle/ast/main.go"
+  cp "$PKG/tests/oracle/jsdoc.go"  "$SUB/oracle/jsdoc/main.go"
+  cp "$PKG/tests/oracle/split.go"  "$SUB/oracle/split/main.go"
+  ( cd "$SUB" && go build -o "$REPO/$OUT/oracle_tokens" ./oracle/tokens \
+              && go build -o "$REPO/$OUT/oracle_ast"    ./oracle/ast \
+              && go build -o "$REPO/$OUT/oracle_jsdoc"  ./oracle/jsdoc \
+              && go build -o "$REPO/$OUT/oracle_split"  ./oracle/split ) \
+    > "$OUT/oracle-build.log" 2>&1
+  orc=$?
+  rm -rf "$SUB/oracle"
+
+  if [ $orc -ne 0 ]; then
+    red "an oracle failed to build:"
+    sed 's/^/    /' "$OUT/oracle-build.log"
+    exit 2
+  fi
+  printf '%s\n' "$WANT" > "$STAMP"
 fi
 
 if submodule_dirty; then
@@ -196,6 +237,11 @@ for prog in tscaly_tokens tscaly_ast tscaly_jsdoc; do
   fi
 done
 
+# The binaries above have just been built from the tree as it stands, so whatever
+# ctl.sh left behind is no longer true. See the "restored source is not a restored
+# artifact" rule in ctl.sh's header for what the marker is for.
+rm -f "$OUT/.built-from-patched-tree"
+
 # ── the cases ────────────────────────────────────────────────────────────────
 #
 # Our own fixtures first — small, and each one aimed at a specific construct —
@@ -220,266 +266,64 @@ while IFS= read -r f; do cases+=("$f"); done < <(
 
 # accepted.txt is <case>\t<artifact>\t<reason> — the artifact column is what
 # lets a case deviate on one yardstick and match on the other, which is the
-# normal state while a slice is in flight.
-is_accepted() {
-  [ -f "$ACCEPTED" ] || return 1
-  grep -q "^$1	$2	" "$ACCEPTED" 2>/dev/null
-}
+# normal state while a slice is in flight. compare.py reads it.
 
-# Clear the whole per-case tree, not just the cases about to run. Renaming the
-# case key once already left a previous run's directories behind, and a stale
-# result directory is indistinguishable from a fresh one when something later
-# reads them.
-rm -rf "$OUT/cases"
+# ── the case loop, as ONE process ────────────────────────────────────────────
+#
+# ★★★ THIS USED TO BE A BASH LOOP AND THE LOOP WAS THE COST. Measured on this
+# tree: 88.3 s a run at 5-20 % CPU, of which 77.5 s was the loop — and almost
+# none of it computing. Per artifact the loop spawned two greps, a cut, a
+# `diff -q` and an accepted.txt grep; per unit two `printf | tr` subshells; per
+# case an `rm`, a `mkdir` and a `grep -c`. Around 22 000 processes at ~3 ms of
+# fork/exec apiece, to perform 2 502 file comparisons. compare.py does the whole
+# loop in one process and runs the dumps on a thread pool.
+#
+# ★★★ IT CHANGES THE COST AND NOT THE MEASUREMENT, and that claim is checked
+# rather than asserted: the `cut -d' ' -f1-<keep>` that drops the oracle's kind-NAME
+# column is reimplemented on bytes and was diffed against BSD `cut` over all 2 502
+# artifacts of a green run before the loop was retired. It is load-bearing and it
+# is not a normalisation — see the root CLAUDE.md's `od -c` lesson, where a
+# normalisation in the comparison hid exactly the class it hid in the comparison.
+# The dump binaries are still one process per (unit, artifact), because a
+# batch-mode dumper would share process state across units and that WOULD change
+# what is measured.
+#
+# ★ `diff` is still a subprocess on the failure path: the `.diff` file is the
+# diagnosis artifact and its first line is quoted into the failure message, so
+# reproducing diff's own format in Python would normalise the evidence. A green
+# run has no failing artifact and never spawns it.
+#
+# TSCALY_JOBS overrides the pool size; the default is the core count, measured
+# rather than reasoned — see compare.py, where going wider is slower rather than
+# neutral.
+#
+# ★ `${cases[@]+"${cases[@]}"}` and not `"${cases[@]}"`: macOS ships bash 3.2,
+# where an EMPTY array under `set -u` is an "unbound variable" error rather than
+# an empty expansion. The preconditions above make an empty list unreachable, so
+# this is a guard against a cryptic failure and not a live path.
 
-# ★ Plain counters per artifact, not an associative array: macOS ships bash
-# 3.2, which has none — and a `declare -A` there fails at the line that USES
-# it, so the run would report zeros rather than refusing.
-matched_tokens=0; unported_tokens=0; failed_tokens=0; accepted_tokens=0; stale_tokens=0
-matched_ast=0;    unported_ast=0;    failed_ast=0;    accepted_ast=0;    stale_ast=0
-matched_jsdoc=0;  unported_jsdoc=0;  failed_jsdoc=0;  accepted_jsdoc=0;  stale_jsdoc=0
-# How many units carry any JSDoc at all. A yardstick whose output is empty on
-# 90 % of the corpus has to say so, or "matched" reads as coverage it does not
-# have — the same reason the .json and .tsx counts are printed.
-jsdoc_bearing=0
+TSCALY_OUT=$OUT \
+TSCALY_ACCEPTED=$ACCEPTED \
+TSCALY_SUB_PREFIX="$SUB/testdata/tests/cases/" \
+TSCALY_PKG_PREFIX="$PKG/tests/" \
+TSCALY_FILTER="$FILTER" \
+python3 "$PKG/tests/compare.py" <<EOF_CASES
+$(printf '%s\n' ${cases[@]+"${cases[@]}"})
+EOF_CASES
+if [ $? -ne 0 ]; then
+  red "the comparator itself failed — this is a harness bug, not a result."
+  exit 2
+fi
+
+# Nine counters per yardstick plus the coverage counts, written by compare.py as
+# plain `name=value` lines. Sourced rather than parsed: a scalar assignment file
+# is the one shape bash 3.2 reads without an associative array.
+. "$OUT/counters.sh"
+
 failures=()
+while IFS= read -r l; do [ -n "$l" ] && failures+=("$l"); done < "$OUT/failures.txt"
 stales=()
-
-# Units the yardsticks do not compare, counted by REASON. Both sides derive the
-# script kind from the unit's NAME and clamp it to the two kinds this port
-# implements — TS and, since slice 19, JSON — so a unit the reference's harness
-# would parse under a THIRD kind is measuring a parse neither side intends. That
-# is the same argument that excludes .tsx at case discovery, applied one level
-# down; each count is printed, because a measurement that silently shrinks is the
-# failure mode this whole suite is organized against.
-cases_seen=0
-skip_jsx=0; skip_other=0
-
-# Compared under ScriptKindJSON on both sides — counted, not skipped, and named
-# in the report so the second grammar's coverage is a number rather than an
-# inference from a total.
-json_compared=0
-# The JavaScript-kind units — compared under ScriptKindJS/ScriptKindJSX on both
-# sides since slice 22, which is where the JSDoc REPARSER landed. Counted and
-# named in the report for the reason the .json and .tsx counts are: a grammar's
-# coverage should be a number rather than an inference from a total.
-js_compared=0
-# Compared under ScriptKindTSX on both sides — the JSX grammar, slice 20. Split in
-# two because only the first half is the kind the reference's harness would
-# choose; see classify_unit.
-tsx_compared=0
-jsx_compared=0
-
-UNIT_SKIP=
-classify_unit() {
-  local low
-  low=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
-  case $low in
-    # ★★ A declaration unit is COMPARED since slice 14, and it is the only class
-    # the split exposed that has since been closed rather than argued. The name
-    # is what makes it ambient: `IsDeclarationFileName` is consulted before
-    # parsing and sets NodeFlagsAmbient as a CONTEXT flag, so the SourceFile node
-    # carries it too. Our dumper takes the same path as its argument and
-    # tscaly/tspath.scaly asks the same question of it.
-    #
-    # ★ Measured before it was ported and again after: all 56 units differed from
-    # the reference by that ONE BIT and by nothing else — same node count, same
-    # kinds, same spans, same diagnostics — and all 56 match now.
-    #
-    # ★ The line that stood here said "the entire difference is ONE line, the
-    # SourceFile's flags", from one unit. That was the right CAUSE and the wrong
-    # SIZE: the flag reaches every node not already under a `declare`, which on
-    # these units is 1 to 41 lines apiece. A cause generalises from one
-    # measurement; a magnitude does not.
-    *.ts|*.mts|*.cts)       UNIT_SKIP= ;;
-    # ★★★ COMPARED since slice 20, under ScriptKindTSX on both sides — the JSX
-    # grammar.
-    *.tsx)                  UNIT_SKIP= ;;
-    # ★★★ .jsx and .js are compared under THEIR OWN kinds since slice 22, and
-    # that closes the last clamp this runner carried. Through slice 21 a .jsx unit
-    # was compared as TSX and a .js unit as TypeScript — valid comparisons of our
-    # parser, but not the parse the reference's harness RUNS, because
-    # ScriptKindJS and ScriptKindJSX carry NodeFlagsJavaScriptFile and that turns
-    # JSDoc from a comment into SYNTAX: `@typedef` becomes a type alias in the
-    # statement list, `@param {T} x` becomes a type annotation on a parameter
-    # that has none. Slice 22 ported that reparser, so the two sides can be asked
-    # the same question at last.
-    #
-    # ★ The clamp was never a skip and the distinction earned its keep: skipping
-    # these was measured at the time and would have cost 60 corpus cases that
-    # MATCHED — the whole jsdoc/salsa/cjs part of the corpus — for no
-    # information. A comparison that is valid but not faithful is worth more than
-    # no comparison, and saying which one it is each time is what let it be
-    # upgraded rather than rediscovered.
-    *.jsx)                  UNIT_SKIP= ;;
-    *.js|*.cjs|*.mjs)       UNIT_SKIP= ;;
-    # ★★★ A .json unit IS compared since slice 19, under ScriptKindJSON on both
-    # sides — the second GRAMMAR (parseJsonText), which is the class the split
-    # was built for and the only one it exposed that is now closed by porting
-    # rather than by argument. Three things follow the kind and all three are
-    # visible here: the parse dispatches to a different entry point, every node
-    # carries JavaScriptFile|JsonFile as context flags, and the SCANNER runs
-    # under the JSX language variant, which is what upstream's own
-    # getLanguageVariant answers for JSON.
-    *.json)                 UNIT_SKIP= ;;
-    *)                      UNIT_SKIP=other ;;
-  esac
-}
-
-# Compare one artifact of one case and leave the verdict in VERDICT, so the
-# caller can bump its own counters. $1 case name, $2 artifact (tokens|ast),
-# $3 the number of oracle fields to keep, $4 our binary, $5 the oracle,
-# $6 the case file, $7 the work directory.
-VERDICT=
-compare_one() {
-  local name=$1 art=$2 keep=$3 ours_bin=$4 ref_bin=$5 case_file=$6 work=$7
-
-  # No pipeline around either binary: `rc=$?` after `$(prog | tr ...)` reads the
-  # LAST command's status, which has silently disabled two suites in this repo.
-  "$ours_bin" "$case_file" > "$work/$art.ours" 2> "$work/$art.ours.err"
-  local ours_rc=$?
-  "$ref_bin" "$case_file" > "$work/$art.ref" 2> "$work/$art.ref.err"
-  local ref_rc=$?
-
-  if [ $ours_rc -ne 0 ]; then
-    failures+=("$art/$name: our dumper exited $ours_rc")
-    VERDICT=FAIL; return
-  fi
-  if [ $ref_rc -ne 0 ]; then
-    failures+=("$art/$name: the ORACLE exited $ref_rc — suspect the harness, not the port")
-    VERDICT=FAIL; return
-  fi
-
-  # ★★★ `no-tree` is NOT an honest unported report. It is the parser answering
-  # NULL with no unported record — a port defect wearing the unported column's
-  # clothes, and the state is never correct. Slice 13c produced five of them in
-  # one afternoon by letting seventeen callers keep reading a result that had
-  # stopped failing (CLAUDE.md §3.5ae), and the only thing that told them apart
-  # from a real report was this tag. So the tag is a hard failure here.
-  if grep -q '^UNPORTED 0 no-tree ' "$work/$art.ours"; then
-    failures+=("$art/$name: no-tree — the parser answered null with NO unported record, which is a port defect and not an unported construct")
-    VERDICT=FAIL; return
-  fi
-
-  if grep -q '^UNPORTED ' "$work/$art.ours"; then
-    VERDICT=UNPORTED; return
-  fi
-
-  # The oracle's last column is the kind NAME, carried for readability only.
-  # A diagnostic line (`D pos end code`) has four fields either way and is
-  # unaffected by a cut that keeps more.
-  cut -d' ' -f1-$keep < "$work/$art.ref" > "$work/$art.ref.cut"
-
-  if diff -q "$work/$art.ref.cut" "$work/$art.ours" > /dev/null 2>&1; then
-    if is_accepted "$name" "$art"; then
-      # A deviation that no longer deviates. Left unreported, accepted.txt rots
-      # into a list of things that used to be true.
-      stales+=("$art/$name")
-      VERDICT=STALE; return
-    fi
-    VERDICT=MATCH; return
-  fi
-
-  if is_accepted "$name" "$art"; then
-    VERDICT=ACCEPTED; return
-  fi
-
-  diff "$work/$art.ref" "$work/$art.ours" > "$work/$art.diff" 2>&1
-  failures+=("$art/$name: $(head -1 "$work/$art.diff" 2>/dev/null)")
-  VERDICT=FAIL
-}
-
-for case_file in "${cases[@]}"; do
-  # Path-derived, not basename: conformance/ nests, and two directories there
-  # can hold the same file name. A basename key would let one case's accepted.txt
-  # entry silently excuse a different case.
-  name=${case_file#"$SUB/testdata/tests/cases/"}
-  name=${name#"$PKG/tests/"}
-  name=${name%.ts}
-  name=${name//\//_}
-  [ -n "$FILTER" ] && case "$name" in *"$FILTER"*) ;; *) continue ;; esac
-  cases_seen=$((cases_seen + 1))
-
-  case_work="$OUT/cases/$name"
-  rm -rf "$case_work"; mkdir -p "$case_work"
-
-  # The reference's own splitter. No pipeline: its exit code is read.
-  "$OUT/oracle_split" "$case_file" "$case_work/units" \
-    > "$case_work/units.manifest" 2> "$case_work/units.err"
-  if [ $? -ne 0 ]; then
-    failures+=("split/$name: $(head -1 "$case_work/units.err" 2>/dev/null)")
-    failed_tokens=$((failed_tokens + 1)); failed_ast=$((failed_ast + 1))
-    continue
-  fi
-
-  unit_count=$(grep -c . "$case_work/units.manifest")
-
-  while read -r idx written unit_name; do
-    [ -n "$written" ] || continue
-
-    classify_unit "$unit_name"
-    if [ -n "$UNIT_SKIP" ]; then
-      case $UNIT_SKIP in
-        jsx)         skip_jsx=$((skip_jsx + 1)) ;;
-        *)           skip_other=$((skip_other + 1)) ;;
-      esac
-      continue
-    fi
-
-    # ★ A single-unit case keeps its own key, so every existing accepted.txt
-    # entry, every fixture name and every number in CLAUDE.md's tables still
-    # refers to the same thing. Only a genuinely multi-file case gains a suffix,
-    # and the suffix is the unit's own PATH — unique within the case and stable
-    # across a pin bump, where an index would not be.
-    if [ "$unit_count" = 1 ]; then
-      key=$name
-    else
-      suffix=${unit_name#/}
-      suffix=${suffix//\//_}
-      key="$name@$suffix"
-    fi
-
-    case $(printf '%s' "$unit_name" | tr 'A-Z' 'a-z') in
-      *.js|*.cjs|*.mjs) js_compared=$((js_compared + 1)) ;;
-      *.jsx)            jsx_compared=$((jsx_compared + 1)) ;;
-      *.tsx)            tsx_compared=$((tsx_compared + 1)) ;;
-      *.json)           json_compared=$((json_compared + 1)) ;;
-    esac
-
-    work="$case_work/$idx"
-    mkdir -p "$work"
-
-    compare_one "$key" tokens 4 "$OUT/tscaly_tokens" "$OUT/oracle_tokens" "$written" "$work"
-    case $VERDICT in
-      MATCH)    matched_tokens=$((matched_tokens + 1)) ;;
-      STALE)    matched_tokens=$((matched_tokens + 1)); stale_tokens=$((stale_tokens + 1)) ;;
-      UNPORTED) unported_tokens=$((unported_tokens + 1)) ;;
-      ACCEPTED) accepted_tokens=$((accepted_tokens + 1)) ;;
-      FAIL)     failed_tokens=$((failed_tokens + 1)) ;;
-    esac
-
-    compare_one "$key" ast 5 "$OUT/tscaly_ast" "$OUT/oracle_ast" "$written" "$work"
-    case $VERDICT in
-      MATCH)    matched_ast=$((matched_ast + 1)) ;;
-      STALE)    matched_ast=$((matched_ast + 1)); stale_ast=$((stale_ast + 1)) ;;
-      UNPORTED) unported_ast=$((unported_ast + 1)) ;;
-      ACCEPTED) accepted_ast=$((accepted_ast + 1)) ;;
-      FAIL)     failed_ast=$((failed_ast + 1)) ;;
-    esac
-
-    compare_one "$key" jsdoc 5 "$OUT/tscaly_jsdoc" "$OUT/oracle_jsdoc" "$written" "$work"
-    case $VERDICT in
-      MATCH)    matched_jsdoc=$((matched_jsdoc + 1)) ;;
-      STALE)    matched_jsdoc=$((matched_jsdoc + 1)); stale_jsdoc=$((stale_jsdoc + 1)) ;;
-      UNPORTED) unported_jsdoc=$((unported_jsdoc + 1)) ;;
-      ACCEPTED) accepted_jsdoc=$((accepted_jsdoc + 1)) ;;
-      FAIL)     failed_jsdoc=$((failed_jsdoc + 1)) ;;
-    esac
-    if [ -s "$work/jsdoc.ref" ]; then
-      jsdoc_bearing=$((jsdoc_bearing + 1))
-    fi
-  done < "$case_work/units.manifest"
-done
+while IFS= read -r l; do [ -n "$l" ] && stales+=("$l"); done < "$OUT/stales.txt"
 
 # ── report ───────────────────────────────────────────────────────────────────
 

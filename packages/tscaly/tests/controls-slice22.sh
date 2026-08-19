@@ -21,8 +21,8 @@
 # not change without an argument is a row's VERDICT: a RED row going UNGATED
 # means the claim has lost its witness.
 #
-# Usage (about three hours; it patches the source tree and restores it after
-# every control, so nothing may edit the tree while it runs — §3.5y):
+# Usage (it patches the source tree and restores it after every control, so
+# nothing may edit the tree while it runs — §3.5y):
 #
 #   packages/tscaly/tests/controls-slice22.sh 2>&1 | tee /tmp/battery.log
 #
@@ -31,13 +31,43 @@
 #   packages/tscaly/tests/ctl.sh "label" <<'SPEC'
 #   ... the spec ...
 #   SPEC
+#
+# ★★★ THE BATTERY IS 47 RUNS, NOT 135, AND THE ARITHMETIC IS THE WHOLE OF IT.
+# Each control used to measure three: its own baseline, the patched tree, and the
+# baseline again after restoring. But the "after" of control N and the "before" of
+# control N+1 are the SAME TREE by construction — ctl.sh restores the one file it
+# patched and touches nothing else — so of those 90 baseline runs, 88 were
+# measuring a tree that had already been measured, most of them twice in a row.
+# What replaces them is ONE baseline at the top, a
+# FINGERPRINT over every input that each control verifies before trusting it and
+# again after restoring, and ONE clean run at the bottom that has to reproduce the
+# baseline report byte for byte. 1 + 45 + 1.
+#
+# ★★ Nothing was dropped from the CHECKING to buy that — the fingerprint sees any
+# byte of any input, where the four-counter comparison it replaces could not see a
+# change that does not move a counter (§3.5y's own hole). ctl.sh's header has the
+# argument.
 
 set -u
 cd "$(dirname "$0")/../../.."
 
 CTL=packages/tscaly/tests/ctl.sh
+RUN=packages/tscaly/tests/run.sh
 P=packages/tscaly/0.1.0/tscaly/parser.scaly
 A=packages/tscaly/0.1.0/tscaly/ast.scaly
+
+# The shared baseline lives for the length of this battery and no longer. A cache
+# that outlives the process it was measured in is the stale baseline slice 7
+# nearly lost three gates to.
+export TSCALY_BASELINE=$(mktemp -t tscaly-baseline)
+BATTERY_START=$(python3 -c 'import time; print(time.time())')
+cleanup() { rm -f "$TSCALY_BASELINE" "$TSCALY_BASELINE.fp"; }
+trap cleanup EXIT
+
+echo "################################################################"
+if ! "$CTL" --establish-baseline </dev/null; then
+  exit 2
+fi
 
 run() { echo; echo "################################################################"; "$CTL" "$1"; }
 run "c1 the reparser never runs at all" <<SPEC
@@ -590,3 +620,41 @@ FILE $A
                 return ix.full_signature
 >>>NEW
 SPEC
+
+# ── the 47th run: the tree must come back to where the battery found it ──────
+#
+# ★★★ THIS IS THE ONE CHECK THAT CANNOT BE REPLACED BY A HASH, and it is why the
+# battery ends with a run rather than with the last control. Each control verifies
+# its own restore by fingerprint, so the INPUTS are provably unchanged — but a
+# fingerprint says nothing about whether those inputs still produce the report the
+# battery was measured against. A build that has drifted, a submodule that moved,
+# an oracle stamp that went stale: all of them keep the fingerprint and change the
+# answer. Reproducing the baseline report BYTE FOR BYTE is the statement the
+# forty-five numbers above rest on.
+echo
+echo "################################################################"
+echo "the 47th run: reproducing the baseline from the restored tree ..."
+FINAL=$(mktemp -t tscaly-final)
+"$RUN" > "$FINAL" 2>&1 </dev/null
+FINAL_RC=$?
+if [ $FINAL_RC -ne 0 ]; then
+  printf '\033[31m%s\033[0m\n' "the final run is not green (rc $FINAL_RC) — the battery left the tree broken."
+  tail -30 "$FINAL"
+  rm -f "$FINAL"
+  exit 2
+fi
+if diff -q "$TSCALY_BASELINE" "$FINAL" > /dev/null 2>&1; then
+  printf '\033[32m%s\033[0m\n' "BATTERY VERIFIED: the final report is byte-identical to the baseline."
+  echo "  So every control above was measured against this tree, and the tree is"
+  echo "  the one the battery started from."
+else
+  printf '\033[31m%s\033[0m\n' "THE FINAL REPORT DIFFERS FROM THE BASELINE — every number above is suspect."
+  echo "  The shared baseline no longer describes this tree, which means something"
+  echo "  moved during the battery that the per-control fingerprints did not see."
+  diff "$TSCALY_BASELINE" "$FINAL" | head -40
+  rm -f "$FINAL"
+  exit 1
+fi
+rm -f "$FINAL"
+
+python3 -c 'import sys,time; d=time.time()-float(sys.argv[1]); print("battery wall time: %d min %d s (%d runs of the yardsticks)" % (d//60, d%60, 47))' "$BATTERY_START"

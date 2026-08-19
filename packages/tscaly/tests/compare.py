@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+#
+# compare.py — the case loop of run.sh, as ONE process.
+#
+# ★★★ THIS FILE CHANGES THE COST OF THE MEASUREMENT AND NOT THE MEASUREMENT.
+# Every rule the bash loop encoded is reproduced here deliberately, and the two
+# were diffed over the whole corpus before the loop was retired:
+#
+#   * the ORACLE'S LAST COLUMN IS DROPPED BY FIELD COUNT, not by a regex and not
+#     by a normalisation. `cut_fields` is `cut -d' ' -f1-<keep>` and nothing else:
+#     single-space delimiters, empty fields preserved, a line with fewer fields
+#     passed through whole, the trailing newline kept or absent as the input had
+#     it. Verified byte-for-byte against BSD `cut` over all 2502 artifacts of a
+#     green run before this file was committed. The root CLAUDE.md's `od -c`
+#     lesson is why that check exists at all: a normalisation in the comparison
+#     hides exactly the class it hides in the comparison.
+#
+#   * NO PIPELINE AROUND A BINARY WHOSE EXIT CODE IS READ. `subprocess.run`
+#     answers the process's own status; that is the point.
+#
+#   * `diff` IS STILL A SUBPROCESS, on the failure path only. The `.diff` file is
+#     a diagnosis artifact and its first line is quoted into the failure message,
+#     so reproducing diff's normal format in Python would be a normalisation of
+#     the evidence for no gain — it runs on failing artifacts, which a green run
+#     has none of.
+#
+#   * THE REPORT IS ORDER-STABLE. The work runs on a thread pool, so completion
+#     order is arbitrary; results are keyed by (case index, unit index, artifact)
+#     and accumulated in that order afterwards. A parallel run and a serial one
+#     print the same bytes.
+#
+# ★ ONE DELIBERATE TIGHTENING, stated because it is a change: `is_accepted` was
+# `grep -q "^<case>\t<artifact>\t"`, i.e. the case key was read as a BRE, so a
+# key containing `.` — every multi-file unit key does — matched any character in
+# that position. Here it is an exact prefix match on the first two tab-separated
+# fields. Strictly narrower, and provably neutral on today's tree: accepted.txt
+# carries zero entries, so both readings answer false everywhere.
+#
+# ★ Parallelism is spawn-bound rather than CPU-bound (the whole bash loop ran at
+# 5-20 % CPU), and the pool size was MEASURED rather than reasoned: on a
+# 10-core box, spawning 600 dumps runs at 210 proc/s serially, 837 at 4 threads,
+# **952 at 8**, and then back DOWN — 878 at 16, 800 at 24. So the default is the
+# core count, not a multiple of it, and going wider is slower rather than
+# neutral. TSCALY_JOBS overrides it.
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
+
+def cut_fields(data: bytes, keep: int) -> bytes:
+    """Exactly `cut -d' ' -f1-keep`, on bytes."""
+    if not data:
+        return b""
+    trailing_nl = data.endswith(b"\n")
+    lines = data.split(b"\n")
+    if trailing_nl:
+        lines = lines[:-1]
+    out = b"\n".join(b" ".join(line.split(b" ")[:keep]) for line in lines)
+    return out + (b"\n" if trailing_nl else b"")
+
+
+def run_capture(argv, out_path, err_path):
+    """Run argv, write stdout/stderr to the two paths, answer (rc, stdout bytes).
+
+    The dumps are tens of kilobytes at most (29 547 bytes is the corpus maximum),
+    so holding stdout in memory costs nothing and saves reading it back.
+    """
+    proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    with open(out_path, "wb") as fh:
+        fh.write(proc.stdout)
+    with open(err_path, "wb") as fh:
+        fh.write(proc.stderr)
+    return proc.returncode, proc.stdout
+
+
+# ── the classifications, moved off `tr` and `case` ───────────────────────────
+#
+# Both were a subshell plus a `tr` per unit in the bash loop. The suffix sets and
+# the order of the tests are the loop's, unchanged; see run.sh for the argument
+# behind each one.
+
+_COMPARED_SUFFIXES = (
+    ".ts", ".mts", ".cts",     # TypeScript, declaration units included
+    ".tsx",                    # the JSX grammar, slice 20
+    ".jsx",                    # ScriptKindJSX, slice 22
+    ".js", ".cjs", ".mjs",     # ScriptKindJS, slice 22
+    ".json",                   # the second grammar, slice 19
+)
+
+
+def classify_unit(unit_name: str):
+    """None when the unit is compared, else the skip reason."""
+    low = unit_name.lower()
+    return None if low.endswith(_COMPARED_SUFFIXES) else "other"
+
+
+def kind_bucket(unit_name: str):
+    low = unit_name.lower()
+    if low.endswith((".js", ".cjs", ".mjs")):
+        return "js"
+    if low.endswith(".jsx"):
+        return "jsx"
+    if low.endswith(".tsx"):
+        return "tsx"
+    if low.endswith(".json"):
+        return "json"
+    return None
+
+
+class Ctx:
+    pass
+
+
+def load_accepted(path):
+    accepted = set()
+    if not os.path.isfile(path):
+        return accepted
+    with open(path, "r", errors="surrogateescape") as fh:
+        for line in fh:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 3:
+                accepted.add((parts[0], parts[1]))
+    return accepted
+
+
+# ── one artifact of one unit ─────────────────────────────────────────────────
+#
+# A faithful transcription of compare_one, including the ORDER of its checks:
+# both binaries run before either exit code is read, so `jsdoc.ref` exists even
+# when our dumper failed — which is what the jsdoc-bearing count depends on.
+
+
+def compare_one(ctx, name, art, keep, ours_bin, ref_bin, case_file, work):
+    ours_rc, ours_out = run_capture(
+        [ours_bin, case_file], f"{work}/{art}.ours", f"{work}/{art}.ours.err")
+    ref_rc, ref_out = run_capture(
+        [ref_bin, case_file], f"{work}/{art}.ref", f"{work}/{art}.ref.err")
+
+    if ours_rc != 0:
+        return "FAIL", f"{art}/{name}: our dumper exited {ours_rc}"
+    if ref_rc != 0:
+        return "FAIL", (f"{art}/{name}: the ORACLE exited {ref_rc}"
+                        " — suspect the harness, not the port")
+
+    # ★★★ `no-tree` is NOT an honest unported report — it is the parser answering
+    # NULL with no unported record, a port defect wearing the unported column's
+    # clothes. A hard failure here, as in the bash loop.
+    if _has_line_prefix(ours_out, b"UNPORTED 0 no-tree "):
+        return "FAIL", (f"{art}/{name}: no-tree — the parser answered null with NO"
+                        " unported record, which is a port defect and not an"
+                        " unported construct")
+
+    if _has_line_prefix(ours_out, b"UNPORTED "):
+        return "UNPORTED", None
+
+    cut = cut_fields(ref_out, keep)
+    with open(f"{work}/{art}.ref.cut", "wb") as fh:
+        fh.write(cut)
+
+    is_acc = (name, art) in ctx.accepted
+
+    if cut == ours_out:
+        # A deviation that no longer deviates. Left unreported, accepted.txt rots
+        # into a list of things that used to be true.
+        return ("STALE" if is_acc else "MATCH"), None
+
+    if is_acc:
+        return "ACCEPTED", None
+
+    with open(f"{work}/{art}.diff", "wb") as fh:
+        subprocess.run(["diff", f"{work}/{art}.ref", f"{work}/{art}.ours"],
+                       stdout=fh, stderr=subprocess.STDOUT)
+    first = _first_line(f"{work}/{art}.diff")
+    return "FAIL", f"{art}/{name}: {first}"
+
+
+def _has_line_prefix(data: bytes, prefix: bytes) -> bool:
+    if data.startswith(prefix):
+        return True
+    return (b"\n" + prefix) in data
+
+
+def _first_line(path):
+    try:
+        with open(path, "r", errors="surrogateescape") as fh:
+            return fh.readline().rstrip("\n")
+    except OSError:
+        return ""
+
+
+ARTIFACTS = (("tokens", 4), ("ast", 5), ("jsdoc", 5))
+
+
+def main():
+    ctx = Ctx()
+    out = os.environ["TSCALY_OUT"]
+    ctx.accepted = load_accepted(os.environ["TSCALY_ACCEPTED"])
+    sub_prefix = os.environ["TSCALY_SUB_PREFIX"]
+    pkg_prefix = os.environ["TSCALY_PKG_PREFIX"]
+    filt = os.environ.get("TSCALY_FILTER", "")
+    jobs = int(os.environ.get("TSCALY_JOBS") or min(16, os.cpu_count() or 8))
+
+    bins = {art: (f"{out}/tscaly_{art}", f"{out}/oracle_{art}") for art, _ in ARTIFACTS}
+    split_bin = f"{out}/oracle_split"
+
+    cases = [line.rstrip("\n") for line in sys.stdin if line.strip()]
+
+    # Clear the whole per-case tree, not just the cases about to run: a stale
+    # result directory is indistinguishable from a fresh one when something later
+    # reads it.
+    shutil.rmtree(f"{out}/cases", ignore_errors=True)
+
+    selected = []
+    for case_file in cases:
+        name = case_file
+        if name.startswith(sub_prefix):
+            name = name[len(sub_prefix):]
+        elif name.startswith(pkg_prefix):
+            name = name[len(pkg_prefix):]
+        if name.endswith(".ts"):
+            name = name[:-3]
+        name = name.replace("/", "_")
+        if filt and filt not in name:
+            continue
+        selected.append((case_file, name))
+
+    # ── phase A: the reference's own splitter, one process per case ──────────
+    def do_split(item):
+        case_file, name = item
+        case_work = f"{out}/cases/{name}"
+        os.makedirs(case_work, exist_ok=True)
+        rc, _ = run_capture([split_bin, case_file, f"{case_work}/units"],
+                            f"{case_work}/units.manifest", f"{case_work}/units.err")
+        return rc
+
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        split_rcs = list(pool.map(do_split, selected))
+
+    # ── phase B: the unit list, in the loop's own order ──────────────────────
+    counters = {}
+    for art, _ in ARTIFACTS:
+        for k in ("matched", "unported", "failed", "accepted", "stale"):
+            counters[f"{k}_{art}"] = 0
+    counters["cases_seen"] = 0
+    counters["skip_jsx"] = 0
+    counters["skip_other"] = 0
+    counters["json_compared"] = 0
+    counters["js_compared"] = 0
+    counters["tsx_compared"] = 0
+    counters["jsx_compared"] = 0
+    counters["jsdoc_bearing"] = 0
+    failures = []
+    stales = []
+
+    tasks = []          # (order key, unit record, artifact, keep)
+    split_failures = []
+    for ci, ((case_file, name), rc) in enumerate(zip(selected, split_rcs)):
+        counters["cases_seen"] += 1
+        case_work = f"{out}/cases/{name}"
+        if rc != 0:
+            split_failures.append((ci, f"split/{name}: {_first_line(case_work + '/units.err')}"))
+            counters["failed_tokens"] += 1
+            counters["failed_ast"] += 1
+            continue
+
+        with open(f"{case_work}/units.manifest", "r", errors="surrogateescape") as fh:
+            manifest = [ln.rstrip("\n") for ln in fh]
+        units = [ln for ln in manifest if ln != ""]   # `grep -c .`
+        unit_count = len(units)
+
+        for ui, line in enumerate(manifest):
+            # `read -r idx written unit_name` — the remainder goes to the last name.
+            parts = line.split(None, 2)
+            if len(parts) < 2 or not parts[1]:
+                continue
+            idx, written = parts[0], parts[1]
+            unit_name = parts[2] if len(parts) > 2 else ""
+
+            if classify_unit(unit_name) is not None:
+                counters["skip_other"] += 1
+                continue
+
+            # A single-unit case keeps its own key, so every accepted.txt entry and
+            # every number in CLAUDE.md's tables still refers to the same thing.
+            if unit_count == 1:
+                key = name
+            else:
+                key = name + "@" + unit_name.lstrip("/").replace("/", "_")
+
+            bucket = kind_bucket(unit_name)
+            if bucket:
+                counters[bucket + "_compared"] += 1
+
+            work = f"{case_work}/{idx}"
+            os.makedirs(work, exist_ok=True)
+            for art, keep in ARTIFACTS:
+                tasks.append(((ci, ui, art), key, art, keep, written, work))
+
+    # ── phase C: every (unit, artifact) on the pool ──────────────────────────
+    def do_compare(task):
+        _, key, art, keep, written, work = task
+        ours_bin, ref_bin = bins[art]
+        return compare_one(ctx, key, art, keep, ours_bin, ref_bin, written, work)
+
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        verdicts = list(pool.map(do_compare, tasks))
+
+    # ── phase D: accumulate in the loop's order ─────────────────────────────
+    results = {}
+    for task, (verdict, message) in zip(tasks, verdicts):
+        results[task[0]] = (verdict, message, task[1], task[3], task[5])
+
+    split_fail_by_case = dict(split_failures)
+    art_order = [a for a, _ in ARTIFACTS]
+    by_case = {}
+    for k in results:
+        by_case.setdefault(k[0], []).append(k)
+
+    for ci in range(len(selected)):
+        if ci in split_fail_by_case:
+            failures.append(split_fail_by_case[ci])
+            continue
+        keys = sorted(by_case.get(ci, ()),
+                      key=lambda k: (k[1], art_order.index(k[2])))
+        seen_units = []
+        for k in keys:
+            verdict, message, key, _keep, work = results[k]
+            art = k[2]
+            if verdict == "MATCH":
+                counters[f"matched_{art}"] += 1
+            elif verdict == "STALE":
+                counters[f"matched_{art}"] += 1
+                counters[f"stale_{art}"] += 1
+                stales.append(f"{art}/{key}")
+            elif verdict == "UNPORTED":
+                counters[f"unported_{art}"] += 1
+            elif verdict == "ACCEPTED":
+                counters[f"accepted_{art}"] += 1
+            else:
+                counters[f"failed_{art}"] += 1
+                failures.append(message)
+            if art == "jsdoc":
+                seen_units.append(work)
+        for work in seen_units:
+            try:
+                if os.path.getsize(f"{work}/jsdoc.ref") > 0:
+                    counters["jsdoc_bearing"] += 1
+            except OSError:
+                pass
+
+    # ── the results, for the report in run.sh ───────────────────────────────
+    with open(f"{out}/counters.sh", "w") as fh:
+        for k in sorted(counters):
+            fh.write(f"{k}={counters[k]}\n")
+    with open(f"{out}/failures.txt", "w", errors="surrogateescape") as fh:
+        for f in failures:
+            fh.write(f + "\n")
+    with open(f"{out}/stales.txt", "w") as fh:
+        for s in stales:
+            fh.write(s + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
