@@ -103,19 +103,12 @@ func main() {
 	}
 	fileName := tspath.GetNormalizedAbsolutePath(os.Args[1], cwd)
 
-	// The same clamp ast.go applies, and for the same reasons — see its comment.
-	// It matters here too: the kind decides whether the reference parses JSDoc
-	// EAGERLY (JS) or lazily on access (TS/TSX), and the accessor hides that
-	// difference, which is precisely what makes one dumper serve both.
+	// The same question ast.go asks, and for the same reasons — see its comment.
+	// It matters here MORE than there: the kind decides whether the reference
+	// parses JSDoc EAGERLY (JS, into the cache this dump reads) or lazily on
+	// access (TS/TSX), and the accessor hides that difference, which is precisely
+	// what makes one dumper serve both. Since slice 22 both paths are exercised.
 	scriptKind := core.GetScriptKindFromFileName(fileName)
-	switch scriptKind {
-	case core.ScriptKindJSON:
-		// keep
-	case core.ScriptKindTSX, core.ScriptKindJSX:
-		scriptKind = core.ScriptKindTSX
-	default:
-		scriptKind = core.ScriptKindTS
-	}
 
 	opts := ast.SourceFileParseOptions{
 		FileName: fileName,

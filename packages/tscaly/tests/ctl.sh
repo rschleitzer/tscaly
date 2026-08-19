@@ -19,6 +19,26 @@
 #     three slots and so moved two of them: RED 12, of which 8 belonged to a
 #     different row. A control that changes two things measures neither.
 #
+#   ★★★ AND THE COMMONEST WAY TO BREAK THAT RULE IS TO INVERT A TEST RATHER THAN
+#     DISABLE A BRANCH — `if x = false` → `if x = true` does not merely stop the
+#     behaviour where it belongs, it ADDS it everywhere it does not. Write
+#     `if true  return` instead. Slice 22 shipped six controls with this defect
+#     and caught them only on a re-read: c22 reported RED 28 where the claim
+#     gates 3, and c36 RED 12 where it gates 2.
+#
+#     ★★★ THE DIRECTION IS THE POINT. A control that reports too LOW looks like a
+#     weak gate and gets investigated; one that reports too HIGH looks like
+#     strong evidence for the very claim being defended, and reads as success.
+#     Nobody audits a number that flatters them. The tell in slice 22 was
+#     implausibility alone — c22 appeared to gate more units than the commonest
+#     tag in the whole corpus.
+#
+#   ★★ AN INVERTED NULL TEST ALSO WALKS INTO THE BRANCH IT WAS GUARDING.
+#     `if x = null  return` → `if x <> null  return` means the patched port
+#     dereferences a null on every input that has one. Three of slice 22's
+#     controls did this and did not crash — which is luck about what the corpus
+#     contains, not a property of the control.
+#
 #   ★ A BASELINE IS A MEASUREMENT OF ONE TREE ON ONE DAY. Slice 7 nearly wrote
 #     off three working gates because their numbers were read against a stale
 #     baseline — and the direction that bites is the surprising one: a stale

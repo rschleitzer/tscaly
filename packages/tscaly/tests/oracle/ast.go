@@ -93,37 +93,25 @@ func main() {
 	}
 	fileName := tspath.GetNormalizedAbsolutePath(os.Args[1], cwd)
 
-	// ★★★ The extension-derived kind, CLAMPED to the two kinds our port
-	// implements — the reference's own GetScriptKindFromFileName, then TS for
-	// anything that is not JSON. Both halves are deliberate.
+	// ★★★ The extension-derived kind, and since slice 22 there is NO CLAMP left:
+	// the reference's own GetScriptKindFromFileName, whole. Our side asks the
+	// identical question in Parser.supported_script_kind.
 	//
-	// JSON must come through, because it is a different GRAMMAR (parseJSONText,
-	// reached from ParseSourceFile before parseSourceFileWorker) with different
-	// context flags and a different language variant. Comparing a .json unit as
-	// TypeScript measured a document the reference never parses that way, which
-	// is what split.go exists to say.
-	//
-	// ★★★ Since slice 20 TSX comes through too, for the same reason: it is the
-	// JSX grammar, a third entry into the expression ladder with its own token
+	// The clamp that stood here was removed one kind at a time and each removal
+	// was a slice. JSON came through in slice 19, because it is a different
+	// GRAMMAR (parseJSONText, reached from ParseSourceFile before
+	// parseSourceFileWorker) with different context flags and a different
+	// language variant. TSX came through in slice 20, for the same reason: the
+	// JSX grammar is a third entry into the expression ladder, with its own token
 	// scanners and its own language variant.
 	//
-	// .jsx is clamped to TSX rather than passed as ScriptKindJSX, because the
-	// GRAMMAR the two kinds select is identical and JSX additionally carries
-	// NodeFlagsJavaScriptFile — checkJSSyntax and the JSDoc reparse, i.e. the
-	// whole .js question. .js stays on TS for that same reason: under
-	// ScriptKindJS JSDoc is SYNTAX and our port has no JSDoc grammar, so asking
-	// for that kind here would compare against a parse it cannot produce — see
-	// classify_unit's .js arm for the measurement. Our side spells the same three
-	// arms in Parser.supported_script_kind.
+	// ★★★ .js and .jsx came through in slice 22, and they are the pair the clamp
+	// existed for. ScriptKindJS and ScriptKindJSX carry NodeFlagsJavaScriptFile,
+	// which turns on the JSDoc REPARSE — in a JavaScript file JSDoc is not a
+	// comment, it is the type syntax, and `@typedef` becomes a declaration in the
+	// statement list — so asking for those kinds before the port had a reparser
+	// would have compared against a parse it could not produce. It has one now.
 	scriptKind := core.GetScriptKindFromFileName(fileName)
-	switch scriptKind {
-	case core.ScriptKindJSON:
-		// keep
-	case core.ScriptKindTSX, core.ScriptKindJSX:
-		scriptKind = core.ScriptKindTSX
-	default:
-		scriptKind = core.ScriptKindTS
-	}
 
 	opts := ast.SourceFileParseOptions{
 		FileName: fileName,

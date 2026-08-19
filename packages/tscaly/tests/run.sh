@@ -259,9 +259,10 @@ skip_jsx=0; skip_other=0
 # in the report so the second grammar's coverage is a number rather than an
 # inference from a total.
 json_compared=0
-# Compared, but not under the kind the reference's harness would choose — see
-# classify_unit's .js arm. Counted so the report states it rather than implying
-# that every compared unit is a faithful one.
+# The JavaScript-kind units — compared under ScriptKindJS/ScriptKindJSX on both
+# sides since slice 22, which is where the JSDoc REPARSER landed. Counted and
+# named in the report for the reason the .json and .tsx counts are: a grammar's
+# coverage should be a number rather than an inference from a total.
 js_compared=0
 # Compared under ScriptKindTSX on both sides — the JSX grammar, slice 20. Split in
 # two because only the first half is the kind the reference's harness would
@@ -292,29 +293,25 @@ classify_unit() {
     # measurement; a magnitude does not.
     *.ts|*.mts|*.cts)       UNIT_SKIP= ;;
     # ★★★ COMPARED since slice 20, under ScriptKindTSX on both sides — the JSX
-    # grammar. A .jsx unit is compared under that same kind rather than under
-    # ScriptKindJSX, and the distinction is the .js one all over again: the two
-    # kinds select the identical GRAMMAR, and JSX additionally carries
-    # NodeFlagsJavaScriptFile, i.e. checkJSSyntax and the JSDoc reparse. So a .jsx
-    # unit is a valid comparison of the JSX parser and not the kind the reference's
-    # harness would choose; it is counted with the .js units below for that reason.
+    # grammar.
     *.tsx)                  UNIT_SKIP= ;;
-    *.jsx)                  UNIT_SKIP= ;;
-    # ★★★ A .js unit IS compared, as TypeScript on BOTH sides, and the reasoning
-    # is worth having because the first draft skipped it. The reference's harness
-    # would parse it under ScriptKindJS, where JSDoc is syntax — so this is not
-    # the parse the reference RUNS. It is still a well-defined comparison of the
-    # component being ported (our TypeScript parser against the reference's, over
-    # that text), because the oracle is TOLD which kind to use, and JSDoc is just
-    # a comment under ScriptKindTS.
+    # ★★★ .jsx and .js are compared under THEIR OWN kinds since slice 22, and
+    # that closes the last clamp this runner carried. Through slice 21 a .jsx unit
+    # was compared as TSX and a .js unit as TypeScript — valid comparisons of our
+    # parser, but not the parse the reference's harness RUNS, because
+    # ScriptKindJS and ScriptKindJSX carry NodeFlagsJavaScriptFile and that turns
+    # JSDoc from a comment into SYNTAX: `@typedef` becomes a type alias in the
+    # statement list, `@param {T} x` becomes a type annotation on a parameter
+    # that has none. Slice 22 ported that reparser, so the two sides can be asked
+    # the same question at last.
     #
-    # Skipping them was measured and cost 60 corpus cases that MATCH — the whole
-    # jsdoc/salsa/cjs part of the corpus, previously compared as part of the
-    # concatenated case text. The .json exclusion below earns its keep by VALUE
-    # (25 cases blocked behind the error recovery of a document that is not a
-    # program, for no information); this one would have subtracted 60 matching
-    # comparisons and bought nothing. They move to ScriptKindJS when the port has
-    # one, and that slice is what makes them faithful rather than merely valid.
+    # ★ The clamp was never a skip and the distinction earned its keep: skipping
+    # these was measured at the time and would have cost 60 corpus cases that
+    # MATCHED — the whole jsdoc/salsa/cjs part of the corpus — for no
+    # information. A comparison that is valid but not faithful is worth more than
+    # no comparison, and saying which one it is each time is what let it be
+    # upgraded rather than rediscovered.
+    *.jsx)                  UNIT_SKIP= ;;
     *.js|*.cjs|*.mjs)       UNIT_SKIP= ;;
     # ★★★ A .json unit IS compared since slice 19, under ScriptKindJSON on both
     # sides — the second GRAMMAR (parseJsonText), which is the class the split
@@ -533,12 +530,21 @@ if [ $skipped -ne 0 ]; then
 fi
 
 echo
-echo "$js_compared .js/.cjs/.mjs units ARE compared, as TypeScript on both sides, and"
-echo "  $jsx_compared .jsx units as TSX — well-defined comparisons of our parser, but NOT"
-echo "  the kind the reference harness would choose (ScriptKindJS / ScriptKindJSX:"
-echo "  JSDoc is syntax there and checkJSSyntax runs). Skipping the .js ones was"
-echo "  measured and cost 60 matching corpus cases for no information;"
-echo "  classify_unit has the argument."
+echo "$js_compared .js/.cjs/.mjs units ARE compared, under ScriptKindJS, and"
+echo "  $jsx_compared .jsx units under ScriptKindJSX — the kind the reference's harness"
+echo "  chooses, since slice 22. The kind turns on NodeFlagsJavaScriptFile, and with"
+echo "  it the JSDoc REPARSER: in a JavaScript file JSDoc is not a comment but the"
+echo "  type syntax, so \`@typedef\` becomes a declaration in the statement list and"
+echo "  \`@param {T} x\` a type annotation on a parameter that has none. Both"
+echo "  yardsticks witness it — the parser one sees the synthesized declarations,"
+echo "  the jsdoc one reads the CACHE the eager parse filled rather than a lazy"
+echo "  re-derivation, which is the only way a synthesized node's JSDoc is visible"
+echo "  at all."
+echo
+echo "  NOT compared on these units: checkJSSyntax, whose diagnostics the reference"
+echo "  routes to a separate list that sf.Diagnostics() does not include. Neither"
+echo "  yardstick can see one, in either direction — stated because a distinction"
+echo "  the dump hides hides every bug in it."
 echo
 echo "  Each count is printed rather than folded away: a yardstick that shrinks in"
 echo "  silence is the failure mode this suite exists to prevent."

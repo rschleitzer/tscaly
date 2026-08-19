@@ -491,18 +491,25 @@ define ParserState
     diagnostics_len: int
     diagnostics_has_error: bool
 
+    ; The reference's `jsdocInfosLen`, restored the same way the diagnostics are:
+    ; a speculation that parsed a JSDoc comment and was thrown away must not
+    ; leave the documented node in the side table. `reparseList` is deliberately
+    ; NOT here — the reference's ParserState does not carry it either.
+    jsdoc_infos_len: int
+
     statement_has_await_identifier: bool
     unported_pos: int
     unported_tag: pointer[const_char]
     unported_detail: int
 )
 {
-    init(ss: ScannerState, cf: int, dl: int, dhe: bool, hai: bool, up: int, ut: pointer[const_char], ud: int)
+    init(ss: ScannerState, cf: int, dl: int, dhe: bool, jil: int, hai: bool, up: int, ut: pointer[const_char], ud: int)
     {
         set scanner_state: ss
         set context_flags: cf
         set diagnostics_len: dl
         set diagnostics_has_error: dhe
+        set jsdoc_infos_len: jil
         set statement_has_await_identifier: hai
         set unported_pos: up
         set unported_tag: ut
@@ -693,6 +700,28 @@ define Parser
     ; the comment and the reader is two routines above it.
     has_deprecated_tag: bool
 
+    ; ── the JSDoc reparser's state (slice 22) ───────────────────────────────
+    ;
+    ; `reparse_list` is the reference's own: a tag that becomes a DECLARATION is
+    ; parked here and parse_list flushes it into the enclosing list before the
+    ; statement whose comment produced it.
+    reparse_list: pointer[Array[pointer[AstNode]]]
+
+    ; The reference's `jsdocInfos`, which finishSourceFile turns into a map from
+    ; node to JSDoc list. Two parallel arrays, because there is no map here and
+    ; the table is small — one entry per DOCUMENTED node, not per node. It is
+    ; read by jsdoc_for_node for a JavaScript file, where the reference reads its
+    ; cache rather than re-deriving: the reparser puts entries in it for nodes
+    ; that have no comment ranges of their own (a synthesized parameter carrying
+    ; its @param tag's text), and no re-derivation can produce those.
+    ; The two arrays are the storage and `jsdoc_infos_len` is the LENGTH — a
+    ; rewind has to shorten the table (the reference slices it) and `Array` has no
+    ; truncate, so an entry past the length is dead storage waiting to be
+    ; overwritten. Every reader and the writer go through the length.
+    jsdoc_info_nodes: pointer[Array[pointer[AstNode]]]
+    jsdoc_info_lists: pointer[Array[pointer[Array[pointer[AstNode]]]]]
+    jsdoc_infos_len: int
+
     ; The reference's parse RESULT, kept so that a caller which needs the parser
     ; afterwards can have both. Slice 21 is the first such caller: the JSDoc
     ; yardstick walks the tree and asks the parser to parse a comment per node,
@@ -726,6 +755,14 @@ define Parser
         set this.script_kind: ScriptKindTS
         set this.language_variant_jsx: false
         set this.has_deprecated_tag: false
+        set this.reparse_list: AstNode.new_node_list(host)
+        let jin host.allocate(sizeof Array[pointer[AstNode]], alignof Array[pointer[AstNode]]) as pointer[Array[pointer[AstNode]]]
+        set *jin: Array[pointer[AstNode]]()
+        set this.jsdoc_info_nodes: jin
+        let jil host.allocate(sizeof Array[pointer[Array[pointer[AstNode]]]], alignof Array[pointer[Array[pointer[AstNode]]]]) as pointer[Array[pointer[Array[pointer[AstNode]]]]]
+        set *jil: Array[pointer[Array[pointer[AstNode]]]]()
+        set this.jsdoc_info_lists: jil
+        set this.jsdoc_infos_len: 0
         set this.result_file: null
         set this.unported_pos: 0 - 1
         set this.unported_tag: null
@@ -825,46 +862,37 @@ define Parser
     function source_file_of(p: pointer[Parser]) returns pointer[AstNode]
         p.result_file
 
-    ; ★★★ The script kind THIS PORT implements for a given file name, which is
-    ; the reference's `core.GetScriptKindFromFileName` clamped to the two kinds
-    ; that exist here. Exported as a concept STATIC because the callers are
-    ; program roots: a cross-package module-level constant is not readable from
-    ; one, and §3.5a's rule is to export the QUESTION.
+    ; ★★★ The script kind this port implements for a given file name — and since
+    ; slice 22 there is no clamp left: it is the reference's own
+    ; `core.GetScriptKindFromFileName`, whole. Exported as a concept STATIC
+    ; because the callers are program roots: a cross-package module-level
+    ; constant is not readable from one, and §3.5a's rule is to export the
+    ; QUESTION.
     ;
-    ; The clamp is a statement about the port, not about the test harness, and it
-    ; has three arms:
+    ; The clamp that stood here through slice 21 sent `.js` and `.jsx` to the
+    ; TypeScript and TSX kinds, and its reason was exact: ScriptKindJS and
+    ; ScriptKindJSX carry NodeFlagsJavaScriptFile, which turns on the JSDoc
+    ; REPARSE — JSDoc is not a comment in a JavaScript file, it is the type
+    ; syntax — and a port without the reparser would have been compared against a
+    ; parse it could not produce. Slice 22 built the reparser, so the clamp is the
+    ; claim it was waiting to stop making.
     ;
-    ;   .json                 → ScriptKindJSON, the second grammar (slice 19)
-    ;   .tsx, .jsx            → ScriptKindTSX, the JSX grammar (slice 20)
-    ;   everything else       → ScriptKindTS
+    ;   .json                → ScriptKindJSON, the second grammar (slice 19)
+    ;   .tsx                 → ScriptKindTSX,  the JSX grammar (slice 20)
+    ;   .jsx                 → ScriptKindJSX,  the same grammar with the
+    ;                                          JavaScript bit on (slice 22)
+    ;   .js, .cjs, .mjs      → ScriptKindJS    (slice 22)
+    ;   everything else      → ScriptKindTS
     ;
-    ; So a `.js` file is parsed as TypeScript here, which is exactly what the
-    ; yardstick's classify_unit already says in prose: under ScriptKindJS the
-    ; reference reads JSDoc as SYNTAX, and this port has no JSDoc grammar, so
-    ; asking for that kind would compare against a parse we cannot produce.
-    ;
-    ; ★★★ `.jsx` maps to TSX and NOT to ScriptKindJSX, and the reason is the same
-    ; one that keeps `.js` on TS: ScriptKindJSX carries NodeFlagsJavaScriptFile,
-    ; which turns on checkJSSyntax and the JSDoc reparse — the whole `.js`
-    ; question — while the GRAMMAR the two kinds select is identical. So a `.jsx`
-    ; unit is compared under the JSX grammar with the JavaScript bit off, which is
-    ; a well-defined comparison of the part being ported and not the kind the
-    ; reference's harness would choose. It moves to JSX when the port has JSDoc.
-    ; The one place that distinction IS visible from here is the type-argument test
-    ; in parse_jsx_opening_or_self_closing_element_or_opening_fragment, which asks
-    ; the context flag: `<Foo<T> …>` parses its type arguments under TSX and would
-    ; not under JSX.
+    ; ★ What is NOT ported and is reachable from here is checkJSSyntax, whose
+    ; diagnostics the reference routes to a SEPARATE list (SetJSDiagnostics) that
+    ; sf.Diagnostics() does not include — so neither yardstick can see one, in
+    ; either direction. That is stated rather than left to be noticed, because a
+    ; distinction the dump hides hides every bug in it: a fourth section in the
+    ; ast dump is what would make it visible, and it is the next slice's question
+    ; rather than this one's.
     function supported_script_kind(file_name: String) returns int
-    {
-        let k script_kind_from_file_name(file_name)
-        if k = ScriptKindJSON
-            return ScriptKindJSON
-        if k = ScriptKindTSX
-            return ScriptKindTSX
-        if k = ScriptKindJSX
-            return ScriptKindTSX
-        ScriptKindTS
-    }
+        script_kind_from_file_name(file_name)
 
     ; The same question one step further, for the caller that has a SCANNER and
     ; no parser — the token yardstick. `getLanguageVariant` applied to the
@@ -1024,35 +1052,49 @@ define Parser
     ; is the only thing that exercises that restore on the main parse path.
     ; `has_deprecated_tag` is the one answer that does reach the tree.
     ;
-    ; ★ The reference's `if p.isJavaScript() { p.reparseTags(...) }` is NOT
-    ; ported: the reparser turns `@typedef` and friends into synthesized
-    ; DECLARATIONS in the statement list, and it is reachable only under
-    ; ScriptKindJS/JSX, which `supported_script_kind` does not yet select. It is
-    ; the slice that clamps `.js` to its own kind.
+    ; ★★★ Slice 22 filled in the last line of it: for a JAVASCRIPT file there is
+    ; no deferral at all — every comment is parsed here, the result is kept in the
+    ; side table (`jsdoc_infos`), and reparse_tags turns the tags into syntax.
+    ; That is what `.js` means in this compiler, and it is the reason the flag is
+    ; set AFTER the parse on that path rather than before it: a comment that
+    ; produces no JSDoc node leaves the node undocumented.
     procedure with_jsdoc(this, n: pointer[AstNode], info: int) returns pointer[AstNode]
     {
         if n = null
             return null
         if (info & JsdocInfoHasJsdoc) = 0
             return n
-        set n.flags: n.flags | NodeFlagsHasJSDoc
-        if (info & JsdocInfoHasDeprecated) <> 0
-            set n.flags: n.flags | NodeFlagsPossiblyContainsDeprecatedTag
-        if (info & JsdocInfoHasSeeOrLink) = 0
-            return n
+        if this.is_java_script() = false
+        {
+            set n.flags: n.flags | NodeFlagsHasJSDoc
+            if (info & JsdocInfoHasDeprecated) <> 0
+                set n.flags: n.flags | NodeFlagsPossiblyContainsDeprecatedTag
+            if (info & JsdocInfoHasSeeOrLink) = 0
+                return n
+        }
 
         set has_deprecated_tag: false
-        let jsdoc this.parse_jsdoc_for_node(n)
+        let jsdoc this.parse_jsdoc_comments_of(n)
         if jsdoc <> null
         {
+            if (n.flags & NodeFlagsHasJSDoc) = 0
+                set n.flags: n.flags | NodeFlagsHasJSDoc
             if has_deprecated_tag
             {
                 set has_deprecated_tag: false
                 set n.flags: n.flags | NodeFlagsPossiblyContainsDeprecatedTag
             }
+            if this.is_java_script()
+                this.reparse_tags(n, jsdoc)
+            this.add_jsdoc_info(n, jsdoc)
         }
         n
     }
+
+    ; The reference's isJavaScript(): the SCRIPT KIND, not the context flag. A
+    ; JSON file carries NodeFlagsJavaScriptFile too and is not one of these.
+    function is_java_script(this) returns bool
+        (script_kind = ScriptKindJS) or (script_kind = ScriptKindJSX)
 
     procedure next_token(this) returns int
     {
@@ -1306,7 +1348,7 @@ define Parser
     ; ── speculation ─────────────────────────────────────────────────────────
 
     function mark(this) returns ParserState
-        ParserState(scanner.mark(), context_flags, diagnostics.length(), diagnostics.has_error, statement_has_await_identifier, unported_pos, unported_tag, unported_detail)
+        ParserState(scanner.mark(), context_flags, diagnostics.length(), diagnostics.has_error, jsdoc_infos_len, statement_has_await_identifier, unported_pos, unported_tag, unported_detail)
 
     ; ★ The unported record is restored HERE, with everything else — the
     ; reference truncates p.diagnostics at exactly this point. See the ParserState
@@ -1319,6 +1361,7 @@ define Parser
         set context_flags: saved.context_flags
         diagnostics.truncate(saved.diagnostics_len)
         set diagnostics.has_error: saved.diagnostics_has_error
+        set jsdoc_infos_len: saved.jsdoc_infos_len
         set statement_has_await_identifier: saved.statement_has_await_identifier
         set unported_pos: saved.unported_pos
         set unported_tag: saved.unported_tag
@@ -1393,6 +1436,24 @@ define Parser
         let eof this.parse_token_node()
         if this.with_jsdoc(eof, end_jsdoc) = null
             return null
+
+        ; ★★★ parseSourceFileWorker's `if len(p.reparseList) != 0` (slice 22), and
+        ; the one thing it can still hold at this point is what the END-OF-FILE
+        ; token's own comment produced: parse_list flushed everything else into
+        ; the statement list as it went, and the eof's with_jsdoc runs after that
+        ; list is closed. A file ending in a bare `/** @typedef {T} X */` is the
+        ; shape, and the corpus has two of them.
+        if (reparse_list.get_length() as int) <> 0
+        {
+            var ri 0
+            let rn reparse_list.get_length() as int
+            while ri < rn
+            {
+                statements.add(*(reparse_list.get_buffer() + ri))
+                set ri: ri + 1
+            }
+            set reparse_list: AstNode.new_node_list(host)
+        }
 
         ; ★ The FIRST SourceFile is built and finished whatever happens next, and
         ; that is not bookkeeping. finish_node CONSUMES `diagnostics.has_error` —
@@ -1967,11 +2028,22 @@ define Parser
         ; file's parse_source_file), so no nested list can reach the write. The
         ; reference has the index as a parameter and cannot make the mistake at
         ; all; a field can, the day a second source-element list appears.
-        let i top_level_statement_index
+        var i top_level_statement_index
         set statement_has_await_identifier: false
         let statement this.parse_statement()
         if statement = null
             return null
+
+        ; ★★★ The reference's `i += len(p.reparseList)`, ported in slice 22 —
+        ; see the note below, which said this term was zero at every call and was
+        ; right until the reparser existed. It is the JSDoc declarations THIS
+        ; statement produced, which parse_list is about to insert AHEAD of it, so
+        ; the statement's own index in the finished list is that much higher. The
+        ; span it records is an index into that list and the re-parse seeks to
+        ; the statement it names; off by one, the scanner is repositioned inside
+        ; the comment that produced the insertion and the file is parsed twice
+        ; from two different places.
+        set i: i + (reparse_list.get_length() as int)
 
         ; possibleAwaitSpans, whole:
         ;
@@ -1983,10 +2055,12 @@ define Parser
         ;
         ; i.e. EXTEND the open span when this statement directly follows the last
         ; recorded one, and start a new pair otherwise. The reference's own
-        ; `i += len(p.reparseList)` is dropped rather than ported: reparseList
-        ; holds the nodes JSDoc `@typedef` reparsing inserts ahead of a
-        ; statement, and this port has no JSDoc, so the term is zero at every
-        ; call. Stated because the line is visibly missing next to the reference.
+        ; `i += len(p.reparseList)` is ported since slice 22 and sits above,
+        ; right after the parse. Through slice 21 it was deliberately dropped —
+        ; reparseList holds the nodes a JSDoc `@typedef` inserts ahead of a
+        ; statement, this port had no reparser, and the term was zero at every
+        ; call — which is exactly the shape of claim that expires when the thing
+        ; it is about gets built. It cost three corpus units.
         ;
         ; ★★ The MERGE is ported and is UNGATED, and the verdict is the one slice
         ; 8 called a REDUNDANCY IN THE REFERENCE rather than any of §3.5v's four
@@ -4493,7 +4567,7 @@ define Parser
     }
 
     procedure make_binary_expression(this, left: pointer[AstNode], operator_token: pointer[AstNode], right: pointer[AstNode], pos: int) returns pointer[AstNode]
-        this.finish_node(this.new_node(KindBinaryExpression, NodeData.BinaryExpression(BinaryExpressionData(left, operator_token, right))), pos)
+        this.finish_node(this.new_node(KindBinaryExpression, NodeData.BinaryExpression(BinaryExpressionData(null, left, null, operator_token, right))), pos)
 
     ; ── yield ───────────────────────────────────────────────────────────────
 
@@ -5096,7 +5170,7 @@ define Parser
         ; keep). Passing five here is what the very first draft did, and it is
         ; worth the line: rather than a diagnostic it fell through to the
         ; positional-tuple path and CRASHED the emitter (see §3.5ay).
-        this.finish_node(this.new_node(KindBinaryExpression, NodeData.BinaryExpression(BinaryExpressionData(result, operator_token, invalid_element))), pos)
+        this.finish_node(this.new_node(KindBinaryExpression, NodeData.BinaryExpression(BinaryExpressionData(null, result, null, operator_token, invalid_element))), pos)
     }
 
     ; The reference's parseJsxChildren, and it is NOT a parse_list call: every
@@ -6486,7 +6560,7 @@ define Parser
                 if object_assignment_initializer = null
                     return null
             }
-            let short_result this.finish_node(this.new_node(KindShorthandPropertyAssignment, NodeData.ShorthandPropertyAssignment(ShorthandPropertyAssignmentData(modifiers, name, postfix_token, equals_token, object_assignment_initializer))), pos)
+            let short_result this.finish_node(this.new_node(KindShorthandPropertyAssignment, NodeData.ShorthandPropertyAssignment(ShorthandPropertyAssignmentData(modifiers, name, postfix_token, null, equals_token, object_assignment_initializer))), pos)
             return this.with_jsdoc(short_result, jsdoc)
         }
 
@@ -6494,7 +6568,7 @@ define Parser
         let initializer this.parse_assignment_expression_allow_in()
         if initializer = null
             return null
-        let result this.finish_node(this.new_node(KindPropertyAssignment, NodeData.PropertyAssignment(PropertyAssignmentData(modifiers, name, postfix_token, initializer))), pos)
+        let result this.finish_node(this.new_node(KindPropertyAssignment, NodeData.PropertyAssignment(PropertyAssignmentData(modifiers, name, postfix_token, null, initializer))), pos)
         this.with_jsdoc(result, jsdoc)
     }
 
@@ -6615,7 +6689,7 @@ define Parser
         if body = null
             return null
 
-        let result this.finish_node(this.new_node(KindFunctionExpression, NodeData.FunctionExpression(FunctionExpressionData(modifiers, asterisk_token, name, type_parameters, parameters, return_type, body))), pos)
+        let result this.finish_node(this.new_node(KindFunctionExpression, NodeData.FunctionExpression(FunctionExpressionData(modifiers, asterisk_token, name, type_parameters, parameters, return_type, null, body))), pos)
         this.with_jsdoc(result, jsdoc)
     }
 
@@ -7062,7 +7136,7 @@ define Parser
             }
         }
 
-        let result this.finish_node(this.new_node(KindArrowFunction, NodeData.ArrowFunction(ArrowFunctionData(modifiers, type_parameters, parameters, return_type, equals_greater_than_token, body))), pos)
+        let result this.finish_node(this.new_node(KindArrowFunction, NodeData.ArrowFunction(ArrowFunctionData(modifiers, type_parameters, parameters, return_type, null, equals_greater_than_token, body))), pos)
         this.with_jsdoc(result, jsdoc)
     }
 
@@ -7211,7 +7285,7 @@ define Parser
         if body = null
             return null
 
-        let result this.finish_node(this.new_node(KindArrowFunction, NodeData.ArrowFunction(ArrowFunctionData(async_modifier, null, parameters, null, equals_greater_than_token, body))), pos)
+        let result this.finish_node(this.new_node(KindArrowFunction, NodeData.ArrowFunction(ArrowFunctionData(async_modifier, null, parameters, null, null, equals_greater_than_token, body))), pos)
         this.with_jsdoc(result, jsdoc)
     }
 
@@ -9285,7 +9359,7 @@ define Parser
         if this.is_unported()
             return null
 
-        let result this.finish_node(this.new_node(KindFunctionDeclaration, NodeData.FunctionDeclaration(FunctionDeclarationData(modifiers, asterisk_token, name, type_parameters, parameters, return_type, body))), pos)
+        let result this.finish_node(this.new_node(KindFunctionDeclaration, NodeData.FunctionDeclaration(FunctionDeclarationData(modifiers, asterisk_token, name, type_parameters, parameters, return_type, null, body))), pos)
         this.with_jsdoc(result, jsdoc)
     }
 
@@ -9917,7 +9991,7 @@ define Parser
         if this.is_unported()
             return null
 
-        let result this.finish_node(this.new_node(KindConstructor, NodeData.ConstructorDeclaration(ConstructorDeclarationData(modifiers, type_parameters, parameters, return_type, body))), pos)
+        let result this.finish_node(this.new_node(KindConstructor, NodeData.ConstructorDeclaration(ConstructorDeclarationData(modifiers, type_parameters, parameters, return_type, null, body))), pos)
         this.with_jsdoc(result, jsdoc)
     }
 
@@ -9981,7 +10055,7 @@ define Parser
         if this.is_unported()
             return null
 
-        let result this.finish_node(this.new_node(KindMethodDeclaration, NodeData.MethodDeclaration(MethodDeclarationData(modifiers, asterisk_token, name, postfix_token, type_parameters, parameters, type_node, body))), pos)
+        let result this.finish_node(this.new_node(KindMethodDeclaration, NodeData.MethodDeclaration(MethodDeclarationData(modifiers, asterisk_token, name, postfix_token, type_parameters, parameters, type_node, null, body))), pos)
         this.with_jsdoc(result, jsdoc)
     }
 
@@ -10534,9 +10608,9 @@ define Parser
 
         var result null as pointer[AstNode]
         if kind = KindGetAccessor
-            set result: this.new_node(KindGetAccessor, NodeData.GetAccessorDeclaration(AccessorDeclarationData(modifiers, name, type_parameters, parameters, return_type, body)))
+            set result: this.new_node(KindGetAccessor, NodeData.GetAccessorDeclaration(AccessorDeclarationData(modifiers, name, type_parameters, parameters, return_type, null, body)))
         else
-            set result: this.new_node(KindSetAccessor, NodeData.SetAccessorDeclaration(AccessorDeclarationData(modifiers, name, type_parameters, parameters, return_type, body)))
+            set result: this.new_node(KindSetAccessor, NodeData.SetAccessorDeclaration(AccessorDeclarationData(modifiers, name, type_parameters, parameters, return_type, null, body)))
 
         this.with_jsdoc(this.finish_node(result, pos), jsdoc)
     }
@@ -10627,7 +10701,7 @@ define Parser
 
         this.parse_type_member_semicolon()
 
-        let result this.finish_node(this.new_node(KindIndexSignature, NodeData.IndexSignatureDeclaration(IndexSignatureDeclarationData(modifiers, parameters, type_node))), pos)
+        let result this.finish_node(this.new_node(KindIndexSignature, NodeData.IndexSignatureDeclaration(IndexSignatureDeclarationData(modifiers, parameters, type_node, null))), pos)
         this.with_jsdoc(result, jsdoc)
     }
 
@@ -10807,9 +10881,9 @@ define Parser
 
         var result null as pointer[AstNode]
         if kind = KindCallSignature
-            set result: this.new_node(KindCallSignature, NodeData.CallSignature(SignatureDeclarationData(type_parameters, parameters, type_node)))
+            set result: this.new_node(KindCallSignature, NodeData.CallSignature(SignatureDeclarationData(type_parameters, parameters, type_node, null)))
         else
-            set result: this.new_node(KindConstructSignature, NodeData.ConstructSignature(SignatureDeclarationData(type_parameters, parameters, type_node)))
+            set result: this.new_node(KindConstructSignature, NodeData.ConstructSignature(SignatureDeclarationData(type_parameters, parameters, type_node, null)))
 
         this.with_jsdoc(this.finish_node(result, pos), jsdoc)
     }
@@ -10842,7 +10916,7 @@ define Parser
             let return_type this.parse_return_type(KindColonToken, true)
             if this.is_unported()
                 return null
-            set result: this.new_node(KindMethodSignature, NodeData.MethodSignature(MethodSignatureData(modifiers, name, question_token, type_parameters, parameters, return_type)))
+            set result: this.new_node(KindMethodSignature, NodeData.MethodSignature(MethodSignatureData(modifiers, name, question_token, type_parameters, parameters, return_type, null)))
         }
         else
         {
@@ -11896,7 +11970,7 @@ define Parser
         ; changes one flag on one node, and the dump says so.
         set context_flags: saved
         set statement_has_await_identifier: saved_await_identifier
-        let result this.finish_node(this.new_node(KindExportAssignment, NodeData.ExportAssignment(ExportAssignmentData(modifiers, is_export_equals, expression))), pos)
+        let result this.finish_node(this.new_node(KindExportAssignment, NodeData.ExportAssignment(ExportAssignmentData(modifiers, is_export_equals, null, expression))), pos)
         this.with_jsdoc(result, jsdoc)
     }
 
@@ -12153,6 +12227,19 @@ define Parser
     {
         let saved_contexts parsing_contexts
         set parsing_contexts: parsing_contexts | (1 << ctx)
+
+        ; ★★★ parseListIndex's reparse plumbing (slice 22), and EVERY list in the
+        ; parser is part of it. A tag that becomes a declaration is parked in
+        ; `reparse_list` while the element it documents is being parsed, and is
+        ; flushed into THIS list immediately after — before the element, which is
+        ; what puts a `@typedef`'s type alias ahead of the statement it
+        ; documented. The saved outer list is what makes the nesting work: an
+        ; alias or an import produced inside a list that cannot hold a
+        ; declaration (a class body, an object literal) is propagated OUTWARDS
+        ; instead, to the nearest list that can.
+        let outer_reparse_list reparse_list
+        set reparse_list: AstNode.new_node_list(host)
+
         let list AstNode.new_node_list(host)
         var failed false
         while this.is_list_terminator(ctx) = false
@@ -12173,6 +12260,27 @@ define Parser
                     set failed: true
                     break
                 }
+                if (reparse_list.get_length() as int) <> 0
+                {
+                    var ri 0
+                    let rn reparse_list.get_length() as int
+                    while ri < rn
+                    {
+                        let e *(reparse_list.get_buffer() + ri)
+                        set ri: ri + 1
+                        var outwards false
+                        if (e.kind = KindJSTypeAliasDeclaration) or (e.kind = KindJSImportDeclaration)
+                        {
+                            if (ctx <> PCSourceElements) and (ctx <> PCBlockStatements)
+                                set outwards: true
+                        }
+                        if outwards
+                            outer_reparse_list.add(e)
+                        else
+                            list.add(e)
+                    }
+                    set reparse_list: AstNode.new_node_list(host)
+                }
                 list.add(element)
             }
             else
@@ -12181,6 +12289,7 @@ define Parser
                     break
             }
         }
+        set reparse_list: outer_reparse_list
         set parsing_contexts: saved_contexts
         if failed
             return null
@@ -15433,6 +15542,1736 @@ define Parser
         this.finish_node_with_end(this.new_node(KindIdentifier, NodeData.Identifier(IdentifierData(text, text_len))), pos, end)
     }
 
+
+    ; ── the JSDoc REPARSER (slice 22) ───────────────────────────────────────
+    ;
+    ; internal/parser/reparser.go, and it is what `.js` means. For a JavaScript
+    ; file JSDoc is not a comment that documents the code — it IS the type
+    ; syntax, so `@typedef` has to become a type alias in the statement list and
+    ; `@param {T} x` has to put a type annotation on a parameter that has none.
+    ; The reference does that in one pass, hanging off with_jsdoc, and splits it
+    ; in two:
+    ;
+    ;   reparse_unhosted   a tag that becomes a NEW declaration (@typedef,
+    ;                      @callback, @import, @overload) — it goes into
+    ;                      `reparse_list` and parse_list flushes it into the
+    ;                      enclosing statement list, BEFORE the statement the
+    ;                      comment documented.
+    ;   reparse_hosted     a tag that MUTATES the node it documents (@type,
+    ;                      @satisfies, @template, @param, @this, @return, the
+    ;                      five modifier tags, @implements, @augments).
+    ;
+    ; ★★★ THE MUTATING HALF IS WHY THE AST GREW SLOTS THIS SLICE. Nothing the
+    ; grammar can write fills FunctionDeclaration.full_signature,
+    ; BinaryExpression.type_node, PropertyAssignment.type_node,
+    ; ShorthandPropertyAssignment.type_node or ExportAssignment.type_node — every
+    ; one of them exists for a tag, and every earlier slice's record comment said
+    ; so and named the place in the child order. They are filled here.
+    ;
+    ; ★★★ CLONING: the reference deep-clones every node it lifts out of the JSDoc
+    ; tree into the statement tree (`DeepCloneReparse`), and THIS PORT CLONES THE
+    ; ROOT ONLY, sharing the children. The argument is what the two yardsticks
+    ; compare. A deep clone preserves kind, pos and end and copies flags; only the
+    ; clone's ROOT gains NodeFlagsReparsed, never its children. So a root copy
+    ; with shared children produces the identical dump on the parser yardstick,
+    ; and the original subtree — which the JSDoc yardstick still walks — is
+    ; untouched, because the only node written to is the fresh root.
+    ;
+    ; The condition under which that stops being true is exact and worth writing
+    ; down: a mutation reaching a SHARED child. Read against the reference, every
+    ; write after a clone lands on the clone's own root (the `@import` arm's
+    ; phase modifier is the only one), and every deeper node the reparse needs is
+    ; SYNTHESIZED rather than cloned. If a later slice adds a write that reaches
+    ; into a clone's subtree, this decision has to be revisited — the symptom
+    ; would be a JSDoc-yardstick failure on a unit whose parser yardstick passed.
+    ;
+    ; ★ The reference additionally keeps `reparsedClones`, sorted, on the
+    ; SourceFile, for the binder's benefit (a symbol is attached to the reparsed
+    ; node, not to the JSDoc node). Nothing here reads it and neither yardstick
+    ; can see it, so it is not carried — stated rather than silently dropped.
+
+    ; finishReparsedNode. The flags are ASSIGNED, not OR'd: a synthesized node
+    ; carries the context it was made in plus Reparsed and nothing else.
+    procedure finish_reparsed_node(this, n: pointer[AstNode], location: pointer[AstNode])
+    {
+        if n = null
+            return
+        if location = null
+            return
+        set n.flags: context_flags | NodeFlagsReparsed
+        set n.pos: location.pos
+        set n.end: location.end
+    }
+
+    ; DeepCloneReparse, as the root copy §3.5be argues for. `*c: *n` copies the
+    ; whole node INCLUDING the union payload by value, so the children are the
+    ; originals and only the new root is ours to write.
+    procedure add_deep_clone_reparse(this, n: pointer[AstNode]) returns pointer[AstNode]
+    {
+        if n = null
+            return null
+        let c AstNode.alloc(host)
+        set *c: *n
+        set c.flags: c.flags | NodeFlagsReparsed
+        c
+    }
+
+    ; addTransformedReparse — a node the reparse INVENTED to stand for one whose
+    ; text is not a valid identifier. It takes the original's range and carries
+    ; the extra bit that says the literal was rewritten.
+    procedure add_transformed_reparse(this, new_n: pointer[AstNode], old: pointer[AstNode]) returns pointer[AstNode]
+    {
+        this.finish_reparsed_node(new_n, old)
+        if new_n <> null
+            set new_n.flags: new_n.flags | NodeFlagsReparserTransformedLiteral
+        new_n
+    }
+
+    ; ── the small helpers ───────────────────────────────────────────────────
+
+    ; scanner.IsValidIdentifier over an identifier node's stored TEXT. The
+    ; reference iterates over RUNES, so the bytes have to be decoded — the
+    ; scanner's own decoder does it, over the value buffer rather than the source.
+    function is_valid_identifier_text(this, n: pointer[AstNode]) returns bool
+    {
+        let t AstNode.identifier_text_of(n)
+        let len AstNode.identifier_text_length_of(n)
+        if len = 0
+            return false
+        if t = null
+            return false
+        var i 0
+        var first true
+        while i < len
+        {
+            let cp scanner.utf8_decode_in(t, len, i)
+            if first
+            {
+                if Scanner.is_identifier_start(cp) = false
+                    return false
+            }
+            else
+            {
+                if Scanner.is_identifier_part(cp) = false
+                    return false
+            }
+            set first: false
+            set i: i + scanner.utf8_size_in(t, len, i)
+        }
+        true
+    }
+
+    ; checkNonIdentifierName: an identifier whose text is not one gets
+    ; `Identifier expected` — at the character BEFORE it when the name is missing
+    ; and therefore zero-width.
+    procedure check_non_identifier_name(this, name: pointer[AstNode]) returns pointer[AstNode]
+    {
+        if name = null
+            return null
+        if name.kind <> KindIdentifier
+            return name
+        if this.is_valid_identifier_text(name)
+            return name
+        var p name.pos
+        var e name.end
+        if p = e
+        {
+            set p: p - 1
+            set e: name.pos
+        }
+        this.parse_error_at(p, e, DiagIdentifier_expected)
+        name
+    }
+
+    ; A synthesized identifier with text this port has to own: the bytes are
+    ; copied onto the parse page, because a C string literal is not a
+    ; `pointer[char]` the node can keep and the sanitizer builds its text a byte
+    ; at a time anyway.
+    ; ★★★ The range is left UNDEFINED, which is what the reference's factory
+    ; leaves on a node nobody finishes — and the two callers differ on exactly
+    ; that. `reparseJSDocSignature`'s `this` identifier is given the tag's range
+    ; and the reparsed flags explicitly, one line after it is built;
+    ; `reparseHosted`'s `this` identifier is NOT, so it reaches the tree at
+    ; (-1, -1) with no flags while the PARAMETER around it carries the tag name's
+    ; range. Both are in the dump, so a `new_node`'s default 0,0 is wrong for one
+    ; of them — the fixture parser_jsdoc_reparse_signature_host.ts is what says so.
+    procedure new_synthesized_identifier(this, bytes: pointer[char], len: int) returns pointer[AstNode]
+    {
+        let n this.new_node(KindIdentifier, NodeData.Identifier(IdentifierData(bytes, len)))
+        set n.pos: 0 - 1
+        set n.end: 0 - 1
+        n
+    }
+
+    procedure copy_bytes_to_page(this, src: pointer[const_char], len: int) returns pointer[char]
+    {
+        let b host.allocate(len + 1, 1) as pointer[char]
+        var i 0
+        while i < len
+        {
+            set *(b + i): *(src + i)
+            set i: i + 1
+        }
+        set *(b + len): 0 as char
+        b
+    }
+
+    ; createExportModifier — one `export` keyword in a one-element modifier list,
+    ; both taking the location node's range.
+    procedure create_export_modifier(this, location: pointer[AstNode]) returns pointer[Array[pointer[AstNode]]]
+    {
+        let m this.new_node(KindExportKeyword, NodeData.Token(TokenData()))
+        this.finish_reparsed_node(m, location)
+        let l AstNode.new_node_list(host)
+        l.add(m)
+        l
+    }
+
+    ; makeNewCast: `e as T` for a @type tag, `e satisfies T` for @satisfies. The
+    ; range is the EXPRESSION's — the cast is invisible in the text.
+    procedure make_new_cast(this, t: pointer[AstNode], e: pointer[AstNode], is_assertion: bool) returns pointer[AstNode]
+    {
+        var n null as pointer[AstNode]
+        if is_assertion
+            set n: this.new_node(KindAsExpression, NodeData.AsExpression(AsExpressionData(e, t)))
+        else
+            set n: this.new_node(KindSatisfiesExpression, NodeData.SatisfiesExpression(AsExpressionData(e, t)))
+        this.finish_node_with_end(n, e.pos, e.end)
+    }
+
+    ; skipSatisfiesExpressions.
+    function skip_satisfies_expressions(n: pointer[AstNode]) returns pointer[AstNode]
+    {
+        var x n
+        while x <> null
+        {
+            if x.kind <> KindSatisfiesExpression
+                return x
+            set x: AstNode.expression_of(x)
+        }
+        x
+    }
+
+    ; IsFunctionLikeKind, WHOLE — the seven declaration kinds plus the seven
+    ; signature ones.
+    ;
+    ; ★ It was first written narrowed to the declarations, on the argument that
+    ; getFunctionLikeHost is only ever handed a statement or an initializer
+    ; expression and a signature cannot be either. That is true of everything the
+    ; switch REACHES THROUGH — but not of its default arm, where `fun` stays the
+    ; documented node itself, and a `.js` file may perfectly well contain an
+    ; `interface` whose member carries a `@type` tag. A narrowing that holds for
+    ; every path but one is a divergence with a comment on it; the seven extra
+    ; lines are cheaper than the comment.
+    function is_function_like_node(n: pointer[AstNode]) returns bool
+    {
+        if n = null
+            return false
+        let k n.kind
+        if k = KindFunctionDeclaration
+            return true
+        if k = KindFunctionExpression
+            return true
+        if k = KindArrowFunction
+            return true
+        if k = KindMethodDeclaration
+            return true
+        if k = KindConstructor
+            return true
+        if k = KindGetAccessor
+            return true
+        if k = KindSetAccessor
+            return true
+        if k = KindMethodSignature
+            return true
+        if k = KindCallSignature
+            return true
+        if k = KindConstructSignature
+            return true
+        if k = KindIndexSignature
+            return true
+        if k = KindFunctionType
+            return true
+        if k = KindConstructorType
+            return true
+        k = KindJSDocSignature
+    }
+
+    ; IsAssignmentExpression(node, false) — a binary `=` (or a compound
+    ; assignment) whose left side IS A VALID TARGET. The reference's
+    ; GetRightMostAssignedExpression walks the RIGHT side of a run of them.
+    ;
+    ; ★ The left-hand-side test is the second conjunct and is not decoration:
+    ; without it the walk crosses `1 = f()` and answers the call rather than the
+    ; assignment, which is a different function-like host.
+    function is_assignment_expression_node(n: pointer[AstNode]) returns bool
+    {
+        if n = null
+            return false
+        if n.kind <> KindBinaryExpression
+            return false
+        if is_assignment_operator(AstNode.binary_operator_kind(n)) = false
+            return false
+        let left AstNode.binary_left_of(n)
+        if left = null
+            return false
+        is_left_hand_side_expression_kind(left.kind)
+    }
+
+    function get_right_most_assigned_expression(n: pointer[AstNode]) returns pointer[AstNode]
+    {
+        var x n
+        while is_assignment_expression_node(x)
+            set x: AstNode.binary_right_of(x)
+        x
+    }
+
+    ; getFunctionLikeHost: from the node a comment documents, find the function
+    ; the tag is really about.
+    function get_function_like_host(host_node: pointer[AstNode]) returns pointer[AstNode]
+    {
+        if host_node = null
+            return null
+        var fun host_node
+        let k host_node.kind
+        if k = KindVariableStatement
+        {
+            let dl AstNode.variable_statement_list_of(host_node)
+            let ds AstNode.variable_declarations_of(dl)
+            if ds <> null
+            {
+                if (ds.get_length() as int) <> 0
+                    set fun: AstNode.initializer_of(*(ds.get_buffer()))
+                else
+                    set fun: null
+            }
+            else
+                set fun: null
+        }
+        if (k = KindPropertyAssignment) or (k = KindPropertyDeclaration)
+            set fun: AstNode.initializer_of(host_node)
+        if (k = KindExportAssignment) or (k = KindReturnStatement)
+            set fun: AstNode.expression_of(host_node)
+        if k = KindExpressionStatement
+            set fun: get_right_most_assigned_expression(AstNode.expression_of(host_node))
+        set fun: skip_satisfies_expressions(fun)
+        if is_function_like_node(fun)
+            return fun
+        null
+    }
+
+    ; getClassLikeData, as the one question the reparser asks of it.
+    function is_class_like_node(n: pointer[AstNode]) returns bool
+    {
+        if n = null
+            return false
+        (n.kind = KindClassDeclaration) or (n.kind = KindClassExpression)
+    }
+
+    ; getInnermostNameOfJSDocNamespace: for `A.B.C` the name parses as nested
+    ; ModuleDeclarations, and the alias is named after the innermost one.
+    function get_innermost_name_of_jsdoc_namespace(full_name: pointer[AstNode]) returns pointer[AstNode]
+    {
+        if full_name = null
+            return null
+        var x full_name
+        while x.kind = KindModuleDeclaration
+        {
+            let body AstNode.body_of(x)
+            if body = null
+                return AstNode.name_of(x)
+            set x: body
+        }
+        x
+    }
+
+    ; wrapInJSDocNamespace: `@typedef {T} A.B.C` declares C inside namespace B
+    ; inside namespace A. Every INNER namespace is exported so the dotted access
+    ; works from outside; the outermost is not, because the binder decides that
+    ; one (IsImplicitlyExportedJSDocDeclaration).
+    procedure wrap_in_jsdoc_namespace(this, full_name: pointer[AstNode], statement: pointer[AstNode], nested: bool) returns pointer[AstNode]
+    {
+        if full_name = null
+            return statement
+        if full_name.kind <> KindModuleDeclaration
+            return statement
+        let wrapped this.wrap_in_jsdoc_namespace(AstNode.body_of(full_name), statement, true)
+        let inner AstNode.new_node_list(host)
+        inner.add(wrapped)
+        let block this.new_node(KindModuleBlock, NodeData.ModuleBlock(BlockData(inner)))
+        this.finish_reparsed_node(block, full_name)
+        var modifiers null as pointer[Array[pointer[AstNode]]]
+        if nested
+            set modifiers: this.create_export_modifier(full_name)
+        let name this.add_deep_clone_reparse(AstNode.name_of(full_name))
+        let result this.new_node(KindModuleDeclaration, NodeData.ModuleDeclaration(ModuleDeclarationData(modifiers, KindNamespaceKeyword, name, block)))
+        this.finish_reparsed_node(result, full_name)
+        result
+    }
+
+    ; makeQuestionIfOptional: `[x]` or `{T=}` on the tag becomes a `?` on the
+    ; parameter or property it produces.
+    procedure make_question_if_optional(this, tag: pointer[AstNode]) returns pointer[AstNode]
+    {
+        var optional AstNode.jsdoc_param_is_bracketed(tag)
+        if optional = false
+        {
+            let te AstNode.jsdoc_type_expression_of(tag)
+            if te <> null
+            {
+                let inner AstNode.jsdoc_type_expression_inner_of(te)
+                if inner <> null
+                {
+                    if inner.kind = KindJSDocOptionalType
+                        set optional: true
+                }
+            }
+        }
+        if optional = false
+            return null
+        let q this.new_node(KindQuestionToken, NodeData.Token(TokenData()))
+        this.finish_reparsed_node(q, tag)
+        q
+    }
+
+    ; ── the jsdoc side table ────────────────────────────────────────────────
+    ;
+    ; The reference's `jsdocInfos`, which finishSourceFile turns into a map. Two
+    ; parallel arrays here, and the LOOKUP answers the LAST match — which is the
+    ; map's own semantics, since a later `result[parent] = jsDocs` overwrites an
+    ; earlier one.
+    procedure add_jsdoc_info(this, parent: pointer[AstNode], docs: pointer[Array[pointer[AstNode]]])
+    {
+        if jsdoc_infos_len < (jsdoc_info_nodes.get_length() as int)
+        {
+            jsdoc_info_nodes.put(jsdoc_infos_len as size_t, parent)
+            jsdoc_info_lists.put(jsdoc_infos_len as size_t, docs)
+        }
+        else
+        {
+            jsdoc_info_nodes.add(parent)
+            jsdoc_info_lists.add(docs)
+        }
+        set jsdoc_infos_len: jsdoc_infos_len + 1
+    }
+
+    function lookup_jsdoc_info(this, n: pointer[AstNode]) returns pointer[Array[pointer[AstNode]]]
+    {
+        var i jsdoc_infos_len - 1
+        while i >= 0
+        {
+            if *(jsdoc_info_nodes.get_buffer() + i) = n
+                return *(jsdoc_info_lists.get_buffer() + i)
+            set i: i - 1
+        }
+        null
+    }
+
+    ; reparseJSDocComment: a synthesized parameter or property inherits the
+    ; tag's own comment as a JSDoc of its own.
+    procedure reparse_jsdoc_comment(this, n: pointer[AstNode], tag: pointer[AstNode])
+    {
+        if n = null
+            return
+        let comment AstNode.jsdoc_tag_comment_of(tag)
+        if comment = null
+            return
+        let new_comment AstNode.new_node_list(host)
+        var i 0
+        let c comment.get_length() as int
+        while i < c
+        {
+            new_comment.add(this.add_deep_clone_reparse(*(comment.get_buffer() + i)))
+            set i: i + 1
+        }
+        let doc this.new_node(KindJSDoc, NodeData.JSDoc(JSDocData(new_comment, null)))
+        this.finish_reparsed_node(doc, tag)
+        let l AstNode.new_node_list(host)
+        l.add(doc)
+        this.add_jsdoc_info(n, l)
+        set n.flags: n.flags | NodeFlagsHasJSDoc
+    }
+
+    ; gatherTypeParameters: every `@template` of ONE comment becomes the type
+    ; parameter list of whatever the comment declares. The first template tag's
+    ; constraint applies to its first parameter alone, which is why that one is
+    ; rebuilt and the rest are cloned.
+    procedure gather_type_parameters(this, j: pointer[AstNode], typedef_or_callback: bool) returns pointer[Array[pointer[AstNode]]]
+    {
+        let tags AstNode.jsdoc_tags_of(j)
+        if tags = null
+            return null
+        var out null as pointer[Array[pointer[AstNode]]]
+        var pos 0 - 1
+        var end_pos 0 - 1
+        var first_template true
+        var i 0
+        let n tags.get_length() as int
+        while i < n
+        {
+            let tag *(tags.get_buffer() + i)
+            set i: i + 1
+            if typedef_or_callback = false
+            {
+                if (tag.kind = KindJSDocTypedefTag) or (tag.kind = KindJSDocCallbackTag)
+                    return null
+            }
+            if tag.kind <> KindJSDocTemplateTag
+                continue
+            if first_template
+            {
+                set pos: tag.pos
+                set first_template: false
+            }
+            set end_pos: tag.end
+            let constraint AstNode.jsdoc_template_constraint_of(tag)
+            var first_type_parameter true
+            let tps AstNode.type_parameters_of(tag)
+            if tps <> null
+            {
+                var k 0
+                let tn tps.get_length() as int
+                while k < tn
+                {
+                    let tp *(tps.get_buffer() + k)
+                    set k: k + 1
+                    var reparse null as pointer[AstNode]
+                    if (constraint <> null) and first_type_parameter
+                    {
+                        let mods this.clone_modifier_list(AstNode.modifiers_of(tp))
+                        let nm this.add_deep_clone_reparse(this.check_non_identifier_name(AstNode.name_of(tp)))
+                        let cn this.add_deep_clone_reparse(AstNode.jsdoc_type_expression_inner_of(constraint))
+                        let dt this.add_deep_clone_reparse(AstNode.type_parameter_default_of(tp))
+                        set reparse: this.new_node(KindTypeParameter, NodeData.TypeParameter(TypeParameterData(mods, nm, cn, null, dt)))
+                        this.finish_reparsed_node(reparse, tp)
+                    }
+                    else
+                        set reparse: this.add_deep_clone_reparse(tp)
+                    if out = null
+                        set out: AstNode.new_node_list(host)
+                    out.add(reparse)
+                    set first_type_parameter: false
+                }
+            }
+        }
+        if out = null
+            return null
+        if (out.get_length() as int) = 0
+            return null
+        out
+    }
+
+    ; DeepCloneReparseModifiers — the same root copy, per element. The LIST is
+    ; new; the elements are the originals with the Reparsed bit added, which is
+    ; what the reference's visitor produces.
+    procedure clone_modifier_list(this, m: pointer[Array[pointer[AstNode]]]) returns pointer[Array[pointer[AstNode]]]
+    {
+        if m = null
+            return null
+        let l AstNode.new_node_list(host)
+        var i 0
+        let n m.get_length() as int
+        while i < n
+        {
+            l.add(this.add_deep_clone_reparse(*(m.get_buffer() + i)))
+            set i: i + 1
+        }
+        l
+    }
+
+    ; ── reparseJSDocTypeLiteral ─────────────────────────────────────────────
+    ;
+    ; A `@typedef` whose type is written as a run of `@property` tags becomes a
+    ; TYPE LITERAL — and an array of one when the tag said `Object[]`. Anything
+    ; else is simply the type, cloned.
+    procedure reparse_jsdoc_type_literal(this, t: pointer[AstNode]) returns pointer[AstNode]
+    {
+        if t = null
+            return null
+        if t.kind <> KindJSDocTypeLiteral
+            return this.add_deep_clone_reparse(t)
+
+        let is_array AstNode.jsdoc_type_literal_is_array(t)
+        let props AstNode.new_node_list(host)
+        let tags AstNode.jsdoc_type_literal_tags_of(t)
+        if tags <> null
+        {
+            var i 0
+            let n tags.get_length() as int
+            while i < n
+            {
+                let prop *(tags.get_buffer() + i)
+                set i: i + 1
+                if prop.kind <> KindJSDocPropertyTag
+                {
+                    if prop.kind <> KindJSDocParameterTag
+                        continue
+                }
+                var name AstNode.name_of(prop)
+                if name <> null
+                {
+                    if name.kind = KindQualifiedName
+                        set name: AstNode.qualified_right_of(name)
+                }
+                if name <> null
+                {
+                    if name.kind = KindIdentifier
+                    {
+                        if this.is_valid_identifier_text(name) = false
+                        {
+                            ; The reference turns an unusable property name into a
+                            ; STRING literal — `{ "a-b": T }` is writable where
+                            ; `a-b` is not.
+                            let s this.new_node(KindStringLiteral, NodeData.StringLiteral(LiteralData(TokenFlagsNone)))
+                            set name: this.add_transformed_reparse(s, name)
+                        }
+                        else
+                            set name: this.add_deep_clone_reparse(name)
+                    }
+                    else
+                        set name: this.add_deep_clone_reparse(name)
+                }
+                let q this.make_question_if_optional(prop)
+                let property this.new_node(KindPropertySignature, NodeData.PropertySignature(PropertyDeclarationData(null, name, q, null, null)))
+                let pte AstNode.jsdoc_type_expression_of(prop)
+                if pte <> null
+                    AstNode.set_type(property, this.reparse_jsdoc_type_literal(AstNode.jsdoc_type_expression_inner_of(pte)))
+                this.finish_reparsed_node(property, prop)
+                props.add(property)
+                this.reparse_jsdoc_comment(property, prop)
+            }
+        }
+        var r this.new_node(KindTypeLiteral, NodeData.TypeLiteral(TypeLiteralData(props)))
+        if is_array
+        {
+            this.finish_reparsed_node(r, t)
+            set r: this.new_node(KindArrayType, NodeData.ArrayType(WrappedTypeData(r)))
+        }
+        this.finish_reparsed_node(r, t)
+        r
+    }
+
+    ; ── reparseJSDocSignature ───────────────────────────────────────────────
+    ;
+    ; The shape shared by `@callback` (which declares a function TYPE) and
+    ; `@overload` (which declares another signature of the function it documents).
+    ; `fun` is what the signature is built AFTER — the documented declaration for
+    ; @overload, the tag itself for @callback.
+    procedure reparse_jsdoc_signature(this, js_signature: pointer[AstNode], fun: pointer[AstNode], jsdoc: pointer[AstNode], tag: pointer[AstNode], modifiers: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
+    {
+        var signature null as pointer[AstNode]
+        let cloned_modifiers this.clone_modifier_list(modifiers)
+        let fk fun.kind
+        if fk = KindFunctionDeclaration
+            set signature: this.new_node(KindFunctionDeclaration, NodeData.FunctionDeclaration(FunctionDeclarationData(cloned_modifiers, null, this.add_deep_clone_reparse(this.check_non_identifier_name(AstNode.name_of(fun))), null, null, null, null, null)))
+        else
+        {
+            if fk = KindMethodDeclaration
+                set signature: this.new_node(KindMethodDeclaration, NodeData.MethodDeclaration(MethodDeclarationData(cloned_modifiers, null, this.add_deep_clone_reparse(this.check_non_identifier_name(AstNode.name_of(fun))), null, null, null, null, null, null)))
+            else
+            {
+                if fk = KindConstructor
+                    set signature: this.new_node(KindConstructor, NodeData.ConstructorDeclaration(ConstructorDeclarationData(cloned_modifiers, null, null, null, null, null)))
+                else
+                {
+                    if fk = KindJSDocCallbackTag
+                    {
+                        ; ★ NewKeywordTypeNode is never finished — the factory
+                        ; leaves its range UNDEFINED, which the reference spells
+                        ; (-1, -1) — and it survives unfinished only when the
+                        ; callback declares no `@returns`, since a return type
+                        ; overwrites the slot outright. The dump compares the
+                        ; range, so the placeholder has to carry the reference's.
+                        let any_kw this.new_node(KindAnyKeyword, NodeData.Token(TokenData()))
+                        set any_kw.pos: 0 - 1
+                        set any_kw.end: 0 - 1
+                        set signature: this.new_node(KindFunctionType, NodeData.FunctionType(FunctionTypeData(null, null, any_kw)))
+                    }
+                    else
+                        return this.unported("jsdoc-reparse-signature-host", fk)
+                }
+            }
+        }
+
+        if tag.kind <> KindJSDocCallbackTag
+            AstNode.set_type_parameters(signature, this.gather_type_parameters(jsdoc, false))
+
+        let parameters AstNode.new_node_list(host)
+        let sig_params AstNode.parameters_of(js_signature)
+        if sig_params <> null
+        {
+            var pi 0
+            let pn sig_params.get_length() as int
+            while pi < pn
+            {
+                let param *(sig_params.get_buffer() + pi)
+                let index pi
+                set pi: pi + 1
+                var parameter null as pointer[AstNode]
+                if param.kind = KindJSDocThisTag
+                {
+                    let bytes this.copy_bytes_to_page("this", 4)
+                    let this_ident this.new_synthesized_identifier(bytes, 4)
+                    set this_ident.pos: param.pos
+                    set this_ident.end: param.end
+                    set this_ident.flags: context_flags | NodeFlagsReparsed
+                    set parameter: this.new_node(KindParameter, NodeData.Parameter(ParameterData(null, null, this_ident, null, null, null)))
+                    let te AstNode.jsdoc_type_expression_of(param)
+                    if te <> null
+                        AstNode.set_type(parameter, this.add_deep_clone_reparse(AstNode.jsdoc_type_expression_inner_of(te)))
+                }
+                else
+                {
+                    if param.kind = KindJSDocParameterTag
+                        set parameter: this.reparse_jsdoc_signature_parameter(param, index)
+                    else
+                    {
+                        if param.kind = KindJSDocPropertyTag
+                            set parameter: this.reparse_jsdoc_signature_parameter(param, index)
+                    }
+                }
+                ; ★ A sub-property tag (`@param x.y`) is SKIPPED — it describes a
+                ; property of another parameter, not a parameter of its own — and
+                ; the skip leaves `parameter` null, which is the reference's own
+                ; `continue`.
+                if parameter = null
+                    continue
+                this.finish_reparsed_node(parameter, param)
+                parameters.add(parameter)
+                this.reparse_jsdoc_comment(parameter, param)
+            }
+        }
+        AstNode.set_parameters(signature, parameters)
+
+        let ret AstNode.jsdoc_signature_type_of(js_signature)
+        if ret <> null
+        {
+            let rte AstNode.jsdoc_type_expression_of(ret)
+            if rte <> null
+                AstNode.set_type(signature, this.add_deep_clone_reparse(AstNode.jsdoc_type_expression_inner_of(rte)))
+        }
+        var loc js_signature
+        if tag.kind = KindJSDocOverloadTag
+            set loc: AstNode.jsdoc_tag_name_of(tag)
+        this.finish_reparsed_node(signature, loc)
+        signature
+    }
+
+    ; The @param/@property arm of the loop above, split out because it is long
+    ; and because the sub-property skip has to answer null to its caller.
+    procedure reparse_jsdoc_signature_parameter(this, param: pointer[AstNode], index: int) returns pointer[AstNode]
+    {
+        let raw_name AstNode.name_of(param)
+        if raw_name <> null
+        {
+            if raw_name.kind = KindQualifiedName
+                return null
+        }
+        var dot_dot_dot null as pointer[AstNode]
+        var param_type null as pointer[AstNode]
+        let te AstNode.jsdoc_type_expression_of(param)
+        if te <> null
+        {
+            let inner AstNode.jsdoc_type_expression_inner_of(te)
+            if inner <> null
+            {
+                if inner.kind = KindJSDocVariadicType
+                {
+                    set dot_dot_dot: this.new_node(KindDotDotDotToken, NodeData.Token(TokenData()))
+                    this.finish_reparsed_node(dot_dot_dot, param)
+                    set param_type: this.reparse_jsdoc_type_literal(AstNode.jsdoc_variadic_inner_of(inner))
+                }
+                else
+                    set param_type: this.reparse_jsdoc_type_literal(inner)
+            }
+        }
+        var name raw_name
+        if name <> null
+        {
+            if name.kind = KindIdentifier
+            {
+                if this.is_valid_identifier_text(name) = false
+                    set name: this.sanitize_parameter_name(name, index)
+                else
+                    set name: this.add_deep_clone_reparse(name)
+            }
+            else
+                set name: this.add_deep_clone_reparse(name)
+        }
+        let q this.make_question_if_optional(param)
+        this.new_node(KindParameter, NodeData.Parameter(ParameterData(null, dot_dot_dot, name, q, param_type, null)))
+    }
+
+    ; The reference's in-place rewrite of a `@param` name that is not a valid
+    ; identifier: every bad code point becomes `_`, and a name that empties out
+    ; entirely becomes `_<index>` so the emitter has something to write.
+    procedure sanitize_parameter_name(this, name: pointer[AstNode], index: int) returns pointer[AstNode]
+    {
+        let t AstNode.identifier_text_of(name)
+        let len AstNode.identifier_text_length_of(name)
+        let out host.allocate(len + 24, 1) as pointer[char]
+        var n 0
+        var i 0
+        var first true
+        while i < len
+        {
+            let cp scanner.utf8_decode_in(t, len, i)
+            let sz scanner.utf8_size_in(t, len, i)
+            var ok false
+            if first
+                set ok: Scanner.is_identifier_start(cp)
+            else
+                set ok: Scanner.is_identifier_part(cp)
+            if ok
+            {
+                var k 0
+                while k < sz
+                {
+                    set *(out + n): *(t + i + k)
+                    set n: n + 1
+                    set k: k + 1
+                }
+            }
+            else
+            {
+                set *(out + n): "_" as char
+                set n: n + 1
+            }
+            set first: false
+            set i: i + sz
+        }
+        if n = 0
+        {
+            set *(out + n): "_" as char
+            set n: n + 1
+            set n: n + write_decimal(out + n, index)
+        }
+        set *(out + n): 0 as char
+        this.add_transformed_reparse(this.new_synthesized_identifier(out, n), name)
+    }
+
+    ; strconv.Itoa for a non-negative index, written into a buffer. Answers how
+    ; many bytes it wrote.
+    function write_decimal(out: pointer[char], v: int) returns int
+    {
+        if v = 0
+        {
+            set *out: "0" as char
+            return 1
+        }
+        var digits: int 0
+        var x v
+        while x > 0
+        {
+            set digits: digits + 1
+            set x: x / 10
+        }
+        var i digits
+        var y v
+        while i > 0
+        {
+            set i: i - 1
+            set *(out + i): (("0" as char as int) + (y % 10)) as char
+            set y: y / 10
+        }
+        digits
+    }
+
+    ; ── GetAssignmentDeclarationKind, as the question the reparser asks ──────
+    ;
+    ; The reference answers a JSDeclarationKind; both readers here compare it
+    ; against `None` and nothing else, so this answers the BOOLEAN and says so.
+    ; ★ Only the KindBinaryExpression arm is ported: the other arm is
+    ; KindCallExpression (`Object.defineProperty(...)`), and both call sites ask
+    ; this only after establishing that the expression IS a binary one, so that
+    ; arm — and the whole IsBindableStaticNameExpression family under it — is
+    ; unreachable from here.
+    function is_access_expression(n: pointer[AstNode]) returns bool
+    {
+        if n = null
+            return false
+        (n.kind = KindPropertyAccessExpression) or (n.kind = KindElementAccessExpression)
+    }
+
+    function is_string_or_numeric_literal_like(n: pointer[AstNode]) returns bool
+    {
+        if n = null
+            return false
+        if n.kind = KindStringLiteral
+            return true
+        if n.kind = KindNoSubstitutionTemplateLiteral
+            return true
+        n.kind = KindNumericLiteral
+    }
+
+    function skip_parentheses(n: pointer[AstNode]) returns pointer[AstNode]
+    {
+        var x n
+        while x <> null
+        {
+            if x.kind <> KindParenthesizedExpression
+                return x
+            set x: AstNode.expression_of(x)
+        }
+        x
+    }
+
+    ; GetElementOrPropertyAccessName — the NAME of an access expression, or null
+    ; when it has none that can be used as one.
+    function get_element_or_property_access_name(n: pointer[AstNode]) returns pointer[AstNode]
+    {
+        if n = null
+            return null
+        if n.kind = KindPropertyAccessExpression
+        {
+            let nm AstNode.property_access_name_of(n)
+            if nm = null
+                return null
+            if nm.kind = KindIdentifier
+                return nm
+            return null
+        }
+        if n.kind = KindElementAccessExpression
+        {
+            let arg skip_parentheses(AstNode.element_access_argument_of(n))
+            if is_string_or_numeric_literal_like(arg)
+                return arg
+            return null
+        }
+        null
+    }
+
+    function is_module_identifier(n: pointer[AstNode]) returns bool
+    {
+        if n = null
+            return false
+        if n.kind <> KindIdentifier
+            return false
+        AstNode.identifier_text_is(n, "module")
+    }
+
+    function is_exports_identifier(n: pointer[AstNode]) returns bool
+    {
+        if n = null
+            return false
+        if n.kind <> KindIdentifier
+            return false
+        AstNode.identifier_text_is(n, "exports")
+    }
+
+    function is_module_exports_access_expression(n: pointer[AstNode]) returns bool
+    {
+        if is_access_expression(n) = false
+            return false
+        if is_module_identifier(AstNode.expression_of(n)) = false
+            return false
+        let name get_element_or_property_access_name(n)
+        if name = null
+            return false
+        AstNode.identifier_text_is(name, "exports")
+    }
+
+    ; IsEntityNameExpressionEx with allowJS true — which is what the one caller
+    ; passes, since the whole routine runs only in a JavaScript file.
+    function is_entity_name_expression_js(n: pointer[AstNode]) returns bool
+    {
+        if n = null
+            return false
+        if n.kind = KindIdentifier
+            return true
+        if n.kind = KindThisKeyword
+            return true
+        if n.kind = KindPropertyAccessExpression
+        {
+            let nm AstNode.property_access_name_of(n)
+            if nm = null
+                return false
+            if nm.kind <> KindIdentifier
+                return false
+            return is_entity_name_expression_js(AstNode.expression_of(n))
+        }
+        if n.kind = KindElementAccessExpression
+        {
+            if is_string_or_numeric_literal_like(AstNode.element_access_argument_of(n)) = false
+                return false
+            return is_entity_name_expression_js(AstNode.expression_of(n))
+        }
+        false
+    }
+
+    function is_assignment_declaration(bin: pointer[AstNode]) returns bool
+    {
+        if bin = null
+            return false
+        if bin.kind <> KindBinaryExpression
+            return false
+        let left AstNode.binary_left_of(bin)
+        if AstNode.binary_operator_kind(bin) <> KindEqualsToken
+            return false
+        if is_access_expression(left) = false
+            return false
+
+        ; IsInJSFile(bin.Left) — always true where this is asked.
+        if is_module_exports_access_expression(left)
+        {
+            if is_exports_identifier(AstNode.binary_right_of(bin)) = false
+                return true
+        }
+        let inner AstNode.expression_of(left)
+        if is_module_exports_access_expression(inner) or is_exports_identifier(inner)
+        {
+            if get_element_or_property_access_name(left) <> null
+                return true
+        }
+        if inner <> null
+        {
+            if inner.kind = KindThisKeyword
+                return true
+        }
+        if left.kind = KindPropertyAccessExpression
+        {
+            if is_entity_name_expression_js(inner)
+            {
+                let nm AstNode.property_access_name_of(left)
+                if nm <> null
+                {
+                    if nm.kind = KindIdentifier
+                        return true
+                }
+            }
+        }
+        if left.kind = KindElementAccessExpression
+        {
+            if is_entity_name_expression_js(inner)
+                return true
+        }
+        false
+    }
+
+    ; HasSamePropertyAccessName.
+    function has_same_property_access_name(a: pointer[AstNode], b: pointer[AstNode]) returns bool
+    {
+        if a = null
+            return false
+        if b = null
+            return false
+        if (a.kind = KindIdentifier) and (b.kind = KindIdentifier)
+        {
+            let at AstNode.identifier_text_of(a)
+            let al AstNode.identifier_text_length_of(a)
+            let bt AstNode.identifier_text_of(b)
+            let bl AstNode.identifier_text_length_of(b)
+            if al <> bl
+                return false
+            var i 0
+            while i < al
+            {
+                if *(at + i) <> *(bt + i)
+                    return false
+                set i: i + 1
+            }
+            return true
+        }
+        if (a.kind = KindPropertyAccessExpression) and (b.kind = KindPropertyAccessExpression)
+        {
+            if has_same_property_access_name(AstNode.property_access_name_of(a), AstNode.property_access_name_of(b)) = false
+                return false
+            return has_same_property_access_name(AstNode.expression_of(a), AstNode.expression_of(b))
+        }
+        false
+    }
+
+    ; findMatchingParameter: the tag's own index among the comment's @param tags
+    ; decides the match when the names do not — which is what makes
+    ; `@param {T}` with no name at all reach the right parameter.
+    procedure find_matching_parameter(this, fun: pointer[AstNode], parameter_tag: pointer[AstNode], jsdoc: pointer[AstNode]) returns pointer[AstNode]
+    {
+        var tag_index 0 - 1
+        var param_count 0 - 1
+        let tags AstNode.jsdoc_tags_of(jsdoc)
+        if tags <> null
+        {
+            var i 0
+            let n tags.get_length() as int
+            while i < n
+            {
+                let tag *(tags.get_buffer() + i)
+                set i: i + 1
+                if tag.kind = KindJSDocParameterTag
+                {
+                    set param_count: param_count + 1
+                    if tag = parameter_tag
+                    {
+                        set tag_index: param_count
+                        break
+                    }
+                }
+            }
+        }
+        let params AstNode.parameters_of(fun)
+        if params = null
+            return null
+        let tag_name AstNode.name_of(parameter_tag)
+        var pi 0
+        let pn params.get_length() as int
+        while pi < pn
+        {
+            let parameter *(params.get_buffer() + pi)
+            let index pi
+            set pi: pi + 1
+            let pname AstNode.name_of(parameter)
+            if pname = null
+                continue
+            if pname.kind = KindIdentifier
+            {
+                if tag_name <> null
+                {
+                    if tag_name.kind = KindIdentifier
+                    {
+                        if has_same_property_access_name(pname, tag_name)
+                            return parameter
+                        if index = tag_index
+                        {
+                            if AstNode.identifier_text_length_of(tag_name) = 0
+                                return parameter
+                        }
+                    }
+                }
+            }
+            else
+            {
+                if index = tag_index
+                    return parameter
+            }
+        }
+        null
+    }
+
+    ; ── reparseTags and the two halves ──────────────────────────────────────
+
+    procedure reparse_tags(this, parent: pointer[AstNode], jsdoc: pointer[Array[pointer[AstNode]]])
+    {
+        if jsdoc = null
+            return
+        let n jsdoc.get_length() as int
+        var i 0
+        while i < n
+        {
+            let j *(jsdoc.get_buffer() + i)
+            let is_last i = (n - 1)
+            set i: i + 1
+            let tags AstNode.jsdoc_tags_of(j)
+            if tags = null
+                continue
+            var k 0
+            let tn tags.get_length() as int
+            while k < tn
+            {
+                let tag *(tags.get_buffer() + k)
+                set k: k + 1
+                this.reparse_unhosted(tag, parent, j)
+                if is_last
+                    this.reparse_hosted(tag, parent, j)
+            }
+        }
+    }
+
+    ; A tag that becomes a declaration of its own.
+    procedure reparse_unhosted(this, tag: pointer[AstNode], parent: pointer[AstNode], jsdoc: pointer[AstNode])
+    {
+        let tk tag.kind
+
+        if (tk = KindJSDocTypedefTag) or (tk = KindJSDocCallbackTag)
+        {
+            let type_expression AstNode.jsdoc_type_expression_of(tag)
+            if type_expression = null
+                return
+            let full_name AstNode.name_of(tag)
+            var modifiers null as pointer[Array[pointer[AstNode]]]
+            if full_name <> null
+            {
+                if full_name.kind = KindModuleDeclaration
+                    set modifiers: this.create_export_modifier(tag)
+            }
+            ; ★★★ The two arms are merged because everything else about them is
+            ; the same, and this ONE line is what the merge nearly swallowed: the
+            ; reference applies checkNonIdentifierName to the @typedef name and
+            ; NOT to the @callback name. A `@callback c-d` therefore reports
+            ; nothing where a `@typedef {T} a-b` reports `Identifier expected`,
+            ; and the difference is a diagnostic — which is the half of the ast
+            ; dump that is easiest to add by accident. Fixture:
+            ; parser_jsdoc_reparse_callback_name.ts.
+            var raw_alias_name get_innermost_name_of_jsdoc_namespace(full_name)
+            if tk = KindJSDocTypedefTag
+                set raw_alias_name: this.check_non_identifier_name(raw_alias_name)
+            let alias_name this.add_deep_clone_reparse(raw_alias_name)
+            var t null as pointer[AstNode]
+            if tk = KindJSDocCallbackTag
+                set t: this.reparse_jsdoc_signature(type_expression, tag, jsdoc, tag, null)
+            else
+            {
+                if type_expression.kind = KindJSDocTypeExpression
+                    set t: this.add_deep_clone_reparse(AstNode.jsdoc_type_expression_inner_of(type_expression))
+                else
+                {
+                    if type_expression.kind = KindJSDocTypeLiteral
+                        set t: this.reparse_jsdoc_type_literal(type_expression)
+                    else
+                    {
+                        this.unported("jsdoc-typedef-type-expression", type_expression.kind)
+                        return
+                    }
+                }
+            }
+            let type_alias this.new_node(KindJSTypeAliasDeclaration, NodeData.JSTypeAliasDeclaration(TypeAliasDeclarationData(modifiers, alias_name, null, t)))
+            AstNode.set_type_parameters(type_alias, this.gather_type_parameters(jsdoc, true))
+            this.finish_reparsed_node(type_alias, tag)
+            let docs AstNode.new_node_list(host)
+            docs.add(jsdoc)
+            this.add_jsdoc_info(type_alias, docs)
+            set type_alias.flags: type_alias.flags | NodeFlagsHasJSDoc
+            reparse_list.add(this.wrap_in_jsdoc_namespace(full_name, type_alias, false))
+            return
+        }
+
+        if tk = KindJSDocImportTag
+        {
+            let clause AstNode.jsdoc_import_clause_of(tag)
+            if clause = null
+                return
+            let import_clause this.add_deep_clone_reparse(clause)
+            AstNode.set_import_clause_phase_modifier(import_clause, KindTypeKeyword)
+            ; ★ The reference passes `importTag.Modifiers()` here and a
+            ; JSDocImportTag has no Modifiers slot — Node.Modifiers() answers nil
+            ; for that kind — so the argument is always nil and this port does not
+            ; carry the field at all.
+            let decl this.new_node(KindJSImportDeclaration, NodeData.JSImportDeclaration(ImportDeclarationData(null, import_clause, this.add_deep_clone_reparse(AstNode.jsdoc_import_specifier_of(tag)), this.add_deep_clone_reparse(AstNode.jsdoc_import_attributes_of(tag)))))
+            this.finish_reparsed_node(decl, tag)
+            reparse_list.add(decl)
+            return
+        }
+
+        if tk = KindJSDocOverloadTag
+        {
+            ; An overload signature is created only for a function, method or
+            ; constructor declaration, and never inside an object literal — where
+            ; those kinds are not class-like members at all.
+            let pk parent.kind
+            var ok false
+            if pk = KindFunctionDeclaration
+                set ok: true
+            if pk = KindMethodDeclaration
+                set ok: true
+            if pk = KindConstructor
+                set ok: true
+            if ok = false
+                return
+            if (parsing_contexts & (1 << PCObjectLiteralMembers)) <> 0
+                return
+            let te AstNode.jsdoc_type_expression_of(tag)
+            reparse_list.add(this.reparse_jsdoc_signature(te, parent, jsdoc, tag, AstNode.modifiers_of(parent)))
+        }
+    }
+
+    ; A tag that mutates the node it documents.
+    procedure reparse_hosted(this, tag: pointer[AstNode], parent: pointer[AstNode], jsdoc: pointer[AstNode])
+    {
+        let tk tag.kind
+
+        if tk = KindJSDocTypeTag
+        {
+            if this.reparse_type_tag_on_host(tag, parent)
+                return
+            let fun get_function_like_host(parent)
+            if fun = null
+                return
+            let te AstNode.jsdoc_type_expression_of(tag)
+            if te = null
+                return
+            if AstNode.type_parameters_of(fun) <> null
+                return
+            if AstNode.type_of(fun) <> null
+                return
+            let params AstNode.parameters_of(fun)
+            if params <> null
+            {
+                var i 0
+                let n params.get_length() as int
+                while i < n
+                {
+                    if AstNode.type_of(*(params.get_buffer() + i)) <> null
+                        return
+                    set i: i + 1
+                }
+            }
+            AstNode.set_full_signature(fun, this.add_deep_clone_reparse(AstNode.jsdoc_type_expression_inner_of(te)))
+            return
+        }
+
+        if tk = KindJSDocSatisfiesTag
+        {
+            this.reparse_satisfies_tag(tag, parent)
+            return
+        }
+
+        if tk = KindJSDocTemplateTag
+        {
+            let fun get_function_like_host(parent)
+            if fun <> null
+            {
+                if AstNode.type_parameters_of(fun) = null
+                {
+                    if AstNode.full_signature_of(fun) = null
+                        AstNode.set_type_parameters(fun, this.gather_type_parameters(jsdoc, false))
+                }
+                return
+            }
+            if is_class_like_node(parent)
+            {
+                if AstNode.type_parameters_of(parent) = null
+                    AstNode.set_type_parameters(parent, this.gather_type_parameters(jsdoc, false))
+            }
+            return
+        }
+
+        if tk = KindJSDocParameterTag
+        {
+            let fun get_function_like_host(parent)
+            if fun = null
+                return
+            if AstNode.full_signature_of(fun) <> null
+                return
+            let param this.find_matching_parameter(fun, tag, jsdoc)
+            if param = null
+                return
+            let te AstNode.jsdoc_type_expression_of(tag)
+            if AstNode.type_of(param) = null
+            {
+                if te <> null
+                    AstNode.set_type(param, this.reparse_jsdoc_type_literal(AstNode.jsdoc_type_expression_inner_of(te)))
+            }
+            if AstNode.parameter_question_token_of(param) = null
+                AstNode.set_parameter_question_token(param, this.make_question_if_optional(tag))
+            return
+        }
+
+        if tk = KindJSDocThisTag
+        {
+            let fun get_function_like_host(parent)
+            if fun = null
+                return
+            let params AstNode.parameters_of(fun)
+            var has_this false
+            if params <> null
+            {
+                if (params.get_length() as int) <> 0
+                {
+                    let first_name AstNode.name_of(*(params.get_buffer()))
+                    if first_name <> null
+                    {
+                        if first_name.kind = KindThisKeyword
+                            set has_this: true
+                        if first_name.kind = KindIdentifier
+                        {
+                            if AstNode.identifier_text_is(first_name, "this")
+                                set has_this: true
+                        }
+                    }
+                }
+            }
+            if has_this
+                return
+            let bytes this.copy_bytes_to_page("this", 4)
+            let ident this.new_synthesized_identifier(bytes, 4)
+            let this_param this.new_node(KindParameter, NodeData.Parameter(ParameterData(null, null, ident, null, null, null)))
+            let te AstNode.jsdoc_type_expression_of(tag)
+            if te <> null
+                AstNode.set_type(this_param, this.add_deep_clone_reparse(AstNode.jsdoc_type_expression_inner_of(te)))
+            this.finish_reparsed_node(this_param, AstNode.jsdoc_tag_name_of(tag))
+            let new_params AstNode.new_node_list(host)
+            new_params.add(this_param)
+            if params <> null
+            {
+                var i 0
+                let n params.get_length() as int
+                while i < n
+                {
+                    new_params.add(*(params.get_buffer() + i))
+                    set i: i + 1
+                }
+            }
+            AstNode.set_parameters(fun, new_params)
+            return
+        }
+
+        if tk = KindJSDocReturnTag
+        {
+            let fun get_function_like_host(parent)
+            if fun = null
+                return
+            if AstNode.full_signature_of(fun) <> null
+                return
+            if AstNode.type_of(fun) <> null
+                return
+            let te AstNode.jsdoc_type_expression_of(tag)
+            if te = null
+                return
+            AstNode.set_type(fun, this.add_deep_clone_reparse(AstNode.jsdoc_type_expression_inner_of(te)))
+            return
+        }
+
+        if is_jsdoc_modifier_tag(tk)
+        {
+            this.reparse_modifier_tag(tag, parent)
+            return
+        }
+
+        if tk = KindJSDocImplementsTag
+        {
+            this.reparse_implements_tag(tag, parent)
+            return
+        }
+
+        if tk = KindJSDocAugmentsTag
+            this.reparse_augments_tag(tag, parent)
+    }
+
+    ; The @type tag's HOSTED arms — the switch over the documented node's kind.
+    ; Answers whether the tag was consumed, so the caller can fall through to the
+    ; function-like host the reference falls through to.
+    procedure reparse_type_tag_on_host(this, tag: pointer[AstNode], parent: pointer[AstNode]) returns bool
+    {
+        let te AstNode.jsdoc_type_expression_of(tag)
+        if te = null
+            return false
+        let inner AstNode.jsdoc_type_expression_inner_of(te)
+        let pk parent.kind
+
+        if pk = KindVariableStatement
+        {
+            let ds AstNode.variable_declarations_of(AstNode.variable_statement_list_of(parent))
+            if ds = null
+                return false
+            var i 0
+            let n ds.get_length() as int
+            while i < n
+            {
+                let d *(ds.get_buffer() + i)
+                set i: i + 1
+                if AstNode.type_of(d) = null
+                {
+                    AstNode.set_type(d, this.add_deep_clone_reparse(inner))
+                    return true
+                }
+            }
+            return false
+        }
+
+        var direct false
+        if pk = KindVariableDeclaration
+            set direct: true
+        if pk = KindExportAssignment
+            set direct: true
+        if pk = KindPropertyDeclaration
+            set direct: true
+        if pk = KindPropertyAssignment
+            set direct: true
+        if pk = KindShorthandPropertyAssignment
+            set direct: true
+        if pk = KindGetAccessor
+            set direct: true
+        if direct
+        {
+            if AstNode.type_of(parent) <> null
+                return false
+            AstNode.set_type(parent, this.add_deep_clone_reparse(inner))
+            return true
+        }
+
+        if pk = KindParameter
+        {
+            if AstNode.type_of(parent) <> null
+                return false
+            AstNode.set_type(parent, this.reparse_jsdoc_type_literal(inner))
+            return true
+        }
+
+        if pk = KindExpressionStatement
+        {
+            let bin AstNode.expression_of(parent)
+            if bin = null
+                return false
+            if bin.kind <> KindBinaryExpression
+                return false
+            if is_assignment_declaration(bin) = false
+                return false
+            AstNode.set_type(bin, this.add_deep_clone_reparse(inner))
+            return true
+        }
+
+        if (pk = KindReturnStatement) or (pk = KindParenthesizedExpression)
+        {
+            let e AstNode.expression_of(parent)
+            if e = null
+                return false
+            AstNode.set_expression(parent, this.make_new_cast(this.add_deep_clone_reparse(inner), e, true))
+            return true
+        }
+
+        false
+    }
+
+    procedure reparse_satisfies_tag(this, tag: pointer[AstNode], parent: pointer[AstNode])
+    {
+        let te AstNode.jsdoc_type_expression_of(tag)
+        if te = null
+            return
+        let inner AstNode.jsdoc_type_expression_inner_of(te)
+        let pk parent.kind
+
+        if pk = KindVariableStatement
+        {
+            let ds AstNode.variable_declarations_of(AstNode.variable_statement_list_of(parent))
+            if ds = null
+                return
+            var i 0
+            let n ds.get_length() as int
+            while i < n
+            {
+                let d *(ds.get_buffer() + i)
+                set i: i + 1
+                let initializer AstNode.initializer_of(d)
+                if initializer <> null
+                {
+                    AstNode.set_initializer(d, this.make_new_cast(this.add_deep_clone_reparse(inner), initializer, false))
+                    break
+                }
+            }
+            return
+        }
+
+        var direct false
+        if pk = KindVariableDeclaration
+            set direct: true
+        if pk = KindPropertyDeclaration
+            set direct: true
+        if pk = KindPropertyAssignment
+            set direct: true
+        if direct
+        {
+            let initializer AstNode.initializer_of(parent)
+            if initializer = null
+                return
+            AstNode.set_initializer(parent, this.make_new_cast(this.add_deep_clone_reparse(inner), initializer, false))
+            return
+        }
+
+        if pk = KindShorthandPropertyAssignment
+        {
+            let initializer AstNode.shorthand_object_assignment_initializer_of(parent)
+            if initializer = null
+                return
+            AstNode.set_shorthand_object_assignment_initializer(parent, this.make_new_cast(this.add_deep_clone_reparse(inner), initializer, false))
+            return
+        }
+
+        var expr_host false
+        if pk = KindReturnStatement
+            set expr_host: true
+        if pk = KindParenthesizedExpression
+            set expr_host: true
+        if pk = KindExportAssignment
+            set expr_host: true
+        if expr_host
+        {
+            let e AstNode.expression_of(parent)
+            if e = null
+                return
+            AstNode.set_expression(parent, this.make_new_cast(this.add_deep_clone_reparse(inner), e, false))
+            return
+        }
+
+        if pk = KindExpressionStatement
+        {
+            let bin AstNode.expression_of(parent)
+            if bin = null
+                return
+            if bin.kind <> KindBinaryExpression
+                return
+            if is_assignment_declaration(bin) = false
+                return
+            AstNode.set_binary_right(bin, this.make_new_cast(this.add_deep_clone_reparse(inner), AstNode.binary_right_of(bin), false))
+        }
+    }
+
+    ; @readonly / @private / @public / @protected / @override become real
+    ; modifiers on the member they document.
+    function is_jsdoc_modifier_tag(k: int) returns bool
+    {
+        if k = KindJSDocReadonlyTag
+            return true
+        if k = KindJSDocPrivateTag
+            return true
+        if k = KindJSDocPublicTag
+            return true
+        if k = KindJSDocProtectedTag
+            return true
+        k = KindJSDocOverrideTag
+    }
+
+    procedure reparse_modifier_tag(this, tag: pointer[AstNode], parent_in: pointer[AstNode])
+    {
+        var parent parent_in
+        if parent.kind = KindExpressionStatement
+            set parent: AstNode.expression_of(parent)
+        if parent = null
+            return
+        let pk parent.kind
+
+        var accessor_like false
+        if pk = KindMethodDeclaration
+            set accessor_like: true
+        if pk = KindGetAccessor
+            set accessor_like: true
+        if pk = KindSetAccessor
+            set accessor_like: true
+        if accessor_like
+        {
+            ; ★ In an object literal these are not class-like members, so a JSDoc
+            ; modifier is not a modifier there and reparsing it would produce a
+            ; grammar error the reference does not (upstream issue #4437).
+            if (parsing_contexts & (1 << PCObjectLiteralMembers)) <> 0
+                return
+        }
+        else
+        {
+            var member false
+            if pk = KindPropertyDeclaration
+                set member: true
+            if pk = KindConstructor
+                set member: true
+            if pk = KindBinaryExpression
+                set member: true
+            if member = false
+                return
+        }
+
+        var keyword KindUnknown
+        if tag.kind = KindJSDocReadonlyTag
+            set keyword: KindReadonlyKeyword
+        if tag.kind = KindJSDocPrivateTag
+            set keyword: KindPrivateKeyword
+        if tag.kind = KindJSDocPublicTag
+            set keyword: KindPublicKeyword
+        if tag.kind = KindJSDocProtectedTag
+            set keyword: KindProtectedKeyword
+        if tag.kind = KindJSDocOverrideTag
+            set keyword: KindOverrideKeyword
+
+        let modifier this.new_node(keyword, NodeData.Token(TokenData()))
+        this.finish_reparsed_node(modifier, tag)
+        let existing AstNode.modifiers_of(parent)
+        let nodes AstNode.new_node_list(host)
+        if existing <> null
+        {
+            var i 0
+            let n existing.get_length() as int
+            while i < n
+            {
+                nodes.add(*(existing.get_buffer() + i))
+                set i: i + 1
+            }
+        }
+        nodes.add(modifier)
+        AstNode.set_modifiers(parent, nodes)
+    }
+
+    procedure reparse_implements_tag(this, tag: pointer[AstNode], parent: pointer[AstNode])
+    {
+        if is_class_like_node(parent) = false
+            return
+        let class_name AstNode.jsdoc_class_name_of(tag)
+        if class_name = null
+            return
+        let clauses AstNode.class_heritage_clauses_of(parent)
+        if clauses <> null
+        {
+            var i 0
+            let n clauses.get_length() as int
+            while i < n
+            {
+                let c *(clauses.get_buffer() + i)
+                set i: i + 1
+                if AstNode.heritage_clause_token_of(c) = KindImplementsKeyword
+                {
+                    let types AstNode.heritage_clause_types_of(c)
+                    if types <> null
+                    {
+                        types.add(this.add_deep_clone_reparse(class_name))
+                        return
+                    }
+                }
+            }
+        }
+        let types_list AstNode.new_node_list(host)
+        types_list.add(this.add_deep_clone_reparse(class_name))
+        let clause this.new_node(KindHeritageClause, NodeData.HeritageClause(HeritageClauseData(KindImplementsKeyword, types_list)))
+        this.finish_reparsed_node(clause, class_name)
+        if clauses = null
+        {
+            let hs AstNode.new_node_list(host)
+            hs.add(clause)
+            AstNode.set_class_heritage_clauses(parent, hs)
+        }
+        else
+            clauses.add(clause)
+    }
+
+    ; @augments {Base<T>} fills in the type arguments of an `extends Base` the
+    ; source wrote without any — and only when the two name the same base.
+    procedure reparse_augments_tag(this, tag: pointer[AstNode], parent: pointer[AstNode])
+    {
+        if is_class_like_node(parent) = false
+            return
+        let clauses AstNode.class_heritage_clauses_of(parent)
+        if clauses = null
+            return
+        var i 0
+        let n clauses.get_length() as int
+        while i < n
+        {
+            let c *(clauses.get_buffer() + i)
+            set i: i + 1
+            if AstNode.heritage_clause_token_of(c) <> KindExtendsKeyword
+                continue
+            let types AstNode.heritage_clause_types_of(c)
+            if types = null
+                continue
+            if (types.get_length() as int) <> 1
+                continue
+            let target *(types.get_buffer())
+            let source AstNode.jsdoc_class_name_of(tag)
+            if source = null
+                continue
+            if has_same_property_access_name(AstNode.expression_of(target), AstNode.expression_of(source)) = false
+                continue
+            if AstNode.type_arguments_of(target) <> null
+                continue
+            let src_args AstNode.type_arguments_of(source)
+            if src_args = null
+                continue
+            let new_args AstNode.new_node_list(host)
+            var k 0
+            let m src_args.get_length() as int
+            while k < m
+            {
+                new_args.add(this.add_deep_clone_reparse(*(src_args.get_buffer() + k)))
+                set k: k + 1
+            }
+            AstNode.set_expression_type_arguments(target, new_args)
+        }
+    }
+
     ; ── the entry points ────────────────────────────────────────────────────
 
     ; parseJSDocForNode — the LAZY parse a TS/TSX file defers to. The reference
@@ -15450,6 +17289,25 @@ define Parser
         ; that statement's JSDoc as its own.
         if (AstNode.flags_of(n) & NodeFlagsHasJSDoc) = 0
             return null
+
+        ; ★★★ Node.JSDoc(file)'s second test, and slice 22 is what makes it more
+        ; than one branch: `if file.hasLazyJSDoc { return file.resolveJSDoc(node) }
+        ; return file.jsdocCache[node]`. finishSourceFile sets hasLazyJSDoc for a
+        ; NON-JavaScript file only, so a `.js` unit answers out of the table the
+        ; parse filled — and it has to, because the reparser puts entries there
+        ; for nodes with no comment ranges of their own: a synthesized parameter
+        ; carrying its @param tag's text starts nowhere near the comment.
+        if this.is_java_script()
+            return this.lookup_jsdoc_info(n)
+
+        this.parse_jsdoc_comments_of(n)
+    }
+
+    ; The same walk without the flag gate. with_jsdoc needs it for a JavaScript
+    ; file, where the flag is set only AFTER a comment has parsed — the gate above
+    ; belongs to the ACCESSOR, which is asked about a node whose parse is over.
+    procedure parse_jsdoc_comments_of(this, n: pointer[AstNode]) returns pointer[Array[pointer[AstNode]]]
+    {
         let ranges this.cparts_new()
         this.get_jsdoc_comment_ranges(n, ranges)
         let count (ranges.get_length() as int) / 2

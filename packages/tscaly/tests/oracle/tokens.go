@@ -45,15 +45,19 @@ func main() {
 	// ★★★ The LANGUAGE VARIANT, which a token dump needs for the same reason the
 	// parse does and which the file's NAME decides. `getLanguageVariant` is not
 	// exported, so its rule is spelled here: it answers JSX for TSX, JSX, JS —
-	// and for JSON. The clamp is the ast oracle's, applied FIRST, so a .js unit is
-	// scanned Standard here exactly as it is parsed as TypeScript there, and a
-	// .tsx or .jsx unit is scanned JSX exactly as it is parsed as TSX. Under the
-	// JSX variant `</` is one token, which is the whole of the difference at scan
-	// time — the four JSX token scanners are driven by the PARSER and no token
-	// dump reaches them.
+	// and for JSON. Under the JSX variant `</` is one token, which is the whole
+	// of the difference at scan time; the four JSX token scanners are driven by
+	// the PARSER and no token dump reaches them.
+	//
+	// ★★★ The CLAMP that stood in front of this went away in slice 22, and its
+	// removal moves this line: a .js unit used to be scanned Standard here
+	// because it was parsed as TypeScript there, and it is now scanned JSX
+	// because it is parsed as ScriptKindJS. The two questions have to be asked of
+	// the same kind or the two yardsticks read one file two ways — which is the
+	// same argument our side spells in Parser.script_kind_is_jsx_variant.
 	variant := core.LanguageVariantStandard
 	switch core.GetScriptKindFromFileName(os.Args[1]) {
-	case core.ScriptKindJSON, core.ScriptKindTSX, core.ScriptKindJSX:
+	case core.ScriptKindJSON, core.ScriptKindTSX, core.ScriptKindJSX, core.ScriptKindJS:
 		variant = core.LanguageVariantJSX
 	}
 
