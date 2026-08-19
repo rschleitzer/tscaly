@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // The reference half of the PATH cross-check (slice 28). Reads the same
 // `<cwd>TAB<path>` corpus tscaly_paths reads and prints the same two fields, off
 // the reference's own tspath.
