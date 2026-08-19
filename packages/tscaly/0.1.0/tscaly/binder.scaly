@@ -104,6 +104,17 @@ define Binder
     ; check. The parse is over, so the count cannot move during the bind.
     file_has_no_parse_errors: bool
 
+    ; `b.file.FileName()`, and it is here for ONE question: an external module's
+    ; symbol is named after it (bind_source_file_as_external_module). It arrives
+    ; as a parameter rather than off the node for the same reason `source` does —
+    ; the reference's SourceFile carries both, this port's carries neither — and
+    ; it must be the name the CALLER normalized, because upstream's
+    ; `opts.FileName` is `GetNormalizedAbsolutePath(arg, cwd)` and the symbol name
+    ; is that string character for character (tspath.scaly's absolute-path
+    ; section). Kept as a RANGE, since a Symbol's name is one.
+    file_name_data: pointer[char]
+    file_name_len: int
+
     ; The four container registers. `last_container` is the head of the
     ; reference's container CHAIN (addToContainerChain) — the chain's links are
     ; NextContainer fields this port does not carry, since the only reader is the
@@ -141,7 +152,7 @@ define Binder
     ;
     ; The reference's BindSourceFile/bindSourceFile pair, minus the pool and the
     ; once-guard: a Binder here is one object on the caller's page, used once.
-    function bind_source_file(host: pointer[Page], file: pointer[AstNode], source: String, is_external_module: bool) returns pointer[Binder]
+    function bind_source_file(host: pointer[Page], file: pointer[AstNode], source: String, file_name: String, is_external_module: bool) returns pointer[Binder]
     {
         let b host.allocate(sizeof Binder, alignof Binder) as pointer[Binder]
         set b.host: host
@@ -150,6 +161,8 @@ define Binder
         set *sc: Scanner(source)
         set b.trivia: sc
         set b.is_external_module: is_external_module
+        set b.file_name_data: file_name.get_buffer() as pointer[char]
+        set b.file_name_len: file_name.get_length() as int
         set b.file_has_no_parse_errors: AstNode.diagnostic_count(file) = 0
         set b.container: null
         set b.this_container: null
@@ -382,6 +395,37 @@ define Binder
     ; ASCII word. Built on the host rather than declared, because Scaly has no
     ; spelling for a string constant carrying that byte and because the name only
     ; has to compare EQUAL by bytes, never by pointer.
+    ; ★★★ FOUR OF THE REFERENCE'S CONSTANTS DO NOT CARRY THE PREFIX, and slice 28
+    ; found it the way §3.5v predicts these are found — by a construct starting to
+    ; produce one. `InternalSymbolNameExportEquals` is the bare string `export=`,
+    ; and so are `default`, `this` and `module.exports`; every other one is
+    ; `InternalSymbolNamePrefix + word`. Upstream says why in a comment on the
+    ; `default` line: those names are "technically not wholly internal" — they are
+    ; names a program can actually resolve — so they must NOT be unspellable. Slice
+    ; 27 routed all of them through the prefixing helper, which was invisible while
+    ; nothing produced an `export=` or a `default` symbol: the JSON arm produces
+    ; the first (six units) and an unnamed default export the second, and both
+    ; turned up as `%FEexport=` against `export=` in the dump.
+    ;
+    ; So there are two helpers, and the choice at a call site is a transcription of
+    ; which constant the reference names — not a judgement about what the name is
+    ; for.
+    function internal_name_unprefixed(host: pointer[Page], word: pointer[const_char], out_data: pointer[pointer[char]]) returns int
+    {
+        var n 0
+        while *(word + n) <> (0 as char)
+            set n: n + 1
+        let buf host.allocate((n + 1) as size_t, 1) as pointer[char]
+        var i 0
+        while i < n
+        {
+            set *(buf + i): *(word + i)
+            set i: i + 1
+        }
+        set *out_data: buf
+        n
+    }
+
     function internal_name(host: pointer[Page], word: pointer[const_char], out_data: pointer[pointer[char]]) returns int
     {
         var n 0
@@ -1063,7 +1107,7 @@ define Binder
         if is_default_export
         {
             if parent <> null
-                set name_len: Binder.internal_name(host, "default", &name_data)
+                set name_len: Binder.internal_name_unprefixed(host, "default", &name_data)
             else
                 this.get_declaration_name(n, &name_data, &name_len)
         }
@@ -1320,37 +1364,152 @@ define Binder
         }
         if k = KindSourceFile
         {
-            set *out_len: Binder.internal_name(host, "export=", out_data)
+            set *out_len: Binder.internal_name_unprefixed(host, "export=", out_data)
             return
         }
         if k = KindBinaryExpression
         {
-            set *out_len: Binder.internal_name(host, "export=", out_data)
+            set *out_len: Binder.internal_name_unprefixed(host, "export=", out_data)
             return
         }
         set *out_len: Binder.internal_name(host, "missing", out_data)
     }
 
-    ; declareModuleMember. This slice reaches only the last line of it — the plain
-    ; `locals` case — and the two above it are reported: an ALIAS needs the
-    ; import/export arms, and an exported member needs the export-context flag the
-    ; unported module arm sets.
+    ; ast.IsAmbientModule: a module declaration whose name is a STRING, or a
+    ; `global` augmentation. Ported rather than argued away — the argument would
+    ; have been that no ModuleDeclaration can reach declare_module_member while its
+    ; bind arm is unported, which is true today and is exactly the shape §3.5p
+    ; charges interest on.
+    function is_ambient_module(n: pointer[AstNode]) returns bool
+    {
+        if AstNode.kind_of(n) <> KindModuleDeclaration
+            return false
+        let name AstNode.name_of(n)
+        if name <> null
+        {
+            if AstNode.kind_of(name) = KindStringLiteral
+                return true
+        }
+        ; IsGlobalScopeAugmentation, which is the keyword and not the name.
+        AstNode.module_keyword_of(n) = KindGlobalKeyword
+    }
+
+    ; ast.IsImplicitlyExportedJSDocDeclaration — the second disjunct of
+    ; hasExportModifier. A JSDoc `@typedef` in a module file is exported without
+    ; anybody writing `export`, and so is a ModuleDeclaration the JSDoc reparser
+    ; synthesized for a dotted `@typedef` name.
+    ;
+    ; ★ `IsExternalOrCommonJSModule(node.Parent)` is asked here as
+    ; `is_external_module`, which is the EXTERNAL half only: the commonJS indicator
+    ; is set DURING the bind, by a `require` call or a `module.exports`
+    ; assignment, and both of those arms are unported — the slice that ports
+    ; bind_call_expression owns the other half of this test.
+    function is_implicitly_exported_jsdoc_declaration(this, n: pointer[AstNode]) returns bool
+    {
+        let parent AstNode.parent_node_of(n)
+        if parent = null
+            return false
+        if AstNode.kind_of(parent) <> KindSourceFile
+            return false
+        if is_external_module = false
+            return false
+        let k AstNode.kind_of(n)
+        if k = KindJSTypeAliasDeclaration
+            return true
+        if k <> KindModuleDeclaration
+            return false
+        (AstNode.flags_of(n) & NodeFlagsReparsed) <> 0
+    }
+
+    ; declareModuleMember, all four arms (slice 28 — before it, the ALIAS arm and
+    ; the EXPORTED arm reported themselves).
+    ;
+    ; ★★★ THE EXPORTED ARM IS WHY AN EXPORTED DECLARATION OWNS TWO SYMBOLS, and the
+    ; reference's own comment gives both reasons: locals and exports of one name are
+    ; mutually exclusive within a container (so the duplicate-identifier check sees
+    ; them collide), and the checker resolves an identifier to the LOCAL while
+    ; answering the EXPORT. The local carries only the ExportValue flag — not the
+    ; declaration's own flags — which is what makes the pair visible in the dump:
+    ; two symbols, one declaration each, joined by the `x` line.
     procedure declare_module_member(this, n: pointer[AstNode], symbol_flags: int, symbol_excludes: int) returns pointer[Symbol]
     {
+        var has_export_modifier: bool this.has_combined_modifier(n, ModifierFlagsExport)
+        if has_export_modifier = false
+            set has_export_modifier: this.is_implicitly_exported_jsdoc_declaration(n)
+
         if (symbol_flags & SymbolFlagsAlias) <> 0
         {
-            this.record_unported("declare-module-member-alias", 0)
-            return null
+            ; An export specifier, and an `import x = require(…)` that is itself
+            ; exported, declare into the container's EXPORTS; every other alias is a
+            ; local.
+            var into_exports false
+            if AstNode.kind_of(n) = KindExportSpecifier
+                set into_exports: true
+            if AstNode.kind_of(n) = KindImportEqualsDeclaration
+            {
+                if has_export_modifier
+                    set into_exports: true
+            }
+            if into_exports
+            {
+                let cs AstNode.symbol_of(container)
+                return this.declare_symbol(Symbol.get_exports(host, cs), cs, n, symbol_flags, symbol_excludes)
+            }
+            return this.declare_symbol(Binder.get_locals(host, container), null as pointer[Symbol], n, symbol_flags, symbol_excludes)
         }
-        let has_export_modifier this.has_combined_modifier(n, ModifierFlagsExport)
+
         var exported: bool has_export_modifier
         if (AstNode.flags_of(container) & NodeFlagsExportContext) <> 0
             set exported: true
+        if Binder.is_ambient_module(n)
+            set exported: false
+
         if exported
         {
-            this.record_unported("declare-module-member-exported", 0)
-            return null
+            ; ★ The reference's first disjunct here is `!IsLocalsContainer(container)`
+            ; and it is DEAD in the reference too, not just in this port: all three
+            ; call sites of declareModuleMember pass a SourceFile or a
+            ; ModuleDeclaration, and both of those embed LocalsContainerBase. It is
+            ; left out with that argument rather than transcribed as a kind list
+            ; nothing can exercise; the slice that gives declare_module_member a
+            ; fourth caller is the slice that owes the list.
+            ;
+            ; What IS live is the second disjunct: an UNNAMED default export
+            ; (`export default function () {}`) gets no local symbol at all, because
+            ; there is no name to declare one under — getDeclarationName answers the
+            ; internal `missing` name for it.
+            var no_local false
+            if this.has_syntactic_modifier(n, ModifierFlagsDefault)
+            {
+                var nd null as pointer[char]
+                var nl 0
+                this.get_declaration_name(n, &nd, &nl)
+                if this.is_unported()
+                    return null
+                var mid null as pointer[char]
+                let ml Binder.internal_name(host, "missing", &mid)
+                if SymbolTable.names_equal(nd, nl, mid, ml)
+                    set no_local: true
+            }
+            let cs AstNode.symbol_of(container)
+            if no_local
+                return this.declare_symbol(Symbol.get_exports(host, cs), cs, n, symbol_flags, symbol_excludes)
+
+            var export_kind 0
+            if (symbol_flags & SymbolFlagsValue) <> 0
+                set export_kind: SymbolFlagsExportValue
+            let local this.declare_symbol(Binder.get_locals(host, container), null as pointer[Symbol], n, export_kind, symbol_excludes)
+            let exported_symbol this.declare_symbol(Symbol.get_exports(host, cs), cs, n, symbol_flags, symbol_excludes)
+            if local <> null
+                set local.export_symbol: exported_symbol
+            ; ★ `node.ExportableData().LocalSymbol = local` is NOT ported, and this is
+            ; §3.5be's rule in its own direction: the only reader in the whole
+            ; reference is nameresolver.go's GetLocalSymbolForExportDefault, which the
+            ; CHECKER calls — no dump here can see the slot, so a port of it would be
+            ; a field nobody reads. The slice that ports that resolver adds it.
+            return local
         }
+
         this.declare_symbol(Binder.get_locals(host, container), null as pointer[Symbol], n, symbol_flags, symbol_excludes)
     }
 
@@ -1463,23 +1622,65 @@ define Binder
         this.set_export_context_flag(file)
         if is_external_module
         {
-            this.record_unported("source-file-as-external-module", 0)
+            this.bind_source_file_as_external_module()
             return
         }
 
         ; ★★★ THE JSON ARM, and leaving it out was a WRONG ANSWER rather than a
         ; gap — which is what the yardstick was built to catch and did, on its first
-        ; run: a JSON document is bound as an external module too (its symbol is the
-        ; quoted file name) plus a second symbol standing for `module.exports = {}`,
-        ; and this port answered `f 0 0` for six units with rc 0. An arm that is
-        ; MISSING from a switch produces a well-formed dump; an arm that REPORTS
-        ; produces a column entry. The difference is the whole discipline.
+        ; run (slice 27): a JSON document is bound as an external module too (its
+        ; symbol is the quoted file name) plus a second symbol standing for
+        ; `module.exports = {}`, and this port answered `f 0 0` for six units with
+        ; rc 0. An arm that is MISSING from a switch produces a well-formed dump; an
+        ; arm that REPORTS produces a column entry. The difference is the whole
+        ; discipline.
         ;
         ; ★ `IsJsonSourceFile` asks the file's SCRIPT KIND upstream; here the
         ; equivalent is the JsonFile context flag, which the parser stamps on every
         ; node of a JSON parse (parser.scaly's initializeState arm).
+        ;
+        ; ★★ The save-and-RESTORE of the file's symbol is not defensive coding, it
+        ; is the mechanism: declare_symbol ends in add_declaration_to_symbol, which
+        ; writes `n.symbol` — and the node here IS the file, so declaring the
+        ; property symbol would otherwise leave the file owning the `module.exports`
+        ; symbol instead of the module one. The reference saves it for exactly that
+        ; reason and the dump would show it (the `n` line for the file names its
+        ; symbol).
         if (AstNode.flags_of(file) & NodeFlagsJsonFile) <> 0
-            this.record_unported("source-file-as-json", 0)
+        {
+            this.bind_source_file_as_external_module()
+            let original_symbol AstNode.symbol_of(file)
+            if original_symbol <> null
+            {
+                this.declare_symbol(Symbol.get_exports(host, original_symbol), original_symbol, file, SymbolFlagsProperty, SymbolFlagsAll)
+                set file.symbol: original_symbol
+            }
+        }
+    }
+
+    ; bindSourceFileAsExternalModule. One line upstream, and the whole of it is the
+    ; NAME:
+    ;
+    ;     b.bindAnonymousDeclaration(b.file.AsNode(), SymbolFlagsValueModule,
+    ;                                "\"" + tspath.RemoveFileExtension(b.file.FileName()) + "\"")
+    ;
+    ; The quotes are part of the symbol's name — that is how the checker tells a
+    ; module symbol from a declared one (`IsAmbientModuleSymbolName` is a test for
+    ; exactly this pair of bytes) — and the extension is removed from the WHOLE
+    ; path, not from the base name, so `a/b/c.ts` becomes `"a/b/c"`.
+    procedure bind_source_file_as_external_module(this)
+    {
+        let len remove_file_extension(file_name_data, file_name_len)
+        let buf host.allocate((len + 2) as size_t, 1) as pointer[char]
+        set *buf: "\"" as char
+        var i 0
+        while i < len
+        {
+            set *(buf + 1 + i): *(file_name_data + i)
+            set i: i + 1
+        }
+        set *(buf + 1 + len): "\"" as char
+        this.bind_anonymous_declaration(file, SymbolFlagsValueModule, buf, len + 2)
     }
 
     ; setExportContextFlag. An AMBIENT declaration container with no export
@@ -1915,6 +2116,16 @@ define Binder
     ;
     ; ★ The first step is not decoration: a class or function DECLARATION's own name
     ; is a binding in the SURROUNDING scope, so the walk starts one level up for it.
+    ;
+    ; ★★★ ITS UNREACHABILITY CLAIM EXPIRED WITH SLICE 28 and this is the paragraph
+    ; that used to carry it: slice 27 ported this properly rather than
+    ; approximating it, noting that no fixture could fail because its only caller
+    ; sits behind `if is_external_module` and external modules were unported. They
+    ; are ported now, and the caller RUNS — `binder_module_await_identifier.ts`
+    ; reports TS1262 at the `await` binding through exactly this walk, which is
+    ; what makes the whole GetThisContainer list below a checked transcription
+    ; instead of a careful one (§3.5p, paid in the direction it usually is: the
+    ; slice that lifts a condition owns every comment resting on it).
     function is_in_top_level_context(n: pointer[AstNode]) returns bool
     {
         var node n
