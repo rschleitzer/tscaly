@@ -332,6 +332,12 @@ def main():
     counters["tsx_compared"] = 0
     counters["jsx_compared"] = 0
     counters["jsdoc_bearing"] = 0
+    # ★ Slice 24: how many units carry a JS-SYNTAX diagnostic, and how many there
+    # are. The J section is empty for every file that is not JavaScript, so its
+    # matched count would otherwise read as coverage it does not have — the same
+    # argument jsdoc_bearing rests on, one section over.
+    counters["js_diag_units"] = 0
+    counters["js_diag_lines"] = 0
     failures = []
     stales = []
 
@@ -447,6 +453,16 @@ def main():
             try:
                 if os.path.getsize(f"{work}/jsdoc.ref") > 0:
                     counters["jsdoc_bearing"] += 1
+            except OSError:
+                pass
+            # Counted off the REFERENCE dump, so the number says what the corpus
+            # contains rather than what this port answered.
+            try:
+                with open(f"{work}/ast.ref", "rb") as fh:
+                    n = sum(1 for line in fh if line.startswith(b"J "))
+                if n:
+                    counters["js_diag_units"] += 1
+                    counters["js_diag_lines"] += n
             except OSError:
                 pass
 

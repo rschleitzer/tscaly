@@ -2,10 +2,22 @@
 //
 // ast — the parser yardstick.
 //
-// Dumps the reference's parse of one file. Two sections, in this order:
+// Dumps the reference's parse of one file. Three sections, in this order:
 //
 //	<depth> <kind> <pos> <end> <flags> <kindName>     one line per node
 //	D <pos> <end> <code>                              one line per diagnostic
+//	J <pos> <end> <code>                              one line per JS diagnostic
+//
+// ★★★ THE THIRD SECTION EXISTS BECAUSE THE REFERENCE KEEPS THOSE DIAGNOSTICS
+// OUT OF sf.Diagnostics(). `checkJSSyntax` reports TypeScript-only syntax found
+// in a JavaScript file — `Type annotations can only be used in TypeScript files`
+// and its eighteen neighbours — into a SEPARATE list, which `SetJSDiagnostics`
+// hangs off the SourceFile and `Diagnostics()` does not include. So with two
+// sections a port producing none of them and a port producing WRONG ones compare
+// exactly equal here, in both directions: the hidden-distinction failure mode
+// this suite is organized against. The section is emitted unconditionally and is
+// empty for every file that is not JavaScript, which is what makes its absence
+// on a TS unit a comparison rather than a gap.
 //
 // The node lines are a pre-order walk through the reference's own ForEachChild,
 // so the walk ORDER is part of what is compared — a port that visits a node's
@@ -22,9 +34,17 @@
 // ★ WHAT THIS FORMAT DOES NOT SHOW, stated because a format that hides a
 // distinction hides every bug in that distinction:
 //
-//   - NodeList ranges. A list (statements, parameters, members) carries its own
-//     TextRange, and ForEachChild visits the list's ELEMENTS, never the list. Two
-//     parses that disagree only about a list's extent compare equal here.
+//   - NodeList ranges, MOSTLY. A list (statements, parameters, members) carries
+//     its own TextRange, and ForEachChild visits the list's ELEMENTS, never the
+//     list, so two parses that disagree only about a list's extent compare equal
+//     in the node section. ★ Since the J section exists, THREE of them no longer
+//     do: a type-parameter-list, type-argument-list or parameter-modifier-list
+//     diagnostic reports the LIST's range, so those three extents are compared
+//     wherever such a diagnostic fires. Measured before the section was built —
+//     over the 111 JavaScript units of the stage-1 corpus, the range a list
+//     carries differs from (first element pos, last element end) for 15 of 15
+//     type-parameter lists and 2 of 105 modifier lists — so a port cannot derive
+//     what it does not store.
 //   - Node.Parent. It is set by a later pass (`setParentFromContext`), not by
 //     ParseSourceFile, so there is nothing to compare yet.
 //   - The diagnostic MESSAGE. Only code and span are compared; the message text
@@ -123,5 +143,15 @@ func main() {
 	walk(out, sf.AsNode(), 0)
 	for _, d := range sf.Diagnostics() {
 		fmt.Fprintf(out, "D %d %d %d\n", d.Pos(), d.End(), d.Code())
+	}
+	// ★ Emission order, not sorted, exactly as the D section is: finishSourceFile
+	// does SetJSDiagnostics(attachFileToDiagnostics(p.jsDiagnostics, result)) with
+	// no sort and no filter, so the list is compared as it was appended. RELATED
+	// INFO is not dumped — checkJSDecoratorSyntax attaches one to a diagnostic
+	// rather than appending it to the list, so it is invisible here for the same
+	// reason parseExpectedMatchingBrackets' related info is invisible in the D
+	// section.
+	for _, d := range sf.JSDiagnostics() {
+		fmt.Fprintf(out, "J %d %d %d\n", d.Pos(), d.End(), d.Code())
 	}
 }

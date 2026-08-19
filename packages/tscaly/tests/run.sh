@@ -10,7 +10,9 @@
 #   scanner   the token stream — kind, start, end, flags, token for token
 #   parser    the parse tree — a pre-order walk of kind, pos, end, flags,
 #             through the reference's own child ORDER, plus the syntactic
-#             diagnostics (code and span)
+#             diagnostics (code and span), plus — since slice 24 — the
+#             JS-SYNTAX diagnostics, which the reference keeps in a list of
+#             its own that sf.Diagnostics() does not include
 #   jsdoc     the JSDoc parse — for every node the parser walk has agreed on,
 #             the JSDoc trees hanging off it, in the same shape (slice 21)
 #
@@ -454,10 +456,16 @@ echo "  the jsdoc one reads the CACHE the eager parse filled rather than a lazy"
 echo "  re-derivation, which is the only way a synthesized node's JSDoc is visible"
 echo "  at all."
 echo
-echo "  NOT compared on these units: checkJSSyntax, whose diagnostics the reference"
-echo "  routes to a separate list that sf.Diagnostics() does not include. Neither"
-echo "  yardstick can see one, in either direction — stated because a distinction"
-echo "  the dump hides hides every bug in it."
+echo "  $js_diag_lines JS-SYNTAX diagnostics over $js_diag_units of those units are compared, in the"
+echo "  ast dump's THIRD section — checkJSSyntax, ported in slice 24. The reference"
+echo "  routes them to a separate list that sf.Diagnostics() does NOT include, so"
+echo "  until that section existed neither yardstick could see one in either"
+echo "  direction: a port producing none of them and a port producing wrong ones"
+echo "  compared exactly equal. The count is counted off the REFERENCE dump, so it"
+echo "  says what the corpus contains and not what this port answered, and it is"
+echo "  printed for the reason the JSDoc-bearing count is — the section is empty on"
+echo "  every unit that is not JavaScript, so a matched total including it would"
+echo "  read as coverage it does not have."
 echo
 echo "  Each count is printed rather than folded away: a yardstick that shrinks in"
 echo "  silence is the failure mode this suite exists to prevent."

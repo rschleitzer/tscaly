@@ -489,6 +489,24 @@ define JsdocInfoHasSeeOrLink: int 1 << 2
 ; Getting it backwards is silent in both directions: `unported` where the answer
 ; escapes lets a wrong tree through, and `unanswerable` where the reference
 ; discards over-reports a construct this port can in fact parse.
+; ★ One row of the list-range side table — see `list_ranges` on the Parser for
+; why the range lives beside the list rather than in it. Three fields and no
+; methods; the search is on the Parser, which owns the table.
+define ListRange
+(
+    list: pointer[Array[pointer[AstNode]]]
+    pos: int
+    end: int
+)
+{
+    init(l: pointer[Array[pointer[AstNode]]], p: int, e: int)
+    {
+        set list: l
+        set pos: p
+        set end: e
+    }
+}
+
 define ParserState
 (
     scanner_state: ScannerState
@@ -503,6 +521,14 @@ define ParserState
     diagnostics_len: int
     diagnostics_has_error: bool
 
+    ; The reference's `jsDiagnosticsLen`, restored exactly as the other length
+    ; is. It is a SECOND list because checkJSSyntax's diagnostics never reach
+    ; sf.Diagnostics() (see js_diagnostics on the Parser) — and it is in
+    ; ParserState because the reference put it there: a speculation that read a
+    ; type annotation in a JavaScript file and was thrown away must not leave the
+    ; complaint about it behind.
+    js_diagnostics_len: int
+
     ; The reference's `jsdocInfosLen`, restored the same way the diagnostics are:
     ; a speculation that parsed a JSDoc comment and was thrown away must not
     ; leave the documented node in the side table. `reparseList` is deliberately
@@ -515,12 +541,13 @@ define ParserState
     unported_detail: int
 )
 {
-    init(ss: ScannerState, cf: int, dl: int, dhe: bool, jil: int, hai: bool, up: int, ut: pointer[const_char], ud: int)
+    init(ss: ScannerState, cf: int, dl: int, dhe: bool, jdl: int, jil: int, hai: bool, up: int, ut: pointer[const_char], ud: int)
     {
         set scanner_state: ss
         set context_flags: cf
         set diagnostics_len: dl
         set diagnostics_has_error: dhe
+        set js_diagnostics_len: jdl
         set jsdoc_infos_len: jil
         set statement_has_await_identifier: hai
         set unported_pos: up
@@ -542,6 +569,48 @@ define Parser
     ; scanner whose whole body is an append to this list, so the list is what a
     ; closure would have captured, and the flag it also sets belongs with it.
     diagnostics: pointer[DiagnosticList]
+
+    ; ★★★ The reference's `p.jsDiagnostics` — a SECOND list, and the reason it is
+    ; second is the whole of why slice 24 needed a new dump section.
+    ; `checkJSSyntax` reports TypeScript-only syntax found in a JavaScript file
+    ; (`Type annotations can only be used in TypeScript files` and its eighteen
+    ; neighbours), and finishSourceFile hands those to `SetJSDiagnostics`, which
+    ; `sf.Diagnostics()` does NOT include. So they are not a subset of the list
+    ; above and cannot be merged into it: merging would put them in the D section,
+    ; where the reference has none, and every JavaScript unit would diverge.
+    ;
+    ; ★ It is written through `add_direct` exclusively — `jsErrorAtRange` does a
+    ; raw `append`, with neither the DEDUP nor `hasParseError`. Both omissions are
+    ; the reference's: two JS complaints at one position are two complaints (a
+    ; parameter with a `?` AND a type annotation is the shape), and a JS complaint
+    ; is not a parse error, so it must not stamp ThisNodeHasError on the node
+    ; finish_node closes next.
+    js_diagnostics: pointer[DiagnosticList]
+
+    ; ★★★ The RANGE of a node list, for the three lists a diagnostic can point at.
+    ;
+    ; The reference's NodeList carries its own TextRange and this port's lists are
+    ; plain arrays — ast.scaly's new_node_list says so, and says that nothing read
+    ; a list's extent. checkJSSyntax reads three: a type-PARAMETER list, a
+    ; type-ARGUMENT list and a parameter's MODIFIER list are each reported at the
+    ; LIST's range, not at any node's.
+    ;
+    ; ★ It cannot be derived from the elements, and that was measured rather than
+    ; assumed: over the 111 JavaScript units of the stage-1 corpus the range a
+    ; list carries differs from (first element pos, last element end) for 15 of 15
+    ; type-parameter lists and 2 of 105 modifier lists. A bracketed list's range
+    ; starts INSIDE the `<` and ends at the full start of the `>`, so it includes
+    ; the trivia before the bracket and any trailing comma, and a list the JSDoc
+    ; reparser synthesized has a range from the TAG.
+    ;
+    ; A side table rather than a range on every list, because the type
+    ; `pointer[Array[pointer[AstNode]]]` occurs 209 times across the two files and
+    ; changing it would rewrite both to make three spans exact. The key is the
+    ; list POINTER: `new_node_list` allocates fresh memory every time, so a key is
+    ; unique for the life of the parse and a REWIND needs no truncation — a
+    ; discarded list's entry is unreachable rather than wrong. Searched from the
+    ; most recent end, because the list being asked about was just built.
+    list_ranges: pointer[Array[ListRange]]
 
     ; ★★★ The reference's `missingListNodes` SENTINEL, and it is a sentinel here
     ; for the same reason it is one there: a list that is EMPTY and a list that is
@@ -598,6 +667,14 @@ define Parser
     ; live only for the duration of one parse_delimited_list(PCParameters) call
     ; and is saved and restored around it, exactly as a capture would be.
     parameter_outer_await_context: bool
+
+    ; parseParametersWorker's `flags&ParseFlagsType == 0`, travelling the same way
+    ; and for the same reason (§3.5k). The reference's parameter callback reads it
+    ; out of the closure to decide whether the parameter gets checkJSSyntax at all
+    ; — a parameter of a TYPE never does, because a type's parameters are
+    ; TypeScript syntax by construction and the file's JS-ness is not what decides
+    ; whether they may be there. True everywhere else.
+    parameter_check_js: bool
 
     ; parseParametersWorker's `allowAmbiguity`, travelling the same way and for
     ; the same reason: the element callback is a static arm of parse_list_element
@@ -752,8 +829,15 @@ define Parser
         let dl host.allocate(sizeof DiagnosticList, alignof DiagnosticList) as pointer[DiagnosticList]
         set *dl: DiagnosticList(host)
         set this.diagnostics: dl
+        let jdl host.allocate(sizeof DiagnosticList, alignof DiagnosticList) as pointer[DiagnosticList]
+        set *jdl: DiagnosticList(host)
+        set this.js_diagnostics: jdl
+        let lr host.allocate(sizeof Array[ListRange], alignof Array[ListRange]) as pointer[Array[ListRange]]
+        set *lr: Array[ListRange]()
+        set this.list_ranges: lr
         set this.parameter_outer_await_context: false
         set this.parameter_allow_ambiguity: true
+        set this.parameter_check_js: true
         set this.specifier_is_import: true
         set this.variable_declaration_allow_exclamation: true
         set this.not_parenthesized_arrow: null
@@ -1357,10 +1441,49 @@ define Parser
     function in_await_context(this) returns bool
         (context_flags & NodeFlagsAwaitContext) <> 0
 
+    ; ── the list-range side table (slice 24) ────────────────────────────────
+    ;
+    ; `p.newNodeList(core.NewTextRange(pos, p.nodePos()), nodes)` on the reference
+    ; side; here the list is built first and its range recorded beside it. Every
+    ; caller that has a range to record calls this at the point the reference
+    ; passes the TextRange, so the two are the same expression in two shapes.
+
+    procedure record_list_range(this, list: pointer[Array[pointer[AstNode]]], pos: int, end: int)
+    {
+        if list = null
+            return
+        list_ranges.add(ListRange(list, pos, end))
+    }
+
+    ; Answers false when the list has no recorded range, which is not an error:
+    ; the JSDoc reparser synthesizes lists without going through the routines
+    ; above, and every reader of a range first asks whether ANY element of the
+    ; list is un-reparsed — which a wholly synthesized list has none of. Reading
+    ; a range that was never recorded would therefore be a defect elsewhere, so
+    ; the caller reports nothing rather than guessing a span.
+    function list_range(this, list: pointer[Array[pointer[AstNode]]], out_pos: pointer[int], out_end: pointer[int]) returns bool
+    {
+        if list = null
+            return false
+        var i list_ranges.get_length() as int
+        while i > 0
+        {
+            set i: i - 1
+            let r *(list_ranges.get_buffer() + i)
+            if r.list = list
+            {
+                set *out_pos: r.pos
+                set *out_end: r.end
+                return true
+            }
+        }
+        false
+    }
+
     ; ── speculation ─────────────────────────────────────────────────────────
 
     function mark(this) returns ParserState
-        ParserState(scanner.mark(), context_flags, diagnostics.length(), diagnostics.has_error, jsdoc_infos_len, statement_has_await_identifier, unported_pos, unported_tag, unported_detail)
+        ParserState(scanner.mark(), context_flags, diagnostics.length(), diagnostics.has_error, js_diagnostics.length(), jsdoc_infos_len, statement_has_await_identifier, unported_pos, unported_tag, unported_detail)
 
     ; ★ The unported record is restored HERE, with everything else — the
     ; reference truncates p.diagnostics at exactly this point. See the ParserState
@@ -1373,6 +1496,7 @@ define Parser
         set context_flags: saved.context_flags
         diagnostics.truncate(saved.diagnostics_len)
         set diagnostics.has_error: saved.diagnostics_has_error
+        js_diagnostics.truncate(saved.js_diagnostics_len)
         set jsdoc_infos_len: saved.jsdoc_infos_len
         set statement_has_await_identifier: saved.statement_has_await_identifier
         set unported_pos: saved.unported_pos
@@ -1474,7 +1598,7 @@ define Parser
         ; reparse and stamp it on a node the reference does not. The reference
         ; builds it too, and for its own additional reason: finishSourceFile
         ; computes the external-module indicator the decision below reads.
-        let file this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(statements, eof, diagnostics))), pos)
+        let file this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(statements, eof, diagnostics, this.js_diagnostics_for_file()))), pos)
         if file = null
             return null
 
@@ -1518,7 +1642,7 @@ define Parser
                     ; (ast.scaly's new_node_list says so). The `end` is right
                     ; regardless: the last rewind put the scanner back at the end
                     ; of the file, so node_pos() answers what it answered above.
-                    let reparsed_file this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(reparsed, eof, diagnostics))), pos)
+                    let reparsed_file this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(reparsed, eof, diagnostics, this.js_diagnostics_for_file()))), pos)
                     if reparsed_file = null
                         return null
                     ; finishSourceFile runs a SECOND time on the reparse result,
@@ -1676,7 +1800,7 @@ define Parser
             set eof: this.parse_expected_token(KindEndOfFile)
         }
 
-        let file this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(statements, eof, diagnostics))), pos)
+        let file this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(statements, eof, diagnostics, this.js_diagnostics_for_file()))), pos)
         if file = null
             return null
 
@@ -2631,6 +2755,10 @@ define Parser
     ; class C {}` parses here exactly as it does upstream.
     procedure parse_modifiers(this, allow_decorators: bool, permit_const_as_modifier: bool, stop_on_start_of_class_static_block: bool) returns pointer[Array[pointer[AstNode]]]
     {
+        ; parseModifiersEx's `pos := p.nodePos()`, which becomes the modifier
+        ; list's range start. checkJSSyntax reports a parameter's modifiers at the
+        ; LIST's range, so this one is read (see record_list_range).
+        let pos this.node_pos()
         let list AstNode.new_node_list(host)
         var has_leading_modifier false
         var has_trailing_decorator false
@@ -2674,6 +2802,7 @@ define Parser
 
         if list.get_length() as int = 0
             return null
+        this.record_list_range(list, pos, this.node_pos())
         list
     }
 
@@ -3844,6 +3973,7 @@ define Parser
         this.parse_semicolon()
         let result this.finish_node(this.new_node(KindVariableStatement, NodeData.VariableStatement(VariableStatementData(modifiers, list))), pos)
         this.with_jsdoc(result, jsdoc)
+        this.check_js_syntax(result)
     }
 
     ; ★★★ `in_for_statement_initializer` is what slice 9 had to add, and BOTH of
@@ -3980,6 +4110,7 @@ define Parser
 
         let result this.finish_node(this.new_node(KindVariableDeclaration, NodeData.VariableDeclaration(VariableDeclarationData(name, exclamation_token, type_node, initializer))), pos)
         this.with_jsdoc(result, jsdoc)
+        this.check_js_syntax(result)
     }
 
     ; ── binding patterns (parser slice 10) ──────────────────────────────────
@@ -4770,6 +4901,10 @@ define Parser
                 set left_operand: this.finish_node(n, AstNode.pos_of(left_operand))
                 if left_operand = null
                     return null
+                ; makeAsExpression / makeSatisfiesExpression both wrap their
+                ; finishNode in checkJSSyntax; the two are inlined here (see the
+                ; kind selection above), so one call covers both.
+                this.check_js_syntax(left_operand)
 
                 if get_binary_operator_precedence(this.re_scan_greater_than_token()) > last_precedence
                     break
@@ -6026,7 +6161,7 @@ define Parser
                     if this.has_preceding_line_break() = false
                     {
                         this.next_token()
-                        set expression: this.finish_node(this.new_node(KindNonNullExpression, NodeData.NonNullExpression(WrappedTypeData(expression))), pos)
+                        set expression: this.check_js_syntax(this.finish_node(this.new_node(KindNonNullExpression, NodeData.NonNullExpression(WrappedTypeData(expression))), pos))
                         if expression = null
                             return null
                         continue
@@ -6242,7 +6377,7 @@ define Parser
                 let n this.new_node(KindCallExpression, NodeData.CallExpression(CallExpressionData(expression, question_dot_token, type_arguments, argument_list)))
                 if is_optional_chain
                     set n.flags: n.flags | NodeFlagsOptionalChain
-                set expression: this.finish_node(n, pos)
+                set expression: this.check_js_syntax(this.finish_node(n, pos))
                 if expression = null
                     return null
                 continue
@@ -6755,6 +6890,7 @@ define Parser
 
         let result this.finish_node(this.new_node(KindFunctionExpression, NodeData.FunctionExpression(FunctionExpressionData(modifiers, asterisk_token, name, type_parameters, parameters, return_type, null, body))), pos)
         this.with_jsdoc(result, jsdoc)
+        this.check_js_syntax(result)
     }
 
     ; ── new ─────────────────────────────────────────────────────────────────
@@ -6809,7 +6945,7 @@ define Parser
                 return null
         }
 
-        this.finish_node(this.new_node(KindNewExpression, NodeData.NewExpression(NewExpressionData(expression, type_arguments, argument_list))), pos)
+        this.check_js_syntax(this.finish_node(this.new_node(KindNewExpression, NodeData.NewExpression(NewExpressionData(expression, type_arguments, argument_list))), pos))
     }
 
     ; ── arrow functions ─────────────────────────────────────────────────────
@@ -7202,6 +7338,7 @@ define Parser
 
         let result this.finish_node(this.new_node(KindArrowFunction, NodeData.ArrowFunction(ArrowFunctionData(modifiers, type_parameters, parameters, return_type, null, equals_greater_than_token, body))), pos)
         this.with_jsdoc(result, jsdoc)
+        this.check_js_syntax(result)
     }
 
     procedure parse_modifiers_for_arrow_function(this) returns pointer[Array[pointer[AstNode]]]
@@ -7215,6 +7352,9 @@ define Parser
             return null
         let list AstNode.new_node_list(host)
         list.add(m)
+        ; `p.newModifierList(modifier.Loc, ...)` — this list's range IS the one
+        ; modifier's, not a span computed from the token stream.
+        this.record_list_range(list, m.pos, m.end)
         list
     }
 
@@ -7819,7 +7959,7 @@ define Parser
         let n this.new_node(KindTaggedTemplateExpression, NodeData.TaggedTemplateExpression(TaggedTemplateData(tag, question_dot_token, type_arguments, template)))
         if is_optional_chain
             set n.flags: n.flags | NodeFlagsOptionalChain
-        this.finish_node(n, pos)
+        this.check_js_syntax(this.finish_node(n, pos))
     }
 
     ; ════════════════════════════════════════════════════════════════════════
@@ -9069,6 +9209,7 @@ define Parser
 
         let result this.finish_node(this.new_node(KindTypeAliasDeclaration, NodeData.TypeAliasDeclaration(TypeAliasDeclarationData(modifiers, name, type_parameters, type_node))), pos)
         this.with_jsdoc(result, jsdoc)
+        this.check_js_syntax(result)
     }
 
     ; ════════════════════════════════════════════════════════════════════════
@@ -9135,8 +9276,10 @@ define Parser
         ; same reason.
         let saved_outer parameter_outer_await_context
         let saved_ambiguity parameter_allow_ambiguity
+        let saved_check_js parameter_check_js
         set parameter_outer_await_context: this.in_await_context()
         set parameter_allow_ambiguity: allow_ambiguity
+        set parameter_check_js: (flags & ParseFlagsType) = 0
 
         let saved context_flags
         this.set_context_flags(NodeFlagsYieldContext, (flags & ParseFlagsYield) <> 0)
@@ -9145,6 +9288,7 @@ define Parser
         set context_flags: saved
         set parameter_outer_await_context: saved_outer
         set parameter_allow_ambiguity: saved_ambiguity
+        set parameter_check_js: saved_check_js
         parameters
     }
 
@@ -9425,6 +9569,7 @@ define Parser
 
         let result this.finish_node(this.new_node(KindFunctionDeclaration, NodeData.FunctionDeclaration(FunctionDeclarationData(modifiers, asterisk_token, name, type_parameters, parameters, return_type, null, body))), pos)
         this.with_jsdoc(result, jsdoc)
+        this.check_js_syntax(result)
     }
 
     ; Answers the body, or null for a body-less overload signature. See above.
@@ -9520,6 +9665,8 @@ define Parser
             return null
         let list AstNode.new_node_list(host)
         list.add(m)
+        ; `p.newModifierList(modifier.Loc, ...)`, as above.
+        this.record_list_range(list, m.pos, m.end)
         list
     }
 
@@ -9631,6 +9778,44 @@ define Parser
             set result: this.new_node(KindClassExpression, NodeData.ClassExpression(ClassLikeData(modifiers, name, type_parameters, heritage_clauses, members)))
 
         this.with_jsdoc(this.finish_node(result, pos), jsdoc)
+
+        ; ★★★ The one call site with a GUARD of its own, and with a second call
+        ; behind it. The reference asks `result.Flags&JavaScriptFile != 0` before
+        ; entering — which checkJSSyntax asks again, so the guard buys nothing on
+        ; its own — because it also walks the `extends` clauses and checks each
+        ; TYPE. Those are ExpressionWithTypeArguments nodes, and nothing else
+        ; reaches them: parse_heritage_clause checks the CLAUSE, whose own arm is
+        ; about `implements`, and the type-ARGUMENT arm is what this loop is for.
+        ; `class C extends Base<T> {}` in a JavaScript file is the shape.
+        if (AstNode.flags_of(result) & NodeFlagsJavaScriptFile) <> 0
+        {
+            this.check_js_syntax(result)
+            if heritage_clauses <> null
+            {
+                var ci 0
+                let cn heritage_clauses.get_length() as int
+                while ci < cn
+                {
+                    let clause *(heritage_clauses.get_buffer() + ci)
+                    if AstNode.heritage_clause_token_of(clause) = KindExtendsKeyword
+                    {
+                        let types AstNode.heritage_clause_types_of(clause)
+                        if types <> null
+                        {
+                            var ti 0
+                            let tn types.get_length() as int
+                            while ti < tn
+                            {
+                                this.check_js_syntax(*(types.get_buffer() + ti))
+                                set ti: ti + 1
+                            }
+                        }
+                    }
+                    set ci: ci + 1
+                }
+            }
+        }
+        result
     }
 
     ; ★ `implements` is a FUTURE RESERVED WORD, not a keyword, so `class
@@ -9687,7 +9872,7 @@ define Parser
         let types this.parse_delimited_list(PCHeritageClauseElement)
         if types = null
             return null
-        this.finish_node(this.new_node(KindHeritageClause, NodeData.HeritageClause(HeritageClauseData(clause_token, types))), pos)
+        this.check_js_syntax(this.finish_node(this.new_node(KindHeritageClause, NodeData.HeritageClause(HeritageClauseData(clause_token, types))), pos))
     }
 
     procedure parse_expression_with_type_arguments(this) returns pointer[AstNode]
@@ -9812,7 +9997,7 @@ define Parser
         ; look-ahead separates them. The reference notes the ordering at this
         ; exact line; it is not incidental.
         if this.is_index_signature()
-            return this.parse_index_signature_declaration(pos, jsdoc, modifiers)
+            return this.check_js_syntax(this.parse_index_signature_declaration(pos, jsdoc, modifiers))
         if this.is_unported()
             return null
 
@@ -10061,6 +10246,7 @@ define Parser
 
         let result this.finish_node(this.new_node(KindConstructor, NodeData.ConstructorDeclaration(ConstructorDeclarationData(modifiers, type_parameters, parameters, return_type, null, body))), pos)
         this.with_jsdoc(result, jsdoc)
+        this.check_js_syntax(result)
     }
 
     procedure parse_property_or_method_declaration(this, pos: int, jsdoc: int, modifiers: pointer[Array[pointer[AstNode]]]) returns pointer[AstNode]
@@ -10125,6 +10311,7 @@ define Parser
 
         let result this.finish_node(this.new_node(KindMethodDeclaration, NodeData.MethodDeclaration(MethodDeclarationData(modifiers, asterisk_token, name, postfix_token, type_parameters, parameters, type_node, null, body))), pos)
         this.with_jsdoc(result, jsdoc)
+        this.check_js_syntax(result)
     }
 
     procedure parse_property_declaration(this, pos: int, jsdoc: int, modifiers: pointer[Array[pointer[AstNode]]], name: pointer[AstNode], question_token: pointer[AstNode]) returns pointer[AstNode]
@@ -10166,6 +10353,7 @@ define Parser
 
         let result this.finish_node(this.new_node(KindPropertyDeclaration, NodeData.PropertyDeclaration(PropertyDeclarationData(modifiers, name, postfix_token, type_node, initializer))), pos)
         this.with_jsdoc(result, jsdoc)
+        this.check_js_syntax(result)
     }
 
     ; parseSemicolonAfterPropertyName — FIVE diagnostics for one missing
@@ -10681,6 +10869,15 @@ define Parser
             set result: this.new_node(KindSetAccessor, NodeData.SetAccessorDeclaration(AccessorDeclarationData(modifiers, name, type_parameters, parameters, return_type, null, body)))
 
         this.with_jsdoc(this.finish_node(result, pos), jsdoc)
+
+        ; ★ Guarded by `flags&ParseFlagsType == 0`, i.e. an accessor in a class
+        ; body is checked and one in a TYPE is not — the same guard the parameter
+        ; list carries, and for the same reason: a type's accessors and parameters
+        ; are TypeScript syntax by construction, and the file's own JS-ness is not
+        ; what decides whether they may be there.
+        if (flags & ParseFlagsType) = 0
+            this.check_js_syntax(result)
+        result
     }
 
     ; ── the index signature ─────────────────────────────────────────────────
@@ -10749,13 +10946,27 @@ define Parser
         ; parseParameter, not parseParameterEx: an index signature's parameter is
         ; read with NO outer await context and ambiguity allowed. Both travel as
         ; parser state here (§3.5g/§3.5k), so both are set and put back.
+        ;
+        ; ★★★ And a THIRD thing travels the same way since slice 24, for a reason
+        ; the other two do not have: the reference passes `parseParameter` as the
+        ; element function HERE and a CLOSURE at parseParametersWorker, and only
+        ; the closure calls checkJSSyntax. So the difference between the two
+        ; element functions is not just their arguments — one of them checks and
+        ; one does not — and this port has ONE `parse_list_element(PCParameters)`
+        ; arm serving both. Measured, not reasoned about after the fact: with the
+        ; flag left true, `[k: string]: number` inside a `.js` file reported its
+        ; `string` as a type annotation and the reference reported nothing
+        ; (fixture parser_jsdoc_reparse_signature_host).
         let saved_outer parameter_outer_await_context
         let saved_ambiguity parameter_allow_ambiguity
+        let saved_check_js parameter_check_js
         set parameter_outer_await_context: false
         set parameter_allow_ambiguity: true
+        set parameter_check_js: false
         let parameters this.parse_bracketed_list(PCParameters, KindOpenBracketToken, KindCloseBracketToken)
         set parameter_outer_await_context: saved_outer
         set parameter_allow_ambiguity: saved_ambiguity
+        set parameter_check_js: saved_check_js
         if parameters = null
             return null
 
@@ -11195,6 +11406,7 @@ define Parser
         ; initializer that could use `await` as a name.
         let result this.finish_node(this.new_node(KindInterfaceDeclaration, NodeData.InterfaceDeclaration(ClassLikeData(modifiers, name, type_parameters, heritage_clauses, members))), pos)
         this.with_jsdoc(result, jsdoc)
+        this.check_js_syntax(result)
     }
 
     ; ── the enum declaration ────────────────────────────────────────────────
@@ -11228,6 +11440,7 @@ define Parser
             set members: this.create_missing_list()
 
         let result this.with_jsdoc(this.finish_node(this.new_node(KindEnumDeclaration, NodeData.EnumDeclaration(EnumDeclarationData(modifiers, name, members))), pos), jsdoc)
+        this.check_js_syntax(result)
         ; An `await` used as a name inside an enum body says nothing about the
         ; enclosing top-level statement — one more of the sites §3.5l names.
         set statement_has_await_identifier: saved_await_identifier
@@ -11368,6 +11581,7 @@ define Parser
             return null
 
         let result this.with_jsdoc(this.finish_node(this.new_node(KindModuleDeclaration, NodeData.ModuleDeclaration(ModuleDeclarationData(modifiers, keyword, name, body))), pos), jsdoc)
+        this.check_js_syntax(result)
         set statement_has_await_identifier: saved_await_identifier
         result
     }
@@ -11501,7 +11715,7 @@ define Parser
         if take_import_equals
         {
             let is_type_only phase_modifier = KindTypeKeyword
-            let import_equals this.parse_import_equals_declaration(pos, jsdoc, modifiers, identifier, is_type_only)
+            let import_equals this.check_js_syntax(this.parse_import_equals_declaration(pos, jsdoc, modifiers, identifier, is_type_only))
             set statement_has_await_identifier: saved_await_identifier
             return import_equals
         }
@@ -11524,6 +11738,7 @@ define Parser
 
         let result this.finish_node(this.new_node(KindImportDeclaration, NodeData.ImportDeclaration(ImportDeclarationData(modifiers, import_clause, module_specifier, attributes))), pos)
         this.with_jsdoc(result, jsdoc)
+        this.check_js_syntax(result)
     }
 
     ; The `type` test's two remaining halves, minus the text comparison the
@@ -11777,7 +11992,7 @@ define Parser
                 return null
         }
 
-        this.finish_node(this.new_node(KindImportSpecifier, NodeData.ImportSpecifier(ImportOrExportSpecifierData(is_type_only, property_name, identifier_name))), pos)
+        this.check_js_syntax(this.finish_node(this.new_node(KindImportSpecifier, NodeData.ImportSpecifier(ImportOrExportSpecifierData(is_type_only, property_name, identifier_name))), pos))
     }
 
     ; ★★★ parseImportOrExportSpecifier, and the four readings of `type` are the
@@ -12054,6 +12269,7 @@ define Parser
         set statement_has_await_identifier: saved_await_identifier
         let result this.finish_node(this.new_node(KindExportAssignment, NodeData.ExportAssignment(ExportAssignmentData(modifiers, is_export_equals, null, expression))), pos)
         this.with_jsdoc(result, jsdoc)
+        this.check_js_syntax(result)
     }
 
     ; `export as namespace N;` — a UMD global declaration. The reference
@@ -12159,6 +12375,7 @@ define Parser
         set statement_has_await_identifier: saved_await_identifier
         let result this.finish_node(this.new_node(KindExportDeclaration, NodeData.ExportDeclaration(ExportDeclarationData(modifiers, is_type_only, export_clause, module_specifier, attributes))), pos)
         this.with_jsdoc(result, jsdoc)
+        this.check_js_syntax(result)
     }
 
     ; ★ The reference discards this call's `nameOk` (`exportName, _ :=`), and
@@ -12199,6 +12416,7 @@ define Parser
             return null
         let result this.finish_node(this.new_node(KindExportSpecifier, NodeData.ExportSpecifier(ImportOrExportSpecifierData(is_type_only, property_name, name))), pos)
         this.with_jsdoc(result, jsdoc)
+        this.check_js_syntax(result)
     }
 
     ; ── the two look-aheads this slice adds ─────────────────────────────────
@@ -12380,6 +12598,11 @@ define Parser
 
     procedure parse_delimited_list(this, ctx: int) returns pointer[Array[pointer[AstNode]]]
     {
+        ; The reference's `pos := p.nodePos()`, taken before a single element is
+        ; read. It is the list's RANGE start — see record_list_range — and for a
+        ; bracketed list it is the full start of the token AFTER the opening
+        ; bracket, since parse_bracketed_list has already consumed that.
+        let pos this.node_pos()
         let saved_contexts parsing_contexts
         set parsing_contexts: parsing_contexts | (1 << ctx)
         let list AstNode.new_node_list(host)
@@ -12466,6 +12689,12 @@ define Parser
         set parsing_contexts: saved_contexts
         if failed
             return null
+        ; `p.newNodeList(core.NewTextRange(pos, p.nodePos()), ...)`. The END is
+        ; taken HERE, before parse_bracketed_list consumes the closing token, so
+        ; it is that token's full start — the trivia before the bracket and any
+        ; trailing comma included. That is what makes the range undeliverable
+        ; from the elements.
+        this.record_list_range(list, pos, this.node_pos())
         list
     }
 
@@ -12672,7 +12901,22 @@ define Parser
         if ctx = PCTupleElementTypes
             return this.parse_tuple_element_name_or_tuple_element_type()
         if ctx = PCParameters
-            return this.parse_parameter_ex(parameter_outer_await_context, parameter_allow_ambiguity)
+        {
+            ; The reference's parameter callback, whole:
+            ;
+            ;     parameter := p.parseParameterEx(inAwaitContext, allowAmbiguity)
+            ;     if parameter != nil && flags&ParseFlagsType == 0 {
+            ;         p.checkJSSyntax(parameter)
+            ;     }
+            ;     return parameter
+            let parameter this.parse_parameter_ex(parameter_outer_await_context, parameter_allow_ambiguity)
+            if parameter <> null
+            {
+                if parameter_check_js
+                    this.check_js_syntax(parameter)
+            }
+            return parameter
+        }
         if ctx = PCArgumentExpressions
             return this.parse_argument_expression()
         ; ★ An ARRAY literal's element is NOT wrapped in the argument context:
@@ -13451,6 +13695,496 @@ define Parser
         let r this.next_token() <> KindDotToken
         this.rewind(saved)
         r
+    }
+
+    ; ════════════════════════════════════════════════════════════════════════
+    ; TYPESCRIPT-ONLY SYNTAX IN A JAVASCRIPT FILE — slice 24
+    ; ════════════════════════════════════════════════════════════════════════
+    ;
+    ; ★★★ THE REFERENCE ROUTES THESE DIAGNOSTICS TO A SECOND LIST, and that is
+    ; the whole reason this slice needed a new section in the ast dump before it
+    ; could be written at all. `checkJSSyntax` reports `Type annotations can only
+    ; be used in TypeScript files` and its eighteen neighbours into
+    ; `p.jsDiagnostics`, which finishSourceFile hands to `SetJSDiagnostics` — and
+    ; `sf.Diagnostics()` does not include it. So with the old two-section dump a
+    ; port producing NONE of them and a port producing WRONG ones compared exactly
+    ; equal, in both directions: the hidden-distinction failure mode this suite is
+    ; organized against, which is why the note that stood in run.sh and in §3.5
+    ; named the section as the prerequisite rather than the calls.
+    ;
+    ; ★★ Every call site is a bare statement even where the reference writes
+    ; `return p.checkJSSyntax(p.finishNode(...))`: the function answers its own
+    ; argument, so the value is the node either way, and a bare call is one
+    ; statement instead of a wrapped expression at thirty sites. The RESULT arm is
+    ; kept for the two sites that genuinely read it back.
+    ;
+    ; ★ The MESSAGE ARGUMENTS are not carried, as everywhere else in this port:
+    ; the four `{0} declarations can only be used in TypeScript files` sites differ
+    ; only in the word they print (`interface`, `enum`, `import type`, …) and share
+    ; one code. `scanner.TokenToString` therefore stays unported — the one thing
+    ; the reference needs it for here is that word.
+
+    ; jsErrorAtRange. A RAW append: neither the dedup nor `hasParseError`. Both
+    ; omissions are the reference's own and both matter — a parameter with a `?`
+    ; AND a type annotation reports twice at overlapping positions, and a JS
+    ; complaint is not a parse error, so it must not stamp ThisNodeHasError on
+    ; whatever node finish_node closes next. The POS is trivia-skipped and the END
+    ; is not, exactly as report_json_error does it.
+    ; finishSourceFile's last statement, which is a GUARD:
+    ;
+    ;     if ast.IsInJSFile(node) {
+    ;         result.SetJSDiagnostics(attachFileToDiagnostics(p.jsDiagnostics, result))
+    ;     }
+    ;
+    ; ★ The guard is unobservable and is ported anyway. checkJSSyntax's own first
+    ; test is the same one — a node without NodeFlagsJavaScriptFile returns
+    ; immediately — so for any other file the list is empty and handing it over
+    ; would print nothing either way. What the guard buys is that the DISTINCTION
+    ; between "not a JavaScript file" and "a JavaScript file with nothing to
+    ; report" survives into the tree, which is the shape that stays right if a
+    ; later slice ever appends from outside checkJSSyntax.
+    ;
+    ; The question is asked of the CONTEXT flags rather than of the finished node,
+    ; because the node is being constructed in the expression this feeds. They are
+    ; the same bit: JavaScriptFile is a context flag set once in initializeState
+    ; from the script kind, and finish_node stamps it onto every node of the file.
+    function js_diagnostics_for_file(this) returns pointer[DiagnosticList]
+    {
+        if (context_flags & NodeFlagsJavaScriptFile) = 0
+            return null
+        js_diagnostics
+    }
+
+    procedure js_error_at_range(this, pos: int, end: int, code: int)
+        js_diagnostics.add_direct(this.skip_range_trivia_pos(pos), end, code)
+
+    ; core.Some(list.Nodes, func(n) { n.Flags&Reparsed == 0 }) — asked of a
+    ; type-parameter and a type-argument list. It is what keeps a `@template T`
+    ; comment in a JavaScript file from being reported as TypeScript syntax: the
+    ; JSDoc reparser synthesized that list, so every element carries Reparsed and
+    ; the list is not the author's.
+    function list_has_unreparsed(this, list: pointer[Array[pointer[AstNode]]]) returns bool
+    {
+        if list = null
+            return false
+        var i 0
+        let n list.get_length() as int
+        while i < n
+        {
+            let e *(list.get_buffer() + i)
+            if e <> null
+            {
+                if (AstNode.flags_of(e) & NodeFlagsReparsed) = 0
+                    return true
+            }
+            set i: i + 1
+        }
+        false
+    }
+
+    ; core.Some(node.ModifierNodes(), ast.IsModifier) — a parameter carrying a
+    ; real modifier (`constructor(private x)`), as against one carrying only
+    ; decorators, which are legal in a JavaScript file and are checked separately.
+    function list_has_modifier(this, list: pointer[Array[pointer[AstNode]]]) returns bool
+    {
+        if list = null
+            return false
+        var i 0
+        let n list.get_length() as int
+        while i < n
+        {
+            let e *(list.get_buffer() + i)
+            if e <> null
+            {
+                if is_modifier_kind(AstNode.kind_of(e))
+                    return true
+            }
+            set i: i + 1
+        }
+        false
+    }
+
+    ; core.FindIndex over a modifier list, for the three questions
+    ; checkJSDecoratorSyntax asks by INDEX rather than by presence: where the
+    ; first decorator is, where `export` is, where `default` is. The order of the
+    ; three is the diagnostic, so an index is not an implementation detail here.
+    function first_index_of_kind(this, list: pointer[Array[pointer[AstNode]]], kind: int) returns int
+    {
+        if list = null
+            return 0 - 1
+        var i 0
+        let n list.get_length() as int
+        while i < n
+        {
+            let e *(list.get_buffer() + i)
+            if e <> null
+            {
+                if AstNode.kind_of(e) = kind
+                    return i
+            }
+            set i: i + 1
+        }
+        0 - 1
+    }
+
+    ; checkJSDecoratorSyntax. Two questions, and the FIRST one decides which:
+    ; a node that may not carry a decorator at all reports one wherever it sits,
+    ; while a node that may carry one reports only a decorator in the wrong PLACE
+    ; — before `export` with another after it, or between `export` and `default`.
+    ;
+    ; ★ The `export`-ordering arm builds its diagnostic with RELATED INFO
+    ; (`Decorator used before export here`), which the reference attaches to the
+    ; diagnostic rather than appending to the list — so it never reaches the dump,
+    ; exactly as parseExpectedMatchingBrackets' related info never reaches the D
+    ; section. The port therefore appends the one diagnostic and the related
+    ; information is the one thing about this function that is deliberately not
+    ; carried; it is a MESSAGE, and no message is carried here.
+    procedure check_js_decorator_syntax(this, n: pointer[AstNode])
+    {
+        let modifiers AstNode.modifiers_of(n)
+        if modifiers = null
+            return
+        if (modifiers.get_length() as int) = 0
+            return
+
+        if AstNode.can_have_illegal_decorators(n)
+        {
+            var i 0
+            let count modifiers.get_length() as int
+            while i < count
+            {
+                let m *(modifiers.get_buffer() + i)
+                if AstNode.is_decorator(m)
+                {
+                    this.js_error_at_range(m.pos, m.end, DiagDecorators_are_not_valid_here)
+                    return
+                }
+                set i: i + 1
+            }
+            return
+        }
+
+        if AstNode.can_have_decorators(n) = false
+            return
+        let decorator_index this.first_index_of_kind(modifiers, KindDecorator)
+        if decorator_index < 0
+            return
+        if AstNode.kind_of(n) <> KindClassDeclaration
+            return
+        let export_index this.first_index_of_kind(modifiers, KindExportKeyword)
+        if export_index < 0
+            return
+        let default_index this.first_index_of_kind(modifiers, KindDefaultKeyword)
+
+        if decorator_index > export_index
+        {
+            ; A decorator between `export` and `default`.
+            if default_index >= 0
+            {
+                if decorator_index < default_index
+                {
+                    let d *(modifiers.get_buffer() + decorator_index)
+                    this.js_error_at_range(d.pos, d.end, DiagDecorators_are_not_valid_here)
+                }
+            }
+            return
+        }
+
+        ; A decorator BEFORE `export`, and another one after it — the reference
+        ; searches forward from the export keyword for the trailing decorator and
+        ; reports at THAT one, with the leading one as related information.
+        var trailing 0 - 1
+        var j export_index
+        let count2 modifiers.get_length() as int
+        while j < count2
+        {
+            if trailing < 0
+            {
+                let m *(modifiers.get_buffer() + j)
+                if AstNode.is_decorator(m)
+                    set trailing: j
+            }
+            set j: j + 1
+        }
+        if trailing >= 0
+        {
+            let t *(modifiers.get_buffer() + trailing)
+            this.js_error_at_range(t.pos, t.end, DiagDecorators_may_not_appear_after_export_or_export_default_if_they_also_appear_before_export)
+        }
+    }
+
+    ; checkJSSyntax itself. Two switches with a `fallthrough` each, which become
+    ; flat kind tests here — the fallthrough is why {Parameter,
+    ; PropertyDeclaration, MethodDeclaration} run the question-token test AND the
+    ; signature/annotation test, and why the nine function-and-class kinds run the
+    ; type-parameter test AND the modifier loop.
+    procedure check_js_syntax(this, n: pointer[AstNode]) returns pointer[AstNode]
+    {
+        if n = null
+            return n
+        ; The guard, and it is three conditions: the node must belong to a
+        ; JavaScript file, must not be part of a JSDoc comment's own tree, and must
+        ; not have been synthesized by the reparser. The last two are why a
+        ; `@type {number}` annotation is not reported as a type annotation.
+        if (AstNode.flags_of(n) & NodeFlagsJavaScriptFile) = 0
+            return n
+        if (AstNode.flags_of(n) & (NodeFlagsJSDoc | NodeFlagsReparsed)) <> 0
+            return n
+
+        let k AstNode.kind_of(n)
+
+        ; ── the first switch ────────────────────────────────────────────────
+        var question_host false
+        if k = KindParameter
+            set question_host: true
+        if k = KindPropertyDeclaration
+            set question_host: true
+        if k = KindMethodDeclaration
+            set question_host: true
+        if question_host
+        {
+            let q AstNode.question_token_of(n)
+            if q <> null
+            {
+                if (AstNode.flags_of(q) & NodeFlagsReparsed) = 0
+                {
+                    if AstNode.is_question_token(q)
+                        this.js_error_at_range(q.pos, q.end, DiagThe_0_modifier_can_only_be_used_in_TypeScript_files)
+                }
+            }
+        }
+
+        ; ... and the arm it falls through into. `Signature declarations` is the
+        ; body-less form (`function f();`) and takes precedence over the return
+        ; type; anything else complains about the ANNOTATION, at the annotation's
+        ; own range.
+        var signature_host question_host
+        if k = KindMethodSignature
+            set signature_host: true
+        if k = KindConstructor
+            set signature_host: true
+        if k = KindGetAccessor
+            set signature_host: true
+        if k = KindSetAccessor
+            set signature_host: true
+        if k = KindFunctionExpression
+            set signature_host: true
+        if k = KindFunctionDeclaration
+            set signature_host: true
+        if k = KindArrowFunction
+            set signature_host: true
+        if k = KindVariableDeclaration
+            set signature_host: true
+        if k = KindIndexSignature
+            set signature_host: true
+        if signature_host
+        {
+            var reported false
+            if AstNode.is_function_like(n)
+            {
+                if AstNode.body_of(n) = null
+                {
+                    this.js_error_at_range(n.pos, n.end, DiagSignature_declarations_can_only_be_used_in_TypeScript_files)
+                    set reported: true
+                }
+            }
+            if reported = false
+            {
+                let t AstNode.type_of(n)
+                if t <> null
+                {
+                    if (AstNode.flags_of(t) & NodeFlagsReparsed) = 0
+                        this.js_error_at_range(t.pos, t.end, DiagType_annotations_can_only_be_used_in_TypeScript_files)
+                }
+            }
+        }
+
+        if k = KindImportDeclaration
+        {
+            let clause AstNode.import_clause_of(n)
+            if clause <> null
+            {
+                if AstNode.is_type_only_of(clause)
+                    this.js_error_at_range(n.pos, n.end, DiagX_0_declarations_can_only_be_used_in_TypeScript_files)
+            }
+        }
+
+        if k = KindExportDeclaration
+        {
+            if AstNode.is_type_only_of(n)
+                this.js_error_at_range(n.pos, n.end, DiagX_0_declarations_can_only_be_used_in_TypeScript_files)
+        }
+
+        if k = KindImportSpecifier
+        {
+            if AstNode.is_type_only_of(n)
+                this.js_error_at_range(n.pos, n.end, DiagX_0_declarations_can_only_be_used_in_TypeScript_files)
+        }
+
+        if k = KindExportSpecifier
+        {
+            if AstNode.is_type_only_of(n)
+                this.js_error_at_range(n.pos, n.end, DiagX_0_declarations_can_only_be_used_in_TypeScript_files)
+        }
+
+        if k = KindImportEqualsDeclaration
+            this.js_error_at_range(n.pos, n.end, DiagX_import_can_only_be_used_in_TypeScript_files)
+
+        if k = KindExportAssignment
+        {
+            if AstNode.is_export_equals_of(n)
+                this.js_error_at_range(n.pos, n.end, DiagX_export_can_only_be_used_in_TypeScript_files)
+        }
+
+        if k = KindHeritageClause
+        {
+            if AstNode.heritage_clause_token_of(n) = KindImplementsKeyword
+                this.js_error_at_range(n.pos, n.end, DiagX_implements_clauses_can_only_be_used_in_TypeScript_files)
+        }
+
+        ; The four declaration kinds that are reported at their NAME rather than
+        ; at the whole node.
+        var name_reported 0
+        if k = KindInterfaceDeclaration
+            set name_reported: DiagX_0_declarations_can_only_be_used_in_TypeScript_files
+        if k = KindModuleDeclaration
+            set name_reported: DiagX_0_declarations_can_only_be_used_in_TypeScript_files
+        if k = KindTypeAliasDeclaration
+            set name_reported: DiagType_aliases_can_only_be_used_in_TypeScript_files
+        if k = KindEnumDeclaration
+            set name_reported: DiagX_0_declarations_can_only_be_used_in_TypeScript_files
+        if name_reported <> 0
+        {
+            let name AstNode.name_of(n)
+            if name <> null
+                this.js_error_at_range(name.pos, name.end, name_reported)
+        }
+
+        if k = KindNonNullExpression
+            this.js_error_at_range(n.pos, n.end, DiagNon_null_assertions_can_only_be_used_in_TypeScript_files)
+
+        if k = KindAsExpression
+        {
+            let t AstNode.type_of(n)
+            if t <> null
+                this.js_error_at_range(t.pos, t.end, DiagType_assertion_expressions_can_only_be_used_in_TypeScript_files)
+        }
+
+        if k = KindSatisfiesExpression
+        {
+            let t AstNode.type_of(n)
+            if t <> null
+                this.js_error_at_range(t.pos, t.end, DiagType_satisfaction_expressions_can_only_be_used_in_TypeScript_files)
+        }
+
+        ; Decorator PLACEMENT, unconditionally — the reference calls it between the
+        ; two switches and not from an arm of either.
+        this.check_js_decorator_syntax(n)
+
+        ; ── the second switch: type parameters, type arguments, modifiers ────
+        var type_param_host false
+        if k = KindClassDeclaration
+            set type_param_host: true
+        if k = KindClassExpression
+            set type_param_host: true
+        if k = KindMethodDeclaration
+            set type_param_host: true
+        if k = KindConstructor
+            set type_param_host: true
+        if k = KindGetAccessor
+            set type_param_host: true
+        if k = KindSetAccessor
+            set type_param_host: true
+        if k = KindFunctionExpression
+            set type_param_host: true
+        if k = KindFunctionDeclaration
+            set type_param_host: true
+        if k = KindArrowFunction
+            set type_param_host: true
+        if type_param_host
+        {
+            let tps AstNode.type_parameters_of(n)
+            if this.list_has_unreparsed(tps)
+            {
+                var lpos 0
+                var lend 0
+                if this.list_range(tps, &lpos, &lend)
+                    this.js_error_at_range(lpos, lend, DiagType_parameter_declarations_can_only_be_used_in_TypeScript_files)
+            }
+        }
+
+        ; ... and the arm it falls through into: every modifier that is not a
+        ; decorator and is not one of the five JavaScript may carry.
+        var modifier_host type_param_host
+        if k = KindVariableStatement
+            set modifier_host: true
+        if k = KindPropertyDeclaration
+            set modifier_host: true
+        if modifier_host
+        {
+            let mods AstNode.modifiers_of(n)
+            if mods <> null
+            {
+                var i 0
+                let count mods.get_length() as int
+                while i < count
+                {
+                    let m *(mods.get_buffer() + i)
+                    if m <> null
+                    {
+                        if (AstNode.flags_of(m) & NodeFlagsReparsed) = 0
+                        {
+                            let mk AstNode.kind_of(m)
+                            if mk <> KindDecorator
+                            {
+                                if (AstNode.modifier_to_flag(mk) & ModifierFlagsJavaScript) = 0
+                                    this.js_error_at_range(m.pos, m.end, DiagThe_0_modifier_can_only_be_used_in_TypeScript_files)
+                            }
+                        }
+                    }
+                    set i: i + 1
+                }
+            }
+        }
+
+        if k = KindParameter
+        {
+            let mods AstNode.modifiers_of(n)
+            if this.list_has_modifier(mods)
+            {
+                var lpos 0
+                var lend 0
+                if this.list_range(mods, &lpos, &lend)
+                    this.js_error_at_range(lpos, lend, DiagParameter_modifiers_can_only_be_used_in_TypeScript_files)
+            }
+        }
+
+        var type_arg_host false
+        if k = KindCallExpression
+            set type_arg_host: true
+        if k = KindNewExpression
+            set type_arg_host: true
+        if k = KindExpressionWithTypeArguments
+            set type_arg_host: true
+        if k = KindJsxSelfClosingElement
+            set type_arg_host: true
+        if k = KindJsxOpeningElement
+            set type_arg_host: true
+        if k = KindTaggedTemplateExpression
+            set type_arg_host: true
+        if type_arg_host
+        {
+            let tas AstNode.type_arguments_of(n)
+            if this.list_has_unreparsed(tas)
+            {
+                var lpos 0
+                var lend 0
+                if this.list_range(tas, &lpos, &lend)
+                    this.js_error_at_range(lpos, lend, DiagType_arguments_can_only_be_used_in_TypeScript_files)
+            }
+        }
+
+        n
     }
 
     ; ════════════════════════════════════════════════════════════════════════
