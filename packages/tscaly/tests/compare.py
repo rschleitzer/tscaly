@@ -49,6 +49,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 
@@ -64,13 +65,32 @@ def cut_fields(data: bytes, keep: int) -> bytes:
     return out + (b"\n" if trailing_nl else b"")
 
 
-def run_capture(argv, out_path, err_path):
+TIMED_OUT = "TIMEOUT"
+
+
+def run_capture(argv, out_path, err_path, timeout=None):
     """Run argv, write stdout/stderr to the two paths, answer (rc, stdout bytes).
 
-    The dumps are tens of kilobytes at most (29 547 bytes is the corpus maximum),
-    so holding stdout in memory costs nothing and saves reading it back.
+    A stage-1 dump is tens of kilobytes (29 547 bytes is that corpus's maximum),
+    so holding stdout in memory costs nothing and saves reading it back; the
+    submodule corpus has larger cases, and the pool bounds how many are in flight.
+
+    ★ THE TIMEOUT IS A STAGE-2 REQUIREMENT AND IT IS NOT A NORMALISATION. A
+    non-terminating parse — the shape §3.5bf records, a scan that never advances —
+    is a defect, and without a bound one of them replaces the entire measurement
+    with nothing. It answers TIMED_OUT rather than a status, so the verdict layer
+    can name it instead of folding it into "exited N". Neutral on stage 1: nothing
+    there comes near the bound, which the byte-identical report proves.
     """
-    proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        with open(out_path, "wb") as fh:
+            fh.write(exc.stdout or b"")
+        with open(err_path, "wb") as fh:
+            fh.write(exc.stderr or b"")
+        return TIMED_OUT, b""
     with open(out_path, "wb") as fh:
         fh.write(proc.stdout)
     with open(err_path, "wb") as fh:
@@ -137,9 +157,17 @@ def load_accepted(path):
 
 def compare_one(ctx, name, art, keep, ours_bin, ref_bin, case_file, work):
     ours_rc, ours_out = run_capture(
-        [ours_bin, case_file], f"{work}/{art}.ours", f"{work}/{art}.ours.err")
+        [ours_bin, case_file], f"{work}/{art}.ours", f"{work}/{art}.ours.err",
+        ctx.timeout)
     ref_rc, ref_out = run_capture(
-        [ref_bin, case_file], f"{work}/{art}.ref", f"{work}/{art}.ref.err")
+        [ref_bin, case_file], f"{work}/{art}.ref", f"{work}/{art}.ref.err",
+        ctx.timeout)
+
+    if ours_rc is TIMED_OUT:
+        return "TIMEOUT", f"{art}/{name}: our dumper timed out after {ctx.timeout}s"
+    if ref_rc is TIMED_OUT:
+        return "TIMEOUT", (f"{art}/{name}: the ORACLE timed out after {ctx.timeout}s"
+                           " — suspect the harness, not the port")
 
     if ours_rc != 0:
         return "FAIL", f"{art}/{name}: our dumper exited {ours_rc}"
@@ -202,8 +230,11 @@ def main():
     ctx.accepted = load_accepted(os.environ["TSCALY_ACCEPTED"])
     sub_prefix = os.environ["TSCALY_SUB_PREFIX"]
     pkg_prefix = os.environ["TSCALY_PKG_PREFIX"]
+    ts_prefix = os.environ.get("TSCALY_TS_PREFIX", "")
     filt = os.environ.get("TSCALY_FILTER", "")
     jobs = int(os.environ.get("TSCALY_JOBS") or min(16, os.cpu_count() or 8))
+    stage = int(os.environ.get("TSCALY_STAGE") or 1)
+    ctx.timeout = float(os.environ.get("TSCALY_TIMEOUT") or 60)
 
     bins = {art: (f"{out}/tscaly_{art}", f"{out}/oracle_{art}") for art, _ in ARTIFACTS}
     split_bin = f"{out}/oracle_split"
@@ -215,10 +246,20 @@ def main():
     # reads it.
     shutil.rmtree(f"{out}/cases", ignore_errors=True)
 
+    # ★ THE THREE PREFIXES ARE THREE KEY SPACES, and the submodule corpus needs
+    # its own. 15 relative paths exist in BOTH corpora (compiler/checkInheritedProperty.ts
+    # among them), so one shared space would silently let one case's directory,
+    # artifacts and verdict stand in for another's. The `submodule_` prefix mirrors
+    # the reference's own separation, testdata/baselines/reference/submodule/.
+    # Order matters: the TS prefix sits UNDER the typescript-go checkout, so it
+    # must be tested first or sub_prefix would never see it — as it happens the two
+    # do not nest, but relying on that is exactly the kind of luck this file avoids.
     selected = []
     for case_file in cases:
         name = case_file
-        if name.startswith(sub_prefix):
+        if ts_prefix and name.startswith(ts_prefix):
+            name = "submodule/" + name[len(ts_prefix):]
+        elif name.startswith(sub_prefix):
             name = name[len(sub_prefix):]
         elif name.startswith(pkg_prefix):
             name = name[len(pkg_prefix):]
@@ -229,22 +270,59 @@ def main():
             continue
         selected.append((case_file, name))
 
+    # ★★★ A DUPLICATE KEY IS A SILENT HALVING, so it is refused rather than
+    # measured. The key is the path with `/` folded to `_`, which is not injective:
+    # `a/b_c.ts` and `a_b/c.ts` collide. Today's two corpora contain no collision —
+    # counted, 0 of 12 760 — but "the corpus happens not to contain it" is the same
+    # standing this file spends its comments arguing against, and the cost of the
+    # check is a dict.
+    seen_keys = {}
+    for case_file, name in selected:
+        if name in seen_keys:
+            print(f"compare.py: two cases map to one key {name!r}:\n"
+                  f"    {seen_keys[name]}\n    {case_file}\n"
+                  "  One would overwrite the other's artifacts and verdict. Give the"
+                  " key space another separator before running this corpus.",
+                  file=sys.stderr)
+            return 2
+        seen_keys[name] = case_file
+
+    # ── progress, on stderr, and only where a run is long enough to need it ───
+    #
+    # ★ STAGE 1 MUST STAY SILENT HERE. ctl.sh captures a run as `2>&1` and compares
+    # the whole report byte for byte across a 45-control battery, so a progress line
+    # on stage 1 would not be noise — it would be a diff in every control's
+    # baseline. Gated on the stage, and stderr even then, so the report itself never
+    # carries it.
+    progress_lock = threading.Lock()
+    progress = {"done": 0}
+
+    def tick(total, every, what):
+        with progress_lock:
+            progress["done"] += 1
+            n = progress["done"]
+        if stage >= 2 and (n % every == 0 or n == total):
+            print(f"  {what} {n}/{total}", file=sys.stderr, flush=True)
+
     # ── phase A: the reference's own splitter, one process per case ──────────
     def do_split(item):
         case_file, name = item
         case_work = f"{out}/cases/{name}"
         os.makedirs(case_work, exist_ok=True)
         rc, _ = run_capture([split_bin, case_file, f"{case_work}/units"],
-                            f"{case_work}/units.manifest", f"{case_work}/units.err")
+                            f"{case_work}/units.manifest", f"{case_work}/units.err",
+                            ctx.timeout)
+        tick(len(selected), 1000, "split")
         return rc
 
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         split_rcs = list(pool.map(do_split, selected))
+    progress["done"] = 0
 
     # ── phase B: the unit list, in the loop's own order ──────────────────────
     counters = {}
     for art, _ in ARTIFACTS:
-        for k in ("matched", "unported", "failed", "accepted", "stale"):
+        for k in ("matched", "unported", "failed", "accepted", "stale", "timeout"):
             counters[f"{k}_{art}"] = 0
     counters["cases_seen"] = 0
     counters["skip_jsx"] = 0
@@ -263,7 +341,9 @@ def main():
         counters["cases_seen"] += 1
         case_work = f"{out}/cases/{name}"
         if rc != 0:
-            split_failures.append((ci, f"split/{name}: {_first_line(case_work + '/units.err')}"))
+            detail = (f"the splitter timed out after {ctx.timeout}s"
+                      if rc is TIMED_OUT else _first_line(case_work + "/units.err"))
+            split_failures.append((ci, f"split/{name}: {detail}"))
             counters["failed_tokens"] += 1
             counters["failed_ast"] += 1
             continue
@@ -274,12 +354,22 @@ def main():
         unit_count = len(units)
 
         for ui, line in enumerate(manifest):
-            # `read -r idx written unit_name` — the remainder goes to the last name.
-            parts = line.split(None, 2)
-            if len(parts) < 2 or not parts[1]:
+            # ★★★ THE MANIFEST IS TAB-SEPARATED SINCE STAGE 2, and it had to become
+            # so. This was `line.split(None, 2)`, the transcription of the loop's
+            # `read -r idx written unit_name` — and a unit NAME may contain a space
+            # (compiler/sourceMapPercentEncoded.ts has one), which truncated the
+            # written PATH at that space and sent our dumper after a file that does
+            # not exist. Reported as `cannot read <prefix>` on all three yardsticks,
+            # i.e. as a port defect. See tests/oracle/split.go.
+            if line == "":
                 continue
-            idx, written = parts[0], parts[1]
-            unit_name = parts[2] if len(parts) > 2 else ""
+            parts = line.split("\t")
+            if len(parts) != 3 or not parts[1]:
+                print(f"compare.py: {name}: unreadable manifest line {line!r} — the"
+                      " splitter and this reader disagree about the format, which is a"
+                      " harness bug and not a result.", file=sys.stderr)
+                return 2
+            idx, written, unit_name = parts
 
             if classify_unit(unit_name) is not None:
                 counters["skip_other"] += 1
@@ -305,7 +395,9 @@ def main():
     def do_compare(task):
         _, key, art, keep, written, work = task
         ours_bin, ref_bin = bins[art]
-        return compare_one(ctx, key, art, keep, ours_bin, ref_bin, written, work)
+        verdict = compare_one(ctx, key, art, keep, ours_bin, ref_bin, written, work)
+        tick(len(tasks), 3000, "compare")
+        return verdict
 
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         verdicts = list(pool.map(do_compare, tasks))
@@ -342,6 +434,11 @@ def main():
             elif verdict == "ACCEPTED":
                 counters[f"accepted_{art}"] += 1
             else:
+                # A TIMEOUT is a failure — the totals must not lose it — and also a
+                # class of its own, so it is counted twice on purpose and the report
+                # names both.
+                if verdict == "TIMEOUT":
+                    counters[f"timeout_{art}"] += 1
                 counters[f"failed_{art}"] += 1
                 failures.append(message)
             if art == "jsdoc":

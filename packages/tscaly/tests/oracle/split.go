@@ -39,9 +39,20 @@
 // Usage:  split <case.ts> <outdir>
 //
 // Writes one file per unit into <outdir> and prints one manifest line per unit
-// to stdout:
+// to stdout, TAB-separated:
 //
-//	<index> <written-file> <original-unit-name>
+//	<index>\t<written-file>\t<original-unit-name>
+//
+// ★★★ TAB AND NOT SPACE, and stage 2 is what paid for the distinction. A unit name
+// comes out of the case's own `// @Filename:` line and CAN CONTAIN A SPACE —
+// compiler/sourceMapPercentEncoded.ts names its file
+// `\u2460\u216B\u3128\u3129 \u554A...` — so a space-separated manifest is ambiguous, and both
+// readers of it (the bash loop, then compare.py's `split(None, 2)`) truncated the
+// PATH at that space and handed our dumper a file that does not exist. It failed
+// as `cannot read <prefix>`, i.e. reported as a port defect on all three
+// yardsticks. Stage 1's 582 cases contain no such name, which is the whole reason
+// it stood: a field separator that works is indistinguishable from a field
+// separator that is right.
 //
 // The written name carries the unit's own BASENAME, so its extension survives —
 // the runner classifies on it, and the ast oracle reads `.d.ts` off it to set
@@ -117,6 +128,6 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		fmt.Printf("%d %s %s\n", i, written, u.name)
+		fmt.Printf("%d\t%s\t%s\n", i, written, u.name)
 	}
 }

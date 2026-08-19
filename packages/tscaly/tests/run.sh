@@ -55,7 +55,40 @@
 # UNPORTED is not a pass. It is counted, printed, and the totals show it — an
 # incomplete port that reported "all green" would be worth less than no runner.
 #
-# Usage:  packages/tscaly/tests/run.sh [filter]
+# Usage:  packages/tscaly/tests/run.sh [filter]        TSCALY_STAGE=2 for the
+#                                                     full submodule corpus
+#
+# ★★★ THE CORPUS HAS STAGES, AND THE REPORT SAYS WHICH ONE IT MEASURED. A count
+# without its corpus is not a result — TESTPLAN.md's table names three stages and
+# `TSCALY_STAGE` selects between the first two:
+#
+#   1 (default)  our fixtures + typescript-go's repo-local cases, under
+#                testdata/tests/cases/{compiler,conformance}
+#   2            + the TypeScript submodule's OWN corpus, the
+#                {compiler,conformance} cases typescript-go's own runner reaches
+#                through ../_submodules/TypeScript (compiler_runner.go:63), with
+#                the reference's own file regex `\.tsx?$`
+#
+# Stage 1 is the working yardstick: 12 s, small enough to run per slice, and every
+# number in CLAUDE.md's tables is one of its numbers. Stage 2 (7 min 23 s) is the
+# one that can turn *it agrees over 834 units* into *the sample of 17 604 found
+# these 21 things* — eleven `unported` markers stand in the code and stage 1
+# reaches none of them, while stage 2 reaches exactly ONE, twice. ★It is a
+# MEASUREMENT and not a gate, and it does not say *finished* either: the corpus is
+# a SAMPLE and the reference is the SPECIFICATION (CLAUDE.md §3.5be).
+#
+# ★ A stage-2 case key is prefixed `submodule_`, mirroring the reference's own
+# separation (testdata/baselines/reference/submodule/ against .../compiler/). It
+# HAS to be: 15 relative paths occur in both corpora, so one shared key space
+# would let one case's result overwrite another's — silently, and in the
+# direction that shrinks a count. compare.py refuses a duplicate key outright
+# rather than trusting today's corpus to have none.
+#
+# ★ What stage 2 does NOT mirror is the reference runner's `skippedTests` list
+# (compiler_runner.go): those cases are skipped there because they depend on a
+# built typescript.d.ts, which is a statement about the CHECKER's inputs. Both
+# sides here parse the same bytes, so skipping them would only remove units from
+# the yardstick.
 #
 # Harness rules observed here, each one paid for by an earlier suite in this repo
 # (root CLAUDE.md): no `git checkout -- .`; a per-case scratch directory; no
@@ -69,9 +102,11 @@ REPO=$(pwd)
 
 PKG=packages/tscaly
 SUB=$PKG/_submodules/typescript-go
+TS=$SUB/_submodules/TypeScript
 OUT=$PKG/tests/out
 ACCEPTED=$PKG/tests/accepted.txt
 FILTER=${1:-}
+STAGE=${TSCALY_STAGE:-1}
 
 LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
 SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
@@ -87,6 +122,25 @@ green() { printf '\033[32m%s\033[0m\n' "$*"; }
 if [ ! -f "$SUB/go.mod" ]; then
   red "corpus not present: the reference submodule is not initialized."
   echo "  git submodule update --init $SUB"
+  exit 2
+fi
+
+case $STAGE in
+  1|2) ;;
+  *) red "TSCALY_STAGE=$STAGE: only stages 1 and 2 are built (3 is fourslash — see TESTPLAN.md)."
+     exit 2 ;;
+esac
+
+# The stage-2 corpus is a submodule OF the submodule, and it is not initialized
+# by the stage-1 setup. Missing it must say so: "0 failures over 0 cases" is the
+# same output as success, which is the failure mode this runner exists to avoid.
+if [ "$STAGE" -ge 2 ] && [ ! -d "$TS/tests/cases/compiler" ]; then
+  red "stage-2 corpus not present: the TypeScript submodule is not initialized."
+  echo "  git -C $SUB submodule update --init --depth 1 _submodules/TypeScript"
+  echo
+  echo "  A shallow clone of the pinned commit is enough (603 MB); nothing here"
+  echo "  reads its history. Cleanliness is checked by the submodule_dirty test"
+  echo "  below — typescript-go's own status reports a dirty nested submodule."
   exit 2
 fi
 
@@ -262,6 +316,10 @@ while IFS= read -r f; do cases+=("$f"); done < <(
   find "$PKG/tests/fixtures" -name '*.ts' -o -name '*.tsx' 2>/dev/null | sort
   find "$SUB/testdata/tests/cases/compiler" "$SUB/testdata/tests/cases/conformance" \
     \( -name '*.ts' -o -name '*.tsx' \) 2>/dev/null | sort
+  if [ "$STAGE" -ge 2 ]; then
+    find "$TS/tests/cases/compiler" "$TS/tests/cases/conformance" \
+      \( -name '*.ts' -o -name '*.tsx' \) 2>/dev/null | sort
+  fi
 )
 
 # accepted.txt is <case>\t<artifact>\t<reason> — the artifact column is what
@@ -305,6 +363,8 @@ while IFS= read -r f; do cases+=("$f"); done < <(
 TSCALY_OUT=$OUT \
 TSCALY_ACCEPTED=$ACCEPTED \
 TSCALY_SUB_PREFIX="$SUB/testdata/tests/cases/" \
+TSCALY_TS_PREFIX="$TS/tests/cases/" \
+TSCALY_STAGE="$STAGE" \
 TSCALY_PKG_PREFIX="$PKG/tests/" \
 TSCALY_FILTER="$FILTER" \
 python3 "$PKG/tests/compare.py" <<EOF_CASES
@@ -326,6 +386,15 @@ stales=()
 while IFS= read -r l; do [ -n "$l" ] && stales+=("$l"); done < "$OUT/stales.txt"
 
 # ── report ───────────────────────────────────────────────────────────────────
+
+echo
+if [ "$STAGE" -ge 2 ]; then
+  echo "corpus stage 2 — our fixtures + typescript-go's repo-local cases + the"
+  echo "  TypeScript submodule's own {compiler,conformance} corpus, $cases_seen cases in all."
+else
+  echo "corpus stage 1 — our fixtures + typescript-go's repo-local cases, $cases_seen cases."
+  echo "  TSCALY_STAGE=2 adds the submodule corpus; see TESTPLAN.md's stage table."
+fi
 
 report() {
   local title=$1 m=$2 u=$3 a=$4 f=$5
@@ -395,6 +464,20 @@ echo "  silence is the failure mode this suite exists to prevent."
 
 total_stale=$(( stale_tokens + stale_ast + stale_jsdoc ))
 total_failed=$(( failed_tokens + failed_ast + failed_jsdoc ))
+total_timeout=$(( timeout_tokens + timeout_ast + timeout_jsdoc ))
+
+# A timed-out dump is counted in UNEXPLAINED like any other failure — it IS one —
+# but it is also named separately, because "our dumper did not finish" and "our
+# dumper answered differently" need different work and a mixed list hides the
+# first inside the second. The bash loop had no timeout at all; over 12 444 cases
+# a single non-terminating scan would have replaced the whole measurement with
+# nothing.
+if [ $total_timeout -ne 0 ]; then
+  echo
+  red "$total_timeout dumps did not finish within ${TSCALY_TIMEOUT:-60}s (counted in UNEXPLAINED above)."
+  echo "  A non-terminating parse is a defect of its own class; grep 'timed out' in"
+  echo "  $OUT/failures.txt for the list."
+fi
 
 if [ $total_stale -ne 0 ]; then
   echo
@@ -404,8 +487,19 @@ fi
 
 if [ $total_failed -ne 0 ]; then
   echo
-  red "unexplained failures:"
-  printf '    %s\n' "${failures[@]}"
+  # ★ The list is CAPPED, not summarised. Stage 2 can produce thousands of
+  # failures and a wall of them is unreadable, but a count is not a diagnosis —
+  # so the file holds every line and the cap says how many it is standing in for.
+  # Neutral on stage 1, which has none. TSCALY_SHOW raises it.
+  show=${TSCALY_SHOW:-40}
+  if [ ${#failures[@]} -gt "$show" ]; then
+    red "unexplained failures — ${#failures[@]}, the first $show:"
+    printf '    %s\n' "${failures[@]:0:$show}"
+    echo "    … $(( ${#failures[@]} - show )) more, all of them in $OUT/failures.txt"
+  else
+    red "unexplained failures:"
+    printf '    %s\n' "${failures[@]}"
+  fi
   echo
   echo "  full diffs under $OUT/cases/<name>/<artifact>.diff"
   exit 1
