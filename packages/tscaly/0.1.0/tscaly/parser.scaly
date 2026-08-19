@@ -325,6 +325,18 @@ define PCObjectBindingElements: int 18
 define PCArrayBindingElements: int 19
 define PCSourceElements:      int 20
 
+; Slice 23. The six argument names processPragmasIntoFields reads off a
+; `<reference>` directive. They are an internal id rather than the reference's
+; map key because the store here is a flat array of triples — see
+; extract_pragmas, which also says why an argument named none of these is
+; parsed and then dropped.
+define PragmaArgTypes:          int 0
+define PragmaArgLib:            int 1
+define PragmaArgPath:           int 2
+define PragmaArgResolutionMode: int 3
+define PragmaArgPreserve:       int 4
+define PragmaArgNoDefaultLib:   int 5
+
 ; Slice 20. PCJsxChildren is the odd one: parse_jsx_children does NOT go through
 ; parse_list — it has its own loop, because every child needs a JSX RE-SCAN
 ; before it can be recognised. The context is still entered, and that is what it
@@ -1473,6 +1485,13 @@ define Parser
         ; `import.meta` and only bothers when PossiblyContainsImportMeta is set.
         set file.flags: file.flags | source_flags
 
+        ; finishSourceFile's pragma pass. ★★★ It runs on the reparse result TOO,
+        ; and the diagnostics are APPENDED — processPragmasIntoFields resets the
+        ; SourceFile's directive lists at its top and never touches p.diagnostics
+        ; — so a file carrying both a top-level await and a bad `<reference>`
+        ; reports that reference TWICE. Faithful, and pinned by the fixture.
+        this.process_pragmas()
+
         ; Now the whole file is in hand, which is when the reference decides
         ; whether to re-parse — see parse_top_level_statement.
         ; !result.IsDeclarationFile && ExternalModuleIndicator != nil &&
@@ -1508,6 +1527,7 @@ define Parser
                     ; first did not (an `import.meta` inside a statement the
                     ; reparse rewrote).
                     set reparsed_file.flags: reparsed_file.flags | source_flags
+                    this.process_pragmas()
                     return reparsed_file
                 }
             }
@@ -1677,6 +1697,13 @@ define Parser
         ; ordinary expression grammar, so `{"a": import("m")}` reaches the
         ; dynamic-import arm and marks the file.
         set file.flags: file.flags | source_flags
+
+        ; finishSourceFile's pragma pass, which the JSON grammar reaches too:
+        ; parseJSONText ends in the same finishSourceFile call. A `.json` file
+        ; whose first line is a `///` comment therefore gets the same directive
+        ; diagnostics — which is the reference's behaviour and not obviously the
+        ; intended one, so it is stated rather than quietly narrowed.
+        this.process_pragmas()
         file
     }
 
@@ -13787,6 +13814,318 @@ define Parser
             out.add(s)
             out.add(e)
         }
+    }
+
+    ; ── the comment pragmas ─────────────────────────────────────────────────
+    ;
+    ; ★★★ getCommentPragmas + extractPragmas + processPragmasIntoFields, and the
+    ; only thing a parser yardstick can see of them is TWO DIAGNOSTICS: TS1084
+    ; for a triple-slash `<reference>` whose arguments name none of types/lib/
+    ; path/no-default-lib, and TS1453 for a `resolution-mode` that is neither
+    ; `require` nor `import`. Everything else a pragma does is a FIELD on the
+    ; SourceFile — ReferencedFiles, TypeReferenceDirectives, LibReferenceDirectives,
+    ; CheckJsDirective — whose readers are the program builder (which files to
+    ; pull in), the emitter and the checker, none of which this port has.
+    ;
+    ; ★ Stated omissions, each with its reader, per §3.5ao:
+    ;   · the three FileReference lists and CheckJsDirective are not STORED. They
+    ;     are computed exactly far enough to decide which arm of the switch a
+    ;     pragma takes, because that decision is what produces the diagnostics.
+    ;   · the MULTI-LINE arm of extractPragmas — `@jsx`, `@jsxfrag`,
+    ;     `@jsximportsource`, `@jsxruntime` inside a `/* */` — is not ported. It
+    ;     produces no diagnostic in any input and its only readers are the
+    ;     emitter's JSX factory selection and the checker's jsxImportSource, so
+    ;     porting it would be forty lines nothing in this repository can measure
+    ;     in either direction.
+    ;   · an argument whose name is none of the six the switch reads is not kept.
+    ;     The reference puts it in the map and never looks it up, and the default
+    ;     arm asks only about types/lib/path/no-default-lib — so `foo="bar"` gets
+    ;     TS1084 either way. It still has to be PARSED, because the loop only
+    ;     stops on a name that is empty or on a missing `=` or quote.
+    ;
+    ; ★★ The pragma scan reads the LEADING comment ranges of position 0, so it
+    ; stops at the first thing that is neither whitespace nor a comment: a
+    ; `/// <reference …>` below the first statement is not a pragma at all.
+    procedure process_pragmas(this)
+    {
+        let ranges this.cparts_new()
+        this.collect_comment_ranges(0, false, ranges)
+        let count (ranges.get_length() as int) / 2
+        var i 0
+        while i < count
+        {
+            let s *(ranges.get_buffer() + (i * 2))
+            let e *(ranges.get_buffer() + ((i * 2) + 1))
+            set i: i + 1
+            this.extract_pragmas(s, e)
+        }
+    }
+
+    ; extractPragmas' single-line arm, and then the `reference` arm of
+    ; processPragmasIntoFields on what it found. The reference keeps the two
+    ; apart because it collects every pragma of the file before processing any;
+    ; here each comment yields at most one pragma and the comments arrive in
+    ; order, so processing per comment leaves the diagnostics in the same
+    ; sequence. The one behaviour that split would buy is CheckJsDirective's
+    ; "last of check/nocheck wins", which nothing here reads.
+    ;
+    ; ★ `pos += 10` rather than `pos += len(tagName) + 1` is the reference's own
+    ; line, and it is safe for the same reason there: the branch is only reached
+    ; when the name IS `reference`, i.e. when nine characters follow the `<`.
+    procedure extract_pragmas(this, comment_pos: int, comment_end: int)
+    {
+        ; A single-line comment only. The KIND the reference stores on a comment
+        ; range is derivable from the two bytes that open it, which is why
+        ; collect_comment_ranges does not carry one.
+        if scanner.byte_at(comment_pos + 1) <> ("/" as char) as int
+            return
+
+        var pos comment_pos + 2
+        let triple_slash this.pragma_match(pos, comment_end, "/")
+        if triple_slash
+            set pos: pos + 1
+        set pos: this.pragma_skip_blanks(pos, comment_end)
+
+        if triple_slash and this.pragma_match(pos, comment_end, "<")
+        {
+            let tag_end this.pragma_extract_name(pos + 1, comment_end)
+            if this.pragma_name_is(pos + 1, tag_end, "reference") = false
+                return
+            set pos: pos + 10
+
+            ; The six argument names the switch below reads, as a flat table of
+            ; (id, value_pos, value_end) triples. An id already present is
+            ; OVERWRITTEN, because the reference's store is a map.
+            let args this.cparts_new()
+            repeat
+            {
+                set pos: this.pragma_skip_blanks(pos, comment_end)
+                if this.pragma_match(pos, comment_end, "/>")
+                    break
+                let name_end this.pragma_extract_name(pos, comment_end)
+                if name_end = pos
+                    break
+                let id this.pragma_arg_id(pos, name_end)
+                set pos: this.pragma_skip_blanks(name_end, comment_end)
+                if this.pragma_match(pos, comment_end, "=") = false
+                    break
+                set pos: this.pragma_skip_blanks(pos + 1, comment_end)
+                let value_end this.pragma_extract_quoted_string(pos, comment_end)
+                if value_end < 0
+                    break
+                if id >= 0
+                    this.pragma_arg_set(args, id, pos + 1, value_end)
+                set pos: value_end + 1
+            }
+
+            this.process_reference_pragma(comment_pos, comment_end, args)
+            return
+        }
+
+        ; `@ts-check` / `@ts-nocheck`. Recognised and then dropped: the field it
+        ; sets is CheckJsDirective, whose reader is the checker.
+        if this.pragma_match(pos, comment_end, "@")
+            return
+    }
+
+    ; processPragmasIntoFields' `reference` arm. Its four cases are ORDERED and
+    ; the order is load-bearing: `no-default-lib="true"` swallows the directive
+    ; whatever else it carries, and `types` beats `lib` beats `path`. Only the
+    ; last case and the resolution-mode parse produce anything visible here.
+    procedure process_reference_pragma(this, comment_pos: int, comment_end: int, args: pointer[Array[int]])
+    {
+        if this.pragma_arg_value_is(args, PragmaArgNoDefaultLib, "true")
+            return
+        if this.pragma_arg_find(args, PragmaArgTypes) >= 0
+        {
+            let rm this.pragma_arg_find(args, PragmaArgResolutionMode)
+            if rm >= 0
+                this.parse_resolution_mode(*(args.get_buffer() + rm + 1), *(args.get_buffer() + rm + 2))
+            return
+        }
+        if this.pragma_arg_find(args, PragmaArgLib) >= 0
+            return
+        if this.pragma_arg_find(args, PragmaArgPath) >= 0
+            return
+        this.parse_error_at_range(comment_pos, comment_end, DiagInvalid_reference_directive_syntax)
+    }
+
+    ; parseResolutionMode. The RESULT — a module kind — has no reader in this
+    ; port; the diagnostic is the whole of what is left.
+    procedure parse_resolution_mode(this, value_pos: int, value_end: int)
+    {
+        if this.pragma_text_is(value_pos, value_end, "import")
+            return
+        if this.pragma_text_is(value_pos, value_end, "require")
+            return
+        this.parse_error_at(value_pos, value_end, DiagX_resolution_mode_should_be_either_require_or_import)
+    }
+
+    ; `strings.HasPrefix(text[pos:], s)`. Past the end is false rather than a
+    ; panic, which is the one place Go's slice would have raised instead.
+    function pragma_match(this, pos: int, limit: int, lit: pointer[const_char]) returns bool
+    {
+        var i 0
+        repeat
+        {
+            let c *(lit + i) as int
+            if c = 0
+                return true
+            if (pos + i) >= limit
+                return false
+            if scanner.byte_at(pos + i) <> c
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    function pragma_skip_blanks(this, pos: int, limit: int) returns int
+    {
+        var p pos
+        while p < limit
+        {
+            let c scanner.byte_at(p)
+            if (c <> (" " as char) as int) and (c <> ("\t" as char) as int)
+                return p
+            set p: p + 1
+        }
+        p
+    }
+
+    ; extractName — letters and `-`, and the reference lowercases the result, so
+    ; every comparison against it below is case-insensitive.
+    function pragma_extract_name(this, pos: int, limit: int) returns int
+    {
+        var p pos
+        while p < limit
+        {
+            let c scanner.byte_at(p)
+            var ok false
+            if (c >= (("A" as char) as int)) and (c <= (("Z" as char) as int))
+                set ok: true
+            if (c >= (("a" as char) as int)) and (c <= (("z" as char) as int))
+                set ok: true
+            if c = ("-" as char) as int
+                set ok: true
+            if ok = false
+                return p
+            set p: p + 1
+        }
+        p
+    }
+
+    ; extractQuotedString. Answers the position of the CLOSING quote, or -1 when
+    ; there is no opening quote or the string is never closed — the second is
+    ; what `path="missingquote.ts />` is, and it is why that line ends up with an
+    ; empty argument map and TS1084.
+    function pragma_extract_quoted_string(this, pos: int, limit: int) returns int
+    {
+        if pos >= limit
+            return 0 - 1
+        let quote scanner.byte_at(pos)
+        if (quote <> (("'" as char) as int)) and (quote <> (("\"" as char) as int))
+            return 0 - 1
+        var p pos + 1
+        while p < limit
+        {
+            if scanner.byte_at(p) = quote
+                return p
+            set p: p + 1
+        }
+        0 - 1
+    }
+
+    ; A name in the source, compared against an ASCII literal case-INSENSITIVELY
+    ; (the reference lowercases the name it extracted).
+    function pragma_name_is(this, pos: int, end: int, lit: pointer[const_char]) returns bool
+    {
+        var i 0
+        while (pos + i) < end
+        {
+            let c *(lit + i) as int
+            if c = 0
+                return false
+            var b scanner.byte_at(pos + i)
+            if (b >= (("A" as char) as int)) and (b <= (("Z" as char) as int))
+                set b: b + 32
+            if b <> c
+                return false
+            set i: i + 1
+        }
+        (*(lit + i) as int) = 0
+    }
+
+    ; A VALUE in the source, compared exactly — a quoted string is not a name and
+    ; the reference does not fold its case.
+    function pragma_text_is(this, pos: int, end: int, lit: pointer[const_char]) returns bool
+    {
+        var i 0
+        while (pos + i) < end
+        {
+            let c *(lit + i) as int
+            if c = 0
+                return false
+            if scanner.byte_at(pos + i) <> c
+                return false
+            set i: i + 1
+        }
+        (*(lit + i) as int) = 0
+    }
+
+    function pragma_arg_id(this, pos: int, end: int) returns int
+    {
+        if this.pragma_name_is(pos, end, "types")
+            return PragmaArgTypes
+        if this.pragma_name_is(pos, end, "lib")
+            return PragmaArgLib
+        if this.pragma_name_is(pos, end, "path")
+            return PragmaArgPath
+        if this.pragma_name_is(pos, end, "resolution-mode")
+            return PragmaArgResolutionMode
+        if this.pragma_name_is(pos, end, "preserve")
+            return PragmaArgPreserve
+        if this.pragma_name_is(pos, end, "no-default-lib")
+            return PragmaArgNoDefaultLib
+        0 - 1
+    }
+
+    ; The index of an argument's triple, or -1.
+    function pragma_arg_find(this, args: pointer[Array[int]], id: int) returns int
+    {
+        let n args.get_length() as int
+        var i 0
+        while i < n
+        {
+            if *(args.get_buffer() + i) = id
+                return i
+            set i: i + 3
+        }
+        0 - 1
+    }
+
+    ; args[name] = value — an existing entry is replaced, because the store is a
+    ; map and `<reference path="a" path="b" />` names one file.
+    procedure pragma_arg_set(this, args: pointer[Array[int]], id: int, value_pos: int, value_end: int)
+    {
+        let at this.pragma_arg_find(args, id)
+        if at >= 0
+        {
+            args.put((at + 1) as size_t, value_pos)
+            args.put((at + 2) as size_t, value_end)
+            return
+        }
+        args.add(id)
+        args.add(value_pos)
+        args.add(value_end)
+    }
+
+    function pragma_arg_value_is(this, args: pointer[Array[int]], id: int, lit: pointer[const_char]) returns bool
+    {
+        let at this.pragma_arg_find(args, id)
+        if at < 0
+            return false
+        this.pragma_text_is(*(args.get_buffer() + at + 1), *(args.get_buffer() + at + 2), lit)
     }
 
     ; ── the JSDoc token helpers ─────────────────────────────────────────────
