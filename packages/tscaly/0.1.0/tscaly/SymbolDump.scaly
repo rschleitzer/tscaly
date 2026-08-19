@@ -1,0 +1,661 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; SymbolDump — our half of the binder yardstick's dump.
+;
+; ★★★ THIS IS NOT A PORT OF ANYTHING. The format is OURS, invented with
+; tests/oracle/symbols.go and described in TESTPLAN.md's *The fourth yardstick*;
+; this file is the second producer of it. It lives inside the package rather than
+; in the dumper PROGRAM for a reason the root CLAUDE.md gives twice: the numbering
+; needs containers (an ordered symbol list, a pointer-keyed index, a sorted view of
+; each table), and a generic instance handed across a package boundary reads back
+; as garbage. So the program root asks for the whole dump in one call and prints
+; nothing itself.
+;
+; ── What the numbering has to get right ─────────────────────────────────────
+;
+; ★★★ SYMBOL IDENTITY is what the yardstick compares, so the two sides must
+; DISCOVER symbols in the same sequence — an index is only comparable if the order
+; that assigns it is the same. The sequence is:
+;
+;   1. the pre-order walk, for every node that owns a symbol;
+;   2. then every LOCALS table's entries, table by table in id order, each table
+;      name-sorted — the oracle learned this the hard way: a locals table can name
+;      a symbol no walked node owns (the reference synthesizes some), and numbering
+;      those while the tables were being PRINTED left 24 of 296 fixtures
+;      referencing an index that was never defined;
+;   3. then, per symbol in index order: its PARENT (during the `s` line, because
+;      Go evaluates that argument first), its export symbol (the `x` line), then
+;      its members' entries and its exports' entries, each name-sorted.
+;
+; Table ids come from ONE counter: locals tables as the walk meets them, then a
+; symbol's members and exports as its `s` line is written. Assignment order is
+; therefore ascending, which is why the tables are printed in the order they were
+; collected rather than sorted afterwards.
+;
+; ★ THE TABLES ARE SORTED BY NAME because the reference's SymbolTable is a Go map
+; with a randomised iteration order — there is no order to compare. That is the one
+; normalisation in this dump, and the count printed beside each table is what keeps
+; it from hiding a missing entry.
+;
+; ★★ THE SORT IS ON UNSIGNED BYTES, and that is not a detail: an internal symbol
+; name begins with 0xFE, which sorts AFTER every ASCII name unsigned and BEFORE all
+; of them signed. Go compares strings bytewise unsigned, so `char` is widened
+; through u8 here at every comparison.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.Vector
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use scaly.io.Console
+use tscaly.ast.AstNode
+use tscaly.ast.Symbol
+use tscaly.ast.SymbolTable
+use tscaly.binder.Binder
+
+; One table to print: its id, its owner's table object.
+define DumpTable (id: int  table: pointer[SymbolTable])
+{
+    init(i: int, t: pointer[SymbolTable])
+    {
+        set id: i
+        set table: t
+    }
+}
+
+define SymbolDump
+(
+    host: pointer[Page]
+    out: pointer[StringBuilder]
+
+    ; The symbol registry: the ORDER is the answer, and the buckets are only there
+    ; to find a symbol's index without walking the order for every question.
+    sym_order: pointer[Array[pointer[Symbol]]]
+    buckets: pointer[Vector[int]]     ; index + 1 into sym_order; 0 = empty
+    mask: int
+
+    tables: pointer[Array[DumpTable]]
+    table_count: int
+)
+{
+    ; The entry point the dumper program calls: bind's results in, one dump out,
+    ; written to stdout in one write.
+    function write(host: pointer[Page], b: pointer[Binder], file: pointer[AstNode])
+    {
+        let d host.allocate(sizeof SymbolDump, alignof SymbolDump) as pointer[SymbolDump]
+        set d.host: host
+        ; ★★★ `StringBuilder^host()` AND NOT allocate-then-assign, and the
+        ; difference is a page-header corruption rather than a style question.
+        ; StringBuilder's init does `set buffer: Array[char]^this()`, so it
+        ; allocates through Page.get(this) — and `set *sb: StringBuilder()` builds
+        ; the value as a TEMPORARY first, whose address is not page-hosted, so that
+        ; Page.get answers a header somewhere in arbitrary memory and the init
+        ; writes a bump pointer over it. Nothing fails at that line: the corruption
+        ; surfaces at the next real allocation, as a memmove with an absurd length
+        ; (SIGBUS, rc 138) — measured, and isolated in eighteen lines. The root
+        ; CLAUDE.md states the rule for opensp's StringC; this is the same rule and
+        ; the same trap one package over. An Array is NOT affected, because its
+        ; empty init allocates nothing at all, which is why `set *a: Array[T]()`
+        ; below is correct.
+        let sb StringBuilder^host()
+        set d.out: sb
+        let so host.allocate(sizeof Array[pointer[Symbol]], alignof Array[pointer[Symbol]]) as pointer[Array[pointer[Symbol]]]
+        set *so: Array[pointer[Symbol]]()
+        set d.sym_order: so
+        set d.buckets: null
+        set d.mask: 0
+        let ts host.allocate(sizeof Array[DumpTable], alignof Array[DumpTable]) as pointer[Array[DumpTable]]
+        set *ts: Array[DumpTable]()
+        set d.tables: ts
+        set d.table_count: 0
+
+        d.walk(file)
+        d.number_collected_tables()
+        d.emit_symbols()
+        d.emit_tables()
+        d.emit_file_totals(b)
+        d.emit_bind_diagnostics(b)
+
+        let s d.out.to_string()
+        Console.print(s.to_c_string())
+    }
+
+    ; ── the registry ────────────────────────────────────────────────────────
+    ;
+    ; Assign-on-demand over the symbol POINTER. Open addressing on the pointer's
+    ; own bits — a pointer is not a hash, so the low bits (always aligned) are
+    ; shifted out first.
+    procedure index_of(this, s: pointer[Symbol]) returns int
+    {
+        if s = null
+            return 0 - 1
+        if buckets <> null
+        {
+            var slot SymbolDump.pointer_hash(s) & mask
+            while true
+            {
+                let e buckets.get(slot as size_t)
+                let idx *e
+                if idx = 0
+                    break
+                if *(sym_order.get_buffer() + (idx - 1)) = s
+                    return idx - 1
+                set slot: (slot + 1) & mask
+            }
+        }
+
+        sym_order.add(s)
+        let count sym_order.get_length() as int
+        var cap 0
+        if buckets <> null
+            set cap: mask + 1
+        if (count * 2) > cap
+        {
+            var new_cap 16
+            while (count * 2) > new_cap
+                set new_cap: new_cap * 2
+            let v Vector[int]^host(new_cap as size_t)
+            set buckets: v
+            set mask: new_cap - 1
+            var j 0
+            while j < count
+            {
+                let sj *(sym_order.get_buffer() + j)
+                var slot SymbolDump.pointer_hash(sj) & mask
+                while true
+                {
+                    let e buckets.get(slot as size_t)
+                    if *e = 0
+                        break
+                    set slot: (slot + 1) & mask
+                }
+                buckets.put(slot as size_t, j + 1)
+                set j: j + 1
+            }
+            return count - 1
+        }
+
+        var slot SymbolDump.pointer_hash(s) & mask
+        while true
+        {
+            let e buckets.get(slot as size_t)
+            if *e = 0
+                break
+            set slot: (slot + 1) & mask
+        }
+        buckets.put(slot as size_t, count)
+        count - 1
+    }
+
+    function pointer_hash(s: pointer[Symbol]) returns int
+    {
+        let bits (s as size_t) as u64
+        let h ((bits >> 4) * 2654435761) as u64
+        ((h >> 1) as int)
+    }
+
+    procedure new_table_id(this) returns int
+    {
+        let id table_count
+        set table_count: table_count + 1
+        id
+    }
+
+    procedure collect_table(this, id: int, t: pointer[SymbolTable])
+    {
+        tables.add(DumpTable(id, t))
+    }
+
+    ; ── section 1: the walk ─────────────────────────────────────────────────
+    procedure walk(this, n: pointer[AstNode])
+    {
+        if n = null
+            return
+        var sym_idx 0 - 1
+        let s AstNode.symbol_of(n)
+        if s <> null
+            set sym_idx: this.index_of(s)
+        var locals_idx 0 - 1
+        let l AstNode.locals_of(n)
+        if l <> null
+        {
+            set locals_idx: this.new_table_id()
+            this.collect_table(locals_idx, l)
+        }
+        ; A node is printed when it has EITHER, which is what keeps this artifact
+        ; about the binder rather than about the tree.
+        var interesting false
+        if sym_idx >= 0
+            set interesting: true
+        if locals_idx >= 0
+            set interesting: true
+        if interesting
+            this.emit_node_line(n, sym_idx, locals_idx)
+
+        var i 0
+        while true
+        {
+            let c AstNode.child_at(n, i)
+            if c = null
+                return
+            this.walk(c)
+            set i: i + 1
+        }
+    }
+
+    procedure emit_node_line(this, n: pointer[AstNode], sym_idx: int, locals_idx: int)
+    {
+        out.append("n ")
+        out.append(AstNode.kind_of(n))
+        out.append(" " as char)
+        out.append(AstNode.pos_of(n))
+        out.append(" " as char)
+        out.append(AstNode.end_of(n))
+        out.append(" " as char)
+        this.append_opt(sym_idx)
+        out.append(" " as char)
+        this.append_opt(locals_idx)
+        out.append("\n" as char)
+    }
+
+    procedure append_opt(this, v: int)
+    {
+        if v < 0
+        {
+            out.append("-" as char)
+            return
+        }
+        out.append(v)
+    }
+
+    ; ── the second numbering pass ───────────────────────────────────────────
+    ;
+    ; Every locals table's entries, in table order, name-sorted. See the header for
+    ; the defect this exists to prevent.
+    procedure number_collected_tables(this)
+    {
+        let count tables.get_length() as int
+        var i 0
+        while i < count
+        {
+            let t (*(tables.get_buffer() + i)).table
+            this.number_table_entries(t)
+            set i: i + 1
+        }
+    }
+
+    procedure number_table_entries(this, t: pointer[SymbolTable])
+    {
+        if t = null
+            return
+        let order this.sorted_order(t)
+        let n SymbolTable.length(t)
+        var i 0
+        while i < n
+        {
+            let e *(order.get_buffer() + i)
+            this.index_of(SymbolTable.entry_symbol_at(t, e))
+            set i: i + 1
+        }
+    }
+
+    ; ── sections 2 and 3: the symbols and their declarations ────────────────
+    ;
+    ; The list GROWS while it is walked, and the loop re-reads its length for that
+    ; reason: a symbol reachable only through another symbol's table gets its index
+    ; here and its own `s` line later in the same pass.
+    procedure emit_symbols(this)
+    {
+        var i 0
+        while i < (sym_order.get_length() as int)
+        {
+            let s *(sym_order.get_buffer() + i)
+
+            ; ★ THE ORDER OF THESE THREE QUESTIONS IS THE FORMAT. The oracle asks
+            ; for the parent's index, then the members table's id, then the exports
+            ; table's id, because Go evaluates a Printf's arguments left to right —
+            ; and each of the three may ASSIGN a number.
+            let parent_idx this.index_of(Symbol.parent_of(s))
+            let vd Symbol.value_declaration_of(s)
+            var vd_pos 0 - 1
+            var vd_end 0 - 1
+            if vd <> null
+            {
+                set vd_pos: AstNode.pos_of(vd)
+                set vd_end: AstNode.end_of(vd)
+            }
+            let members Symbol.members_of(s)
+            var members_id 0 - 1
+            if members <> null
+                set members_id: this.new_table_id()
+            let exports Symbol.exports_of(s)
+            var exports_id 0 - 1
+            if exports <> null
+                set exports_id: this.new_table_id()
+
+            out.append("s ")
+            out.append(i)
+            out.append(" " as char)
+            out.append(Symbol.flags_of(s))
+            out.append(" " as char)
+            this.append_opt(parent_idx)
+            out.append(" " as char)
+            this.append_opt(vd_pos)
+            out.append(" " as char)
+            this.append_opt(vd_end)
+            out.append(" " as char)
+            this.append_opt(members_id)
+            out.append(" " as char)
+            this.append_opt(exports_id)
+            out.append(" " as char)
+            this.append_escaped(Symbol.name_data_of(s), Symbol.name_len_of(s))
+            out.append("\n" as char)
+
+            let dcount Symbol.declaration_count(s)
+            var di 0
+            while di < dcount
+            {
+                let d Symbol.declaration_at(s, di)
+                out.append("d ")
+                out.append(i)
+                out.append(" " as char)
+                out.append(AstNode.kind_of(d))
+                out.append(" " as char)
+                out.append(AstNode.pos_of(d))
+                out.append(" " as char)
+                out.append(AstNode.end_of(d))
+                out.append("\n" as char)
+                set di: di + 1
+            }
+
+            let ex Symbol.export_symbol_of(s)
+            if ex <> null
+            {
+                out.append("x ")
+                out.append(i)
+                out.append(" " as char)
+                out.append(this.index_of(ex))
+                out.append("\n" as char)
+            }
+
+            if members <> null
+                this.collect_table(members_id, members)
+            if exports <> null
+                this.collect_table(exports_id, exports)
+            this.number_table_entries(members)
+            this.number_table_entries(exports)
+
+            set i: i + 1
+        }
+    }
+
+    ; ── section 4: the tables ───────────────────────────────────────────────
+    ;
+    ; In COLLECTION order, which is ascending id order because one counter assigns
+    ; them — the oracle sorts by id and arrives at the same sequence.
+    procedure emit_tables(this)
+    {
+        let count tables.get_length() as int
+        var i 0
+        while i < count
+        {
+            let dt *(tables.get_buffer() + i)
+            let t dt.table
+            let n SymbolTable.length(t)
+            out.append("t ")
+            out.append(dt.id)
+            out.append(" " as char)
+            out.append(n)
+            out.append("\n" as char)
+            let order this.sorted_order(t)
+            var j 0
+            while j < n
+            {
+                let e *(order.get_buffer() + j)
+                out.append("e ")
+                out.append(this.index_of(SymbolTable.entry_symbol_at(t, e)))
+                out.append(" " as char)
+                this.append_escaped(SymbolTable.entry_name_data_at(t, e), SymbolTable.entry_name_len_at(t, e))
+                out.append("\n" as char)
+                set j: j + 1
+            }
+            set i: i + 1
+        }
+    }
+
+    ; ── section 5: the file totals and the bind diagnostics ─────────────────
+    procedure emit_file_totals(this, b: pointer[Binder])
+    {
+        let names Binder.classifiable_count(b)
+        out.append("f ")
+        out.append(Binder.symbol_count_of(b))
+        out.append(" " as char)
+        out.append(names)
+        out.append("\n" as char)
+
+        ; The classifiable names, sorted the same way a table is.
+        let order this.sorted_classifiable(b)
+        var i 0
+        while i < names
+        {
+            let e *(order.get_buffer() + i)
+            out.append("c ")
+            this.append_escaped(Binder.classifiable_name_data_at(b, e), Binder.classifiable_name_len_at(b, e))
+            out.append("\n" as char)
+            set i: i + 1
+        }
+    }
+
+    procedure emit_bind_diagnostics(this, b: pointer[Binder])
+    {
+        let n Binder.diagnostic_count(b)
+        var i 0
+        while i < n
+        {
+            var dpos 0
+            var dend 0
+            var dcode 0
+            if Binder.diagnostic_at(b, i, &dpos, &dend, &dcode)
+            {
+                out.append("B ")
+                out.append(dpos)
+                out.append(" " as char)
+                out.append(dend)
+                out.append(" " as char)
+                out.append(dcode)
+                out.append("\n" as char)
+            }
+            set i: i + 1
+        }
+    }
+
+    ; ── the two orderings ───────────────────────────────────────────────────
+    ;
+    ; A permutation of a table's entry indices, sorted by NAME. Bottom-up MERGE
+    ; sort rather than an insertion sort, and the reason is a measurement: the
+    ; largest locals table in the stage-2 corpus holds 5000 entries, where an
+    ; insertion sort is 12.5 million moves. Merge sort is also stable, so the
+    ; permutation of two equal keys is decided by the entry order rather than by
+    ; luck — a table cannot hold two equal names, so that is a property nothing
+    ; depends on and it costs nothing to have.
+    function sorted_order(this, t: pointer[SymbolTable]) returns pointer[Array[int]]
+    {
+        let n SymbolTable.length(t)
+        let a host.allocate(sizeof Array[int], alignof Array[int]) as pointer[Array[int]]
+        set *a: Array[int]()
+        var i 0
+        while i < n
+        {
+            a.add(i)
+            set i: i + 1
+        }
+        if n < 2
+            return a
+        let scratch host.allocate(sizeof Array[int], alignof Array[int]) as pointer[Array[int]]
+        set *scratch: Array[int]()
+        var k 0
+        while k < n
+        {
+            scratch.add(0)
+            set k: k + 1
+        }
+        var width 1
+        while width < n
+        {
+            var lo 0
+            while lo < n
+            {
+                var mid lo + width
+                if mid > n
+                    set mid: n
+                var hi lo + (width * 2)
+                if hi > n
+                    set hi: n
+                var x lo
+                var y mid
+                var z lo
+                while z < hi
+                {
+                    var take_left false
+                    if x < mid
+                    {
+                        if y >= hi
+                            set take_left: true
+                        else
+                        {
+                            let li *(a.get_buffer() + x)
+                            let ri *(a.get_buffer() + y)
+                            if this.compare_table_names(t, li, ri) <= 0
+                                set take_left: true
+                        }
+                    }
+                    if take_left
+                    {
+                        scratch.put(z as size_t, *(a.get_buffer() + x))
+                        set x: x + 1
+                    }
+                    else
+                    {
+                        scratch.put(z as size_t, *(a.get_buffer() + y))
+                        set y: y + 1
+                    }
+                    set z: z + 1
+                }
+                var w lo
+                while w < hi
+                {
+                    a.put(w as size_t, *(scratch.get_buffer() + w))
+                    set w: w + 1
+                }
+                set lo: lo + (width * 2)
+            }
+            set width: width * 2
+        }
+        a
+    }
+
+    function compare_table_names(this, t: pointer[SymbolTable], i: int, j: int) returns int
+        SymbolDump.compare_names(SymbolTable.entry_name_data_at(t, i), SymbolTable.entry_name_len_at(t, i),
+                                 SymbolTable.entry_name_data_at(t, j), SymbolTable.entry_name_len_at(t, j))
+
+    ; The same ordering over the binder's classifiable-name set, which is a
+    ; SymbolTable used as a set — so the sort is the one above, over that table.
+    function sorted_classifiable(this, b: pointer[Binder]) returns pointer[Array[int]]
+    {
+        let n Binder.classifiable_count(b)
+        let a host.allocate(sizeof Array[int], alignof Array[int]) as pointer[Array[int]]
+        set *a: Array[int]()
+        var i 0
+        while i < n
+        {
+            a.add(i)
+            set i: i + 1
+        }
+        ; An insertion sort is right here and not there: the corpus's largest
+        ; classifiable set is a few hundred names, and this way the two orderings do
+        ; not share a code path that would have to be generic over its key.
+        var p 1
+        while p < n
+        {
+            let key *(a.get_buffer() + p)
+            var q p - 1
+            while q >= 0
+            {
+                let other *(a.get_buffer() + q)
+                if SymbolDump.compare_names(Binder.classifiable_name_data_at(b, other), Binder.classifiable_name_len_at(b, other),
+                                            Binder.classifiable_name_data_at(b, key), Binder.classifiable_name_len_at(b, key)) <= 0
+                    break
+                a.put((q + 1) as size_t, other)
+                set q: q - 1
+            }
+            a.put((q + 1) as size_t, key)
+            set p: p + 1
+        }
+        a
+    }
+
+    ; Bytewise, UNSIGNED, shorter-is-less on a prefix — Go's own string order.
+    function compare_names(ad: pointer[char], an: int, bd: pointer[char], bn: int) returns int
+    {
+        var n an
+        if bn < n
+            set n: bn
+        var i 0
+        while i < n
+        {
+            let a (*(ad + i)) as u8
+            let b (*(bd + i)) as u8
+            if a < b
+                return 0 - 1
+            if a > b
+                return 1
+            set i: i + 1
+        }
+        if an < bn
+            return 0 - 1
+        if an > bn
+            return 1
+        0
+    }
+
+    ; ── the escape ──────────────────────────────────────────────────────────
+    ;
+    ; Every byte outside 0x21..0x7E, and `%` itself, becomes %XX with UPPERCASE
+    ; hex. An empty name is `%00`, because a field has to be a field.
+    procedure append_escaped(this, d: pointer[char], n: int)
+    {
+        if n <= 0
+        {
+            out.append("%00")
+            return
+        }
+        var i 0
+        while i < n
+        {
+            let c (*(d + i)) as u8
+            var plain true
+            if c < (0x21 as u8)
+                set plain: false
+            if c > (0x7E as u8)
+                set plain: false
+            if c = (0x25 as u8)
+                set plain: false
+            if plain
+                out.append(*(d + i))
+            else
+            {
+                out.append("%" as char)
+                out.append(SymbolDump.hex_digit(((c as int) >> 4) & 15))
+                out.append(SymbolDump.hex_digit((c as int) & 15))
+            }
+            set i: i + 1
+        }
+    }
+
+    function hex_digit(v: int) returns char
+    {
+        if v < 10
+            return ((("0" as char) as int) + v) as char
+        ((("A" as char) as int) + (v - 10)) as char
+    }
+}

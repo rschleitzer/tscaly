@@ -81,13 +81,17 @@
 # one that can turn *it agrees over 834 units* into *the sample of 17 604 found
 # these 21 things*, which is what it did on its first pass.
 #
-# ★★★ SINCE SLICE 25 THE `unported` COLUMN IS ZERO IN BOTH STAGES, so every unit
-# is a comparison — and the way the last one was found is the argument for
-# printing that column at all. Stage 2 reported it twice out of 17 634, both
-# reports CORRECT, over a byte of scan_number that stage 1 could not reach; an
-# honest "not compared" is the cheapest place in this suite for a defect to hide,
-# because nobody investigates a unit that declares itself uncompared. Five
-# markers remain in parser.scaly and each stands where the reference PANICS.
+# ★★★ SINCE SLICE 25 THE `unported` COLUMN IS ZERO IN BOTH STAGES FOR THE FIRST
+# THREE YARDSTICKS, so every unit is a comparison there — and the way the last one
+# was found is the argument for printing that column at all. Stage 2 reported it
+# twice out of 17 634, both reports CORRECT, over a byte of scan_number that stage 1
+# could not reach; an honest "not compared" is the cheapest place in this suite for a
+# defect to hide, because nobody investigates a unit that declares itself uncompared.
+# Five markers remain in parser.scaly and each stands where the reference PANICS.
+# ★★ THE BINDER COLUMN IS THE OPPOSITE and is meant to be: slice 27 reads
+# 93 / 772 / 0 on stage 1 and 1 208 / 16 396 / 0 on stage 2, and that column IS the
+# work list — `triage.py` groups it by tag so it names the arm that unlocks the most
+# units next. A number in it is not a failure and not a pass.
 # ★It is a MEASUREMENT and not a gate, and it does not say *finished* either: the
 # corpus is a SAMPLE and the reference is the SPECIFICATION (CLAUDE.md §3.5be).
 #
@@ -434,7 +438,8 @@ echo
 echo "  of those, $symbol_bearing units actually CARRY a symbol, and $bind_diag_units carry a BIND"
 echo "  diagnostic ($bind_diag_lines of them). Printed for the reason the JSDoc-bearing count"
 echo "  is, and slice 26's control c1 is why it is not decoration: a dump of \`f 0 0\`"
-echo "  — no symbols, no tables, symbolCount 0 — MATCHED 44 of the 865 units,"
+echo "  — no symbols, no tables, symbolCount 0 — MATCHED 44 of the 865 units the"
+echo "  corpus held when that control ran,"
 echo "  because that is exactly what the reference produces for a unit that declares"
 echo "  nothing. A matched total on this yardstick therefore includes units where"
 echo "  both sides agree by producing nothing."

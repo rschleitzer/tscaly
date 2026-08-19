@@ -44,6 +44,12 @@ SOURCES = [
     # package; six of its messages appear nowhere else, so the port would have
     # had to spell them as bare numbers.
     os.path.join(SUB, "internal/parser/jsdoc.go"),
+    # Slice 27. The BINDER reports too, into a list of its own that neither
+    # Diagnostics() nor JSDiagnostics() includes — 5 207 diagnostics over 21 codes
+    # across the stage-2 corpus, TS2300 (Duplicate identifier) alone 3 425 — and
+    # the symbols yardstick compares them. Widening this list is exactly the
+    # arrangement the header describes for the phase after the parser.
+    os.path.join(SUB, "internal/binder/binder.go"),
 ]
 DST = os.path.join(REPO, "packages/tscaly/0.1.0/tscaly/DiagnosticCodes.scaly")
 
@@ -79,6 +85,14 @@ def main():
     # records for the ABI audit, where 82 wrong result types hid behind one
     # silently unparsable type name.
     used.discard("Message")
+    # ★ And `diagnostics.Category*` are the CATEGORY constants, not messages.
+    # binder.go names one directly (CategorySuggestion, for the unused-label
+    # suggestion it reports), which is the same class as `Message` above: a name in
+    # this package that is not a message. The set is narrow and named rather than a
+    # pattern that could swallow a real miss.
+    for category in ("CategoryError", "CategoryWarning", "CategorySuggestion",
+                     "CategoryMessage"):
+        used.discard(category)
     missing = sorted(n for n in used if n not in codes)
     if missing:
         sys.exit(
@@ -108,8 +122,9 @@ def main():
     out.append("; carry, and TESTPLAN.md says so where it lists what the dump format does not")
     out.append("; show — a wrong message with a right code passes here.")
     out.append(";")
-    out.append("; The set is exactly the messages the reference's scanner.go and parser.go")
-    out.append("; reference, deduped. The NAMES are the reference's own Go identifiers with a")
+    out.append("; The set is exactly the messages the reference's scanner.go, parser.go,")
+    out.append("; jsdoc.go and binder.go reference, deduped. The NAMES are the reference's own")
+    out.append("; Go identifiers with a")
     out.append("; `Diag` prefix and nothing else changed, so a site in our scanner spells the")
     out.append("; same name as the site in theirs and the two can be diffed by grep.")
     out.append(";")

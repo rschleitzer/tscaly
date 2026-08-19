@@ -103,6 +103,7 @@
 
 use scaly.memory.Page
 use scaly.containers.Array
+use scaly.containers.Vector
 use tscaly.Diagnostics.DiagnosticList
 
 ; ── per-kind payload records ────────────────────────────────────────────────
@@ -1567,6 +1568,46 @@ define AstNode
     end: int
 
     data: NodeData
+
+    ; ── the three slots the BINDER needs (slice 27) ──────────────────────────
+    ;
+    ; ★★★ DIVERGENCE FROM THE REFERENCE'S PLACEMENT, and it is a consequence of
+    ; §3.1's sum type. Upstream puts these in the per-kind data structs —
+    ; `DeclarationBase.Symbol`, `LocalsContainerBase.locals`, `NodeBase.Parent` —
+    ; and asks `node.Symbol()` / `node.Locals()`, which answer nil for a kind whose
+    ; data embeds neither base. Here the payload is a union of 134 records, so the
+    ; same arrangement would mean adding a field to every record that can carry a
+    ; symbol (44 of them, measured over the corpus) and a second one to every
+    ; container kind (25). They sit on the NODE instead: three pointers, 24 bytes
+    ; on every node, region-allocated and freed with the parse.
+    ;
+    ; ★ The observable behaviour is the same because the BINDER decides what gets
+    ; one: a kind the reference gives no symbol to is a kind nothing here assigns
+    ; to, and the symbols dump compares exactly that. What is lost is the
+    ; compiler's refusal — upstream cannot even write `someToken.Symbol = x`,
+    ; while here it type-checks. The yardstick is the check.
+    ;
+    ; `parent` is the reference's Node.Parent and is set during the PARSE, by
+    ; finish_node, from the node that owns the child (parser.go's
+    ; overrideParentInImmediateChildren). It is not derivable in general — the
+    ; reference re-parents at four sites where the owner was never finished — even
+    ; though over the whole stage-2 corpus it agrees with the walk everywhere; the
+    ; header note above has the measurement. Its readers are GetContainerFlags
+    ; (a Block's flags depend on whether its parent is function-like),
+    ; bindParameter, bindTypeParameter and getDeclarationName.
+    parent: pointer[AstNode]
+
+    ; The reference's DeclarationBase.Symbol: the symbol this declaration node
+    ; owns, set by addDeclarationToSymbol. Null on every node the binder does not
+    ; declare, which is most of them.
+    symbol: pointer[Symbol]
+
+    ; The reference's LocalsContainerBase.locals, created LAZILY: upstream's
+    ; bindContainer has the eager creation commented out and every reader goes
+    ; through ast.GetLocals, which makes the table on first use. That laziness is
+    ; observable — 754 of the 12 444 stage-2 files have no locals table at all —
+    ; so it is ported as laziness rather than as a table per container.
+    locals: pointer[SymbolTable]
 )
 {
     function alloc(host: pointer[Page]) returns pointer[AstNode]
@@ -1592,6 +1633,92 @@ define AstNode
 
     function kind_of(n: pointer[AstNode]) returns int
         n.kind
+
+    ; ── the binder's three slots, read back ─────────────────────────────────
+    ;
+    ; `parent_node_of` rather than `parent_of`, because Symbol has a parent too and
+    ; the two questions read very differently at a call site: a node's parent is a
+    ; NODE and a symbol's is a SYMBOL.
+
+    function parent_node_of(n: pointer[AstNode]) returns pointer[AstNode]
+    {
+        if n = null
+            return null
+        n.parent
+    }
+
+    function symbol_of(n: pointer[AstNode]) returns pointer[Symbol]
+    {
+        if n = null
+            return null
+        n.symbol
+    }
+
+    function locals_of(n: pointer[AstNode]) returns pointer[SymbolTable]
+    {
+        if n = null
+            return null
+        n.locals
+    }
+
+    ; The STATEMENT LIST of the three kinds that have one — the source file, a
+    ; block and a module block. The binder needs it as a list rather than through
+    ; child_at, because bindEachStatementFunctionsFirst walks it TWICE.
+    function statements_of(n: pointer[AstNode]) returns pointer[Array[pointer[AstNode]]]
+    {
+        if n = null
+            return null
+        choose n.data
+            when f: SourceFile
+                return f.statements
+            when b: Block
+                return b.statements
+            when mb: ModuleBlock
+                return mb.statements
+        null
+    }
+
+    function end_of_file_token_of(n: pointer[AstNode]) returns pointer[AstNode]
+    {
+        if n = null
+            return null
+        choose n.data
+            when f: SourceFile
+                return f.end_of_file_token
+        null
+    }
+
+    ; The PROPERTY name of a binding element or an import/export specifier — the
+    ; `p` of `{ p: x }` and of `import { p as x }`. IsIdentifierName asks for it,
+    ; and answering null there would be a silent wrong answer rather than a gap.
+    function property_name_of(n: pointer[AstNode]) returns pointer[AstNode]
+    {
+        if n = null
+            return null
+        choose n.data
+            when be: BindingElement
+                return be.property_name
+            when isp: ImportSpecifier
+                return isp.property_name
+            when esp: ExportSpecifier
+                return esp.property_name
+        null
+    }
+
+    ; The `...` token of a parameter or a binding element. Both flow arms bind it
+    ; FIRST, before the name, so the binder asks for it by itself rather than
+    ; through the child order.
+    function dot_dot_dot_token_of(n: pointer[AstNode]) returns pointer[AstNode]
+    {
+        if n = null
+            return null
+        choose n.data
+            when p: Parameter
+                return p.dot_dot_dot_token
+            when be: BindingElement
+                return be.dot_dot_dot_token
+        null
+    }
 
     function flags_of(n: pointer[AstNode]) returns int
         n.flags
@@ -5770,5 +5897,354 @@ define AstNode
                 return null
 
         null
+    }
+}
+
+; ── the binder's data: Symbol, SymbolTable (slice 27) ───────────────────────
+;
+; Ported from the reference's internal/ast/symbol.go, and they live HERE for the
+; reason they live in package ast upstream: a Symbol points at the declaration
+; NODES it was built from and a node points at the symbol it owns, so the two
+; types are mutually recursive. Two modules cannot be, so they share ast's.
+;
+; ★★★ NO NESTED BY-VALUE STRUCT, anywhere in this section, and that is the same
+; decision AstNode's `pos`/`end` pair records: a by-value struct nested in a
+; struct is not laid out in a root that never declared it (exit 16), and these
+; types are read from the dumper program. A symbol's NAME is therefore a
+; (pointer, length) PAIR spelled out as two fields rather than a `SymbolName`
+; concept — which is also what a Go string is.
+;
+; ★ A name's bytes are BORROWED. They point either into the source text (an
+; identifier's or a literal's own bytes, which live as long as the parse) or into
+; a buffer the binder built on its own page for a synthesized name (`__type`,
+; `"module"`, `__#1@x`). Nothing here copies, and nothing may free either.
+
+define Symbol
+(
+    flags: int
+
+    ; The reference's `Name string`. Bytes, not a String: an internal name begins
+    ; with the byte 0xFE, which is not valid UTF-8 — upstream picks it for exactly
+    ; that reason — so a type that promises text would be promising too much.
+    name_data: pointer[char]
+    name_len: int
+
+    ; Every declaration node that contributed to this symbol, in the order the
+    ; binder met them, and the reason the symbols dump prints them all: a merge
+    ; (two `var x`, an interface reopened) is ONE symbol with several
+    ; declarations, which is invisible in the SHAPE at any single node.
+    declarations: pointer[Array[pointer[AstNode]]]
+    value_declaration: pointer[AstNode]
+
+    members: pointer[SymbolTable]
+    exports: pointer[SymbolTable]
+    parent: pointer[Symbol]
+    export_symbol: pointer[Symbol]
+)
+{
+    ; The reference's newSymbol, minus the arena: one allocation on the binder's
+    ; page. NOT a constructed value — a data class with no init zero-fills only on
+    ; CONSTRUCTION, and every field is written here, so a forgotten one would be
+    ; region garbage rather than null.
+    function create(host: pointer[Page], flags: int, name_data: pointer[char], name_len: int) returns pointer[Symbol]
+    {
+        let s host.allocate(sizeof Symbol, alignof Symbol) as pointer[Symbol]
+        set s.flags: flags
+        set s.name_data: name_data
+        set s.name_len: name_len
+        set s.declarations: null
+        set s.value_declaration: null
+        set s.members: null
+        set s.exports: null
+        set s.parent: null
+        set s.export_symbol: null
+        s
+    }
+
+    ; ast.GetMembers / ast.GetExports: the table is made on FIRST USE, exactly as
+    ; upstream's are, because whether a symbol has one at all is observable — the
+    ; symbols dump prints `-` for a symbol with no members table and an id for a
+    ; symbol with an empty one.
+    function get_members(host: pointer[Page], s: pointer[Symbol]) returns pointer[SymbolTable]
+    {
+        if s.members = null
+            set s.members: SymbolTable.create(host)
+        s.members
+    }
+
+    function get_exports(host: pointer[Page], s: pointer[Symbol]) returns pointer[SymbolTable]
+    {
+        if s.exports = null
+            set s.exports: SymbolTable.create(host)
+        s.exports
+    }
+
+    ; ── accessors for the dumper, which is another program ROOT ──────────────
+    ;
+    ; Statics taking the symbol by pointer, for the reason AstNode's accessors are
+    ; statics: a user program calling a CROSS-PACKAGE free function with a
+    ; concept-pointer parameter fails resolution, while a concept STATIC resolves.
+
+    function flags_of(s: pointer[Symbol]) returns int
+        s.flags
+
+    function name_data_of(s: pointer[Symbol]) returns pointer[char]
+        s.name_data
+
+    function name_len_of(s: pointer[Symbol]) returns int
+        s.name_len
+
+    function parent_of(s: pointer[Symbol]) returns pointer[Symbol]
+        s.parent
+
+    function export_symbol_of(s: pointer[Symbol]) returns pointer[Symbol]
+        s.export_symbol
+
+    function value_declaration_of(s: pointer[Symbol]) returns pointer[AstNode]
+        s.value_declaration
+
+    function members_of(s: pointer[Symbol]) returns pointer[SymbolTable]
+        s.members
+
+    function exports_of(s: pointer[Symbol]) returns pointer[SymbolTable]
+        s.exports
+
+    function declaration_count(s: pointer[Symbol]) returns int
+    {
+        if s.declarations = null
+            return 0
+        s.declarations.get_length() as int
+    }
+
+    function declaration_at(s: pointer[Symbol], i: int) returns pointer[AstNode]
+    {
+        if s.declarations = null
+            return null
+        if i >= (s.declarations.get_length() as int)
+            return null
+        *(s.declarations.get_buffer() + i)
+    }
+}
+
+; One slot of a SymbolTable. The hash is stored beside the key because the whole
+; table is rebuilt on growth and rehashing a name means walking its bytes again.
+define SymbolTableEntry
+(
+    name_data: pointer[char]
+    name_len: int
+    hash: int
+    symbol: pointer[Symbol]
+)
+{
+    init(d: pointer[char], n: int, h: int, sym: pointer[Symbol])
+    {
+        set name_data: d
+        set name_len: n
+        set hash: h
+        set symbol: sym
+    }
+}
+
+; The reference's `SymbolTable map[string]*Symbol`.
+;
+; ★★★ WHY A HASH TABLE AND NOT A LIST, measured rather than assumed: the largest
+; locals table in the stage-2 corpus holds 5000 entries and so does the largest
+; exports table, so a linear probe would be 12.5 million name comparisons for one
+; container. Open addressing over a power-of-two bucket array, with the entries
+; kept in a separate Array in INSERTION order — the order is not compared (the
+; dump sorts by name, because a Go map has no order to compare) but it makes a
+; table walkable without touching the buckets.
+;
+; ★ It is OURS rather than the stdlib's HashMap, and that is a decision with two
+; halves. The stdlib's map is IMMUTABLE — built once from a HashMapBuilder — and a
+; symbol table is written to throughout the bind; and the license rule runs the
+; other way for this package (§1: MIT into Apache is fine, so using the stdlib
+; would have been allowed, but nothing here may travel back).
+define SymbolTable
+(
+    entries: pointer[Array[SymbolTableEntry]]
+    buckets: pointer[Vector[int]]      ; entry index + 1; 0 means empty
+    mask: int
+)
+{
+    function create(host: pointer[Page]) returns pointer[SymbolTable]
+    {
+        let t host.allocate(sizeof SymbolTable, alignof SymbolTable) as pointer[SymbolTable]
+        let a host.allocate(sizeof Array[SymbolTableEntry], alignof Array[SymbolTableEntry]) as pointer[Array[SymbolTableEntry]]
+        set *a: Array[SymbolTableEntry]()
+        set t.entries: a
+        set t.buckets: null
+        set t.mask: 0
+        t
+    }
+
+    ; FNV-1a over the bytes, folded to a non-negative int. The function is ours;
+    ; only its CONSISTENCY matters, since no dump compares a hash.
+    function hash_name(d: pointer[char], n: int) returns int
+    {
+        var h: u64 14695981039346656037
+        var i 0
+        while i < n
+        {
+            let b (*(d + i)) as u8
+            set h: h xor (b as u64)
+            set h: h * 1099511628211
+            set i: i + 1
+        }
+        ((h >> 1) as int)
+    }
+
+    function names_equal(a: pointer[char], an: int, b: pointer[char], bn: int) returns bool
+    {
+        if an <> bn
+            return false
+        var i 0
+        while i < an
+        {
+            if *(a + i) <> *(b + i)
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    function length(t: pointer[SymbolTable]) returns int
+    {
+        if t = null
+            return 0
+        t.entries.get_length() as int
+    }
+
+    function entry_symbol_at(t: pointer[SymbolTable], i: int) returns pointer[Symbol]
+    {
+        if t = null
+            return null
+        if i >= (t.entries.get_length() as int)
+            return null
+        (*(t.entries.get_buffer() + i)).symbol
+    }
+
+    function entry_name_data_at(t: pointer[SymbolTable], i: int) returns pointer[char]
+    {
+        if t = null
+            return null
+        if i >= (t.entries.get_length() as int)
+            return null
+        (*(t.entries.get_buffer() + i)).name_data
+    }
+
+    function entry_name_len_at(t: pointer[SymbolTable], i: int) returns int
+    {
+        if t = null
+            return 0
+        if i >= (t.entries.get_length() as int)
+            return 0
+        (*(t.entries.get_buffer() + i)).name_len
+    }
+
+    ; The map read: `symbolTable[name]`, which answers nil for an absent name.
+    function get(t: pointer[SymbolTable], d: pointer[char], n: int) returns pointer[Symbol]
+    {
+        if t = null
+            return null
+        if t.buckets = null
+            return null
+        let h SymbolTable.hash_name(d, n)
+        var slot h & t.mask
+        while true
+        {
+            let e t.buckets.get(slot as size_t)
+            if e = null
+                return null
+            let idx *e
+            if idx = 0
+                return null
+            let ent *(t.entries.get_buffer() + (idx - 1))
+            if ent.hash = h
+            {
+                if SymbolTable.names_equal(ent.name_data, ent.name_len, d, n)
+                    return ent.symbol
+            }
+            set slot: (slot + 1) & t.mask
+        }
+        null
+    }
+
+    ; The map write: `symbolTable[name] = symbol`. An existing name is REPLACED in
+    ; place, which is what the reference's assignment does when a conflict throws
+    ; the old symbol away (declareSymbolEx does exactly that).
+    procedure set_entry(host: pointer[Page], t: pointer[SymbolTable], d: pointer[char], n: int, sym: pointer[Symbol])
+    {
+        let h SymbolTable.hash_name(d, n)
+        if t.buckets <> null
+        {
+            var slot h & t.mask
+            while true
+            {
+                let e t.buckets.get(slot as size_t)
+                if e = null
+                    break
+                let idx *e
+                if idx = 0
+                    break
+                let ent *(t.entries.get_buffer() + (idx - 1))
+                if ent.hash = h
+                {
+                    if SymbolTable.names_equal(ent.name_data, ent.name_len, d, n)
+                    {
+                        set (*(t.entries.get_buffer() + (idx - 1))).symbol: sym
+                        return
+                    }
+                }
+                set slot: (slot + 1) & t.mask
+            }
+        }
+
+        t.entries.add(SymbolTableEntry(d, n, h, sym))
+        let count t.entries.get_length() as int
+
+        ; Grow while the load factor would pass one half, and rebuild every bucket
+        ; from the entry list — the entries themselves never move.
+        var cap 0
+        if t.buckets <> null
+            set cap: (t.mask + 1)
+        if (count * 2) > cap
+        {
+            var new_cap 8
+            while (count * 2) > new_cap
+                set new_cap: new_cap * 2
+            ; Vector[T](len) memsets its buffer, so the empty marker is 0 by
+            ; construction rather than by a loop here — the stdlib's own init has
+            ; the memset and its comment says so.
+            let v Vector[int]^host(new_cap as size_t)
+            set t.buckets: v
+            set t.mask: new_cap - 1
+            var j 0
+            while j < count
+            {
+                let ent *(t.entries.get_buffer() + j)
+                var slot ent.hash & t.mask
+                while true
+                {
+                    let e t.buckets.get(slot as size_t)
+                    if *e = 0
+                        break
+                    set slot: (slot + 1) & t.mask
+                }
+                t.buckets.put(slot as size_t, j + 1)
+                set j: j + 1
+            }
+            return
+        }
+
+        var slot h & t.mask
+        while true
+        {
+            let e t.buckets.get(slot as size_t)
+            if *e = 0
+                break
+            set slot: (slot + 1) & t.mask
+        }
+        t.buckets.put(slot as size_t, count)
     }
 }
