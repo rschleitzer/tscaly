@@ -123,12 +123,12 @@ echo "  patching $FILE:$LINE"
 
 # ── baseline ─────────────────────────────────────────────────────────────────
 
-parse_counts() {   # stdin = a run.sh report; sets M_TOK U_TOK F_TOK M_AST U_AST F_AST
+parse_counts() {   # a run.sh report -> nine numbers, three per yardstick
   python3 - "$1" <<'PY'
 import re, sys
 t = open(sys.argv[1]).read()
 out = []
-for name in ("scanner yardstick", "parser yardstick"):
+for name in ("scanner yardstick", "parser yardstick", "jsdoc yardstick"):
     i = t.find(name)
     if i < 0:
         out += ["?", "?", "?"]; continue
@@ -143,10 +143,10 @@ PY
 
 echo "  running the baseline ..."
 "$RUN" > "$WORK/base.log" 2>&1 </dev/null
-read -r BM_T BU_T BF_T BM_A BU_A BF_A <<<"$(parse_counts "$WORK/base.log")"
-echo "  BASELINE BEFORE   scanner $BM_T/$BU_T/$BF_T   parser $BM_A/$BU_A/$BF_A"
+read -r BM_T BU_T BF_T BM_A BU_A BF_A BM_J BU_J BF_J <<<"$(parse_counts "$WORK/base.log")"
+echo "  BASELINE BEFORE   scanner $BM_T/$BU_T/$BF_T   parser $BM_A/$BU_A/$BF_A   jsdoc $BM_J/$BU_J/$BF_J"
 
-if [ "$BF_T" != "0" ] || [ "$BF_A" != "0" ]; then
+if [ "$BF_T" != "0" ] || [ "$BF_A" != "0" ] || [ "$BF_J" != "0" ]; then
   red "the baseline is not clean — every number below would be meaningless."
   sed -n '/unexplained failures/,$p' "$WORK/base.log" | head -20
   exit 2
@@ -167,8 +167,8 @@ PY
 echo "  running the control ..."
 "$RUN" > "$WORK/ctl.log" 2>&1 </dev/null
 CTL_RC=$?
-read -r CM_T CU_T CF_T CM_A CU_A CF_A <<<"$(parse_counts "$WORK/ctl.log")"
-echo "  PATCHED           scanner $CM_T/$CU_T/$CF_T   parser $CM_A/$CU_A/$CF_A   (rc $CTL_RC)"
+read -r CM_T CU_T CF_T CM_A CU_A CF_A CM_J CU_J CF_J <<<"$(parse_counts "$WORK/ctl.log")"
+echo "  PATCHED           scanner $CM_T/$CU_T/$CF_T   parser $CM_A/$CU_A/$CF_A   jsdoc $CM_J/$CU_J/$CF_J   (rc $CTL_RC)"
 
 cp "$WORK/orig" "$FILE"
 
@@ -177,10 +177,10 @@ cp "$WORK/orig" "$FILE"
 # measure the control.
 echo "  restoring and rebuilding ..."
 "$RUN" > "$WORK/after.log" 2>&1 </dev/null
-read -r AM_T AU_T AF_T AM_A AU_A AF_A <<<"$(parse_counts "$WORK/after.log")"
-echo "  BASELINE AFTER RESTORE   scanner $AM_T/$AU_T/$AF_T   parser $AM_A/$AU_A/$AF_A"
+read -r AM_T AU_T AF_T AM_A AU_A AF_A AM_J AU_J AF_J <<<"$(parse_counts "$WORK/after.log")"
+echo "  BASELINE AFTER RESTORE   scanner $AM_T/$AU_T/$AF_T   parser $AM_A/$AU_A/$AF_A   jsdoc $AM_J/$AU_J/$AF_J"
 
-if [ "$AM_T" != "$BM_T" ] || [ "$AM_A" != "$BM_A" ] || [ "$AU_A" != "$BU_A" ]; then
+if [ "$AM_T" != "$BM_T" ] || [ "$AM_A" != "$BM_A" ] || [ "$AU_A" != "$BU_A" ] || [ "$AM_J" != "$BM_J" ]; then
   red "the tree did NOT come back to its baseline — this is a bug in ctl.sh, and"
   red "every number above is suspect. Check $FILE against git."
   exit 2
@@ -189,12 +189,12 @@ fi
 # ── the verdict ──────────────────────────────────────────────────────────────
 
 echo
-if [ "$CF_A" != "0" ] || [ "$CF_T" != "0" ]; then
-  green "RED $CF_A (parser)$([ "$CF_T" != 0 ] && echo " + $CF_T (scanner)")"
+if [ "$CF_A" != "0" ] || [ "$CF_T" != "0" ] || [ "$CF_J" != "0" ]; then
+  green "RED $CF_J (jsdoc)$([ "$CF_A" != 0 ] && echo " + $CF_A (parser)")$([ "$CF_T" != 0 ] && echo " + $CF_T (scanner)")"
   echo "  the units that differ:"
   sed -n '/unexplained failures/,$p' "$WORK/ctl.log" | sed -n '2,25p'
-elif [ "$CM_A" != "$BM_A" ] || [ "$CM_T" != "$BM_T" ]; then
-  green "MATCHED-COUNT GATE: parser $BM_A -> $CM_A, scanner $BM_T -> $CM_T"
+elif [ "$CM_A" != "$BM_A" ] || [ "$CM_T" != "$BM_T" ] || [ "$CM_J" != "$BM_J" ]; then
+  green "MATCHED-COUNT GATE: parser $BM_A -> $CM_A, scanner $BM_T -> $CM_T, jsdoc $BM_J -> $CM_J"
   echo "  Real — unported is not a pass — but weaker than a red. This is what most"
   echo "  controls produce while the port bails where the reference recovers."
 else

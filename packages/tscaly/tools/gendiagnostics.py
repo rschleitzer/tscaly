@@ -40,6 +40,10 @@ TABLE = os.path.join(SUB, "internal/diagnostics/diagnostics_generated.go")
 SOURCES = [
     os.path.join(SUB, "internal/scanner/scanner.go"),
     os.path.join(SUB, "internal/parser/parser.go"),
+    # Slice 21. jsdoc.go is the parser's second grammar and sits in the same
+    # package; six of its messages appear nowhere else, so the port would have
+    # had to spell them as bare numbers.
+    os.path.join(SUB, "internal/parser/jsdoc.go"),
 ]
 DST = os.path.join(REPO, "packages/tscaly/0.1.0/tscaly/DiagnosticCodes.scaly")
 

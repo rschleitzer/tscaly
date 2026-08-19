@@ -3,7 +3,7 @@
 #
 # run.sh — the tscaly yardsticks.
 #
-# TWO yardsticks over one corpus, both built from the pinned submodule, so
+# THREE yardsticks over one corpus, all built from the pinned submodule, so
 # "green" means our port agrees with the TypeScript compiler's own output and
 # not with an expectation someone typed:
 #
@@ -11,6 +11,16 @@
 #   parser    the parse tree — a pre-order walk of kind, pos, end, flags,
 #             through the reference's own child ORDER, plus the syntactic
 #             diagnostics (code and span)
+#   jsdoc     the JSDoc parse — for every node the parser walk has agreed on,
+#             the JSDoc trees hanging off it, in the same shape (slice 21)
+#
+# ★★★ THE THIRD ONE IS NOT A SUBSET OF THE SECOND, and that is why it exists.
+# JSDoc nodes are not in the tree the parser yardstick walks: the reference hangs
+# them off the documented node through a side table, and for a TS/TSX file it
+# does not parse them during ParseSourceFile at all — it sets HasLazyJSDoc and
+# parses on the first access to Node.JSDoc(file). So a port producing no JSDoc
+# and a port producing a WRONG one compare exactly equal on the parser
+# yardstick, in both directions. See tests/oracle/jsdoc.go.
 #
 # They share one runner rather than one each, because the expensive and
 # error-prone part is not the comparison — it is the submodule discipline
@@ -137,12 +147,14 @@ if [ -n "$SUB_GITDIR" ] && [ -d "$SUB_GITDIR/info" ]; then
     || echo '/oracle/' >> "$SUB_GITDIR/info/exclude"
 fi
 
-mkdir -p "$SUB/oracle/tokens" "$SUB/oracle/ast" "$SUB/oracle/split"
+mkdir -p "$SUB/oracle/tokens" "$SUB/oracle/ast" "$SUB/oracle/jsdoc" "$SUB/oracle/split"
 cp "$PKG/tests/oracle/tokens.go" "$SUB/oracle/tokens/main.go"
 cp "$PKG/tests/oracle/ast.go"    "$SUB/oracle/ast/main.go"
+cp "$PKG/tests/oracle/jsdoc.go"  "$SUB/oracle/jsdoc/main.go"
 cp "$PKG/tests/oracle/split.go"  "$SUB/oracle/split/main.go"
 ( cd "$SUB" && go build -o "$REPO/$OUT/oracle_tokens" ./oracle/tokens \
             && go build -o "$REPO/$OUT/oracle_ast"    ./oracle/ast \
+            && go build -o "$REPO/$OUT/oracle_jsdoc"  ./oracle/jsdoc \
             && go build -o "$REPO/$OUT/oracle_split"  ./oracle/split ) \
   > "$OUT/oracle-build.log" 2>&1
 orc=$?
@@ -172,7 +184,7 @@ if [ $? -ne 0 ]; then
   red "the tscaly package failed to compile:"; sed 's/^/    /' "$OUT/pkg-build.log"; exit 2
 fi
 
-for prog in tscaly_tokens tscaly_ast; do
+for prog in tscaly_tokens tscaly_ast tscaly_jsdoc; do
   "$SCALYC" -c -o "$OUT/$prog.o" "$PKG/0.1.0/$prog.scaly" > "$OUT/$prog-build.log" 2>&1
   if [ $? -ne 0 ]; then
     red "$prog failed to compile:"; sed 's/^/    /' "$OUT/$prog-build.log"; exit 2
@@ -225,6 +237,11 @@ rm -rf "$OUT/cases"
 # it, so the run would report zeros rather than refusing.
 matched_tokens=0; unported_tokens=0; failed_tokens=0; accepted_tokens=0; stale_tokens=0
 matched_ast=0;    unported_ast=0;    failed_ast=0;    accepted_ast=0;    stale_ast=0
+matched_jsdoc=0;  unported_jsdoc=0;  failed_jsdoc=0;  accepted_jsdoc=0;  stale_jsdoc=0
+# How many units carry any JSDoc at all. A yardstick whose output is empty on
+# 90 % of the corpus has to say so, or "matched" reads as coverage it does not
+# have — the same reason the .json and .tsx counts are printed.
+jsdoc_bearing=0
 failures=()
 stales=()
 
@@ -452,6 +469,18 @@ for case_file in "${cases[@]}"; do
       ACCEPTED) accepted_ast=$((accepted_ast + 1)) ;;
       FAIL)     failed_ast=$((failed_ast + 1)) ;;
     esac
+
+    compare_one "$key" jsdoc 5 "$OUT/tscaly_jsdoc" "$OUT/oracle_jsdoc" "$written" "$work"
+    case $VERDICT in
+      MATCH)    matched_jsdoc=$((matched_jsdoc + 1)) ;;
+      STALE)    matched_jsdoc=$((matched_jsdoc + 1)); stale_jsdoc=$((stale_jsdoc + 1)) ;;
+      UNPORTED) unported_jsdoc=$((unported_jsdoc + 1)) ;;
+      ACCEPTED) accepted_jsdoc=$((accepted_jsdoc + 1)) ;;
+      FAIL)     failed_jsdoc=$((failed_jsdoc + 1)) ;;
+    esac
+    if [ -s "$work/jsdoc.ref" ]; then
+      jsdoc_bearing=$((jsdoc_bearing + 1))
+    fi
   done < "$case_work/units.manifest"
 done
 
@@ -470,6 +499,13 @@ report() {
 
 report "scanner yardstick" $matched_tokens $unported_tokens $accepted_tokens $failed_tokens
 report "parser yardstick"  $matched_ast    $unported_ast    $accepted_ast    $failed_ast
+report "jsdoc yardstick"   $matched_jsdoc  $unported_jsdoc  $accepted_jsdoc  $failed_jsdoc
+
+echo
+echo "  of those, $jsdoc_bearing units actually CARRY JSDoc — the rest match by both"
+echo "  sides producing nothing, which is a real comparison and not coverage. A"
+echo "  yardstick that is empty on most of the corpus has to print the number, or"
+echo "  its matched count reads as evidence it does not have."
 
 echo
 echo "$json_compared .json units ARE compared, under ScriptKindJSON on both sides —"
@@ -507,8 +543,8 @@ echo
 echo "  Each count is printed rather than folded away: a yardstick that shrinks in"
 echo "  silence is the failure mode this suite exists to prevent."
 
-total_stale=$(( stale_tokens + stale_ast ))
-total_failed=$(( failed_tokens + failed_ast ))
+total_stale=$(( stale_tokens + stale_ast + stale_jsdoc ))
+total_failed=$(( failed_tokens + failed_ast + failed_jsdoc ))
 
 if [ $total_stale -ne 0 ]; then
   echo

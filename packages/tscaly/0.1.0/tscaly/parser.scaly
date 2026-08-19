@@ -78,6 +78,13 @@
 ;   slice 16 the REGULAR EXPRESSION literal: the scanner's ReScanSlashToken and
 ;            the `/` arm of the primary expression, which is the whole of it on
 ;            this side. The last re-scan entry point outside JSDoc and JSX
+;   slice 21 the JSDOC grammar, at the bottom of this file. A third token
+;            grammar, a truncated source text, and the port's third YARDSTICK —
+;            JSDoc is not in the tree the parser one walks, so neither existing
+;            instrument could see this slice in either direction. It also
+;            supplies the last three re-scan entry points,
+;            ReScanAsteriskEqualsToken, ReScanQuestionToken and ReScanHashToken,
+;            which closes that family
 ;
 ; ── What it deliberately does not, each stated rather than left to be noticed ─
 ;
@@ -258,6 +265,15 @@ use tscaly.ast.JsxTextData
 use tscaly.ast.JsxExpressionData
 use tscaly.ast.JsxAttributeData
 use tscaly.ast.JsxNamespacedNameData
+use tscaly.ast.JSDocData
+use tscaly.ast.JSDocTagData
+use tscaly.ast.JSDocOneSlotTagData
+use tscaly.ast.JSDocTemplateTagData
+use tscaly.ast.JSDocImportTagData
+use tscaly.ast.JSDocNamedTagData
+use tscaly.ast.JSDocSignatureData
+use tscaly.ast.JSDocTypeLiteralData
+use tscaly.ast.JSDocParameterOrPropertyTagData
 
 ; The reference's jsdocScannerInfo — what the scanner noticed about the JSDoc
 ; comment preceding the token the parser is about to consume. It is captured at
@@ -318,9 +334,42 @@ define PCSourceElements:      int 20
 define PCJsxAttributes:       int 21
 define PCJsxChildren:         int 22
 
+; Slice 21. PCJSDocComment is entered by parse_jsdoc_comment and by nothing
+; else: no list is parsed under it. What it is FOR is the same thing
+; PCJsxChildren is for — is_in_some_parsing_context asks every OPEN list about a
+; token an inner list has choked on, and this context answers `true`
+; UNCONDITIONALLY (the reference's `case PCJSDocComment: return true` in
+; isListElement). So while a JSDoc comment is being parsed, an inner list gives
+; up rather than skipping a token, which keeps a malformed type inside a comment
+; from eating the rest of it.
+define PCJSDocComment:        int 23
+
 ; The reference's PCCount — the loop bound of is_in_some_parsing_context, which
 ; is the only reason the values have to be dense.
-define PCCount:               int 23
+define PCCount:               int 24
+
+; The reference's `jsdocState` — the four states parseJSDocCommentWorker and
+; parseTagComments run on. It IS the grammar of a comment: which states admit a
+; tag, and which of the two SCANNERS the next token comes from.
+define JSDOC_STATE_BEGINNING_OF_LINE: int 0
+define JSDOC_STATE_SAW_ASTERISK:      int 1
+define JSDOC_STATE_SAVING_COMMENTS:   int 2
+define JSDOC_STATE_SAVING_BACKTICKS:  int 3
+
+; The reference's `propertyLikeParse` — a BIT SET, and it has to stay one:
+; tryParseChildTag tests `target & t` with a `t` that carries two bits for
+; `@param`, so a plain enum would not express the question.
+define PROPERTY_LIKE_PROPERTY:           int 1
+define PROPERTY_LIKE_PARAMETER:          int 2
+define PROPERTY_LIKE_CALLBACK_PARAMETER: int 4
+
+; parseJSDocLinkPrefix's answer. The reference returns `(string, bool)` and the
+; string is immediately compared against three literals to select a node kind,
+; so the closed value set travels as an int here (§3.6).
+define JSDOC_LINK_NONE:  int 0
+define JSDOC_LINK_LINK:  int 1
+define JSDOC_LINK_CODE:  int 2
+define JSDOC_LINK_PLAIN: int 3
 
 ; ── operator precedence, ported from internal/ast/precedence.go ─────────────
 ;
@@ -636,6 +685,19 @@ define Parser
     ; A bool for the reason the scanner's is one: the reference's enum has two
     ; members and every read is `== LanguageVariantJSX`.
     language_variant_jsx: bool
+
+    ; The reference's `p.hasDeprecatedTag`, set by parse_tag when it meets
+    ; `@deprecated` and read — and CLEARED — by with_jsdoc, which turns it into
+    ; NodeFlagsPossiblyContainsDeprecatedTag on the documented node. It is a
+    ; field rather than a return value because the tag can sit at any depth of
+    ; the comment and the reader is two routines above it.
+    has_deprecated_tag: bool
+
+    ; The reference's parse RESULT, kept so that a caller which needs the parser
+    ; afterwards can have both. Slice 21 is the first such caller: the JSDoc
+    ; yardstick walks the tree and asks the parser to parse a comment per node,
+    ; which is exactly what Node.JSDoc(file) does upstream.
+    result_file: pointer[AstNode]
 )
 {
     init(host: pointer[Page], scanner: pointer[Scanner])
@@ -663,6 +725,8 @@ define Parser
         set this.source_flags: NodeFlagsNone
         set this.script_kind: ScriptKindTS
         set this.language_variant_jsx: false
+        set this.has_deprecated_tag: false
+        set this.result_file: null
         set this.unported_pos: 0 - 1
         set this.unported_tag: null
         set this.unported_detail: 0
@@ -688,6 +752,17 @@ define Parser
     ; before a single token is read. It is answered here rather than carried,
     ; because it is asked once — see the `is_declaration_file` field.
     function parse(host: pointer[Page], file_name: String, source: String, script_kind: int, out_unported: pointer[int], out_tag: pointer[pointer[const_char]], out_detail: pointer[int]) returns pointer[AstNode]
+    {
+        let p parse_ex(host, file_name, source, script_kind, out_unported, out_tag, out_detail)
+        p.result_file
+    }
+
+    ; ★ Slice 21 split this out of `parse` and changed nothing about it. The
+    ; JSDoc yardstick needs the PARSER after the parse — a TS file's JSDoc is
+    ; parsed on demand, per node, exactly as Node.JSDoc(file) does upstream — so
+    ; the parser has to survive the call and the tree has to be reachable from
+    ; it. `parse` stays the one-line entry point every other caller uses.
+    function parse_ex(host: pointer[Page], file_name: String, source: String, script_kind: int, out_unported: pointer[int], out_tag: pointer[pointer[const_char]], out_detail: pointer[int]) returns pointer[Parser]
     {
         let sc host.allocate(sizeof Scanner, alignof Scanner) as pointer[Scanner]
         set *sc: Scanner(source)
@@ -741,8 +816,14 @@ define Parser
         set *out_unported: p.unported_at()
         set *out_tag: p.unported_tag_at()
         set *out_detail: p.unported_detail_at()
-        file
+        set p.result_file: file
+        p
     }
+
+    ; The tree a parse_ex call produced. A concept STATIC for the reason
+    ; parse_ex is one: the caller is a program root.
+    function source_file_of(p: pointer[Parser]) returns pointer[AstNode]
+        p.result_file
 
     ; ★★★ The script kind THIS PORT implements for a given file name, which is
     ; the reference's `core.GetScriptKindFromFileName` clamped to the two kinds
@@ -927,6 +1008,27 @@ define Parser
 
     ; Answers the node, so a caller can end with `this.with_jsdoc(result, jsdoc)`,
     ; or null when the eager path is reached.
+    ; ★★★ Slice 21 turned the last line of this into the real thing. For a TS or
+    ; TSX file the reference DEFERS the JSDoc parse — it sets the two flags from
+    ; the scanner's cheap text scan and stops — with one exception: a comment
+    ; containing `@see` or `@link` is parsed EAGERLY, because the unused-identifier
+    ; check needs those references before anything asks a node for its JSDoc.
+    ;
+    ; ★ What the eager parse produces goes into a side table upstream
+    ; (jsdocInfos) and its diagnostics are discarded for a TS file, so on this
+    ; side it is observationally a no-op for the TREE — and it is run anyway,
+    ; for two reasons that are not cosmetic. It is what the reference does, and
+    ; the difference between "runs and is discarded" and "does not run" is a
+    ; SCANNER-state question: parse_jsdoc_comment moves the end, the position,
+    ; the token and the context flags and puts them all back, so running it here
+    ; is the only thing that exercises that restore on the main parse path.
+    ; `has_deprecated_tag` is the one answer that does reach the tree.
+    ;
+    ; ★ The reference's `if p.isJavaScript() { p.reparseTags(...) }` is NOT
+    ; ported: the reparser turns `@typedef` and friends into synthesized
+    ; DECLARATIONS in the statement list, and it is reachable only under
+    ; ScriptKindJS/JSX, which `supported_script_kind` does not yet select. It is
+    ; the slice that clamps `.js` to its own kind.
     procedure with_jsdoc(this, n: pointer[AstNode], info: int) returns pointer[AstNode]
     {
         if n = null
@@ -936,8 +1038,19 @@ define Parser
         set n.flags: n.flags | NodeFlagsHasJSDoc
         if (info & JsdocInfoHasDeprecated) <> 0
             set n.flags: n.flags | NodeFlagsPossiblyContainsDeprecatedTag
-        if (info & JsdocInfoHasSeeOrLink) <> 0
-            return this.unported("jsdoc-see-or-link", 0)
+        if (info & JsdocInfoHasSeeOrLink) = 0
+            return n
+
+        set has_deprecated_tag: false
+        let jsdoc this.parse_jsdoc_for_node(n)
+        if jsdoc <> null
+        {
+            if has_deprecated_tag
+            {
+                set has_deprecated_tag: false
+                set n.flags: n.flags | NodeFlagsPossiblyContainsDeprecatedTag
+            }
+        }
         n
     }
 
@@ -3917,7 +4030,15 @@ define Parser
     {
         if ok
         {
-            let pos this.node_pos()
+            ; ★★★ The token's START, not its FULL start, when a JSDoc margin
+            ; asterisk was skipped in front of it — the reference's own branch,
+            ; and the ONLY reader of TokenFlagsPrecedingJSDocLeadingAsterisks.
+            ; Inside `{{` NL ` *   a: string }}` the `*` and the spaces around it
+            ; are trivia to the type parser, so an identifier that took its full
+            ; start would begin at the line break and swallow the margin.
+            var pos this.node_pos()
+            if scanner.has_preceding_jsdoc_leading_asterisks()
+                set pos: scanner.token_start()
 
             ; The reference's newIdentifier sets statementHasAwaitIdentifier when
             ; the identifier's TEXT is "await". This asks the token KIND, and
@@ -7955,14 +8076,24 @@ define Parser
             return this.parse_type_reference()
         }
 
-        ; The JSDoc PREFIX forms. `*=` and `??` additionally need a re-scan
-        ; entry point the scanner does not have yet.
+        ; The JSDoc PREFIX forms. `*=` and `??` are ONE token to the ordinary
+        ; scanner and TWO to this grammar, so each needs a re-scan first — slice
+        ; 21 supplied both, and they are the last two entry points of the ReScan
+        ; family. The reference reaches the arm below by FALLING THROUGH from the
+        ; re-scan case into the plain one; here the re-scan sets the token and the
+        ; call is repeated, which is the same program.
         if token = KindAsteriskEqualsToken
-            return this.unported("jsdoc-all-type", token)
+        {
+            scanner.re_scan_asterisk_equals_token()
+            return this.parse_jsdoc_all_type()
+        }
         if token = KindAsteriskToken
-            return this.unported("jsdoc-all-type", token)
+            return this.parse_jsdoc_all_type()
         if token = KindQuestionQuestionToken
-            return this.unported("jsdoc-nullable-type", token)
+        {
+            scanner.re_scan_question_token()
+            return this.parse_jsdoc_nullable_type()
+        }
         if token = KindQuestionToken
             return this.parse_jsdoc_nullable_type()
         if token = KindExclamationToken
@@ -11221,7 +11352,7 @@ define Parser
 
         ; A null clause is `import "m";`, which is legitimate — the failure
         ; test is the flag, not the result (§3.5h).
-        let import_clause this.try_parse_import_clause(identifier, after_import_pos, phase_modifier)
+        let import_clause this.try_parse_import_clause(identifier, after_import_pos, phase_modifier, false)
         if this.is_unported()
             return null
         set statement_has_await_identifier: saved_await_identifier
@@ -11381,7 +11512,14 @@ define Parser
     ; on the parse path. Left out rather than carried as a parameter that can
     ; never be anything but false — the same treatment
     ; ParseFlagsIgnoreMissingOpenBrace gets at the top of this file.
-    procedure try_parse_import_clause(this, identifier: pointer[AstNode], pos: int, phase_modifier: int) returns pointer[AstNode]
+    ; ★★★ Slice 21 gave both of these the reference's fourth parameter, and it is
+    ; the §3.5ar shape from the side that leaves nothing to grep: every caller up
+    ; to slice 20 passes it as FALSE, so it had been folded away, and
+    ; `parseImportTag` is the one caller in the whole reference that passes true.
+    ; An `@import` tag's clause may be written across the lines of a JSDoc
+    ; comment, so the margin asterisks have to become trivia for the length of
+    ; the clause and for nothing else.
+    procedure try_parse_import_clause(this, identifier: pointer[AstNode], pos: int, phase_modifier: int, skip_jsdoc_leading_asterisks: bool) returns pointer[AstNode]
     {
         var has_clause false
         if identifier <> null
@@ -11393,14 +11531,14 @@ define Parser
         if has_clause = false
             return null
 
-        let import_clause this.parse_import_clause(identifier, pos, phase_modifier)
+        let import_clause this.parse_import_clause(identifier, pos, phase_modifier, skip_jsdoc_leading_asterisks)
         if import_clause = null
             return null
         this.parse_expected(KindFromKeyword)
         import_clause
     }
 
-    procedure parse_import_clause(this, identifier: pointer[AstNode], pos: int, phase_modifier: int) returns pointer[AstNode]
+    procedure parse_import_clause(this, identifier: pointer[AstNode], pos: int, phase_modifier: int, skip_jsdoc_leading_asterisks: bool) returns pointer[AstNode]
     {
         let saved_await_identifier statement_has_await_identifier
         var named_bindings null as pointer[AstNode]
@@ -11418,10 +11556,14 @@ define Parser
         }
         if parse_bindings
         {
+            if skip_jsdoc_leading_asterisks
+                scanner.set_skip_jsdoc_leading_asterisks(true)
             if token = KindAsteriskToken
                 set named_bindings: this.parse_namespace_import()
             else
                 set named_bindings: this.parse_named_imports()
+            if skip_jsdoc_leading_asterisks
+                scanner.set_skip_jsdoc_leading_asterisks(false)
             if named_bindings = null
                 return null
         }
@@ -12321,6 +12463,14 @@ define Parser
             return
         }
         if ctx = PCJsxChildren
+        {
+            this.parse_error_at_current_token(DiagIdentifier_expected)
+            return
+        }
+        ; Slice 21. PCJSDocComment shares that same arm upstream — unreachable in
+        ; practice, since no list is parsed under it (see the constant), and
+        ; ported because the reference has it.
+        if ctx = PCJSDocComment
             this.parse_error_at_current_token(DiagIdentifier_expected)
     }
 
@@ -12604,6 +12754,15 @@ define Parser
             return token = KindOpenBraceToken
         }
         if ctx = PCJsxChildren
+            return true
+        ; ★★★ Slice 21. PCJSDocComment answers TRUE unconditionally, which is the
+        ; reference's own arm — and it is the whole POINT of entering the context:
+        ; is_in_some_parsing_context asks `is_list_element(k, true)` of every open
+        ; list BEFORE it asks `is_list_terminator(k)`, so while a JSDoc comment is
+        ; being parsed the disjunction already says yes on every token, and an
+        ; inner list gives up rather than skipping one. Same shape as PCJsxChildren
+        ; one line above, and the same reason its terminator arm cannot be gated.
+        if ctx = PCJSDocComment
             return true
         ; PCTypeArguments and PCTupleElementTypes share one arm upstream too.
         if token = KindCommaToken
@@ -13102,4 +13261,2223 @@ define Parser
         this.rewind(saved)
         r
     }
+
+    ; ════════════════════════════════════════════════════════════════════════
+    ; JSDOC — slice 21, ported from the reference's internal/parser/jsdoc.go
+    ; ════════════════════════════════════════════════════════════════════════
+    ;
+    ; ★★★ THE THIRD GRAMMAR, AND THE THIRD YARDSTICK WITH IT. What a JSDoc
+    ; comment produces is NOT in the tree the parser yardstick walks: the
+    ; reference hangs it off the documented node through a side table
+    ; (jsdocCache), reachable only through Node.JSDoc(file) — and for a TS/TSX
+    ; file it does not parse it during ParseSourceFile at all, only on the first
+    ; such access. So a JSDoc defect is invisible to both existing yardsticks in
+    ; BOTH directions: a port producing no JSDoc and a port producing a wrong
+    ; tree compare exactly equal there. tests/oracle/jsdoc.go is what makes this
+    ; slice measurable, and building it was the first thing this slice did.
+    ;
+    ; ── What is different about this grammar ────────────────────────────────
+    ;
+    ; (1) The SCANNER RUNS ON A TRUNCATED TEXT. parse_jsdoc_comment sets the
+    ;     scanner's end to just before the closing `*/`, so the delimiter is
+    ;     end-of-file to everything inside and no routine has to test for it.
+    ;     Nothing else in this port moves the end.
+    ;
+    ; (2) WHITESPACE AND NEWLINES ARE TOKENS. The comment's LAYOUT is grammar
+    ;     here — the margin decides where a tag's comment ends — so scan() is
+    ;     not used at all inside a comment; scan_jsdoc_token is.
+    ;
+    ; (3) ... except where it IS. Every type is parsed by the ORDINARY type
+    ;     parser, entered through parse_jsdoc_type, which is why the scanner
+    ;     needs skip_jsdoc_leading_asterisks: a type written across two lines
+    ;     of a comment must not see the margin's `*` as an operator.
+    ;
+    ; (4) The COMMENT TEXT is accumulated as a list of source RANGES, and its
+    ;     lengths are load-bearing even though its bytes are never stored:
+    ;     `indent` counts them, `margin` is compared against `indent`, and the
+    ;     margin decides which whitespace becomes part of a comment. So this
+    ;     port carries the accumulation faithfully and drops only the bytes.
+    ;     See the JSDocText arm in ast.scaly for why the bytes are dropped.
+    ;
+    ; (5) The reference reuses three SLICE BUFFERS across parses
+    ;     (jsdocCommentsSpace, jsdocTagCommentsSpace, jsdocTagCommentsPartsSpace)
+    ;     and one of them carries a comment asking whether the routine can call
+    ;     itself. That is allocation reuse for a garbage collector; under RBMM a
+    ;     fresh accumulator per invocation costs a bump and dies with the region,
+    ;     so the buffers are NOT ported and the reentrancy question does not
+    ;     arise. This is the one place the port is deliberately simpler than the
+    ;     reference, and it is simpler because the memory model is different.
+
+    ; ── the comment accumulator ─────────────────────────────────────────────
+    ;
+    ; The reference's `comments []string`. Every part is a slice of the SOURCE —
+    ; a token's text, a token's value, or a suffix of one — so a pair of
+    ; absolute offsets is the faithful representation and no bytes are copied.
+    ;
+    ; The array holds start and end INTERLEAVED and the live count travels as an
+    ; ordinary local, because the operations the reference performs on the slice
+    ; are `append`, truncate-to-n and drop-leading-k, and Array offers `add`,
+    ; `put` and `clear` but no truncation. Keeping the count outside makes
+    ; truncation free and re-pushing after one a `put` rather than an `add`.
+
+    procedure cparts_new(this) returns pointer[Array[int]]
+    {
+        let a host.allocate(sizeof Array[int], alignof Array[int]) as pointer[Array[int]]
+        set *a: Array[int]()
+        a
+    }
+
+    procedure cparts_push(this, a: pointer[Array[int]], count: int, s: int, e: int) returns int
+    {
+        let n a.get_length() as int
+        if (count * 2) < n
+        {
+            a.put((count * 2) as size_t, s)
+            a.put(((count * 2) + 1) as size_t, e)
+        }
+        else
+        {
+            a.add(s)
+            a.add(e)
+        }
+        count + 1
+    }
+
+    function cparts_start(a: pointer[Array[int]], i: int) returns int
+        *(a.get_buffer() + (i * 2))
+
+    function cparts_end(a: pointer[Array[int]], i: int) returns int
+        *(a.get_buffer() + ((i * 2) + 1))
+
+    procedure cparts_set_end(this, a: pointer[Array[int]], i: int, e: int)
+        a.put(((i * 2) + 1) as size_t, e)
+
+    ; The reference's `strings.TrimRightFunc(s, stringutil.IsWhiteSpaceLike)`,
+    ; answering the new END rather than a new string. Decoding backwards is what
+    ; makes a multi-byte separator (U+2028) trim as one character.
+    function trim_end_of(this, s: int, e: int) returns int
+    {
+        var p e
+        while p > s
+        {
+            let c scanner.utf8_decode_last_before(p)
+            if not Scanner.is_white_space_like(c)
+                return p
+            set p: p - scanner.utf8_last_size_before(p)
+        }
+        s
+    }
+
+    ; The final trim of the whole comment uses Go's `unicode.IsSpace`, NOT
+    ; IsWhiteSpaceLike — a wider set that includes U+0085 and the Unicode space
+    ; categories but NOT U+FEFF, which IsWhiteSpaceSingleLine does include. The
+    ; two differ on exactly two code points and the reference uses each of them
+    ; once, so both are carried rather than unified.
+    function is_unicode_space(c: int) returns bool
+    {
+        if (c = 9) or (c = 10) or (c = 11) or (c = 12) or (c = 13) or (c = 32)
+            return true
+        if (c = 0x0085) or (c = 0x00A0) or (c = 0x1680)
+            return true
+        if (c >= 0x2000) and (c <= 0x200A)
+            return true
+        if (c = 0x2028) or (c = 0x2029) or (c = 0x202F) or (c = 0x205F)
+            return true
+        c = 0x3000
+    }
+
+    function trim_end_unicode_space_of(this, s: int, e: int) returns int
+    {
+        var p e
+        while p > s
+        {
+            let c scanner.utf8_decode_last_before(p)
+            if not is_unicode_space(c)
+                return p
+            set p: p - scanner.utf8_last_size_before(p)
+        }
+        s
+    }
+
+    ; removeTrailingWhitespace. Trims the last non-empty part and drops every
+    ; all-whitespace part after it; answers the new COUNT.
+    procedure cparts_remove_trailing_whitespace(this, a: pointer[Array[int]], first: int, count: int) returns int
+    {
+        var stop count
+        var i count - 1
+        while i >= first
+        {
+            let s cparts_start(a, i)
+            let trimmed this.trim_end_of(s, cparts_end(a, i))
+            if trimmed = s
+                set stop: i
+            else
+            {
+                this.cparts_set_end(a, i, trimmed)
+                return stop
+            }
+            set i: i - 1
+        }
+        stop
+    }
+
+    ; removeLeadingNewlines — `strings.TrimLeft(comments[i], "\r\n") == ""`, so
+    ; a part of SPACES is not empty here and is not dropped. Answers the new
+    ; FIRST index.
+    procedure cparts_remove_leading_newlines(this, a: pointer[Array[int]], first: int, count: int) returns int
+    {
+        var i first
+        while i < count
+        {
+            var p cparts_start(a, i)
+            let e cparts_end(a, i)
+            while p < e
+            {
+                let c scanner.byte_at(p)
+                if (c <> 13) and (c <> 10)
+                    break
+                set p: p + 1
+            }
+            if p < e
+                return i
+            set i: i + 1
+        }
+        i
+    }
+
+    ; ── comment ranges ──────────────────────────────────────────────────────
+    ;
+    ; The reference's scanner.GetLeadingCommentRanges / GetTrailingCommentRanges,
+    ; which it exposes as an ITERATOR (`iter.Seq[ast.CommentRange]`) and consumes
+    ; in a `for … range`. Here the ranges are appended to a caller-supplied array
+    ; instead: an iterator in Go is a closure, and Scaly's only escaping-closure
+    ; form is `return \x: …` (§3.9d, the same substitution ForEachChild took).
+    ;
+    ; ★ The reference's CommentRange carries a KIND and a `HasTrailingNewLine`
+    ; flag besides the range. Neither is stored, because the only consumer this
+    ; port has is get_jsdoc_comment_ranges, whose filter reads Pos and End alone
+    ; — a §3.5ao omission with its reader named: the flag's readers are the
+    ; emitter's comment writer and the language service's formatter.
+    ;
+    ; ★★ `collecting` starts FALSE for a leading scan and true for a trailing
+    ; one, and that is the whole difference between them: a trailing comment is
+    ; one that follows a token on the SAME LINE, so the scan stops at the first
+    ; line break; a leading scan skips whatever precedes the first line break and
+    ; only starts collecting after it. Both stop at the first character that is
+    ; neither whitespace nor a comment.
+    procedure collect_comment_ranges(this, from: int, trailing: bool, out: pointer[Array[int]])
+    {
+        var pending_pos 0
+        var pending_end 0
+        var has_pending false
+        var collecting trailing
+        var pos from
+        if pos = 0
+        {
+            set collecting: true
+            ; ★★★ The SHEBANG, and it is the one line of this routine that is
+            ; easy to leave out and reachable in one shape: `#!/usr/bin/env node`
+            ; followed by a JSDoc comment and the statement it documents. That
+            ; statement's POS is 0 — a node's position is its FULL start — so the
+            ; walk begins on the `#`, which is neither whitespace nor a comment
+            ; and ends the scan before the comment is seen. The whole comment then
+            ; vanishes, silently and only in a file that has a shebang.
+            ;
+            ; The reference reaches it through isShebangTrivia/scanShebangTrivia,
+            ; which it PANICS on at any position but 0; here the test is the
+            ; `pos = 0` this block is already inside.
+            if scanner.byte_at(0) = ("#" as char) as int
+            {
+                if scanner.byte_at(1) = ("!" as char) as int
+                {
+                    set pos: 2
+                    while pos < scanner.source_end()
+                    {
+                        if Scanner.is_line_break_rune(scanner.utf8_decode_at(pos))
+                            break
+                        set pos: pos + scanner.utf8_size_at(pos)
+                    }
+                }
+            }
+        }
+
+        let limit scanner.source_end()
+        repeat
+        {
+            if pos < 0
+                break
+            if pos >= limit
+                break
+            let ch scanner.utf8_decode_at(pos)
+            let sz scanner.utf8_size_at(pos)
+
+            if (ch = 13) or (ch = 10)
+            {
+                if ch = 13
+                {
+                    if scanner.byte_at(pos + 1) = 10
+                        set pos: pos + 1
+                }
+                set pos: pos + 1
+                if trailing
+                    break
+                set collecting: true
+                continue
+            }
+
+            if (ch = 9) or (ch = 11) or (ch = 12) or (ch = 32)
+            {
+                set pos: pos + 1
+                continue
+            }
+
+            if ch = ("/" as char) as int
+            {
+                let next scanner.byte_at(pos + 1)
+                if (next <> (("/" as char) as int)) and (next <> (("*" as char) as int))
+                    break
+                let start_pos pos
+                set pos: pos + 2
+                if next = ("/" as char) as int
+                {
+                    while pos < limit
+                    {
+                        if Scanner.is_line_break_rune(scanner.utf8_decode_at(pos))
+                            break
+                        set pos: pos + scanner.utf8_size_at(pos)
+                    }
+                }
+                else
+                {
+                    ; `strings.Index(text[pos:], "*/")`, and the reference runs
+                    ; to the END of the text when there is none — an unterminated
+                    ; block comment swallows the rest of the file.
+                    var p pos
+                    var found 0 - 1
+                    while (p + 1) < limit
+                    {
+                        if scanner.byte_at(p) = ("*" as char) as int
+                        {
+                            if scanner.byte_at(p + 1) = ("/" as char) as int
+                            {
+                                set found: p + 2
+                                break
+                            }
+                        }
+                        set p: p + 1
+                    }
+                    if found >= 0
+                        set pos: found
+                    else
+                        set pos: limit
+                }
+
+                if collecting
+                {
+                    if has_pending
+                    {
+                        out.add(pending_pos)
+                        out.add(pending_end)
+                    }
+                    set pending_pos: start_pos
+                    set pending_end: pos
+                    set has_pending: true
+                }
+                continue
+            }
+
+            ; A non-ASCII whitespace character — the reference's default arm.
+            if ch > 127
+            {
+                if Scanner.is_white_space_like(ch)
+                {
+                    set pos: pos + sz
+                    continue
+                }
+            }
+            break
+        }
+
+        if has_pending
+        {
+            out.add(pending_pos)
+            out.add(pending_end)
+        }
+    }
+
+    ; The reference's GetJSDocCommentRanges. Seven node kinds take their JSDoc
+    ; from the TRAILING comments of the position before them as well as from the
+    ; leading ones — a parameter documented as `/** the x */ x` is the shape —
+    ; and the trailing scan comes FIRST, which is the order the ranges end up in.
+    ;
+    ; The filter is the reference's, and each clause is a real case: a comment
+    ; that reaches past the node's own end is not its documentation, `/**/` is
+    ; not JSDoc (four characters, and the fourth must not be `/`), and a comment
+    ; must open with `/**`.
+    procedure get_jsdoc_comment_ranges(this, n: pointer[AstNode], out: pointer[Array[int]])
+    {
+        let pos AstNode.pos_of(n)
+        let k AstNode.kind_of(n)
+        var trailing_too false
+        if k = KindParameter
+            set trailing_too: true
+        if k = KindTypeParameter
+            set trailing_too: true
+        if k = KindFunctionExpression
+            set trailing_too: true
+        if k = KindArrowFunction
+            set trailing_too: true
+        if k = KindParenthesizedExpression
+            set trailing_too: true
+        if k = KindVariableDeclaration
+            set trailing_too: true
+        if k = KindExportSpecifier
+            set trailing_too: true
+
+        let raw this.cparts_new()
+        if trailing_too
+            this.collect_comment_ranges(pos, true, raw)
+        this.collect_comment_ranges(pos, false, raw)
+
+        let node_end AstNode.end_of(n)
+        let count (raw.get_length() as int) / 2
+        var i 0
+        while i < count
+        {
+            let s *(raw.get_buffer() + (i * 2))
+            let e *(raw.get_buffer() + ((i * 2) + 1))
+            set i: i + 1
+            if e > node_end
+                continue
+            if (e - s) < 4
+                continue
+            if scanner.byte_at(s + 1) <> ("*" as char) as int
+                continue
+            if scanner.byte_at(s + 2) <> ("*" as char) as int
+                continue
+            if scanner.byte_at(s + 3) = ("/" as char) as int
+                continue
+            out.add(s)
+            out.add(e)
+        }
+    }
+
+    ; ── the JSDoc token helpers ─────────────────────────────────────────────
+
+    procedure next_token_jsdoc(this) returns int
+    {
+        set token: scanner.scan_jsdoc_token()
+        token
+    }
+
+    procedure next_jsdoc_comment_text_token(this, in_backticks: bool) returns int
+    {
+        set token: scanner.scan_jsdoc_comment_text_token(in_backticks)
+        token
+    }
+
+    procedure parse_expected_jsdoc(this, kind: int) returns bool
+    {
+        if token = kind
+        {
+            this.next_token_jsdoc()
+            return true
+        }
+        ; The reference PANICS on a kind that is neither a keyword nor
+        ; punctuation ("Invalid JSDoc kind"), which is unreachable for the call
+        ; sites this port has; the report below is the ordinary one.
+        this.parse_error_at_current_token(DiagX_0_expected)
+        false
+    }
+
+    procedure parse_optional_jsdoc(this, t: int) returns bool
+    {
+        if token = t
+        {
+            this.next_token_jsdoc()
+            return true
+        }
+        false
+    }
+
+    ; ★★★ THE ORDINARY parse_token_node, NOT A JSDOC ONE — and the reference has
+    ; no JSDoc variant of it at all. That is not an oversight there and it is the
+    ; only place in this grammar where the ORDINARY scanner is deliberately used
+    ; to leave a JSDoc token: `p.parseTokenNode()` advances with `nextToken()`,
+    ; which SKIPS TRIVIA, so the token after a consumed backtick has its full
+    ; start at the whitespace rather than past it — and that full start is what
+    ; the following tag comment begins at.
+    ;
+    ; Measured, on `` @param `d` markdown-quoted ``: with a JSDoc-scanning
+    ; variant the whitespace becomes a token of its own, skip_whitespace_or_asterisk
+    ; consumes it, and the JSDocText starts ONE BYTE LATE. It is the only
+    ; difference the whole fixture produces, which is why it needed a fixture —
+    ; no corpus unit has a backquoted @param name.
+    procedure parse_optional_token_jsdoc(this, kind: int) returns pointer[AstNode]
+    {
+        if token = kind
+            return this.parse_token_node()
+        null
+    }
+
+    procedure parse_expected_token_jsdoc(this, kind: int) returns pointer[AstNode]
+    {
+        let optional this.parse_optional_token_jsdoc(kind)
+        if optional <> null
+            return optional
+        this.parse_error_at_current_token(DiagX_0_expected)
+        this.finish_node(this.new_node(kind, NodeData.Token(TokenData())), this.node_pos())
+    }
+
+    ; ── the type grammar inside a comment ───────────────────────────────────
+
+    ; parseJSDocType. The ORDINARY type parser runs here — that is the point of
+    ; the routine — with two things around it: the scanner is told to eat a
+    ; leading `*` per line, so a type may be written across the comment's
+    ; margin, and a trailing `=` makes the whole thing OPTIONAL, which is the
+    ; Closure spelling `{string=}`.
+    procedure parse_jsdoc_type(this) returns pointer[AstNode]
+    {
+        scanner.set_skip_jsdoc_leading_asterisks(true)
+        let pos this.node_pos()
+
+        let has_dot_dot_dot this.parse_optional(KindDotDotDotToken)
+        var t this.parse_type_or_type_predicate()
+        scanner.set_skip_jsdoc_leading_asterisks(false)
+        if has_dot_dot_dot
+            set t: this.finish_node(this.new_node(KindJSDocVariadicType, NodeData.JSDocVariadicType(WrappedTypeData(t))), pos)
+        if token = KindEqualsToken
+        {
+            this.next_token()
+            return this.finish_node(this.new_node(KindJSDocOptionalType, NodeData.JSDocOptionalType(WrappedTypeData(t))), pos)
+        }
+        t
+    }
+
+    ; parseJSDocAllType — the bare `*`, which is Closure's "any".
+    procedure parse_jsdoc_all_type(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        this.next_token()
+        this.finish_node(this.new_node(KindJSDocAllType, NodeData.JSDocAllType(TokenData())), pos)
+    }
+
+    ; parseJSDocTypeExpression. `mayOmitBraces` is true for the two tags whose
+    ; type may be written bare (`@type string`, `@this Foo`) and false
+    ; everywhere else, where a missing `{` is reported.
+    ;
+    ; ★ The JSDoc CONTEXT FLAG is set around the type and not around the whole
+    ; comment: it is what makes `?` and `!` prefix operators and what
+    ; parse_non_array_type tests. finish_node stamps it onto every node built
+    ; inside, which is how the flag reaches the yardstick.
+    procedure parse_jsdoc_type_expression(this, may_omit_braces: bool) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        var has_brace false
+        if may_omit_braces
+            set has_brace: this.parse_optional(KindOpenBraceToken)
+        else
+            set has_brace: this.parse_expected(KindOpenBraceToken)
+        let saved context_flags
+        this.set_context_flags(NodeFlagsJSDoc, true)
+        let t this.parse_jsdoc_type()
+        set context_flags: saved
+        if has_brace
+            this.parse_expected_jsdoc(KindCloseBraceToken)
+        this.finish_node(this.new_node(KindJSDocTypeExpression, NodeData.JSDocTypeExpression(WrappedTypeData(t))), pos)
+    }
+
+    ; parseJSDocNameReference — `@see {Foo.bar}`. The ResetPos is the reference's
+    ; and is load-bearing: the name was read with the ORDINARY scanner (through
+    ; parse_jsdoc_link_name's parse_identifier_name), so the scan has to be put
+    ; back to the token's full start and re-read as a JSDoc token before the
+    ; caller's comment loop continues.
+    procedure parse_jsdoc_name_reference(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let has_brace this.parse_optional(KindOpenBraceToken)
+        let entity_name this.parse_jsdoc_link_name()
+        if has_brace
+            this.parse_expected_jsdoc(KindCloseBraceToken)
+        scanner.reset_pos(scanner.token_full_start())
+        this.next_token_jsdoc()
+        this.finish_node(this.new_node(KindJSDocNameReference, NodeData.JSDocNameReference(WrappedTypeData(entity_name))), pos)
+    }
+
+    ; ── the comment ─────────────────────────────────────────────────────────
+
+    ; parseJSDocComment. The SAVE-AND-RESTORE around it is the whole of the
+    ; routine's outer half, and every field it touches is one the inner parse
+    ; will disturb: the scanner's END (truncated to just before `*/`), its whole
+    ; state, the token, the context flags, the parsing contexts, and the
+    ; diagnostics accumulated inside.
+    ;
+    ; ★★★ THE DIAGNOSTICS ARE DISCARDED for a TS file and MOVED to a separate
+    ; list for a JS one. That is not a shortcut: the reference does exactly this,
+    ; and it is why the third yardstick compares SPANS and not diagnostics — a
+    ; JSDoc parse error has no observable code anywhere the port can compare it.
+    ; This port drops them rather than keeping a second list, and says so here:
+    ; the list would have no reader, and its reader arrives with the checker.
+    procedure parse_jsdoc_comment(this, parent: pointer[AstNode], start: int, comment_end: int, full_start: int) returns pointer[AstNode]
+    {
+        var e comment_end
+        if e = 0 - 1
+            set e: scanner.source_end()
+
+        ; isJSDocLikeText — the caller has already filtered on it, but the
+        ; reference re-asks and answers nil rather than trapping.
+        if (e - start) < 4
+            return null
+        if scanner.byte_at(start + 1) <> ("*" as char) as int
+            return null
+        if scanner.byte_at(start + 2) <> ("*" as char) as int
+            return null
+        if scanner.byte_at(start + 3) = ("/" as char) as int
+            return null
+
+        let saved_end scanner.source_end()
+        let saved_parsing_contexts parsing_contexts
+        let saved this.mark()
+        let saved_diagnostics_len diagnostics.length()
+
+        ; The initial indent is `start + 4` — past `/** ` — measured from the
+        ; beginning of the LINE the comment opens on. The `+ 1` in the reference
+        ; is what makes "no newline before start" answer 0 rather than -1.
+        var line_start 0
+        var p start - 1
+        while p >= 0
+        {
+            if scanner.byte_at(p) = 10
+            {
+                set line_start: p + 1
+                break
+            }
+            set p: p - 1
+        }
+        let initial_indent (start + 4) - line_start
+
+        ; -2 for the trailing `*/`: inside the comment the delimiter is the end
+        ; of the text, so nothing has to test for it.
+        scanner.set_end(e - 2)
+        this.set_context_flags(NodeFlagsJSDoc, true)
+        set parsing_contexts: parsing_contexts | (1 << PCJSDocComment)
+        scanner.reset_pos(start + 3)
+
+        let comment this.parse_jsdoc_comment_worker(start, e, full_start, initial_indent)
+
+        diagnostics.truncate(saved_diagnostics_len)
+        scanner.set_end(saved_end)
+        set parsing_contexts: saved_parsing_contexts
+        this.rewind(saved)
+        comment
+    }
+
+    ; parseJSDocCommentWorker — the state machine that turns a comment into a
+    ; JSDoc node: prose becomes JSDocText, `{@link X}` becomes a node of its own,
+    ; and an `@` at the start of a line hands over to parse_tag.
+    ;
+    ; ★★★ THE `state` VARIABLE IS THE GRAMMAR. BeginningOfLine admits a tag;
+    ; SawAsterisk is what a margin `*` leaves behind and still admits one;
+    ; SavingComments and SavingBackticks do not, and they also switch the
+    ; SCANNER — a comment run is read by scan_jsdoc_comment_text_token and
+    ; everything else by scan_jsdoc_token. The reference PANICS if whitespace
+    ; arrives while saving, because the text scanner would have eaten it.
+    procedure parse_jsdoc_comment_worker(this, start: int, comment_end: int, full_start: int, initial_indent: int) returns pointer[AstNode]
+    {
+        var indent initial_indent
+        let tags AstNode.new_node_list(host)
+        var tags_pos 0 - 1
+        var tags_end 0 - 1
+        var state JSDOC_STATE_SAW_ASTERISK
+        var backtick_count 0
+        var in_fenced_code_block false
+        let comment_parts AstNode.new_node_list(host)
+        let comments this.cparts_new()
+        var ccount 0
+        var cfirst 0
+        var comments_pos 0 - 1
+        var link_end start
+        var margin 0 - 1
+
+        this.next_token_jsdoc()
+        while this.parse_optional_jsdoc(KindWhitespaceTrivia)
+            ; the reference's empty `for` body
+            0
+        if this.parse_optional_jsdoc(KindNewLineTrivia)
+        {
+            set state: JSDOC_STATE_BEGINNING_OF_LINE
+            set indent: 0
+        }
+
+        repeat
+        {
+            ; Three or more consecutive backticks toggle a fenced code block, and
+            ; the count is closed out by the first token that is not a backtick.
+            if token <> KindBacktickToken
+            {
+                if backtick_count > 0
+                {
+                    if backtick_count >= 3
+                        set in_fenced_code_block: not in_fenced_code_block
+                    set backtick_count: 0
+                }
+            }
+
+            var handled false
+
+            if token = KindEndOfFile
+                break
+
+            if token = KindAtToken
+            {
+                set handled: true
+                var is_tag true
+                if in_fenced_code_block
+                    set is_tag: false
+                if not scanner.can_follow_jsdoc_at()
+                    set is_tag: false
+                if not is_tag
+                {
+                    if in_fenced_code_block
+                        set state: JSDOC_STATE_SAVING_BACKTICKS
+                    else
+                        set state: JSDOC_STATE_SAVING_COMMENTS
+                    if margin = 0 - 1
+                        set margin: indent
+                    set ccount: this.cparts_push(comments, ccount, scanner.token_start(), scanner.token_end())
+                    set indent: indent + (scanner.token_end() - scanner.token_start())
+                }
+                else
+                {
+                    set ccount: this.cparts_remove_trailing_whitespace(comments, cfirst, ccount)
+                    if comments_pos = 0 - 1
+                        set comments_pos: this.node_pos()
+                    let tag this.parse_tag(tags, indent)
+                    if tags_pos = 0 - 1
+                        set tags_pos: AstNode.pos_of(tag)
+                    tags.add(tag)
+                    set tags_end: AstNode.end_of(tag)
+                    ; A tag runs to the end of the line, EXCEPT the last one —
+                    ; and real comments break that rule, so this "beginning of
+                    ; line" is not always one. The reference says so here.
+                    set state: JSDOC_STATE_BEGINNING_OF_LINE
+                    set margin: 0 - 1
+                }
+            }
+
+            if (not handled) and (token = KindNewLineTrivia)
+            {
+                set handled: true
+                set ccount: this.cparts_push(comments, ccount, scanner.token_start(), scanner.token_end())
+                set state: JSDOC_STATE_BEGINNING_OF_LINE
+                set indent: 0
+            }
+
+            if (not handled) and (token = KindAsteriskToken)
+            {
+                set handled: true
+                let width scanner.token_end() - scanner.token_start()
+                if state = JSDOC_STATE_SAW_ASTERISK
+                {
+                    ; A second asterisk on a line ends any chance of a tag.
+                    set state: JSDOC_STATE_SAVING_COMMENTS
+                    if margin = 0 - 1
+                        set margin: indent
+                    set ccount: this.cparts_push(comments, ccount, scanner.token_start(), scanner.token_end())
+                    set indent: indent + width
+                }
+                else
+                {
+                    ; The first asterisk on a line is the margin and is ignored.
+                    set state: JSDOC_STATE_SAW_ASTERISK
+                    set indent: indent + width
+                }
+            }
+
+            if (not handled) and (token = KindWhitespaceTrivia)
+            {
+                set handled: true
+                let ws_start scanner.token_start()
+                let ws_end scanner.token_end()
+                let width ws_end - ws_start
+                if margin > (0 - 1)
+                {
+                    if (indent + width) > margin
+                    {
+                        var existing margin - indent
+                        if existing < 0
+                            set existing: existing + width
+                        if existing < 0
+                            set existing: 0
+                        set ccount: this.cparts_push(comments, ccount, ws_start + existing, ws_end)
+                    }
+                }
+                set indent: indent + width
+            }
+
+            if (not handled) and (token = KindJSDocCommentTextToken)
+            {
+                set handled: true
+                if state <> JSDOC_STATE_SAVING_BACKTICKS
+                {
+                    if in_fenced_code_block
+                        set state: JSDOC_STATE_SAVING_BACKTICKS
+                    else
+                        set state: JSDOC_STATE_SAVING_COMMENTS
+                }
+                if margin = 0 - 1
+                    set margin: indent
+                set ccount: this.cparts_push(comments, ccount, scanner.token_start(), scanner.token_end())
+                set indent: indent + (scanner.token_end() - scanner.token_start())
+            }
+
+            if (not handled) and (token = KindBacktickToken)
+            {
+                set handled: true
+                set backtick_count: backtick_count + 1
+                if state = JSDOC_STATE_SAVING_BACKTICKS
+                    set state: JSDOC_STATE_SAVING_COMMENTS
+                else
+                    set state: JSDOC_STATE_SAVING_BACKTICKS
+                if margin = 0 - 1
+                    set margin: indent
+                set ccount: this.cparts_push(comments, ccount, scanner.token_start(), scanner.token_end())
+                set indent: indent + (scanner.token_end() - scanner.token_start())
+            }
+
+            if (not handled) and (token = KindOpenBraceToken)
+            {
+                if in_fenced_code_block
+                {
+                    set handled: true
+                    set state: JSDOC_STATE_SAVING_BACKTICKS
+                    if margin = 0 - 1
+                        set margin: indent
+                    set ccount: this.cparts_push(comments, ccount, scanner.token_start(), scanner.token_end())
+                    set indent: indent + (scanner.token_end() - scanner.token_start())
+                }
+                else
+                {
+                    set state: JSDOC_STATE_SAVING_COMMENTS
+                    let comment_end_pos scanner.token_full_start()
+                    let link_start scanner.token_end() - 1
+                    let link this.parse_jsdoc_link(link_start)
+                    if link <> null
+                    {
+                        set handled: true
+                        if link_end = start
+                            set cfirst: this.cparts_remove_leading_newlines(comments, cfirst, ccount)
+                        let jsdoc_text this.finish_node_with_end(this.new_node(KindJSDocText, NodeData.JSDocText(TokenData())), link_end, comment_end_pos)
+                        comment_parts.add(jsdoc_text)
+                        comment_parts.add(link)
+                        set cfirst: 0
+                        set ccount: 0
+                        set link_end: scanner.token_end()
+                    }
+                    ; else: the reference FALLS THROUGH to the default arm.
+                }
+            }
+
+            if not handled
+            {
+                if state <> JSDOC_STATE_SAVING_BACKTICKS
+                {
+                    if in_fenced_code_block
+                        set state: JSDOC_STATE_SAVING_BACKTICKS
+                    else
+                        set state: JSDOC_STATE_SAVING_COMMENTS
+                }
+                if margin = 0 - 1
+                    set margin: indent
+                set ccount: this.cparts_push(comments, ccount, scanner.token_start(), scanner.token_end())
+                set indent: indent + (scanner.token_end() - scanner.token_start())
+            }
+
+            if (state = JSDOC_STATE_SAVING_COMMENTS) or (state = JSDOC_STATE_SAVING_BACKTICKS)
+                this.next_jsdoc_comment_text_token(state = JSDOC_STATE_SAVING_BACKTICKS)
+            else
+                this.next_token_jsdoc()
+        }
+
+        if comments_pos = 0 - 1
+            set comments_pos: scanner.token_full_start()
+
+        if ccount > cfirst
+        {
+            ; The reference trims the LAST part with unicode.IsSpace here, which
+            ; is a wider set than the IsWhiteSpaceLike used everywhere else — the
+            ; two differ on exactly two code points and it uses each of them once.
+            ;
+            ; ★ It is INERT in this port and is carried anyway: the trim shortens
+            ; a comment PART, nothing reads a part after this line, and the text
+            ; node's own span is (link_end, comments_pos), which no part
+            ; contributes to. Ported because the reference has it, stated because
+            ; a computation whose result nobody reads is otherwise a puzzle — and
+            ; it stops being inert the day a JSDocText stores its text (§3.5ao).
+            let last ccount - 1
+            this.cparts_set_end(comments, last, this.trim_end_unicode_space_of(cparts_start(comments, last), cparts_end(comments, last)))
+            let jsdoc_text this.finish_node_with_end(this.new_node(KindJSDocText, NodeData.JSDocText(TokenData())), link_end, comments_pos)
+            comment_parts.add(jsdoc_text)
+        }
+
+        var tags_list null as pointer[Array[pointer[AstNode]]]
+        if tags_pos <> 0 - 1
+            set tags_list: tags
+
+        this.finish_node_with_end(this.new_node(KindJSDoc, NodeData.JSDoc(JSDocData(comment_parts, tags_list))), full_start, comment_end)
+    }
+
+    ; ── whitespace skipping ─────────────────────────────────────────────────
+
+    ; isNextNonwhitespaceTokenEndOfFile. INFINITE lookahead, as the reference's
+    ; own comment says: there can be any number of newlines before the end.
+    procedure is_next_nonwhitespace_token_end_of_file(this) returns bool
+    {
+        repeat
+        {
+            this.next_token_jsdoc()
+            if token = KindEndOfFile
+                return true
+            if token = KindWhitespaceTrivia
+                continue
+            if token = KindNewLineTrivia
+                continue
+            return false
+        }
+        false
+    }
+
+    procedure look_ahead_is_next_nonwhitespace_token_end_of_file(this) returns bool
+    {
+        let saved this.mark()
+        let r this.is_next_nonwhitespace_token_end_of_file()
+        this.rewind(saved)
+        r
+    }
+
+    ; skipWhitespace. The look-ahead is what keeps the whitespace before the end
+    ; of a comment OUT of every node's range — a node that ended at the `*/`
+    ; would be a different tree.
+    procedure skip_whitespace(this)
+    {
+        if (token = KindWhitespaceTrivia) or (token = KindNewLineTrivia)
+        {
+            if this.look_ahead_is_next_nonwhitespace_token_end_of_file()
+                return
+        }
+        while (token = KindWhitespaceTrivia) or (token = KindNewLineTrivia)
+            this.next_token_jsdoc()
+    }
+
+    ; skipWhitespaceOrAsterisk. Answers the INDENT TEXT — the run of whitespace
+    ; and margin asterisks after the LAST line break — as a source range, or an
+    ; empty one when no line break was crossed.
+    ;
+    ; ★ The reference builds it with `strings.Join(indents, "")` over the tokens
+    ; it collected, and those tokens are CONSECUTIVE (nothing is trivia inside a
+    ; JSDoc comment), so the join is exactly the source span from the first kept
+    ; token to the last. That is what makes a pair of offsets faithful here and
+    ; not an approximation.
+    procedure skip_whitespace_or_asterisk(this, out_start: pointer[int], out_end: pointer[int])
+    {
+        set *out_start: 0
+        set *out_end: 0
+        if (token = KindWhitespaceTrivia) or (token = KindNewLineTrivia)
+        {
+            if this.look_ahead_is_next_nonwhitespace_token_end_of_file()
+                return
+        }
+
+        var preceding_line_break scanner.has_preceding_line_break()
+        var seen_line_break false
+        var run_start 0 - 1
+        var run_end 0
+        repeat
+        {
+            var take false
+            if preceding_line_break
+            {
+                if token = KindAsteriskToken
+                    set take: true
+            }
+            if token = KindWhitespaceTrivia
+                set take: true
+            if token = KindNewLineTrivia
+                set take: true
+            if not take
+                break
+
+            if run_start < 0
+                set run_start: scanner.token_start()
+            set run_end: scanner.token_end()
+
+            if token = KindNewLineTrivia
+            {
+                set preceding_line_break: true
+                set seen_line_break: true
+                set run_start: 0 - 1
+                set run_end: 0
+            }
+            else
+            {
+                if token = KindAsteriskToken
+                    set preceding_line_break: false
+            }
+            this.next_token_jsdoc()
+        }
+
+        if seen_line_break
+        {
+            if run_start >= 0
+            {
+                set *out_start: run_start
+                set *out_end: run_end
+            }
+        }
+    }
+
+    ; ── the tag dispatcher ──────────────────────────────────────────────────
+
+    ; parseTag. The reference's `switch tagName.Text()`, and the arms are
+    ; independent `if`s that return for the reason mapping decision (2) gives:
+    ; an `else if` chain nests one planner level per arm.
+    ;
+    ; ★ The six SIMPLE tags take a KIND where the reference passes a factory
+    ; CLOSURE (§3.5e): every call site is static, so the func value carries no
+    ; information the kind does not.
+    procedure parse_tag(this, tags: pointer[Array[pointer[AstNode]]], margin: int) returns pointer[AstNode]
+    {
+        let start scanner.token_start()
+        this.next_token_jsdoc()
+
+        let tag_name this.parse_jsdoc_identifier_name(DiagIdentifier_expected)
+        var it_start 0
+        var it_end 0
+        this.skip_whitespace_or_asterisk(&it_start, &it_end)
+
+        if AstNode.identifier_text_is(tag_name, "implements")
+            return this.parse_implements_or_augments_tag(KindJSDocImplementsTag, start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "augments")
+            return this.parse_implements_or_augments_tag(KindJSDocAugmentsTag, start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "extends")
+            return this.parse_implements_or_augments_tag(KindJSDocAugmentsTag, start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "public")
+            return this.parse_simple_tag(KindJSDocPublicTag, start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "private")
+            return this.parse_simple_tag(KindJSDocPrivateTag, start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "protected")
+            return this.parse_simple_tag(KindJSDocProtectedTag, start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "readonly")
+            return this.parse_simple_tag(KindJSDocReadonlyTag, start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "override")
+            return this.parse_simple_tag(KindJSDocOverrideTag, start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "deprecated")
+        {
+            set has_deprecated_tag: true
+            return this.parse_simple_tag(KindJSDocDeprecatedTag, start, tag_name, margin, it_start, it_end)
+        }
+        if AstNode.identifier_text_is(tag_name, "this")
+            return this.parse_this_tag(start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "arg")
+            return this.parse_parameter_or_property_tag(start, tag_name, PROPERTY_LIKE_PARAMETER, margin)
+        if AstNode.identifier_text_is(tag_name, "argument")
+            return this.parse_parameter_or_property_tag(start, tag_name, PROPERTY_LIKE_PARAMETER, margin)
+        if AstNode.identifier_text_is(tag_name, "param")
+            return this.parse_parameter_or_property_tag(start, tag_name, PROPERTY_LIKE_PARAMETER, margin)
+        if AstNode.identifier_text_is(tag_name, "return")
+            return this.parse_return_tag(tags, start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "returns")
+            return this.parse_return_tag(tags, start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "template")
+            return this.parse_template_tag(start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "type")
+            return this.parse_type_tag(tags, start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "typedef")
+            return this.parse_typedef_tag(start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "callback")
+            return this.parse_callback_tag(start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "overload")
+            return this.parse_overload_tag(start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "satisfies")
+            return this.parse_satisfies_tag(start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "see")
+            return this.parse_see_tag(start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "exception")
+            return this.parse_throws_tag(start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "throws")
+            return this.parse_throws_tag(start, tag_name, margin, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "import")
+            return this.parse_import_tag(start, tag_name, margin, it_start, it_end)
+
+        this.parse_unknown_tag(start, tag_name, margin, it_start, it_end)
+    }
+
+    ; parseTrailingTagComments. `margin += end - pos` only when there is NO
+    ; indent text, which is the reference's way of saying "the tag's own text
+    ; counts towards the margin when the tag did not start a fresh line".
+    procedure parse_trailing_tag_comments(this, pos: int, tag_end: int, margin: int, it_start: int, it_end: int) returns pointer[Array[pointer[AstNode]]]
+    {
+        var m margin
+        let it_len it_end - it_start
+        if it_len = 0
+            set m: m + (tag_end - pos)
+        var im_start 0
+        var im_end 0
+        if m < it_len
+        {
+            set im_start: it_start + m
+            set im_end: it_end
+        }
+        ; The initial margin is a non-nil string here even when it is EMPTY, and
+        ; parse_tag_comments distinguishes the two — see its `has_initial_margin`.
+        this.parse_tag_comments(m, true, im_start, im_end)
+    }
+
+    ; parseTagComments — the same state machine as the comment worker, over the
+    ; text that FOLLOWS a tag. It differs in three places and each one is a real
+    ; difference rather than a duplication: an `@` here ENDS the comment (and the
+    ; scanner is reset so the caller sees the `@` again), the newline arm does
+    ; not go through pushComment so the margin survives a line break, and a
+    ; leading margin asterisk starts recording on the NEXT token rather than
+    ; immediately.
+    procedure parse_tag_comments(this, initial_indent: int, has_initial_margin: bool, im_start: int, im_end: int) returns pointer[Array[pointer[AstNode]]]
+    {
+        var indent initial_indent
+        let comments_pos this.node_pos()
+        let comments this.cparts_new()
+        var ccount 0
+        var cfirst 0
+        let parts AstNode.new_node_list(host)
+        var link_end 0 - 1
+        var state JSDOC_STATE_BEGINNING_OF_LINE
+        var backtick_count 0
+        var in_fenced_code_block false
+        var margin 0 - 1
+
+        if has_initial_margin
+        {
+            if im_end > im_start
+            {
+                set margin: indent
+                set ccount: this.cparts_push(comments, ccount, im_start, im_end)
+                set indent: indent + (im_end - im_start)
+            }
+            set state: JSDOC_STATE_SAW_ASTERISK
+        }
+
+        var tok token
+        repeat
+        {
+            if tok <> KindBacktickToken
+            {
+                if backtick_count > 0
+                {
+                    if backtick_count >= 3
+                        set in_fenced_code_block: not in_fenced_code_block
+                    set backtick_count: 0
+                }
+            }
+
+            if tok = KindEndOfFile
+                break
+
+            var handled false
+
+            if tok = KindNewLineTrivia
+            {
+                set handled: true
+                ; NOT pushComment: the margin must not move across a line break.
+                set ccount: this.cparts_push(comments, ccount, scanner.token_start(), scanner.token_end())
+                set state: JSDOC_STATE_BEGINNING_OF_LINE
+                set indent: 0
+            }
+
+            if (not handled) and (tok = KindAtToken)
+            {
+                set handled: true
+                var ends_comment false
+                if not in_fenced_code_block
+                {
+                    if scanner.can_follow_jsdoc_at()
+                        set ends_comment: true
+                }
+                if ends_comment
+                {
+                    scanner.reset_pos(scanner.token_end() - 1)
+                    break
+                }
+                if in_fenced_code_block
+                    set state: JSDOC_STATE_SAVING_BACKTICKS
+                else
+                    set state: JSDOC_STATE_SAVING_COMMENTS
+                if margin = 0 - 1
+                    set margin: indent
+                set ccount: this.cparts_push(comments, ccount, scanner.token_start(), scanner.token_end())
+                set indent: indent + (scanner.token_end() - scanner.token_start())
+            }
+
+            if (not handled) and (tok = KindWhitespaceTrivia)
+            {
+                set handled: true
+                let ws_start scanner.token_start()
+                let ws_end scanner.token_end()
+                let width ws_end - ws_start
+                if margin > (0 - 1)
+                {
+                    if (indent + width) > margin
+                    {
+                        var cut margin - indent
+                        if cut < 0
+                            set cut: 0
+                        set ccount: this.cparts_push(comments, ccount, ws_start + cut, ws_end)
+                        if in_fenced_code_block
+                            set state: JSDOC_STATE_SAVING_BACKTICKS
+                        else
+                            set state: JSDOC_STATE_SAVING_COMMENTS
+                    }
+                }
+                set indent: indent + width
+            }
+
+            if (not handled) and (tok = KindOpenBraceToken)
+            {
+                if in_fenced_code_block
+                {
+                    set handled: true
+                    set state: JSDOC_STATE_SAVING_BACKTICKS
+                    if margin = 0 - 1
+                        set margin: indent
+                    set ccount: this.cparts_push(comments, ccount, scanner.token_start(), scanner.token_end())
+                    set indent: indent + (scanner.token_end() - scanner.token_start())
+                }
+                else
+                {
+                    set handled: true
+                    set state: JSDOC_STATE_SAVING_COMMENTS
+                    let comment_end scanner.token_full_start()
+                    let link_start scanner.token_end() - 1
+                    let link this.parse_jsdoc_link(link_start)
+                    if link <> null
+                    {
+                        var comment_start comments_pos
+                        if link_end > (0 - 1)
+                            set comment_start: link_end
+                        let text this.finish_node_with_end(this.new_node(KindJSDocText, NodeData.JSDocText(TokenData())), comment_start, comment_end)
+                        parts.add(text)
+                        parts.add(link)
+                        set cfirst: 0
+                        set ccount: 0
+                        set link_end: scanner.token_end()
+                    }
+                    else
+                    {
+                        if margin = 0 - 1
+                            set margin: indent
+                        set ccount: this.cparts_push(comments, ccount, scanner.token_start(), scanner.token_end())
+                        set indent: indent + (scanner.token_end() - scanner.token_start())
+                    }
+                }
+            }
+
+            if (not handled) and (tok = KindBacktickToken)
+            {
+                set handled: true
+                set backtick_count: backtick_count + 1
+                if state = JSDOC_STATE_SAVING_BACKTICKS
+                    set state: JSDOC_STATE_SAVING_COMMENTS
+                else
+                    set state: JSDOC_STATE_SAVING_BACKTICKS
+                if margin = 0 - 1
+                    set margin: indent
+                set ccount: this.cparts_push(comments, ccount, scanner.token_start(), scanner.token_end())
+                set indent: indent + (scanner.token_end() - scanner.token_start())
+            }
+
+            if (not handled) and (tok = KindJSDocCommentTextToken)
+            {
+                set handled: true
+                if state <> JSDOC_STATE_SAVING_BACKTICKS
+                {
+                    if in_fenced_code_block
+                        set state: JSDOC_STATE_SAVING_BACKTICKS
+                    else
+                        set state: JSDOC_STATE_SAVING_COMMENTS
+                }
+                if margin = 0 - 1
+                    set margin: indent
+                set ccount: this.cparts_push(comments, ccount, scanner.token_start(), scanner.token_end())
+                set indent: indent + (scanner.token_end() - scanner.token_start())
+            }
+
+            if (not handled) and (tok = KindAsteriskToken)
+            {
+                if state = JSDOC_STATE_BEGINNING_OF_LINE
+                {
+                    set handled: true
+                    ; A leading asterisk starts recording on the NEXT token.
+                    set state: JSDOC_STATE_SAW_ASTERISK
+                    set indent: indent + 1
+                }
+                ; else: the reference FALLS THROUGH and records the `*`.
+            }
+
+            if not handled
+            {
+                if state <> JSDOC_STATE_SAVING_BACKTICKS
+                {
+                    if in_fenced_code_block
+                        set state: JSDOC_STATE_SAVING_BACKTICKS
+                    else
+                        set state: JSDOC_STATE_SAVING_COMMENTS
+                }
+                if margin = 0 - 1
+                    set margin: indent
+                set ccount: this.cparts_push(comments, ccount, scanner.token_start(), scanner.token_end())
+                set indent: indent + (scanner.token_end() - scanner.token_start())
+            }
+
+            if (state = JSDOC_STATE_SAVING_COMMENTS) or (state = JSDOC_STATE_SAVING_BACKTICKS)
+                set tok: this.next_jsdoc_comment_text_token(state = JSDOC_STATE_SAVING_BACKTICKS)
+            else
+                set tok: this.next_token_jsdoc()
+        }
+
+        set cfirst: this.cparts_remove_leading_newlines(comments, cfirst, ccount)
+        set ccount: this.cparts_remove_trailing_whitespace(comments, cfirst, ccount)
+        if ccount > cfirst
+        {
+            var comment_start comments_pos
+            if link_end > (0 - 1)
+                set comment_start: link_end
+            let text this.finish_node(this.new_node(KindJSDocText, NodeData.JSDocText(TokenData())), comment_start)
+            parts.add(text)
+        }
+
+        if (parts.get_length() as int) > 0
+            return parts
+        null
+    }
+
+    ; ── inline links ────────────────────────────────────────────────────────
+
+    ; parseJSDocLink — `{@link Foo}`, `{@linkcode Foo}`, `{@linkplain Foo}`.
+    ; Answers null when the brace did not open one, and the caller then treats
+    ; the `{` as ordinary text.
+    procedure parse_jsdoc_link(this, start: int) returns pointer[AstNode]
+    {
+        let saved this.mark()
+        let link_type this.parse_jsdoc_link_prefix()
+        if link_type = JSDOC_LINK_NONE
+        {
+            this.rewind(saved)
+            return null
+        }
+        this.next_token_jsdoc()
+        ; Start at the token after the link tag, then skip whitespace.
+        this.skip_whitespace()
+        let name this.parse_jsdoc_link_name()
+        while (token <> KindCloseBraceToken) and (token <> KindNewLineTrivia) and (token <> KindEndOfFile)
+            this.next_token_jsdoc()
+
+        var kind KindJSDocLinkPlain
+        if link_type = JSDOC_LINK_LINK
+            set kind: KindJSDocLink
+        if link_type = JSDOC_LINK_CODE
+            set kind: KindJSDocLinkCode
+
+        var data NodeData.JSDocLinkPlain(WrappedTypeData(name))
+        if kind = KindJSDocLink
+            set data: NodeData.JSDocLink(WrappedTypeData(name))
+        if kind = KindJSDocLinkCode
+            set data: NodeData.JSDocLinkCode(WrappedTypeData(name))
+        this.finish_node_with_end(this.new_node(kind, data), start, scanner.token_end())
+    }
+
+    ; parseJSDocLinkName. The name is read with the ORDINARY parser — a dotted
+    ; entity name, and then any number of `#`-separated halves, which is how
+    ; `{@link Foo#bar}` reaches a private member.
+    procedure parse_jsdoc_link_name(this) returns pointer[AstNode]
+    {
+        if not token_is_identifier_or_keyword(token)
+            return null
+        let pos this.node_pos()
+        var name this.parse_identifier_name()
+        while this.parse_optional(KindDotToken)
+        {
+            var right null as pointer[AstNode]
+            if token = KindPrivateIdentifier
+                set right: this.create_missing_identifier()
+            else
+                set right: this.parse_identifier_name()
+            set name: this.finish_node(this.new_node(KindQualifiedName, NodeData.QualifiedName(QualifiedNameData(name, right))), pos)
+        }
+        while token = KindPrivateIdentifier
+        {
+            scanner.re_scan_hash_token()
+            this.next_token_jsdoc()
+            set name: this.finish_node(this.new_node(KindQualifiedName, NodeData.QualifiedName(QualifiedNameData(name, this.parse_identifier()))), pos)
+        }
+        name
+    }
+
+    ; parseJSDocLinkPrefix, plus isJSDocLinkTag folded into it. The reference
+    ; answers `(string, bool)`; here it is one int, because the string's only
+    ; use is to select one of three node kinds (§3.6 — a multi-return whose
+    ; value set is closed).
+    procedure parse_jsdoc_link_prefix(this) returns int
+    {
+        var ignore_start 0
+        var ignore_end 0
+        this.skip_whitespace_or_asterisk(&ignore_start, &ignore_end)
+        if token <> KindOpenBraceToken
+            return JSDOC_LINK_NONE
+        if this.next_token_jsdoc() <> KindAtToken
+            return JSDOC_LINK_NONE
+        if not token_is_identifier_or_keyword(this.next_token_jsdoc())
+            return JSDOC_LINK_NONE
+        if scanner.token_value_equals("link")
+            return JSDOC_LINK_LINK
+        if scanner.token_value_equals("linkcode")
+            return JSDOC_LINK_CODE
+        if scanner.token_value_equals("linkplain")
+            return JSDOC_LINK_PLAIN
+        JSDOC_LINK_NONE
+    }
+
+    ; ── the individual tags ─────────────────────────────────────────────────
+
+    procedure parse_unknown_tag(this, start: int, tag_name: pointer[AstNode], indent: int, it_start: int, it_end: int) returns pointer[AstNode]
+    {
+        let comment this.parse_trailing_tag_comments(start, this.node_pos(), indent, it_start, it_end)
+        this.finish_node(this.new_node(KindJSDocUnknownTag, NodeData.JSDocUnknownTag(JSDocTagData(tag_name, comment))), start)
+    }
+
+    ; The six SIMPLE tags. The reference passes a factory closure; here the KIND
+    ; is the parameter (§3.5e).
+    procedure parse_simple_tag(this, kind: int, start: int, tag_name: pointer[AstNode], margin: int, it_start: int, it_end: int) returns pointer[AstNode]
+    {
+        let comment this.parse_trailing_tag_comments(start, this.node_pos(), margin, it_start, it_end)
+        let d JSDocTagData(tag_name, comment)
+        if kind = KindJSDocPublicTag
+            return this.finish_node(this.new_node(kind, NodeData.JSDocPublicTag(d)), start)
+        if kind = KindJSDocPrivateTag
+            return this.finish_node(this.new_node(kind, NodeData.JSDocPrivateTag(d)), start)
+        if kind = KindJSDocProtectedTag
+            return this.finish_node(this.new_node(kind, NodeData.JSDocProtectedTag(d)), start)
+        if kind = KindJSDocReadonlyTag
+            return this.finish_node(this.new_node(kind, NodeData.JSDocReadonlyTag(d)), start)
+        if kind = KindJSDocOverrideTag
+            return this.finish_node(this.new_node(kind, NodeData.JSDocOverrideTag(d)), start)
+        this.finish_node(this.new_node(kind, NodeData.JSDocDeprecatedTag(d)), start)
+    }
+
+    ; tryParseTypeExpression — a type is present only if a `{` follows.
+    procedure try_parse_type_expression(this) returns pointer[AstNode]
+    {
+        var ignore_start 0
+        var ignore_end 0
+        this.skip_whitespace_or_asterisk(&ignore_start, &ignore_end)
+        if token = KindOpenBraceToken
+            return this.parse_jsdoc_type_expression(false)
+        null
+    }
+
+    ; parseBracketNameInPropertyAndParamTag — `[foo]`, `foo`, `[foo.bar]`,
+    ; `` `foo` `` (a markdown-quoted name, which is not legal JSDoc and occurs
+    ; in the wild), and `[foo = 42]` with a default the reference parses and
+    ; throws away.
+    procedure parse_bracket_name_in_property_and_param_tag(this, target: int, out_bracketed: pointer[bool]) returns pointer[AstNode]
+    {
+        let is_bracketed this.parse_optional_jsdoc(KindOpenBracketToken)
+        set *out_bracketed: is_bracketed
+        if is_bracketed
+            this.skip_whitespace()
+        let is_backquoted this.parse_optional_jsdoc(KindBacktickToken)
+        var code DiagIdentifier_expected
+        if target = PROPERTY_LIKE_PARAMETER
+            set code: 0
+        let name this.parse_jsdoc_entity_name(code)
+        if is_backquoted
+            this.parse_expected_token_jsdoc(KindBacktickToken)
+        if is_bracketed
+        {
+            this.skip_whitespace()
+            if this.parse_optional_token(KindEqualsToken) <> null
+                this.parse_expression()
+            this.parse_expected(KindCloseBracketToken)
+        }
+        name
+    }
+
+    ; isObjectOrObjectArrayTypeReference — `Object`, `Object[]`, and any depth of
+    ; array around one. It is what decides whether a @param or a @typedef may
+    ; carry NESTED property tags.
+    function is_object_or_object_array_type_reference(n: pointer[AstNode]) returns bool
+    {
+        if n = null
+            return false
+        let k AstNode.kind_of(n)
+        if k = KindObjectKeyword
+            return true
+        if k = KindArrayType
+            return is_object_or_object_array_type_reference(AstNode.array_element_type_of(n))
+        if k <> KindTypeReference
+            return false
+        let name AstNode.type_reference_name_of(n)
+        if AstNode.kind_of(name) <> KindIdentifier
+            return false
+        if not AstNode.identifier_text_is(name, "Object")
+            return false
+        AstNode.type_reference_arguments_of(n) = null
+    }
+
+    ; parseParameterOrPropertyTag — @param, @arg, @argument, @prop, @property.
+    ;
+    ; ★★★ THE ORDER OF NAME AND TYPE IS PART OF THE NODE. `@param {T} x` has the
+    ; type first and `@param x {T}` the name first, and `is_name_first` is what
+    ; child_at reads to decide the visit order — see ast.scaly.
+    ;
+    ; ★ The look-ahead in the middle is the reference's, and it is subtle: after
+    ; a NAME-first tag, a `{` could be either a type or the start of an inline
+    ; `{@link}` in the comment. The look-ahead asks parse_jsdoc_link_prefix and
+    ; takes the type only if it is NOT a link.
+    procedure parse_parameter_or_property_tag(this, start: int, tag_name: pointer[AstNode], target: int, indent: int) returns pointer[AstNode]
+    {
+        var type_expression this.try_parse_type_expression()
+        var is_name_first type_expression = null
+        var ignore_start 0
+        var ignore_end 0
+        this.skip_whitespace_or_asterisk(&ignore_start, &ignore_end)
+
+        var is_bracketed false
+        let name this.parse_bracket_name_in_property_and_param_tag(target, &is_bracketed)
+        var it_start 0
+        var it_end 0
+        this.skip_whitespace_or_asterisk(&it_start, &it_end)
+
+        if is_name_first
+        {
+            let saved this.mark()
+            let is_link this.parse_jsdoc_link_prefix() <> JSDOC_LINK_NONE
+            this.rewind(saved)
+            if not is_link
+                set type_expression: this.try_parse_type_expression()
+        }
+
+        let comment this.parse_trailing_tag_comments(start, this.node_pos(), indent, it_start, it_end)
+
+        let nested this.parse_nested_type_literal(type_expression, name, target, indent)
+        if nested <> null
+        {
+            set type_expression: nested
+            set is_name_first: true
+        }
+
+        var kind KindJSDocParameterTag
+        if target = PROPERTY_LIKE_PROPERTY
+            set kind: KindJSDocPropertyTag
+        this.finish_node(this.new_node(kind, NodeData.JSDocParameterOrPropertyTag(JSDocParameterOrPropertyTagData(tag_name, name, is_bracketed, type_expression, is_name_first, comment))), start)
+    }
+
+    ; parseNestedTypeLiteral — the child @param/@property tags that document the
+    ; members of an `Object` parameter. Answers a synthesized JSDocTypeExpression
+    ; wrapping a JSDocTypeLiteral, or null when there were no children.
+    procedure parse_nested_type_literal(this, type_expression: pointer[AstNode], name: pointer[AstNode], target: int, indent: int) returns pointer[AstNode]
+    {
+        if type_expression = null
+            return null
+        let inner AstNode.jsdoc_type_expression_inner_of(type_expression)
+        if not is_object_or_object_array_type_reference(inner)
+            return null
+
+        let pos this.node_pos()
+        let children AstNode.new_node_list(host)
+        var any false
+        repeat
+        {
+            let saved this.mark()
+            let child this.parse_child_parameter_or_property_tag(target, indent, name)
+            if child = null
+            {
+                this.rewind(saved)
+                break
+            }
+            let ck AstNode.kind_of(child)
+            if (ck = KindJSDocParameterTag) or (ck = KindJSDocPropertyTag)
+            {
+                children.add(child)
+                set any: true
+            }
+            else
+            {
+                if ck = KindJSDocTemplateTag
+                {
+                    let tn AstNode.jsdoc_tag_name_of(child)
+                    this.parse_error_at_range(AstNode.pos_of(tn), AstNode.end_of(tn), DiagA_JSDoc_template_tag_may_not_follow_a_typedef_callback_or_overload_tag)
+                }
+            }
+        }
+        if not any
+            return null
+        let is_array AstNode.kind_of(inner) = KindArrayType
+        let literal this.finish_node(this.new_node(KindJSDocTypeLiteral, NodeData.JSDocTypeLiteral(JSDocTypeLiteralData(children, is_array))), pos)
+        this.finish_node(this.new_node(KindJSDocTypeExpression, NodeData.JSDocTypeExpression(WrappedTypeData(literal))), pos)
+    }
+
+    ; The reference reports a DUPLICATE @return / @type against the tags already
+    ; parsed in this comment. `core.Some(previousTags, ast.IsJSDocReturnTag)` —
+    ; a linear scan over the list the worker is building.
+    function tags_contain_kind(tags: pointer[Array[pointer[AstNode]]], kind: int) returns bool
+    {
+        if tags = null
+            return false
+        let n tags.get_length() as int
+        var i 0
+        while i < n
+        {
+            if AstNode.kind_of(*(tags.get_buffer() + i)) = kind
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    procedure parse_return_tag(this, previous_tags: pointer[Array[pointer[AstNode]]], start: int, tag_name: pointer[AstNode], indent: int, it_start: int, it_end: int) returns pointer[AstNode]
+    {
+        if tags_contain_kind(previous_tags, KindJSDocReturnTag)
+            this.parse_error_at(AstNode.pos_of(tag_name), scanner.token_start(), DiagX_0_tag_already_specified)
+        let type_expression this.try_parse_type_expression()
+        let comment this.parse_trailing_tag_comments(start, this.node_pos(), indent, it_start, it_end)
+        this.finish_node(this.new_node(KindJSDocReturnTag, NodeData.JSDocReturnTag(JSDocOneSlotTagData(tag_name, type_expression, comment))), start)
+    }
+
+    ; `indent = -1` skips the trailing comments, which is how a @type nested in
+    ; a @typedef is parsed.
+    procedure parse_type_tag(this, previous_tags: pointer[Array[pointer[AstNode]]], start: int, tag_name: pointer[AstNode], indent: int, it_start: int, it_end: int) returns pointer[AstNode]
+    {
+        if tags_contain_kind(previous_tags, KindJSDocTypeTag)
+            this.parse_error_at(AstNode.pos_of(tag_name), scanner.token_start(), DiagX_0_tag_already_specified)
+        let type_expression this.parse_jsdoc_type_expression(true)
+        var comment null as pointer[Array[pointer[AstNode]]]
+        if indent <> 0 - 1
+            set comment: this.parse_trailing_tag_comments(start, this.node_pos(), indent, it_start, it_end)
+        this.finish_node(this.new_node(KindJSDocTypeTag, NodeData.JSDocTypeTag(JSDocOneSlotTagData(tag_name, type_expression, comment))), start)
+    }
+
+    ; parseSeeTag. The `://` test is the reference's and it is the reason this
+    ; routine reads the SOURCE: `@see http://x` must not read `http` as a name
+    ; reference.
+    procedure parse_see_tag(this, start: int, tag_name: pointer[AstNode], indent: int, it_start: int, it_end: int) returns pointer[AstNode]
+    {
+        var has_name_reference false
+        if this.is_identifier()
+        {
+            let e scanner.token_end()
+            var is_url false
+            if scanner.byte_at(e) = (":" as char) as int
+            {
+                if scanner.byte_at(e + 1) = ("/" as char) as int
+                {
+                    if scanner.byte_at(e + 2) = ("/" as char) as int
+                        set is_url: true
+                }
+            }
+            if not is_url
+                set has_name_reference: true
+        }
+        if token = KindOpenBraceToken
+        {
+            if this.look_ahead_next_token_is_identifier_or_keyword()
+                set has_name_reference: true
+        }
+        var name_expression null as pointer[AstNode]
+        if has_name_reference
+            set name_expression: this.parse_jsdoc_name_reference()
+        let comment this.parse_trailing_tag_comments(start, this.node_pos(), indent, it_start, it_end)
+        this.finish_node(this.new_node(KindJSDocSeeTag, NodeData.JSDocSeeTag(JSDocOneSlotTagData(tag_name, name_expression, comment))), start)
+    }
+
+    ; ★ ONE routine where the reference has TWO — parseImplementsTag and
+    ; parseAugmentsTag — because their bodies are identical apart from the node
+    ; KIND, and this port has one call site per kind. It is §3.5e's argument
+    ; applied to a pair of named functions rather than to a func VALUE: the thing
+    ; that varies carries no information a constant does not. The three tag names
+    ; are still three arms in parse_tag, which is where a reader checks them
+    ; against the reference's switch.
+    procedure parse_implements_or_augments_tag(this, kind: int, start: int, tag_name: pointer[AstNode], margin: int, it_start: int, it_end: int) returns pointer[AstNode]
+    {
+        let class_name this.parse_expression_with_type_arguments_for_augments()
+        let comment this.parse_trailing_tag_comments(start, this.node_pos(), margin, it_start, it_end)
+        let d JSDocOneSlotTagData(tag_name, class_name, comment)
+        if kind = KindJSDocImplementsTag
+            return this.finish_node(this.new_node(kind, NodeData.JSDocImplementsTag(d)), start)
+        this.finish_node(this.new_node(kind, NodeData.JSDocAugmentsTag(d)), start)
+    }
+
+    procedure parse_satisfies_tag(this, start: int, tag_name: pointer[AstNode], margin: int, it_start: int, it_end: int) returns pointer[AstNode]
+    {
+        let type_expression this.parse_jsdoc_type_expression(false)
+        let comment this.parse_trailing_tag_comments(start, this.node_pos(), margin, it_start, it_end)
+        this.finish_node(this.new_node(KindJSDocSatisfiesTag, NodeData.JSDocSatisfiesTag(JSDocOneSlotTagData(tag_name, type_expression, comment))), start)
+    }
+
+    procedure parse_throws_tag(this, start: int, tag_name: pointer[AstNode], margin: int, it_start: int, it_end: int) returns pointer[AstNode]
+    {
+        let type_expression this.try_parse_type_expression()
+        let comment this.parse_trailing_tag_comments(start, this.node_pos(), margin, it_start, it_end)
+        this.finish_node(this.new_node(KindJSDocThrowsTag, NodeData.JSDocThrowsTag(JSDocOneSlotTagData(tag_name, type_expression, comment))), start)
+    }
+
+    procedure parse_this_tag(this, start: int, tag_name: pointer[AstNode], margin: int, it_start: int, it_end: int) returns pointer[AstNode]
+    {
+        let type_expression this.parse_jsdoc_type_expression(true)
+        this.skip_whitespace()
+        let comment this.parse_trailing_tag_comments(start, this.node_pos(), margin, it_start, it_end)
+        this.finish_node(this.new_node(KindJSDocThisTag, NodeData.JSDocThisTag(JSDocOneSlotTagData(tag_name, type_expression, comment))), start)
+    }
+
+    ; parseImportTag — `@import { x } from "m"`, the JSDoc spelling of an import
+    ; declaration. It reuses the ordinary import machinery, which is why the
+    ; skip-asterisk flag is passed down: the clause may cross a line.
+    procedure parse_import_tag(this, start: int, tag_name: pointer[AstNode], margin: int, it_start: int, it_end: int) returns pointer[AstNode]
+    {
+        let after_import_tag_pos scanner.token_full_start()
+        var identifier null as pointer[AstNode]
+        if this.is_identifier()
+            set identifier: this.parse_identifier()
+        let import_clause this.try_parse_import_clause(identifier, after_import_tag_pos, KindTypeKeyword, true)
+        let module_specifier this.parse_module_specifier()
+        let attributes this.try_parse_import_attributes()
+        let comment this.parse_trailing_tag_comments(start, this.node_pos(), margin, it_start, it_end)
+        this.finish_node(this.new_node(KindJSDocImportTag, NodeData.JSDocImportTag(JSDocImportTagData(tag_name, import_clause, module_specifier, attributes, comment))), start)
+    }
+
+    procedure parse_expression_with_type_arguments_for_augments(this) returns pointer[AstNode]
+    {
+        let used_brace this.parse_optional(KindOpenBraceToken)
+        let pos this.node_pos()
+        let expression this.parse_property_access_entity_name_expression()
+        scanner.set_skip_jsdoc_leading_asterisks(true)
+        let type_arguments this.parse_type_arguments()
+        scanner.set_skip_jsdoc_leading_asterisks(false)
+        let node this.finish_node(this.new_node(KindExpressionWithTypeArguments, NodeData.ExpressionWithTypeArguments(ExpressionWithTypeArgumentsData(expression, type_arguments))), pos)
+        if used_brace
+        {
+            this.skip_whitespace()
+            this.parse_expected(KindCloseBraceToken)
+        }
+        node
+    }
+
+    procedure parse_property_access_entity_name_expression(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        var node this.parse_jsdoc_identifier_name(DiagIdentifier_expected)
+        while this.parse_optional(KindDotToken)
+        {
+            let name this.parse_jsdoc_identifier_name(DiagIdentifier_expected)
+            set node: this.finish_node(this.new_node(KindPropertyAccessExpression, NodeData.PropertyAccessExpression(PropertyAccessData(node, null, name))), pos)
+        }
+        node
+    }
+
+    ; ── @typedef, @callback, @overload and the child tags ───────────────────
+
+    ; parseJSDocTypeNameWithNamespace — `@typedef {…} Foo.Bar.Baz`, which builds
+    ; a chain of NAMESPACE declarations rather than a qualified name. The two
+    ; flags it sets are the reference's and neither has a reader in this port
+    ; (§3.5ao): NestedNamespace and IdentifierIsInJSDocNamespace are both read by
+    ; the binder.
+    procedure parse_jsdoc_type_name_with_namespace(this, nested: bool) returns pointer[AstNode]
+    {
+        let start scanner.token_start()
+        if not token_is_identifier_or_keyword(token)
+            return null
+        let type_name_or_namespace_name this.parse_jsdoc_identifier_name(0)
+        if this.parse_optional_jsdoc(KindDotToken)
+        {
+            let body this.parse_jsdoc_type_name_with_namespace(true)
+            let n this.new_node(KindModuleDeclaration, NodeData.ModuleDeclaration(ModuleDeclarationData(null, KindNamespaceKeyword, type_name_or_namespace_name, body)))
+            if nested
+                set n.flags: n.flags | NodeFlagsNestedNamespace
+            return this.finish_node(n, start)
+        }
+        if nested
+            set type_name_or_namespace_name.flags: type_name_or_namespace_name.flags | NodeFlagsIdentifierIsInJSDocNamespace
+        type_name_or_namespace_name
+    }
+
+    ; parseTypedefTag. The longest routine in this grammar, and the reason is the
+    ; END: a typedef's extent depends on which of five things it turned out to
+    ; have — nested children, a comment, a name, a type, or only the tag name —
+    ; and the reference works through them in that order.
+    procedure parse_typedef_tag(this, start: int, tag_name: pointer[AstNode], indent: int, it_start: int, it_end: int) returns pointer[AstNode]
+    {
+        var type_expression this.try_parse_type_expression()
+        var ignore_start 0
+        var ignore_end 0
+        this.skip_whitespace_or_asterisk(&ignore_start, &ignore_end)
+        var full_name this.parse_jsdoc_type_name_with_namespace(false)
+        if full_name = null
+            set full_name: this.parse_jsdoc_identifier_name(DiagIdentifier_expected)
+        this.skip_whitespace()
+        var comment this.parse_tag_comments(indent, false, 0, 0)
+
+        var end 0 - 1
+        var has_children false
+        var consider_children false
+        if type_expression = null
+            set consider_children: true
+        else
+        {
+            if is_object_or_object_array_type_reference(AstNode.jsdoc_type_expression_inner_of(type_expression))
+                set consider_children: true
+        }
+
+        if consider_children
+        {
+            var child_type_tag null as pointer[AstNode]
+            let property_tags AstNode.new_node_list(host)
+            repeat
+            {
+                let saved this.mark()
+                let child this.parse_child_property_tag(indent)
+                if child = null
+                {
+                    this.rewind(saved)
+                    break
+                }
+                set has_children: true
+                let ck AstNode.kind_of(child)
+                if ck = KindJSDocTemplateTag
+                {
+                    let tn AstNode.jsdoc_tag_name_of(child)
+                    this.parse_error_at_range(AstNode.pos_of(tn), AstNode.end_of(tn), DiagA_JSDoc_template_tag_may_not_follow_a_typedef_callback_or_overload_tag)
+                }
+                else
+                {
+                    if ck = KindJSDocTypeTag
+                    {
+                        if child_type_tag = null
+                            set child_type_tag: child
+                        else
+                        {
+                            ; The reference attaches RELATED INFO here naming the
+                            ; first @type; related info never reaches the dump
+                            ; (Diagnostics.scaly's header), so only the report is
+                            ; carried.
+                            this.parse_error_at_current_token(DiagA_JSDoc_typedef_comment_may_not_contain_multiple_type_tags)
+                        }
+                    }
+                    else
+                        property_tags.add(child)
+                }
+            }
+            if has_children
+            {
+                var is_array_type false
+                if type_expression <> null
+                {
+                    if AstNode.kind_of(AstNode.jsdoc_type_expression_inner_of(type_expression)) = KindArrayType
+                        set is_array_type: true
+                }
+                var use_child false
+                if child_type_tag <> null
+                {
+                    let cte AstNode.jsdoc_type_tag_expression_of(child_type_tag)
+                    if cte <> null
+                    {
+                        if not is_object_or_object_array_type_reference(AstNode.jsdoc_type_expression_inner_of(cte))
+                        {
+                            set type_expression: cte
+                            set use_child: true
+                        }
+                    }
+                }
+                if not use_child
+                {
+                    ; ★ The reference's own comment says this differs from Strada
+                    ; and prevents a crash: with no property tags the literal
+                    ; starts at the TAG rather than at a child that is not there.
+                    var pos start
+                    if (property_tags.get_length() as int) > 0
+                        set pos: AstNode.pos_of(*(property_tags.get_buffer()))
+                    set type_expression: this.finish_node(this.new_node(KindJSDocTypeLiteral, NodeData.JSDocTypeLiteral(JSDocTypeLiteralData(property_tags, is_array_type))), pos)
+                }
+                set end: AstNode.end_of(type_expression)
+            }
+        }
+
+        if end = 0 - 1
+        {
+            if has_children and (type_expression <> null)
+                set end: AstNode.end_of(type_expression)
+            else
+            {
+                if comment <> null
+                    set end: this.node_pos()
+                else
+                {
+                    if full_name <> null
+                        set end: AstNode.end_of(full_name)
+                    else
+                    {
+                        if type_expression <> null
+                            set end: AstNode.end_of(type_expression)
+                        else
+                            set end: AstNode.end_of(tag_name)
+                    }
+                }
+            }
+        }
+
+        if comment = null
+            set comment: this.parse_trailing_tag_comments(start, end, indent, it_start, it_end)
+
+        this.finish_node_with_end(this.new_node(KindJSDocTypedefTag, NodeData.JSDocTypedefTag(JSDocNamedTagData(tag_name, type_expression, full_name, comment))), start, end)
+    }
+
+    procedure parse_callback_tag_parameters(this, indent: int) returns pointer[Array[pointer[AstNode]]]
+    {
+        let parameters AstNode.new_node_list(host)
+        repeat
+        {
+            let saved this.mark()
+            let child this.parse_child_parameter_or_property_tag(PROPERTY_LIKE_CALLBACK_PARAMETER, indent, null)
+            if child = null
+            {
+                this.rewind(saved)
+                break
+            }
+            if AstNode.kind_of(child) = KindJSDocTemplateTag
+            {
+                let tn AstNode.jsdoc_tag_name_of(child)
+                this.parse_error_at_range(AstNode.pos_of(tn), AstNode.end_of(tn), DiagA_JSDoc_template_tag_may_not_follow_a_typedef_callback_or_overload_tag)
+            }
+            else
+                parameters.add(child)
+        }
+        parameters
+    }
+
+    ; parseJSDocSignature. The RETURN tag becomes the signature's TYPE slot, and
+    ; the rewind is the point of the routine: an `@` that turned out not to be a
+    ; @return belongs to whatever comes next, so the speculation is undone.
+    procedure parse_jsdoc_signature(this, start: int, indent: int) returns pointer[AstNode]
+    {
+        let parameters this.parse_callback_tag_parameters(indent)
+        var return_tag null as pointer[AstNode]
+        let saved this.mark()
+        if this.parse_optional_jsdoc(KindAtToken)
+        {
+            let tag this.parse_tag(null, indent)
+            if AstNode.kind_of(tag) = KindJSDocReturnTag
+                set return_tag: tag
+        }
+        if return_tag = null
+            this.rewind(saved)
+        this.finish_node(this.new_node(KindJSDocSignature, NodeData.JSDocSignature(JSDocSignatureData(null, parameters, return_tag))), start)
+    }
+
+    procedure parse_callback_tag(this, start: int, tag_name: pointer[AstNode], indent: int, it_start: int, it_end: int) returns pointer[AstNode]
+    {
+        var full_name this.parse_jsdoc_type_name_with_namespace(false)
+        if full_name = null
+            set full_name: this.parse_jsdoc_identifier_name(DiagIdentifier_expected)
+        this.skip_whitespace()
+        var comment this.parse_tag_comments(indent, false, 0, 0)
+        let type_expression this.parse_jsdoc_signature(this.node_pos(), indent)
+        if comment = null
+            set comment: this.parse_trailing_tag_comments(start, this.node_pos(), indent, it_start, it_end)
+        var end AstNode.end_of(type_expression)
+        if comment <> null
+            set end: this.node_pos()
+        this.finish_node_with_end(this.new_node(KindJSDocCallbackTag, NodeData.JSDocCallbackTag(JSDocNamedTagData(tag_name, type_expression, full_name, comment))), start, end)
+    }
+
+    procedure parse_overload_tag(this, start: int, tag_name: pointer[AstNode], indent: int, it_start: int, it_end: int) returns pointer[AstNode]
+    {
+        this.skip_whitespace()
+        var comment this.parse_tag_comments(indent, false, 0, 0)
+        let type_expression this.parse_jsdoc_signature(start, indent)
+        if comment = null
+            set comment: this.parse_trailing_tag_comments(start, this.node_pos(), indent, it_start, it_end)
+        var end AstNode.end_of(type_expression)
+        if comment <> null
+            set end: this.node_pos()
+        this.finish_node_with_end(this.new_node(KindJSDocOverloadTag, NodeData.JSDocOverloadTag(JSDocOneSlotTagData(tag_name, type_expression, comment))), start, end)
+    }
+
+    ; textsEqual — two entity names are the same name. The loop walks both down
+    ; their qualified halves in lockstep and stops when either is a bare
+    ; identifier.
+    function jsdoc_texts_equal(a0: pointer[AstNode], b0: pointer[AstNode]) returns bool
+    {
+        var a a0
+        var b b0
+        while (AstNode.kind_of(a) <> KindIdentifier) or (AstNode.kind_of(b) <> KindIdentifier)
+        {
+            if AstNode.kind_of(a) = KindIdentifier
+                return false
+            if AstNode.kind_of(b) = KindIdentifier
+                return false
+            if not AstNode.identifier_texts_equal(AstNode.qualified_right_of(a), AstNode.qualified_right_of(b))
+                return false
+            set a: AstNode.qualified_left_of(a)
+            set b: AstNode.qualified_left_of(b)
+        }
+        AstNode.identifier_texts_equal(a, b)
+    }
+
+    procedure parse_child_property_tag(this, indent: int) returns pointer[AstNode]
+        this.parse_child_parameter_or_property_tag(PROPERTY_LIKE_PROPERTY, indent, null)
+
+    ; parseChildParameterOrPropertyTag — the scan that finds the NEXT child tag.
+    ; It is a token loop rather than a parse: it walks forward until it finds an
+    ; `@` that may start a tag, and the two flags decide whether one may.
+    ;
+    ; ★ A child whose name is not a member of the parent's — `@param o.x` under
+    ; `@param o` — ends the run, which is what the name comparison is for.
+    procedure parse_child_parameter_or_property_tag(this, target: int, indent: int, name: pointer[AstNode]) returns pointer[AstNode]
+    {
+        var can_parse_tag true
+        var seen_asterisk false
+        repeat
+        {
+            let t this.next_token_jsdoc()
+            if t = KindAtToken
+            {
+                var ok can_parse_tag
+                if ok
+                {
+                    if not scanner.can_follow_jsdoc_at()
+                        set ok: false
+                }
+                if ok
+                {
+                    let child this.try_parse_child_tag(target, indent)
+                    if child <> null
+                    {
+                        if name <> null
+                        {
+                            let ck AstNode.kind_of(child)
+                            if (ck = KindJSDocParameterTag) or (ck = KindJSDocPropertyTag)
+                            {
+                                let cn AstNode.jsdoc_param_name_of(child)
+                                if AstNode.kind_of(cn) = KindIdentifier
+                                    return null
+                                if not jsdoc_texts_equal(name, AstNode.qualified_left_of(cn))
+                                    return null
+                            }
+                        }
+                    }
+                    return child
+                }
+                set seen_asterisk: false
+            }
+            if t = KindNewLineTrivia
+            {
+                set can_parse_tag: true
+                set seen_asterisk: false
+            }
+            if t = KindAsteriskToken
+            {
+                if seen_asterisk
+                    set can_parse_tag: false
+                set seen_asterisk: true
+            }
+            if t = KindIdentifier
+                set can_parse_tag: false
+            if t = KindEndOfFile
+                return null
+        }
+        null
+    }
+
+    procedure try_parse_child_tag(this, target: int, indent: int) returns pointer[AstNode]
+    {
+        let start scanner.token_full_start()
+        this.next_token_jsdoc()
+
+        let tag_name this.parse_jsdoc_identifier_name(DiagIdentifier_expected)
+        var it_start 0
+        var it_end 0
+        this.skip_whitespace_or_asterisk(&it_start, &it_end)
+
+        var t 0
+        if AstNode.identifier_text_is(tag_name, "type")
+        {
+            if target = PROPERTY_LIKE_PROPERTY
+                return this.parse_type_tag(null, start, tag_name, 0 - 1, 0, 0)
+            return null
+        }
+        if AstNode.identifier_text_is(tag_name, "prop")
+            set t: PROPERTY_LIKE_PROPERTY
+        if AstNode.identifier_text_is(tag_name, "property")
+            set t: PROPERTY_LIKE_PROPERTY
+        if AstNode.identifier_text_is(tag_name, "arg")
+            set t: PROPERTY_LIKE_PARAMETER | PROPERTY_LIKE_CALLBACK_PARAMETER
+        if AstNode.identifier_text_is(tag_name, "argument")
+            set t: PROPERTY_LIKE_PARAMETER | PROPERTY_LIKE_CALLBACK_PARAMETER
+        if AstNode.identifier_text_is(tag_name, "param")
+            set t: PROPERTY_LIKE_PARAMETER | PROPERTY_LIKE_CALLBACK_PARAMETER
+        if AstNode.identifier_text_is(tag_name, "template")
+            return this.parse_template_tag(start, tag_name, indent, it_start, it_end)
+        if AstNode.identifier_text_is(tag_name, "this")
+            return this.parse_this_tag(start, tag_name, indent, it_start, it_end)
+        if t = 0
+            return null
+        if (target & t) = 0
+            return null
+        this.parse_parameter_or_property_tag(start, tag_name, target, indent)
+    }
+
+    ; ── @template ───────────────────────────────────────────────────────────
+
+    procedure parse_template_tag_type_parameter(this) returns pointer[AstNode]
+    {
+        let pos this.node_pos()
+        let is_bracketed this.parse_optional_jsdoc(KindOpenBracketToken)
+        if is_bracketed
+            this.skip_whitespace()
+
+        let modifiers this.parse_modifiers(false, true, false)
+        let name this.parse_jsdoc_identifier_name(DiagUnexpected_token_A_type_parameter_name_was_expected_without_curly_braces)
+        var default_type null as pointer[AstNode]
+        if is_bracketed
+        {
+            this.skip_whitespace()
+            this.parse_expected(KindEqualsToken)
+            let saved context_flags
+            this.set_context_flags(NodeFlagsJSDoc, true)
+            set default_type: this.parse_jsdoc_type()
+            set context_flags: saved
+            this.parse_expected(KindCloseBracketToken)
+        }
+
+        if node_is_missing(name)
+            return null
+        this.finish_node(this.new_node(KindTypeParameter, NodeData.TypeParameter(TypeParameterData(modifiers, name, null, null, default_type))), pos)
+    }
+
+    procedure parse_template_tag_type_parameters(this) returns pointer[Array[pointer[AstNode]]]
+    {
+        let type_parameters AstNode.new_node_list(host)
+        var more true
+        while more
+        {
+            this.skip_whitespace()
+            let node this.parse_template_tag_type_parameter()
+            if node <> null
+                type_parameters.add(node)
+            var ignore_start 0
+            var ignore_end 0
+            this.skip_whitespace_or_asterisk(&ignore_start, &ignore_end)
+            set more: this.parse_optional_jsdoc(KindCommaToken)
+        }
+        type_parameters
+    }
+
+    procedure parse_template_tag(this, start: int, tag_name: pointer[AstNode], indent: int, it_start: int, it_end: int) returns pointer[AstNode]
+    {
+        var constraint null as pointer[AstNode]
+        if token = KindOpenBraceToken
+            set constraint: this.parse_jsdoc_type_expression(false)
+        let type_parameters this.parse_template_tag_type_parameters()
+        let comment this.parse_trailing_tag_comments(start, this.node_pos(), indent, it_start, it_end)
+        this.finish_node(this.new_node(KindJSDocTemplateTag, NodeData.JSDocTemplateTag(JSDocTemplateTagData(tag_name, constraint, type_parameters, comment))), start)
+    }
+
+    ; ── names ───────────────────────────────────────────────────────────────
+
+    ; parseJSDocEntityName. `y[]` is accepted as an entity name and the brackets
+    ; are dropped — the reference's own comment says it is not worth enforcing
+    ; the Closure rule that would require them.
+    procedure parse_jsdoc_entity_name(this, code: int) returns pointer[AstNode]
+    {
+        var entity this.parse_jsdoc_identifier_name(code)
+        if this.parse_optional(KindOpenBracketToken)
+            this.parse_expected(KindCloseBracketToken)
+        while this.parse_optional(KindDotToken)
+        {
+            let name this.parse_jsdoc_identifier_name(DiagIdentifier_expected)
+            if this.parse_optional(KindOpenBracketToken)
+                this.parse_expected(KindCloseBracketToken)
+            let pos AstNode.pos_of(entity)
+            set entity: this.finish_node(this.new_node(KindQualifiedName, NodeData.QualifiedName(QualifiedNameData(entity, name))), pos)
+        }
+        entity
+    }
+
+    ; parseJSDocIdentifierName. `code = 0` is the reference's `nil` message, and
+    ; then a RESERVED WORD gets its own report instead — which is the one place
+    ; the two differ.
+    procedure parse_jsdoc_identifier_name(this, code: int) returns pointer[AstNode]
+    {
+        if not token_is_identifier_or_keyword(token)
+        {
+            if code <> 0
+                this.parse_error_at_current_token(code)
+            else
+            {
+                if is_reserved_word(token)
+                    this.parse_error_at_current_token(DiagIdentifier_expected_0_is_a_reserved_word_that_cannot_be_used_here)
+            }
+            return this.finish_node(this.new_node(KindIdentifier, NodeData.Identifier(IdentifierData(null, 0))), this.node_pos())
+        }
+        let pos scanner.token_start()
+        let end scanner.token_end()
+        let text scanner.token_value()
+        let text_len scanner.token_value_length()
+        this.next_token_jsdoc()
+        this.finish_node_with_end(this.new_node(KindIdentifier, NodeData.Identifier(IdentifierData(text, text_len))), pos, end)
+    }
+
+    ; ── the entry points ────────────────────────────────────────────────────
+
+    ; parseJSDocForNode — the LAZY parse a TS/TSX file defers to. The reference
+    ; runs it on a fresh parser out of a pool and throws its diagnostics away;
+    ; here it runs on the parser that produced the tree, which is the same thing
+    ; with one region instead of a pool, and parse_jsdoc_comment already restores
+    ; every field it touches.
+    procedure parse_jsdoc_for_node(this, n: pointer[AstNode]) returns pointer[Array[pointer[AstNode]]]
+    {
+        ; ★★★ The HasJSDoc test is the reference's `Node.JSDoc(file)`'s FIRST
+        ; line and it is not an optimisation: without it every node re-derives
+        ; the comment ranges of the position it starts at, and a node that
+        ; shares its start with a documented one — a SourceFile with its first
+        ; statement, a VariableStatement with its declaration list — answers
+        ; that statement's JSDoc as its own.
+        if (AstNode.flags_of(n) & NodeFlagsHasJSDoc) = 0
+            return null
+        let ranges this.cparts_new()
+        this.get_jsdoc_comment_ranges(n, ranges)
+        let count (ranges.get_length() as int) / 2
+        if count = 0
+            return null
+        let jsdoc AstNode.new_node_list(host)
+        var pos AstNode.pos_of(n)
+        var i 0
+        while i < count
+        {
+            let s *(ranges.get_buffer() + (i * 2))
+            let e *(ranges.get_buffer() + ((i * 2) + 1))
+            let parsed this.parse_jsdoc_comment(n, s, e, pos)
+            if parsed <> null
+            {
+                jsdoc.add(parsed)
+                set pos: AstNode.end_of(parsed)
+            }
+            set i: i + 1
+        }
+        if (jsdoc.get_length() as int) = 0
+            return null
+        jsdoc
+    }
+
+    ; The program-facing form. A concept STATIC taking the parser explicitly,
+    ; because a user program calling a cross-package method on a concept pointer
+    ; does not resolve while a static does (root CLAUDE.md).
+    function jsdoc_for_node(p: pointer[Parser], n: pointer[AstNode]) returns pointer[Array[pointer[AstNode]]]
+        p.parse_jsdoc_for_node(n)
 }
