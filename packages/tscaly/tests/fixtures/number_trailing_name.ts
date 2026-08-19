@@ -1,0 +1,12 @@
+var a = 1 ;
+var b = 1é;
+var c = 1a\u0062;
+var d = 1\u0062;
+var e = 1n\u0062;
+var f = 1a\u{62}c;
+var g = 1é\u0301;
+var h = 1né;
+var i = 1e2n;
+var j = 1.5n;
+var k = 1.5no;
+var l = 1e2no;

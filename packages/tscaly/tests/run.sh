@@ -74,10 +74,17 @@
 # Stage 1 is the working yardstick: 12 s, small enough to run per slice, and every
 # number in CLAUDE.md's tables is one of its numbers. Stage 2 (7 min 23 s) is the
 # one that can turn *it agrees over 834 units* into *the sample of 17 604 found
-# these 21 things* — eleven `unported` markers stand in the code and stage 1
-# reaches none of them, while stage 2 reaches exactly ONE, twice. ★It is a
-# MEASUREMENT and not a gate, and it does not say *finished* either: the corpus is
-# a SAMPLE and the reference is the SPECIFICATION (CLAUDE.md §3.5be).
+# these 21 things*, which is what it did on its first pass.
+#
+# ★★★ SINCE SLICE 25 THE `unported` COLUMN IS ZERO IN BOTH STAGES, so every unit
+# is a comparison — and the way the last one was found is the argument for
+# printing that column at all. Stage 2 reported it twice out of 17 634, both
+# reports CORRECT, over a byte of scan_number that stage 1 could not reach; an
+# honest "not compared" is the cheapest place in this suite for a defect to hide,
+# because nobody investigates a unit that declares itself uncompared. Five
+# markers remain in parser.scaly and each stands where the reference PANICS.
+# ★It is a MEASUREMENT and not a gate, and it does not say *finished* either: the
+# corpus is a SAMPLE and the reference is the SPECIFICATION (CLAUDE.md §3.5be).
 #
 # ★ A stage-2 case key is prefixed `submodule_`, mirroring the reference's own
 # separation (testdata/baselines/reference/submodule/ against .../compiler/). It
