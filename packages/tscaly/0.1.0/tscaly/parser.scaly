@@ -9536,16 +9536,20 @@ define Parser
         if this.is_unported()
             return null
 
-        ; ★ A missing `{` is reported and the body parsed anyway. The reference
-        ; wraps that in `if p.parseExpected(OpenBrace) { … } else { members =
-        ; createMissingList() }`, which differs from this only in whether the
-        ; member list is entered at all — and entering it costs nothing, because
-        ; the first token is then a terminator or the recovery's business.
-        this.parse_expected(KindOpenBraceToken)
-        let members this.parse_list(PCClassMembers)
-        if members = null
-            return null
-        this.parse_expected(KindCloseBraceToken)
+        ; ★★★ THE `{` IS A BRANCH — see §3.5bi, which is where the sentence that
+        ; used to stand here ("entering it costs nothing, because the first token
+        ; is then a terminator or the recovery's business") was measured false.
+        ; `var class;` enters the list and eats the `;` as a SemicolonClassElement.
+        var members null as pointer[Array[pointer[AstNode]]]
+        if this.parse_expected(KindOpenBraceToken)
+        {
+            set members: this.parse_list(PCClassMembers)
+            if members = null
+                return null
+            this.parse_expected(KindCloseBraceToken)
+        }
+        else
+            set members: this.create_missing_list()
 
         set context_flags: saved
 
@@ -10950,10 +10954,10 @@ define Parser
 
     procedure parse_object_type_members(this) returns pointer[Array[pointer[AstNode]]]
     {
-        ; A missing `{` is reported and the members parsed anyway; see
-        ; parse_class_declaration_or_expression for why the reference's
-        ; createMissingList branch collapses into this.
-        this.parse_expected(KindOpenBraceToken)
+        ; ★ The `{` is a BRANCH here too (§3.5bi): `interface Foo.I1 { }` must
+        ; leave the interface at `Foo` and read `.I1` as an expression statement.
+        if this.parse_expected(KindOpenBraceToken) = false
+            return this.create_missing_list()
         let members this.parse_list(PCTypeMembers)
         if members = null
             return null
@@ -11139,17 +11143,25 @@ define Parser
         if name = null
             return null
 
-        ; A missing `{` is reported and the members parsed anyway —
-        ; createMissingList again; see parse_class_declaration_or_expression.
-        this.parse_expected(KindOpenBraceToken)
-        let saved context_flags
-        this.set_context_flags(NodeFlagsYieldContext, false)
-        this.set_context_flags(NodeFlagsAwaitContext, false)
-        let members this.parse_delimited_list(PCEnumMembers)
-        set context_flags: saved
-        if members = null
-            return null
-        this.parse_expected(KindCloseBraceToken)
+        ; ★★★ THE `{` IS A BRANCH, not an expectation — see §3.5bi. With the
+        ; brace missing the reference hands the node the MISSING-list sentinel
+        ; and does not enter the member list at all, so `enum void {}` yields an
+        ; EnumDeclaration that ENDS at the keyword and lets `void {}` re-parse as
+        ; a statement.
+        var members null as pointer[Array[pointer[AstNode]]]
+        if this.parse_expected(KindOpenBraceToken)
+        {
+            let saved context_flags
+            this.set_context_flags(NodeFlagsYieldContext, false)
+            this.set_context_flags(NodeFlagsAwaitContext, false)
+            set members: this.parse_delimited_list(PCEnumMembers)
+            set context_flags: saved
+            if members = null
+                return null
+            this.parse_expected(KindCloseBraceToken)
+        }
+        else
+            set members: this.create_missing_list()
 
         let result this.with_jsdoc(this.finish_node(this.new_node(KindEnumDeclaration, NodeData.EnumDeclaration(EnumDeclarationData(modifiers, name, members))), pos), jsdoc)
         ; An `await` used as a name inside an enum body says nothing about the
@@ -11241,11 +11253,17 @@ define Parser
     procedure parse_module_block(this) returns pointer[AstNode]
     {
         let pos this.node_pos()
-        this.parse_expected(KindOpenBraceToken)
-        let statements this.parse_list(PCBlockStatements)
-        if statements = null
-            return null
-        this.parse_expected(KindCloseBraceToken)
+        ; The `{` is a BRANCH (§3.5bi).
+        var statements null as pointer[Array[pointer[AstNode]]]
+        if this.parse_expected(KindOpenBraceToken)
+        {
+            set statements: this.parse_list(PCBlockStatements)
+            if statements = null
+                return null
+            this.parse_expected(KindCloseBraceToken)
+        }
+        else
+            set statements: this.create_missing_list()
         this.finish_node(this.new_node(KindModuleBlock, NodeData.ModuleBlock(BlockData(statements))), pos)
     }
 
@@ -17300,7 +17318,51 @@ define Parser
         if this.is_java_script()
             return this.lookup_jsdoc_info(n)
 
-        this.parse_jsdoc_comments_of(n)
+        ; ★★★ THE LAZY PARSE RUNS ON A FRESH PARSER, and that is a statement
+        ; about the CONTEXT FLAGS rather than about allocation. resolveJSDoc
+        ; calls `p := getParser()` + `p.initializeState(...)`, so the only bits
+        ; standing when the comment is parsed are the ones the SCRIPT KIND puts
+        ; there — `parseSourceFileWorker`'s `contextFlags |= NodeFlagsAmbient`
+        ; for a `.d.ts` never ran on it. Reusing this parser leaks that bit into
+        ; every JSDoc node of every declaration file: 1<<22 where the reference
+        ; has 1<<22 alone. Three units of the stage-2 corpus, and invisible to a
+        ; dump that prints kinds and spans only (§3.5bj).
+        ;
+        ; Only the flags are reset, not the parser: parse_jsdoc_comment already
+        ; saves and restores the source text, the token, the scanner mark, the
+        ; parsing contexts and the diagnostic length, which is the rest of what a
+        ; fresh instance would give.
+        ;
+        ; ★★★ AND THE CACHE IS ASKED FIRST, which is the same fact from the other
+        ; side. resolveJSDoc's own first act is a cache lookup, and a NON-JS file
+        ; does have entries in that cache: with_jsdoc falls THROUGH to an eager
+        ; parse when the comment carries @see or @link, and those nodes were made
+        ; while the file's flags were standing — so the reference answers them
+        ; WITH Ambient. Re-deriving instead would strip a bit the reference keeps,
+        ; i.e. the very defect above in the opposite direction, and the fixture
+        ; carries both halves for that reason.
+        let cached this.lookup_jsdoc_info(n)
+        if cached <> null
+            return cached
+
+        let saved context_flags
+        set context_flags: this.initial_context_flags()
+        let result this.parse_jsdoc_comments_of(n)
+        set context_flags: saved
+        result
+    }
+
+    ; initializeState's context-flag switch, as a function, because the lazy
+    ; JSDoc accessor above needs the value a FRESH parser would start from.
+    function initial_context_flags(this) returns int
+    {
+        if script_kind = ScriptKindJSON
+            return NodeFlagsJavaScriptFile | NodeFlagsJsonFile
+        if script_kind = ScriptKindJS
+            return NodeFlagsJavaScriptFile
+        if script_kind = ScriptKindJSX
+            return NodeFlagsJavaScriptFile
+        NodeFlagsNone
     }
 
     ; The same walk without the flag gate. with_jsdoc needs it for a JavaScript
