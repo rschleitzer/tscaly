@@ -1,0 +1,10 @@
+let a = (eval = 1) === (eval = 2);
+let b = ((eval = 3), (eval = 4));
+let c = (eval = 5) || (eval = 6);
+let d = (eval = 7) && (eval = 8);
+let e = (eval = 9) ?? (eval = 10);
+declare let g: any;
+g ||= (eval = 11);
+g &&= (eval = 12);
+g ??= (eval = 13);
+let h = { i: 14 } === { j: 15 };
