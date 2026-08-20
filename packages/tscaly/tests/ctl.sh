@@ -62,7 +62,7 @@
 #     file it patched and touches nothing else — so re-measuring it 45 times cost
 #     45 runs to learn what a hash answers in 0.2 s. `TSCALY_BASELINE=<file>`
 #     caches the baseline report and, beside it, a SHA-256 over every input a run
-#     has: all of `0.1.0/**/*.scaly`, all 266 fixtures, the four oracle sources,
+#     has: all of `0.1.0/**/*.scaly`, every fixture (394 today, and the hash is over whatever is there), the four oracle sources,
 #     accepted.txt, the submodule's pinned commit, the compiler binary and the
 #     runtime archive. Every control verifies that fingerprint before it trusts
 #     the cached numbers and again after it restores.
