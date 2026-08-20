@@ -1,0 +1,1 @@
+namespace Invalid { export { "x" }; }

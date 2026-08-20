@@ -46,13 +46,18 @@
 ; the four kinds the reference binds through one line (an import-equals, a
 ; namespace import, an import specifier and an export specifier), plus the four
 ; arms with a body of their own — bindImportClause, bindExportDeclaration,
-; bindExportAssignment and bindNamespaceExportDeclaration. Everything else in
-; either switch reports itself.
+; bindExportAssignment and bindNamespaceExportDeclaration. Slice 30 adds the
+; CLASS-LIKE family and the ten member kinds that declare into the tables those
+; containers own. Slice 31 adds the MODULE DECLARATION: bindModuleDeclaration,
+; declareModuleSymbol and ast.GetModuleInstanceState, which is the first ported
+; function in this package that has to WALK a body to answer a question about
+; the node above it. Everything else in either switch reports itself.
 
 use scaly.memory.Page
 use scaly.containers.Array
 use scaly.containers.String
 use tscaly.scanner.Scanner
+use tscaly.parser.Parser
 use tscaly.ast.AstNode
 use tscaly.ast.Symbol
 use tscaly.ast.SymbolTable
@@ -77,6 +82,67 @@ define ContainerFlagsIsObjectLiteralOrClassExpressionMethodOrAccessor: int 1 << 
 define ContainerFlagsIsThisContainer: int 1 << 8
 define ContainerFlagsPropagatesThisKeyword: int 1 << 9
 
+; ── ModuleInstanceState ─────────────────────────────────────────────────────
+;
+; ast.ModuleInstanceState, and the NUMBERS are load-bearing rather than
+; incidental: getModuleInstanceStateWorker takes a MAXIMUM over an export
+; clause's specifiers with `>`, and upstream's iota order puts ConstEnumOnly
+; ABOVE Instantiated — so a const-enum-only specifier wins the max while only an
+; Instantiated one ends the loop early. Renumbering these would be a silent
+; change of answer on a mixed clause.
+define ModuleInstanceStateUnknown: int 0
+define ModuleInstanceStateNonInstantiated: int 1
+define ModuleInstanceStateInstantiated: int 2
+define ModuleInstanceStateConstEnumOnly: int 3
+
+; ── the three side structures GetModuleInstanceState needs ──────────────────
+;
+; ★★★ `ancestors []*Node` is a stack of VIRTUAL parents, and it exists because
+; the function is called DURING the bind: a module's own Parent chain is set, its
+; body's children's is not, and getModuleInstanceStateForAliasTarget walks
+; UPWARDS out of the node it was handed. Upstream pushes with `append` and pops
+; with a re-slice, so the value is only ever truncated from the end — which is a
+; CONS LIST with the aliasing question removed. Two appends onto one base slice
+; would write the same index twice in Go; here two pushes onto one link cannot
+; interfere, and no reader can tell the difference because every reader reads at
+; its own length.
+define AncestorLink
+(
+    node: pointer[AstNode]
+    prev: pointer[AncestorLink]
+)
+
+; `visited map[NodeId]ModuleInstanceState`, as an association LIST. The map is a
+; memo over a deterministic function, so it is unobservable — EXCEPT for the one
+; thing it is really there for: an entry is written as Unknown BEFORE the worker
+; runs, so a cycle through an export alias answers NonInstantiated instead of
+; recursing forever. A linear scan answers exactly that, over the statements of
+; one module body.
+;
+; ★ The lookup is by NODE POINTER where upstream keys by GetNodeId. Those are the
+; same identity here and the pointer is the cheaper spelling of it — §3.10 gives
+; this port its ids at PARSE time precisely so that identity is not a mutation of
+; the tree.
+define VisitedLink
+(
+    node: pointer[AstNode]
+    state: int
+    next: pointer[VisitedLink]
+)
+
+define VisitedSet (head: pointer[VisitedLink])
+
+; `b.notConstEnumOnlyModules collections.Set[*Symbol]`, as a list for the same
+; reason: it holds one entry per module symbol that has been observed NOT to be
+; const-enum-only, and it is asked once per module declaration. A field on Symbol
+; would be invisible to the dump and would work; the reference keeps the question
+; out of the symbol, and so does this.
+define SymbolLink
+(
+    symbol: pointer[Symbol]
+    next: pointer[SymbolLink]
+)
+
 define Binder
 (
     host: pointer[Page]
@@ -89,7 +155,12 @@ define Binder
     ; `SkipTrivia(text, pos)`, which every bind diagnostic's start position goes
     ; through (`GetErrorRangeForNode`). The reference's SkipTrivia is a free
     ; function over the text; this port's lives on the Scanner because the text
-    ; does, so the binder holds one. It scans nothing.
+    ; does, so the binder holds one.
+    ;
+    ; ★ Slice 31: it SCANS now, at one site. errorOnFirstToken reports at
+    ; `GetRangeOfTokenAtPosition(file, node.Pos())`, which is a fresh scanner, one
+    ; Scan and the token's own [start, end) — see range_of_token_at_position for
+    ; why the shared one is the same answer.
     trivia: pointer[Scanner]
 
     ; `ast.IsExternalModule(b.file)`, computed ONCE at create because the reference
@@ -169,6 +240,13 @@ define Binder
     ; has_error flag.
     bind_diagnostics: pointer[DiagnosticList]
 
+    ; `b.notConstEnumOnlyModules`, slice 31. Written by two sites and read by
+    ; one, all three inside the const-enum-only question: a module symbol that has
+    ; once been seen with a Function, Class or RegularEnum declaration can never
+    ; go back to being const-enum-only, and the set is what remembers it ACROSS
+    ; the declarations of one merged symbol.
+    not_const_enum_only_modules: pointer[SymbolLink]
+
     ; The unported report, in the parser's shape: the first construct this slice
     ; does not implement stops the bind and names itself.
     unported_pos: int
@@ -187,6 +265,13 @@ define Binder
         set b.file: file
         let sc host.allocate(sizeof Scanner, alignof Scanner) as pointer[Scanner]
         set *sc: Scanner(source)
+        ; ★ Slice 31: the scanner is told the file's LANGUAGE VARIANT, because
+        ; since error_on_first_token it SCANS. GetScannerForSourceFile takes the
+        ; variant off the SourceFile; here the file name is what carries it, the
+        ; same question `is_declaration_file` is answered from and through the
+        ; parser's own clamped table (a `.js` unit is NOT the JSX variant even
+        ; though upstream's raw table says so, and a `.json` unit IS).
+        sc.set_language_variant_jsx(Parser.script_kind_is_jsx_variant(file_name))
         set b.trivia: sc
         set b.is_external_module: is_external_module
         set b.is_declaration_file: is_declaration_file_name(file_name)
@@ -200,6 +285,7 @@ define Binder
         set b.last_container: null
         set b.symbol_count: 0
         set b.classifiable_names: SymbolTable.create(host)
+        set b.not_const_enum_only_modules: null
         let dl host.allocate(sizeof DiagnosticList, alignof DiagnosticList) as pointer[DiagnosticList]
         set *dl: DiagnosticList(host)
         set b.bind_diagnostics: dl
@@ -284,6 +370,43 @@ define Binder
         if this.error_range_for_node(n, &start, &stop) = false
             return
         bind_diagnostics.add_direct(start, stop, code)
+    }
+
+    ; b.errorOnFirstToken, slice 31. NOT error_on_node with another span: it does
+    ; not ask GetErrorRangeForNode at all, so no declaration name and no
+    ; trivia-skip is involved — the span is the FIRST TOKEN at the node's own pos,
+    ; which for a `declare module` is the first modifier and for a string name is
+    ; the literal.
+    procedure error_on_first_token(this, n: pointer[AstNode], code: int)
+    {
+        var start 0
+        var stop 0
+        this.range_of_token_at_position(AstNode.pos_of(n), &start, &stop)
+        bind_diagnostics.add_direct(start, stop, code)
+    }
+
+    ; scanner.GetRangeOfTokenAtPosition: a scanner at `pos`, ONE scan, and the
+    ; token's own [TokenStart, TokenEnd) — the start is past the trivia because
+    ; the scan skipped it, so this is not skip_trivia_at with an end bolted on.
+    ;
+    ; ★★ The reference builds a FRESH scanner (GetScannerForSourceFile) and this
+    ; uses the binder's, which is the same answer for three reasons, each of which
+    ; would otherwise be a way to differ: the shared one carries no diagnostic sink
+    ; (so a scan reports nothing anywhere), skip_trivia_at does not touch scanner
+    ; state (so no caller of it can be disturbed by a scan, and no scan can inherit
+    ; a position from one), and the variant is set from the file name at
+    ; construction — a fresh scanner would be told the same thing.
+    ;
+    ; ★ The scanner may also report UNPORTED, and it is deliberately not consulted:
+    ; the position handed to it is a node's own start, which the PARSER already
+    ; scanned successfully with this same variant, so the token here has been
+    ; answered once before.
+    procedure range_of_token_at_position(this, pos: int, out_start: pointer[int], out_end: pointer[int])
+    {
+        trivia.reset_pos(pos)
+        trivia.scan()
+        set *out_start: trivia.token_start()
+        set *out_end: trivia.token_end()
     }
 
     ; scanner.GetErrorRangeForNode. Answers false when it meets an arm this slice
@@ -563,6 +686,28 @@ define Binder
                 this.bind_block_scoped_declaration(n, SymbolFlagsTypeAlias, SymbolFlagsTypeAliasExcludes)
         }
 
+        ; ── slice 31: the ENUM ──────────────────────────────────────────────
+        ;
+        ; ★★★ THE ENUM SHIPS WITH THE MODULE, and the argument is slice 30's
+        ; verbatim: the module's own const-enum-only bit is set from a state that
+        ; only a `const enum` can produce, and a namespace holding a const enum
+        ; STOPS at the enum's bind arm — so shipping the module alone would leave
+        ; the whole const-enum-only tail, and the reset in
+        ; add_declaration_to_symbol, parked as unreachable. The slice that lifts a
+        ; condition owns every claim resting on it.
+        if k = KindEnumDeclaration
+            this.bind_enum_declaration(n)
+        if k = KindEnumMember
+            this.bind_property_or_method_or_accessor(n, SymbolFlagsEnumMember, SymbolFlagsEnumMemberExcludes)
+
+        ; ── slice 31: the MODULE DECLARATION ────────────────────────────────
+        ;
+        ; The last of the three container families the reference's switch names
+        ; (the source file, the class-like nodes, the module), and the first arm
+        ; whose ANSWER depends on the shape of the body below it.
+        if k = KindModuleDeclaration
+            this.bind_module_declaration(n)
+
         ; The two anonymous TYPE containers, which share one flag and one name —
         ; and the name is the binder's own rather than the node's.
         if k = KindTypeLiteral
@@ -661,8 +806,6 @@ define Binder
             return true
         if k = KindShorthandPropertyAssignment
             return true
-        if k = KindEnumMember
-            return true
         if k = KindFunctionType
             return true
         if k = KindConstructorType
@@ -674,10 +817,6 @@ define Binder
         if k = KindArrowFunction
             return true
         if k = KindCallExpression
-            return true
-        if k = KindEnumDeclaration
-            return true
-        if k = KindModuleDeclaration
             return true
         if k = KindJsxAttributes
             return true
@@ -1185,26 +1324,65 @@ define Binder
                 s.declarations.add(n)
         }
 
-        ; The const-enum-only reset needs the module machinery this slice does not
-        ; have; it can only fire on a symbol that already carries
-        ; ConstEnumOnlyModule, which only bindModuleDeclaration sets, and that arm
-        ; is unported. Reported rather than skipped, so the claim expires with the
-        ; arm (§3.5p).
+        ; ★★ The const-enum-only reset, and slice 31 is the slice its stand-in
+        ; named: it can only fire on a symbol that already carries
+        ; ConstEnumOnlyModule, which only bindModuleDeclaration sets. What the
+        ; reference's comment states is the DIRECTION — "on merge of const enum
+        ; module with class or function, reset const enum only flag (namespaces
+        ; will already recalculate)" — so this is the half that a NON-module
+        ; declaration does, and bind_module_declaration is the half a module does.
+        ; The side set is written here too, or a later module declaration of the
+        ; same name would set the bit back.
         if (s.flags & SymbolFlagsConstEnumOnlyModule) <> 0
-            this.record_unported("const-enum-only-module", 0)
+        {
+            if (s.flags & (SymbolFlagsFunction | SymbolFlagsClass | SymbolFlagsRegularEnum)) <> 0
+            {
+                Binder.clear_const_enum_only_module(s)
+                this.add_not_const_enum_only(s)
+            }
+        }
 
         if (symbol_flags & SymbolFlagsValue) <> 0
             Binder.set_value_declaration(s, n)
     }
 
-    ; SetValueDeclaration. The two overriding conditions both concern declarations
-    ; this slice cannot produce — an ASSIGNMENT declaration (a JS `f.x = 1`) and an
-    ; effective MODULE declaration — so what is ported is the first clause and the
-    ; other two are named at their line.
+    ; SetValueDeclaration. Three conditions, and slice 31 makes the THIRD one
+    ; reachable: a non-namespace declaration takes precedence over a namespace
+    ; one, so a `function f` merging into a `namespace f` moves the symbol's value
+    ; declaration to the function. The dump carries the value declaration's span,
+    ; so this is compared rather than inferred.
+    ;
+    ; ★ isEffectiveModuleDeclaration is `IsModuleDeclaration(node) ||
+    ; IsIdentifier(node)`, and the second disjunct stays with the first: an
+    ; IDENTIFIER as a value declaration is a JS expando assignment, whose arms are
+    ; unported — transcribed here rather than left out, because the two are one
+    ; predicate in the reference and splitting it would be a claim about which
+    ; half is live.
+    ;
+    ; ★ The remaining condition — an ASSIGNMENT declaration losing to a
+    ; non-assignment one — is still unreachable for the same reason, and is named
+    ; at its line rather than transcribed: isAssignmentDeclaration is a JS
+    ; question over five node kinds this port does not bind.
     function set_value_declaration(s: pointer[Symbol], n: pointer[AstNode])
     {
         if s.value_declaration = null
+        {
             set s.value_declaration: n
+            return
+        }
+        if AstNode.kind_of(s.value_declaration) = AstNode.kind_of(n)
+            return
+        if Binder.is_effective_module_declaration(s.value_declaration)
+            set s.value_declaration: n
+    }
+
+    ; isEffectiveModuleDeclaration.
+    function is_effective_module_declaration(n: pointer[AstNode]) returns bool
+    {
+        let k AstNode.kind_of(n)
+        if k = KindModuleDeclaration
+            return true
+        k = KindIdentifier
     }
 
     ; declareSymbol / declareSymbolEx. The heart of the binder: find or make the
@@ -1219,10 +1397,10 @@ define Binder
         ; slice 29 owns the second disjunct because it is the slice that binds an
         ; export specifier. `ModuleExportNameIsDefault` is `name.Text() ==
         ; "default"` over a ModuleExportName, i.e. an Identifier or a STRING
-        ; LITERAL (`export { x as "default" }`) — and this port stores no literal
-        ; text (ast.scaly's header), so the literal spelling is reported rather
-        ; than answered. Answering `false` there would be the quiet wrong answer
-        ; §3.9e rejects: it decides the symbol's NAME.
+        ; LITERAL (`export { x as "default" }`), and BOTH are answered since slice
+        ; 31 stored a literal's text. Answering `false` for the literal spelling
+        ; would have been the quiet wrong answer §3.9e rejects: it decides the
+        ; symbol's NAME.
         var is_default_export: bool this.has_syntactic_modifier(n, ModifierFlagsDefault)
         if is_default_export = false
         {
@@ -1238,8 +1416,24 @@ define Binder
                         if SymbolTable.names_equal(AstNode.identifier_text_of(en), AstNode.identifier_text_length_of(en), dd, dl)
                             set is_default_export: true
                     }
+                    ; ★ Slice 31: a STRING-named export specifier is answerable
+                    ; now — `export { x as "default" }` is a default export and its
+                    ; duplicate is TS2528 rather than TS2300, which is the one
+                    ; place slice 29 measured this disjunct to be visible. The
+                    ; stand-in it replaces was not about the specifier at all: it
+                    ; was about a literal's text.
                     else
-                        this.record_unported("export-specifier-name-literal", AstNode.kind_of(en))
+                    {
+                        if AstNode.kind_of(en) = KindStringLiteral
+                        {
+                            var dd null as pointer[char]
+                            let dl Binder.internal_name_unprefixed(host, "default", &dd)
+                            if SymbolTable.names_equal(AstNode.literal_text_of(en), AstNode.literal_text_length_of(en), dd, dl)
+                                set is_default_export: true
+                        }
+                        else
+                            this.record_unported("export-specifier-name-literal", AstNode.kind_of(en))
+                    }
                 }
             }
         }
@@ -1318,8 +1512,20 @@ define Binder
                                 if (s.flags & SymbolFlagsAccessor) <> (includes & SymbolFlagsAccessor)
                                     set s.flags: s.flags | SymbolFlagsAccessor
                             }
+                            ; ★★★ THE FRESH SYMBOL IS NOT PUT BACK IN THE TABLE,
+                            ; and the line that did it was here for four slices as
+                            ; a NO-OP: `SymbolTable.set_entry` could not replace an
+                            ; existing entry (§3.5bx-adjacent — the explicit-deref
+                            ; store, see ast.scaly's set_entry), so writing the
+                            ; second symbol over the first did nothing and the dump
+                            ; agreed with the reference by accident. Fixing the
+                            ; store turned ten units red at once, which is what the
+                            ; line really claimed. Upstream keeps the FIRST symbol
+                            ; in the table — a duplicate declaration gets a symbol
+                            ; of its own that nothing can look up — and re-inserts
+                            ; only in the isReplaceableByMethod branch, which is a
+                            ; JavaScript constructor property and unported.
                             set s: this.new_symbol(SymbolFlagsNone, name_data, name_len)
-                            SymbolTable.set_entry(host, table, name_data, name_len, s)
                         }
                     }
                 }
@@ -1500,15 +1706,43 @@ define Binder
             return
         }
 
-        ; ★ Before the name is looked at, the reference asks IsAmbientModule(node) —
-        ; a module declaration named by a STRING — and answers the quoted module name
-        ; or the global self-reference. Only a ModuleDeclaration can be one, and that
-        ; arm is unported, so the question cannot be asked here yet.
         let name this.get_name_of_declaration(n)
         if this.is_unported()
             return
         if name <> null
         {
+            ; ★★★ Slice 31. BEFORE the name's own kind is looked at: an AMBIENT
+            ; module is named by the reference rather than by its name node —
+            ; `global` answers the internal `global` and a string-named one answers
+            ; the module name IN QUOTES, which is the same pair of bytes
+            ; bindSourceFileAsExternalModule puts around a file name and the pair
+            ; the checker's IsAmbientModuleSymbolName tests for. The order is
+            ; load-bearing: reached through the StringLiteral arm below, `declare
+            ; module "a"` would declare a symbol called `a`, which is a name a
+            ; program can resolve and would collide with an ordinary declaration.
+            if Binder.is_ambient_module(n)
+            {
+                if Binder.is_global_scope_augmentation(n)
+                {
+                    set *out_len: Binder.internal_name(host, "global", out_data)
+                    return
+                }
+                let td AstNode.literal_text_of(name)
+                let tl AstNode.literal_text_length_of(name)
+                let buf host.allocate((tl + 2) as size_t, 1) as pointer[char]
+                set *buf: "\"" as char
+                var i 0
+                while i < tl
+                {
+                    set *(buf + 1 + i): *(td + i)
+                    set i: i + 1
+                }
+                set *(buf + 1 + tl): "\"" as char
+                set *out_data: buf
+                set *out_len: tl + 2
+                return
+            }
+
             let nk AstNode.kind_of(name)
             if nk = KindIdentifier
             {
@@ -1516,29 +1750,87 @@ define Binder
                 set *out_len: AstNode.identifier_text_length_of(name)
                 return
             }
+            ; ★ A PRIVATE identifier's text IS stored (its payload is
+            ; IdentifierData), and slice 31 SHARPENED this stand-in rather than
+            ; retiring it: the name is
+            ; `GetSymbolNameForPrivateIdentifier(containingClass.Symbol(), text)`,
+            ; i.e. the prefix, a `#`, the containing class symbol's ID and the
+            ; text — and a SYMBOL ID is the blocker. Upstream assigns those lazily
+            ; by CAS into the shared tree, which is exactly the mechanism §3.10
+            ; diverges from, so the slice that answers this owes a decision about
+            ; symbol identity and not a text.
             if nk = KindPrivateIdentifier
             {
                 this.record_unported("declaration-name-private-identifier", 0)
                 return
             }
-            if nk = KindComputedPropertyName
-            {
-                this.record_unported("declaration-name-computed", 0)
-                return
-            }
+            ; ★★ IsPropertyNameLiteral: an Identifier — answered above — or one of
+            ; these three, which since slice 31 STORE their text and are therefore
+            ; answerable. What the arm buys is a symbol named by the literal's
+            ; DECODED value, so `{ "a-b": T }` and `{ 0: T }` declare `a-b` and `0`
+            ; and an escape in the name resolves before it becomes a symbol.
             if nk = KindStringLiteral
             {
-                this.record_unported("declaration-name-literal", nk)
+                this.literal_declaration_name(name, out_data, out_len)
                 return
             }
             if nk = KindNumericLiteral
             {
-                this.record_unported("declaration-name-literal", nk)
+                this.literal_declaration_name(name, out_data, out_len)
                 return
             }
             if nk = KindNoSubstitutionTemplateLiteral
             {
-                this.record_unported("declaration-name-literal", nk)
+                this.literal_declaration_name(name, out_data, out_len)
+                return
+            }
+
+            ; ★★ A COMPUTED name whose expression is a literal is treated as that
+            ; literal — `["a"]: T` declares `a` — and one whose expression is a
+            ; SIGNED numeric literal keeps its sign, which is a name built out of
+            ; two nodes (`-` and `1`). The third case, a computed name that is
+            ; neither, PANICS in the reference: it cannot be reached, because
+            ; has_dynamic_name has already sent every dynamic name to the anonymous
+            ; `computed` symbol before this function is asked (slice 30). The marker
+            ; stands where the panic does (§3.5bk).
+            if nk = KindComputedPropertyName
+            {
+                let ne AstNode.expression_of(name)
+                if Binder.is_string_or_numeric_literal_like(ne)
+                {
+                    this.literal_declaration_name(ne, out_data, out_len)
+                    return
+                }
+                if AstNode.is_signed_numeric_literal(ne)
+                {
+                    let sign AstNode.prefix_unary_operator_kind(ne)
+                    let operand AstNode.prefix_unary_operand_of(ne)
+                    var td null as pointer[char]
+                    var tl 0
+                    this.literal_declaration_name(operand, &td, &tl)
+                    if this.is_unported()
+                        return
+                    let buf host.allocate((tl + 1) as size_t, 1) as pointer[char]
+                    ; scanner.TokenToString of a `+` or a `-`, which is the only
+                    ; call this port makes of that function and the reason it is
+                    ; not ported as a table: the two tokens is_signed_numeric_literal
+                    ; admits are the whole domain here (parser.scaly says the same
+                    ; about the ONE thing the reference needs it for).
+                    if sign = KindMinusToken
+                        set *buf: "-" as char
+                    else
+                        set *buf: "+" as char
+                    var i 0
+                    while i < tl
+                    {
+                        set *(buf + 1 + i): *(td + i)
+                        set i: i + 1
+                    }
+                    set *out_data: buf
+                    set *out_len: tl + 1
+                    return
+                }
+                this.record_unported("declaration-name-computed", 0)
                 return
             }
             if nk = KindJsxNamespacedName
@@ -1603,6 +1895,74 @@ define Binder
         set *out_len: Binder.internal_name(host, "missing", out_data)
     }
 
+    ; The text of a literal used as a DECLARATION NAME, with the one shape this
+    ; port cannot answer reported rather than guessed.
+    ;
+    ; ★★★ A NUMERIC literal's `Text` is NOT its source spelling in the reference —
+    ; the scanner ends `scanNumber` with `s.tokenValue =
+    ; jsnum.FromString(s.tokenValue).String()`, i.e. the ECMAScript
+    ; ToString(Number) of the value — so `0.0`, `2.0`, `1.0`, `11e-1`, `0.12e1`,
+    ; `0xF00D`, `0b110` and `0o23534` are named `0`, `2`, `1`, `1.1`, `1.2`,
+    ; `61453`, `6` and `10076`. This port's scanner stores the SOURCE slice, which
+    ; is the same string for a plain decimal integer and a different one for every
+    ; other spelling, and the difference is a SYMBOL NAME: `class C { 0 = 1; 0.0 =
+    ; 2 }` declares ONE member upstream and would declare two here. Found by stage
+    ; 2 as six UNEXPLAINED units in three apparent classes that were one cause.
+    ;
+    ; ★★ So the canonical shapes are answered and the rest REPORTS. The rule is
+    ; derived, not sampled: a digit string with no leading zero (unless it is `0`
+    ; itself), no separator, no dot, no exponent and no radix prefix is already the
+    ; shortest decimal form of its value — as long as the value is exactly
+    ; representable, which 15 digits guarantee (10^15 < 2^53, while
+    ; `9007199254740993` really does round to …92). Everything else needs
+    ; `jsnum`'s shortest-round-trip formatting, which is a port of its own and is
+    ; what the marker names.
+    ;
+    ; ★ A STRING or template literal needs none of this: our scanner's token value
+    ; for those IS the decoded text, escapes resolved, which is exactly what the
+    ; reference stores.
+    procedure literal_declaration_name(this, name: pointer[AstNode], out_data: pointer[pointer[char]], out_len: pointer[int])
+    {
+        if AstNode.kind_of(name) = KindNumericLiteral
+        {
+            if Binder.numeric_text_is_canonical(AstNode.literal_text_of(name), AstNode.literal_text_length_of(name)) = false
+            {
+                this.record_unported("declaration-name-numeric", 0)
+                return
+            }
+        }
+        set *out_data: AstNode.literal_text_of(name)
+        set *out_len: AstNode.literal_text_length_of(name)
+    }
+
+    ; Is this numeric literal's SOURCE text already ToString(Number) of its value?
+    ; See literal_declaration_name for the derivation.
+    function numeric_text_is_canonical(d: pointer[char], len: int) returns bool
+    {
+        if d = null
+            return false
+        if len = 0
+            return false
+        if len > 15
+            return false
+        if len > 1
+        {
+            if (*d as int) = ("0" as char) as int
+                return false
+        }
+        var i 0
+        while i < len
+        {
+            let c *(d + i) as int
+            if c < (("0" as char) as int)
+                return false
+            if c > (("9" as char) as int)
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
     ; ast.IsAmbientModule: a module declaration whose name is a STRING, or a
     ; `global` augmentation. Ported rather than argued away — the argument would
     ; have been that no ModuleDeclaration can reach declare_module_member while its
@@ -1618,7 +1978,17 @@ define Binder
             if AstNode.kind_of(name) = KindStringLiteral
                 return true
         }
-        ; IsGlobalScopeAugmentation, which is the keyword and not the name.
+        Binder.is_global_scope_augmentation(n)
+    }
+
+    ; ast.IsGlobalScopeAugmentation, which is the KEYWORD and not the name — it
+    ; was a line inside is_ambient_module until slice 31 gave it a second caller
+    ; (getDeclarationName, where a `global` block is named by the internal `global`
+    ; rather than by its keyword's text).
+    function is_global_scope_augmentation(n: pointer[AstNode]) returns bool
+    {
+        if AstNode.kind_of(n) <> KindModuleDeclaration
+            return false
         AstNode.module_keyword_of(n) = KindGlobalKeyword
     }
 
@@ -1765,6 +2135,14 @@ define Binder
     procedure declare_symbol_and_add_to_symbol_table(this, n: pointer[AstNode], symbol_flags: int, symbol_excludes: int) returns pointer[Symbol]
     {
         let ck AstNode.kind_of(container)
+
+        ; The MODULE arm, slice 31 — and it is the SAME function the source-file
+        ; arm reaches through for an external module (declareModuleMember, ported
+        ; in slice 28). What differs is only which container's tables it writes,
+        ; which is why the reference has the two arms and one body.
+        if ck = KindModuleDeclaration
+            return this.declare_module_member(n, symbol_flags, symbol_excludes)
+
         if ck = KindSourceFile
             return this.declare_source_file_member(n, symbol_flags, symbol_excludes)
 
@@ -1774,6 +2152,14 @@ define Binder
             return this.declare_class_member(n, symbol_flags, symbol_excludes)
         if ck = KindClassExpression
             return this.declare_class_member(n, symbol_flags, symbol_excludes)
+
+        ; The ENUM arm: an enum member declares into the enum symbol's EXPORTS,
+        ; not into its members — an enum has no instance side.
+        if ck = KindEnumDeclaration
+        {
+            let es AstNode.symbol_of(container)
+            return this.declare_symbol(Symbol.get_exports(host, es), es, n, symbol_flags, symbol_excludes)
+        }
 
         ; The MEMBERS arm, four kinds sharing one body. Two of them are containers
         ; this slice binds — a type literal (and a mapped type through the same
@@ -1793,9 +2179,11 @@ define Binder
         if Binder.container_declares_into_locals(ck)
             return this.declare_symbol(Binder.get_locals(host, container), null as pointer[Symbol], n, symbol_flags, symbol_excludes)
 
-        ; What is left is the reference's ModuleDeclaration arm (declareModuleMember)
-        ; and its EnumDeclaration arm (the enum's exports), and both wait for their
-        ; own bind arm — reaching either means a container this slice cannot bind.
+        ; What is left of the reference's switch is nothing: every arm is above and
+        ; the reference PANICS here, so the marker stands where the panic does
+        ; (§3.5bk). Reaching it means GetContainerFlags called something a
+        ; container that this switch does not know — a defect in one of the two
+        ; lists rather than an unported construct.
         this.record_unported("declare-into-container", ck)
         null
     }
@@ -2176,6 +2564,552 @@ define Binder
         false
     }
 
+    ; bindEnumDeclaration. The two arms differ in BOTH arguments, and the
+    ; excludes are the interesting half: a RegularEnum merges with another regular
+    ; enum and with a module, a ConstEnum with neither — so `const enum E {}`
+    ; twice is a duplicate and `enum E {}` twice is not.
+    procedure bind_enum_declaration(this, n: pointer[AstNode])
+    {
+        ; ast.IsEnumConst, the COMBINED modifier flags — the same question
+        ; getModuleInstanceState asks of the same node.
+        if this.has_combined_modifier(n, ModifierFlagsConst)
+            this.bind_block_scoped_declaration(n, SymbolFlagsConstEnum, SymbolFlagsConstEnumExcludes)
+        else
+            this.bind_block_scoped_declaration(n, SymbolFlagsRegularEnum, SymbolFlagsRegularEnumExcludes)
+    }
+
+    ; ── slice 31: the MODULE DECLARATION ────────────────────────────────────
+    ;
+    ; bindModuleDeclaration. One node kind, three spellings (`namespace A`,
+    ; `module A`, `declare module "a"`) and TWO different questions asked of them:
+    ; an AMBIENT module is a value module by definition and may carry a pattern,
+    ; while an ordinary one has to be WALKED to find out whether it is
+    ; instantiated at all — a namespace holding nothing but types declares a
+    ; NamespaceModule symbol, which is a different symbol with different excludes.
+    procedure bind_module_declaration(this, n: pointer[AstNode])
+    {
+        this.set_export_context_flag(n)
+
+        if Binder.is_ambient_module(n)
+        {
+            ; ★ Not part of the chain below: the report happens and the symbol is
+            ; still declared, the same shape bindNamespaceExportDeclaration's
+            ; modifier report has (slice 29).
+            if this.has_syntactic_modifier(n, ModifierFlagsExport)
+                this.error_on_first_token(n, DiagX_export_modifier_cannot_be_applied_to_ambient_modules_and_module_augmentations_since_they_are_always_visible)
+
+            ; A module AUGMENTATION — an ambient module declared where it can only
+            ; be adding to another one — takes the ordinary route, because whether
+            ; it is instantiated is still a question about its body. Everything
+            ; else ambient is a ValueModule outright.
+            if this.is_module_augmentation_external(n)
+            {
+                this.declare_module_symbol(n)
+                return
+            }
+
+            let name AstNode.name_of(n)
+            this.declare_symbol_and_add_to_symbol_table(n, SymbolFlagsValueModule, SymbolFlagsValueModuleExcludes)
+            if this.is_unported()
+                return
+            if name = null
+                return
+            if AstNode.kind_of(name) <> KindStringLiteral
+                return
+
+            ; ★★★ `core.TryParsePattern` + `Pattern.IsValid`, and what the pair
+            ; DECIDES here is one diagnostic. Upstream's structure is a parse into
+            ; {Text, StarIndex} followed by two tests: invalid — which for the zero
+            ; value TryParsePattern answers on a second star means `StarIndex 0 <
+            ; len("") == 0` is false — reports 5061, and a valid pattern with a
+            ; star is APPENDED to file.PatternAmbientModules.
+            ;
+            ; The predicate is ported as the question it answers (§3.5ag: compute
+            ; WHETHER, not WHICH) and the equivalence is not asserted but derived:
+            ; TryParsePattern answers a valid Pattern for a text with no star
+            ; (StarIndex -1) and for a text with exactly one (StarIndex < len), and
+            ; the ZERO value for two or more — whose only reading is invalid. So
+            ; "at most one asterisk" is the whole of it, and there is no third
+            ; case for a shorter spelling to lose.
+            ;
+            ; ★ The APPEND is NOT ported, and this is §3.5be rather than laziness:
+            ; PatternAmbientModules is read by the checker's module resolution —
+            ; `tryFindAmbientModule` — and by nothing that produces a symbol, a
+            ; span or a diagnostic. No dump can see it, so a stored one could not
+            ; be checked. What IS observable is exactly what stays: the symbol, and
+            ; the report for a pattern that has two stars.
+            if Binder.pattern_has_at_most_one_star(AstNode.literal_text_of(name), AstNode.literal_text_length_of(name)) = false
+                this.error_on_first_token(name, DiagPattern_0_can_have_at_most_one_Asterisk_character)
+            return
+        }
+
+        let state this.declare_module_symbol(n)
+        if this.is_unported()
+            return
+        if state = ModuleInstanceStateNonInstantiated
+            return
+
+        let symbol AstNode.symbol_of(n)
+        if symbol = null
+            return
+
+        ; ★★ The const-enum-only bit, whose three conjuncts are three different
+        ; kinds of statement: the symbol as it stands NOW must carry none of
+        ; Function/Class/RegularEnum (a merge with any of those makes the module a
+        ; real value), THIS declaration's own state must be ConstEnumOnly, and the
+        ; answer must not have been settled negatively by an EARLIER declaration of
+        ; the same merged symbol — which is what the side set remembers. The
+        ; reference's comment says "namespaces will already recalculate", and this
+        ; is where they do it.
+        var const_enum_only true
+        if (Symbol.flags_of(symbol) & (SymbolFlagsFunction | SymbolFlagsClass | SymbolFlagsRegularEnum)) <> 0
+            set const_enum_only: false
+        if state <> ModuleInstanceStateConstEnumOnly
+            set const_enum_only: false
+        if this.symbol_is_not_const_enum_only(symbol)
+            set const_enum_only: false
+
+        if const_enum_only
+        {
+            set symbol.flags: Symbol.flags_of(symbol) | SymbolFlagsConstEnumOnlyModule
+            return
+        }
+        Binder.clear_const_enum_only_module(symbol)
+        this.add_not_const_enum_only(symbol)
+    }
+
+    ; declareModuleSymbol. The state decides BOTH arguments, and they are not two
+    ; spellings of one flag: a NamespaceModule excludes NOTHING
+    ; (SymbolFlagsNamespaceModuleExcludes is 0), so a type-only namespace merges
+    ; with anything, while a ValueModule excludes every other value.
+    procedure declare_module_symbol(this, n: pointer[AstNode]) returns int
+    {
+        let state this.get_module_instance_state(n)
+        if this.is_unported()
+            return state
+        if state = ModuleInstanceStateNonInstantiated
+            this.declare_symbol_and_add_to_symbol_table(n, SymbolFlagsNamespaceModule, SymbolFlagsNamespaceModuleExcludes)
+        else
+            this.declare_symbol_and_add_to_symbol_table(n, SymbolFlagsValueModule, SymbolFlagsValueModuleExcludes)
+        state
+    }
+
+    ; ast.IsModuleAugmentationExternal. An ambient module is an AUGMENTATION of
+    ; another module when it stands where it cannot be declaring one of its own:
+    ; at the top level of a file that is itself an external module, or inside an
+    ; ambient module at the top level of a file that is not.
+    ;
+    ; ★ `IsExternalModule(sourceFile)` is `ExternalModuleIndicator != nil`, and the
+    ; binder's cached `is_external_module` answers IsExternalOrCommonJSModule —
+    ; one disjunct wider. The two coincide in this port and the reason is measured
+    ; rather than assumed (slice 30): CommonJSModuleIndicator is written only by
+    ; setCommonJSModuleIndicator, whose callers are the JS expando arms, and the
+    ; PARSER never writes it. The slice that ports those arms owes the second
+    ; field.
+    function is_module_augmentation_external(this, n: pointer[AstNode]) returns bool
+    {
+        let p AstNode.parent_node_of(n)
+        if p = null
+            return false
+        let pk AstNode.kind_of(p)
+        if pk = KindSourceFile
+            return is_external_module
+        if pk <> KindModuleBlock
+            return false
+        let gp AstNode.parent_node_of(p)
+        if gp = null
+            return false
+        if Binder.is_ambient_module(gp) = false
+            return false
+        let ggp AstNode.parent_node_of(gp)
+        if ggp = null
+            return false
+        if AstNode.kind_of(ggp) <> KindSourceFile
+            return false
+        is_external_module = false
+    }
+
+    ; core.TryParsePattern + Pattern.IsValid, folded into the question its one
+    ; caller asks. See bind_module_declaration for the derivation.
+    function pattern_has_at_most_one_star(d: pointer[char], len: int) returns bool
+    {
+        if d = null
+            return true
+        var stars 0
+        var i 0
+        while i < len
+        {
+            if (*(d + i) as int) = ("*" as char) as int
+                set stars: stars + 1
+            set i: i + 1
+        }
+        stars < 2
+    }
+
+    ; b.notConstEnumOnlyModules.Has / .Add.
+    function symbol_is_not_const_enum_only(this, s: pointer[Symbol]) returns bool
+    {
+        var l not_const_enum_only_modules
+        while l <> null
+        {
+            if l.symbol = s
+                return true
+            set l: l.next
+        }
+        false
+    }
+
+    procedure add_not_const_enum_only(this, s: pointer[Symbol])
+    {
+        if this.symbol_is_not_const_enum_only(s)
+            return
+        let l host.allocate(sizeof SymbolLink, alignof SymbolLink) as pointer[SymbolLink]
+        set l.symbol: s
+        set l.next: not_const_enum_only_modules
+        set not_const_enum_only_modules: l
+    }
+
+    ; `symbol.Flags &^= SymbolFlagsConstEnumOnlyModule`. Scaly has no AND-NOT and
+    ; no unary complement, so the bit is cleared by XOR under a test — which is the
+    ; same value for the one bit and does not depend on the width of an int.
+    function clear_const_enum_only_module(s: pointer[Symbol])
+    {
+        if (Symbol.flags_of(s) & SymbolFlagsConstEnumOnlyModule) <> 0
+            set s.flags: Symbol.flags_of(s) xor SymbolFlagsConstEnumOnlyModule
+    }
+
+    ; ── ast.GetModuleInstanceState ──────────────────────────────────────────
+    ;
+    ; ★★★ The first ported function here that answers a question about a node by
+    ; WALKING THE SUBTREE BELOW IT, and every awkward part of it follows from
+    ; WHEN it is called: from bindModuleDeclaration, i.e. before the body has been
+    ; bound. So the body's Parent pointers are not set yet, which is what the
+    ; `ancestors` stack stands in for, and an export specifier's target may be a
+    ; statement of an ENCLOSING scope, which is why the walk can leave the module
+    ; entirely.
+    ;
+    ; ★ It lives on the Binder although upstream keeps it in ast/utilities.go,
+    ; because its two dependencies do: the modifier questions are methods here
+    ; (they read the modifier NODES rather than a cached flag list) and the
+    ; unreachable-case marker needs the reporting channel.
+    function get_module_instance_state(this, n: pointer[AstNode]) returns int
+    {
+        let v host.allocate(sizeof VisitedSet, alignof VisitedSet) as pointer[VisitedSet]
+        set v.head: null
+        this.module_instance_state(n, null, v)
+    }
+
+    ; getModuleInstanceState. A module with NO body — `declare module "a";` — is
+    ; instantiated, because there is nothing in it to prove otherwise.
+    function module_instance_state(this, n: pointer[AstNode], ancestors: pointer[AncestorLink], visited: pointer[VisitedSet]) returns int
+    {
+        let body AstNode.body_of(n)
+        if body = null
+            return ModuleInstanceStateInstantiated
+        this.module_instance_state_cached(body, this.push_ancestor(ancestors, n), visited)
+    }
+
+    ; getModuleInstanceStateCached, and the Unknown entry written BEFORE the
+    ; worker runs is the cycle guard: `export { x }` naming a declaration that
+    ; re-enters this node answers NonInstantiated rather than recursing.
+    function module_instance_state_cached(this, n: pointer[AstNode], ancestors: pointer[AncestorLink], visited: pointer[VisitedSet]) returns int
+    {
+        var l visited.head
+        while l <> null
+        {
+            if l.node = n
+            {
+                if l.state <> ModuleInstanceStateUnknown
+                    return l.state
+                return ModuleInstanceStateNonInstantiated
+            }
+            set l: l.next
+        }
+        let e host.allocate(sizeof VisitedLink, alignof VisitedLink) as pointer[VisitedLink]
+        set e.node: n
+        set e.state: ModuleInstanceStateUnknown
+        set e.next: visited.head
+        set visited.head: e
+        let result this.module_instance_state_worker(n, ancestors, visited)
+        set e.state: result
+        result
+    }
+
+    ; getModuleInstanceStateWorker. A `switch` whose arms FALL THROUGH to the
+    ; final `return Instantiated` when their own test fails — the enum arm and the
+    ; import arms both do — so each is an `if` that returns only on its own
+    ; condition and the default is the last line.
+    function module_instance_state_worker(this, n: pointer[AstNode], ancestors: pointer[AncestorLink], visited: pointer[VisitedSet]) returns int
+    {
+        let k AstNode.kind_of(n)
+
+        ; A module is uninstantiated if it contains only these.
+        if k = KindInterfaceDeclaration
+            return ModuleInstanceStateNonInstantiated
+        if k = KindTypeAliasDeclaration
+            return ModuleInstanceStateNonInstantiated
+        if k = KindJSTypeAliasDeclaration
+            return ModuleInstanceStateNonInstantiated
+
+        ; ast.IsEnumConst is GetCombinedModifierFlags, not the syntactic one: a
+        ; `const enum` written inside a `declare` block carries the modifier on
+        ; itself, but the combined form is what upstream asks and it is the same
+        ; function that answers `declare` for a variable declaration.
+        if k = KindEnumDeclaration
+        {
+            if this.has_combined_modifier(n, ModifierFlagsConst)
+                return ModuleInstanceStateConstEnumOnly
+        }
+
+        var is_import false
+        if k = KindImportDeclaration
+            set is_import: true
+        if k = KindJSImportDeclaration
+            set is_import: true
+        if k = KindImportEqualsDeclaration
+            set is_import: true
+        if is_import
+        {
+            if this.has_syntactic_modifier(n, ModifierFlagsExport) = false
+                return ModuleInstanceStateNonInstantiated
+        }
+
+        ; ★★ `export { a, b }` with NO module specifier is the only export that
+        ; can be uninstantiated, because its specifiers name declarations of THIS
+        ; file — so each one has to be resolved against the scopes above it.
+        ; `export { a } from "m"` is a re-export of something this file cannot see
+        ; and is instantiated by the last line.
+        if k = KindExportDeclaration
+        {
+            let clause AstNode.export_clause_of(n)
+            var named false
+            if AstNode.module_specifier_of(n) = null
+            {
+                if clause <> null
+                {
+                    if AstNode.kind_of(clause) = KindNamedExports
+                        set named: true
+                }
+            }
+            if named
+            {
+                var state ModuleInstanceStateNonInstantiated
+                let a2 this.push_ancestor(this.push_ancestor(ancestors, n), clause)
+                let elements AstNode.elements_of(clause)
+                if elements <> null
+                {
+                    let len elements.get_length() as int
+                    var i 0
+                    while i < len
+                    {
+                        let ss this.module_instance_state_for_alias_target(*(elements.get_buffer() + i), a2, visited)
+                        if this.is_unported()
+                            return state
+                        ; The MAXIMUM, and ConstEnumOnly is above Instantiated in
+                        ; it — see the enum's own comment. Only Instantiated stops
+                        ; the loop.
+                        if ss > state
+                            set state: ss
+                        if state = ModuleInstanceStateInstantiated
+                            return state
+                        set i: i + 1
+                    }
+                }
+                return state
+            }
+        }
+
+        ; The body itself: ForEachChild over the statements, and the callback's
+        ; return value is a STOP flag — NonInstantiated contributes nothing and
+        ; keeps going, ConstEnumOnly raises the answer and keeps going, and
+        ; Instantiated ends the walk.
+        if k = KindModuleBlock
+        {
+            var state ModuleInstanceStateNonInstantiated
+            let a2 this.push_ancestor(ancestors, n)
+            var i 0
+            var stop false
+            while stop = false
+            {
+                let c AstNode.child_at(n, i)
+                if c = null
+                    set stop: true
+                else
+                {
+                    let cs this.module_instance_state_cached(c, a2, visited)
+                    if this.is_unported()
+                        set stop: true
+                    if cs = ModuleInstanceStateConstEnumOnly
+                        set state: ModuleInstanceStateConstEnumOnly
+                    if cs = ModuleInstanceStateInstantiated
+                    {
+                        set state: ModuleInstanceStateInstantiated
+                        set stop: true
+                    }
+                    ; The reference PANICS on any other value. It cannot be
+                    ; reached — the cached form answers Unknown for nothing, a
+                    ; cycle included — so the marker stands where the panic does
+                    ; (§3.5bk) rather than being silently absorbed.
+                    if cs = ModuleInstanceStateUnknown
+                    {
+                        this.record_unported("module-instance-state-unknown", 0)
+                        set stop: true
+                    }
+                    set i: i + 1
+                }
+            }
+            return state
+        }
+
+        ; A nested module: the same question one level down, and the ancestors
+        ; stack is what makes the nesting answerable before the bind reaches it.
+        if k = KindModuleDeclaration
+            return this.module_instance_state(n, ancestors, visited)
+
+        ModuleInstanceStateInstantiated
+    }
+
+    ; getModuleInstanceStateForAliasTarget. An export specifier names a
+    ; declaration by NAME, so this is a lexical lookup done by hand: walk out
+    ; through the virtual parents, and in every Block, ModuleBlock or SourceFile
+    ; on the way, look for a statement of that name.
+    ;
+    ; ★ `export { "x" }` — a string-named specifier — is invalid syntax and
+    ; answers Instantiated without looking anything up, which is upstream's own
+    ; comment. That arm is why this function does not need a literal's text.
+    function module_instance_state_for_alias_target(this, n: pointer[AstNode], ancestors: pointer[AncestorLink], visited: pointer[VisitedSet]) returns int
+    {
+        var name AstNode.property_name_of(n)
+        if name = null
+            set name: AstNode.name_of(n)
+        if name = null
+            return ModuleInstanceStateInstantiated
+        if AstNode.kind_of(name) <> KindIdentifier
+            return ModuleInstanceStateInstantiated
+
+        ; popAncestor, written TWICE — as the loop's init and as its post step,
+        ; which is how upstream's `for ancestors, p := pop(…); p != nil; ancestors,
+        ; p = pop(…)` spells it. It answers the virtual parent while the stack has
+        ; one and the real Parent afterwards, and once the stack is empty it stays
+        ; empty, so the walk continues up the real chain.
+        var a ancestors
+        var cur n
+        var p null as pointer[AstNode]
+        if a <> null
+        {
+            set p: a.node
+            set a: a.prev
+        }
+        else
+            set p: AstNode.parent_node_of(cur)
+
+        while p <> null
+        {
+            var is_scope false
+            let pk AstNode.kind_of(p)
+            if pk = KindBlock
+                set is_scope: true
+            if pk = KindModuleBlock
+                set is_scope: true
+            if pk = KindSourceFile
+                set is_scope: true
+
+            if is_scope
+            {
+                var found ModuleInstanceStateUnknown
+                let sa this.push_ancestor(a, p)
+                let statements AstNode.statements_of(p)
+                if statements <> null
+                {
+                    let len statements.get_length() as int
+                    var i 0
+                    while i < len
+                    {
+                        let st *(statements.get_buffer() + i)
+                        if Binder.node_has_name(st, name)
+                        {
+                            let s2 this.module_instance_state_cached(st, sa, visited)
+                            if this.is_unported()
+                                return ModuleInstanceStateInstantiated
+                            if found = ModuleInstanceStateUnknown
+                                set found: s2
+                            else
+                            {
+                                if s2 > found
+                                    set found: s2
+                            }
+                            if found = ModuleInstanceStateInstantiated
+                                return found
+                            ; ★ Upstream's own comment: a re-export of an import
+                            ; alias is AMBIGUOUS, so it counts as instantiated —
+                            ; consistent with `export import x = mod.x` being
+                            ; treated that way. It sits AFTER the early return, so
+                            ; it raises the answer for the rest of the list
+                            ; without ending the walk here.
+                            if AstNode.kind_of(st) = KindImportEqualsDeclaration
+                                set found: ModuleInstanceStateInstantiated
+                        }
+                        set i: i + 1
+                    }
+                }
+                if found <> ModuleInstanceStateUnknown
+                    return found
+            }
+
+            set cur: p
+            if a <> null
+            {
+                set p: a.node
+                set a: a.prev
+            }
+            else
+                set p: AstNode.parent_node_of(cur)
+        }
+
+        ; Couldn't locate it — assume it could refer to a value.
+        ModuleInstanceStateInstantiated
+    }
+
+    ; ast.NodeHasName. The declaration's own name slot — NOT
+    ; GetNameOfDeclaration, so an ExportAssignment named by its expression does
+    ; not answer here — plus the one nameless statement that can still declare the
+    ; name: a variable statement, through its declarations.
+    function node_has_name(st: pointer[AstNode], id: pointer[AstNode]) returns bool
+    {
+        if st = null
+            return false
+        let nm AstNode.name_of(st)
+        if nm <> null
+        {
+            if AstNode.kind_of(nm) <> KindIdentifier
+                return false
+            return AstNode.identifier_texts_equal(nm, id)
+        }
+        if AstNode.kind_of(st) <> KindVariableStatement
+            return false
+        let declarations AstNode.variable_declarations_of(AstNode.variable_statement_list_of(st))
+        if declarations = null
+            return false
+        let len declarations.get_length() as int
+        var i 0
+        while i < len
+        {
+            if Binder.node_has_name(*(declarations.get_buffer() + i), id)
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    ; pushAncestor.
+    function push_ancestor(this, ancestors: pointer[AncestorLink], parent: pointer[AstNode]) returns pointer[AncestorLink]
+    {
+        let l host.allocate(sizeof AncestorLink, alignof AncestorLink) as pointer[AncestorLink]
+        set l.node: parent
+        set l.prev: ancestors
+        l
+    }
+
     ; bindVariableDeclarationOrBindingElement.
     procedure bind_variable_declaration_or_binding_element(this, n: pointer[AstNode])
     {
@@ -2319,16 +3253,16 @@ define Binder
         let exports Symbol.get_exports(host, symbol)
         let existing SymbolTable.get(exports, pd, pl)
         ;
-        ; ★★★ AND THE DUPLICATE REPORT IS UNREACHABLE IN THIS SLICE, which is worth
-        ; writing down because the obvious fixture does NOT trigger it. A
+        ; ★★★ AND THE DUPLICATE REPORT WAS UNREACHABLE UNTIL SLICE 31, which is
+        ; worth keeping because the obvious fixture does NOT trigger it. A
         ; `static prototype` member does not collide with the synthesized symbol:
         ; the class is bound BEFORE its members, and Property is not in
         ; PropertyExcludes, so the member MERGES into the prototype symbol and no
         ; diagnostic is raised — what TypeScript says about `static prototype` is
         ; TS2699, from the CHECKER. The only producer of a pre-existing `prototype`
-        ; export is the case the reference's comment names: a class MERGING into a
-        ; namespace that exports one, and the module bind arm is unported. So the
-        ; slice that binds a module declaration owns this branch.
+        ; export is the case the reference's comment names — a class MERGING into a
+        ; namespace that exports one — so the fixture has to be a namespace, and
+        ; the module slice is where it became writable.
         if existing <> null
         {
             ; The reference indexes Declarations[0] with no guard, so an existing
