@@ -39,6 +39,18 @@
 #     controls did this and did not crash — which is luck about what the corpus
 #     contains, not a property of the control.
 #
+#   ★★★ AND ONE STEP FURTHER OUT: REMOVING A DECLARATION WALKS INTO EVERY LATER
+#     LINE THAT WAS ENTITLED TO ASSUME IT. Slice 32's c1 first read
+#     `if false  this.bind_object_literal_expression(n)`, which left the literal
+#     a CONTAINER with no symbol — so the members arm asked Symbol.get_members of
+#     a null and the DUMPER died: RED 131, of which 130 units read `our dumper
+#     exited -11`. A crash is not a disagreement, and a red built out of crashes
+#     measures the port's tolerance for a tree it cannot produce. When a control
+#     takes away something the rest of the pass may rely on, make it REPORT
+#     (`record_unported`) rather than silently omit: that is the pre-slice
+#     behaviour exactly, and the row then measures what the arm unlocks.
+#     ★ The tell is in the unit list, not in the number — read it.
+#
 #   ★ A BASELINE IS A MEASUREMENT OF ONE TREE ON ONE DAY. Slice 7 nearly wrote
 #     off three working gates because their numbers were read against a stale
 #     baseline — and the direction that bites is the surprising one: a stale
