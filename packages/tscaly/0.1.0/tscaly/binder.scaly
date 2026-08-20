@@ -198,7 +198,32 @@ define Binder
     ; the emitFlags/HasAsyncFunctions bit, a SourceFile node flag that no dump here
     ; can see. A field nothing reads is only DECLARED (§3.5be), so the slice that
     ; makes that flag observable is the slice that adds it back.
+    ;
+    ; ★★★ SLICE 37 SPLIT IT, and until this slice the two readings were one field
+    ; because they could not disagree. `ast.IsExternalModule(file)` is
+    ; `ExternalModuleIndicator != nil`; `ast.IsExternalOrCommonJSModule(file)` is
+    ; that OR `CommonJSModuleIndicator != nil` — and the second indicator is
+    ; written only by setCommonJSModuleIndicator, which this slice is the first to
+    ; port. So `is_external_module` keeps the EXTERNAL half exactly and the
+    ; disjunction moves to is_external_or_common_js_module, which is asked at the
+    ; four sites the reference asks it at and at no other. Reading the wrong one
+    ; is not a crash: at three of the four EXTERNAL sites it is a strict-mode
+    ; diagnostic's MESSAGE NUMBER (`… Modules are automatically in strict mode`
+    ; against the plain one), i.e. a well-formed wrong answer.
     is_external_module: bool
+
+    ; `b.file.CommonJSModuleIndicator`, and it is the NODE rather than a bool
+    ; because setCommonJSModuleIndicator's own guard is a null test on it —
+    ; "the first `require` or `module.exports` wins" is the whole content of the
+    ; function, and a bool says it just as well; what decides is that the field
+    ; must be settable from the arms and readable by three of them. Kept as a node
+    ; for the reference's shape, since it costs the same word.
+    ;
+    ; ★ The reference's OTHER indicator is a node too, and this port answers it as
+    ; a bool (§3.5q) — the difference is that the parser computes that one before
+    ; the bind and nothing during a bind can move it, while this one is written
+    ; mid-walk and every reader after the write sees a different answer.
+    common_js_module_indicator: pointer[AstNode]
 
     ; `b.file.IsDeclarationFile`, and it is back — the paragraph above says a field
     ; nothing reads is only DECLARED (§3.5be), and slice 29 is the reader:
@@ -307,6 +332,7 @@ define Binder
         sc.set_language_variant_jsx(Parser.script_kind_is_jsx_variant(file_name))
         set b.trivia: sc
         set b.is_external_module: is_external_module
+        set b.common_js_module_indicator: null
         set b.is_declaration_file: is_declaration_file_name(file_name)
         set b.global_exports: null
         set b.file_name_data: file_name.get_buffer() as pointer[char]
@@ -899,11 +925,7 @@ define Binder
         ; — and answering it is what lets this slice claim anything at all. The
         ; five kinds it can answer are the JavaScript ASSIGNMENT DECLARATIONS
         ; (`module.exports = x`, `exports.a = x`, `this.a = x`, `f.a = x`,
-        ; `Object.defineProperty(f, "a", …)`), and each of them DECLARES A SYMBOL
-        ; through machinery this slice does not port: setCommonJSModuleIndicator,
-        ; the deferred expando pass with its entity lookup, declareSymbolEx's two
-        ; extra flags. So they report, with the KIND as the detail, and the
-        ; histogram prices the family that comes next.
+        ; `Object.defineProperty(f, "a", …)`), and each of them DECLARES A SYMBOL.
         ;
         ; ★★★ AND THE `Property` KIND IS NOT JAVASCRIPT-ONLY. `function f() {}`
         ; followed by `f.x = 1` in a plain .ts file is an expando declaration
@@ -913,10 +935,24 @@ define Binder
         ; declarations happen in JS files" would answer None for every TS unit and
         ; claim agreement on exactly the ones where the reference makes an extra
         ; symbol.
+        ;
+        ; ★★★ SLICE 37 SPLIT THE FAMILY IN TWO ALONG THE MACHINERY, not along the
+        ; switch: the three kinds below share setCommonJSModuleIndicator and
+        ; declare into the FILE symbol's exports, while ThisProperty needs
+        ; declareSymbolEx's two extra flags and the this-class table, and
+        ; Property/ObjectDefinePropertyValue need the DEFERRED expando pass with
+        ; its entity lookup. Both remainders keep reporting, by kind, so the
+        ; histogram still prices them.
         if k = KindBinaryExpression
         {
             let adk Parser.get_assignment_declaration_kind(n)
-            if adk <> JSDeclarationKindNone
+            if adk = JSDeclarationKindModuleExports
+                this.bind_module_exports_assignment(n)
+            if adk = JSDeclarationKindExportsProperty
+                this.bind_exports_or_object_define_property(n)
+            if adk = JSDeclarationKindProperty
+                this.record_unported("assignment-declaration", adk)
+            if adk = JSDeclarationKindThisProperty
                 this.record_unported("assignment-declaration", adk)
 
             ; checkStrictModeBinaryExpression runs AFTER the switch and outside
@@ -931,25 +967,15 @@ define Binder
         ; and then bindCallExpression — which exists for ONE question: a
         ; `require(...)` call in a JavaScript file makes the file a CommonJS
         ; module, i.e. gives it a module symbol and binds it as an external one.
-        ; That is the same machinery the four assignment kinds need, so it reports
-        ; under a tag of its own rather than sharing theirs.
-        ;
-        ; ★ The reference's guard is `b.file.CommonJSModuleIndicator == nil &&
-        ; IsRequireCall(node, false)`, and the first conjunct is not transcribed
-        ; because this port does not carry that field at all — nothing here can
-        ; set it (bind_container's tail says so at its own line), so it is
-        ; unconditionally nil and the test is unconditionally true. It comes back
-        ; with the slice that carries the indicator.
         if k = KindCallExpression
         {
             let adk Parser.get_assignment_declaration_kind(n)
-            if adk <> JSDeclarationKindNone
+            if adk = JSDeclarationKindObjectDefinePropertyValue
                 this.record_unported("assignment-declaration", adk)
+            if adk = JSDeclarationKindObjectDefinePropertyExports
+                this.bind_exports_or_object_define_property(n)
             if Parser.is_in_js_file(n)
-            {
-                if Parser.is_require_call(n, false)
-                    this.record_unported("commonjs-require", 0)
-            }
+                this.bind_call_expression(n)
         }
 
         ; Every other arm of the reference's switch, by kind — and as of slice 35
@@ -2048,21 +2074,24 @@ define Binder
 
         ; ★★ THE TAIL, and slice 30 owns it because slice 30 is what makes it
         ; reachable — which is the §3.5p note the paragraph this replaces ended on,
-        ; coming due. Two of its three parts are ported:
+        ; coming due. All THREE of its parts are ported as of slice 37:
         ;
         ; (a) A JavaScript file's top-level `@typedef` aliases, DEFERRED to here so
         ;     that the CommonJS module indicators are known first. That deferral is
         ;     why bind()'s JSTypeAliasDeclaration arm binds only the ones that are
         ;     NOT top level: either half alone is a typedef that declares nothing.
-        ; (b) bindCommonJSTypeExports for an external or ambient module.
+        ; (b) `declareCommonJSVariable("module")` / `("exports")`, which is what
+        ;     the deferral in (a) is FOR — the indicator is set by an arm somewhere
+        ;     in the walk, and both lines read it after the walk is over.
+        ; (c) bindCommonJSTypeExports for an external or ambient module.
         ;
-        ; What stays out is `declareCommonJSVariable("module")` / `("exports")`, and
-        ; it cannot be reached: file.CommonJSModuleIndicator is written only by
-        ; setCommonJSModuleIndicator, whose three callers are the JS expando arms,
-        ; all unported — and the PARSER never writes it (measured: its only mention
-        ; in parser.go copies the zero value out). So `IsExternalOrCommonJSModule`
-        ; is `is_external_module` here, exactly as bind_block_scoped_declaration
-        ; already assumes. The slice that ports an expando arm owns both lines.
+        ; ★★★ (b) was the paragraph this replaces, and it named its own condition:
+        ; "the slice that ports an expando arm owns both lines". Slice 37 ports
+        ; three of the five assignment kinds plus the `require` call, so
+        ; file.CommonJSModuleIndicator is written now and the two variables are
+        ; declared — and `IsExternalOrCommonJSModule` in (c) stops being
+        ; `is_external_module` at the same moment, which is why the two changes are
+        ; one edit.
         ;
         ; ★ Neither part returns early on `unported`: the three registers are
         ; restored below, and a return would leave the binder's container pointing
@@ -2087,12 +2116,24 @@ define Binder
                         set i: i + 1
                     }
                 }
+                ; The two CommonJS variables. `module` and `exports` are declared
+                ; into the FILE's locals as function-scoped variables, once each,
+                ; and only when something in the walk made the file a CommonJS
+                ; module.
+                if common_js_module_indicator <> null
+                {
+                    if this.is_unported() = false
+                    {
+                        this.declare_common_js_variable("module")
+                        this.declare_common_js_variable("exports")
+                    }
+                }
             }
         }
         var folds_type_exports false
         if AstNode.kind_of(n) = KindSourceFile
         {
-            if is_external_module
+            if this.is_external_or_common_js_module()
                 set folds_type_exports: true
         }
         if Binder.is_ambient_module(n)
@@ -2194,10 +2235,18 @@ define Binder
     ; predicate in the reference and splitting it would be a claim about which
     ; half is live.
     ;
-    ; ★ The remaining condition — an ASSIGNMENT declaration losing to a
-    ; non-assignment one — is still unreachable for the same reason, and is named
-    ; at its line rather than transcribed: isAssignmentDeclaration is a JS
-    ; question over five node kinds this port does not bind.
+    ; ★★ The remaining condition — an ASSIGNMENT declaration losing to a
+    ; non-assignment one — was named at this line rather than transcribed while
+    ; no arm could produce one, and slice 37 is the slice that produces them:
+    ; `exports.a = 1` followed by `function a() {}` in a CommonJS file declares
+    ; the same symbol twice, and the FUNCTION is its value declaration.
+    ;
+    ; ★ The equal-KIND early return below is not the reference's shape and is
+    ; equivalent to it, which is worth an argument rather than a glance: with the
+    ; kinds equal, isAssignmentDeclaration answers the same for both nodes, so
+    ; `A && !A` is false — and the third disjunct's own `Kind != Kind` is false by
+    ; assumption. So neither disjunct can be true there, in the ported set and in
+    ; any future one, because the predicate reads nothing but the KIND.
     function set_value_declaration(s: pointer[Symbol], n: pointer[AstNode])
     {
         if s.value_declaration = null
@@ -2207,8 +2256,37 @@ define Binder
         }
         if AstNode.kind_of(s.value_declaration) = AstNode.kind_of(n)
             return
+        if Binder.is_assignment_declaration(s.value_declaration)
+        {
+            if Binder.is_assignment_declaration(n) = false
+            {
+                set s.value_declaration: n
+                return
+            }
+        }
         if Binder.is_effective_module_declaration(s.value_declaration)
             set s.value_declaration: n
+    }
+
+    ; binder.isAssignmentDeclaration — the four node kinds a JavaScript
+    ; assignment declaration can have. Transcribed whole: the access-expression
+    ; and identifier readings belong to the expando pass, which is not this
+    ; slice, and splitting the predicate would be a claim about which half is
+    ; live.
+    function is_assignment_declaration(n: pointer[AstNode]) returns bool
+    {
+        if n = null
+            return false
+        let k AstNode.kind_of(n)
+        if k = KindBinaryExpression
+            return true
+        if k = KindPropertyAccessExpression
+            return true
+        if k = KindElementAccessExpression
+            return true
+        if k = KindIdentifier
+            return true
+        k = KindCallExpression
     }
 
     ; isEffectiveModuleDeclaration.
@@ -2401,12 +2479,15 @@ define Binder
     ; has none. There is no yardstick for "these two functions are the same"; only
     ; a corpus wide enough to contain the difference.
     ;
-    ; ★ The two other special cases are REPORTED rather than answered. The JS
-    ; assignment kinds route through GetAssignmentDeclarationKind, and the three
-    ; expression kinds through GetAssignedName, which reads the PARENT — a
-    ; different question from anything this function otherwise asks. All five
-    ; belong to bind arms that are unported, so none can reach here; reporting is
-    ; what makes that claim expire with the arm rather than silently.
+    ; ★★ THE JS ASSIGNMENT ARMS ARE ANSWERED SINCE SLICE 37, and all FIVE kinds
+    ; are, not the three that slice binds: GetNonAssignedNameOfDeclaration is a
+    ; pure reading of the tree — no symbol, no table, no indicator — so narrowing
+    ; it to today's callers would be §3.5ar's mistake, and the two kinds whose
+    ; bind arm still reports simply never reach it.
+    ;
+    ; ★ The remaining special case, GetAssignedName over the three EXPRESSION
+    ; kinds, is still REPORTED rather than answered: it reads the PARENT, a
+    ; different question from anything this function otherwise asks.
     procedure get_name_of_declaration(this, n: pointer[AstNode]) returns pointer[AstNode]
     {
         let k AstNode.kind_of(n)
@@ -2419,16 +2500,17 @@ define Binder
                 return e
             return null
         }
+        ; ★ The two kinds share ONE arm upstream and the switch inside it is on
+        ; the assignment-declaration kind rather than on the node kind, so a
+        ; `Object.defineProperty` CALL and an `exports.a =` BINARY meet here.
+        ; Three of the five answer the assigned-to NAME — the property access's
+        ; own name where it has a usable one, and the whole left operand where it
+        ; does not, which get_declaration_name then reads as `missing` — and the
+        ; two defineProperty kinds answer the call's SECOND argument.
         if k = KindBinaryExpression
-        {
-            this.record_unported("name-of-declaration-assignment", k)
-            return null
-        }
+            return Binder.assignment_declaration_name(n)
         if k = KindCallExpression
-        {
-            this.record_unported("name-of-declaration-assignment", k)
-            return null
-        }
+            return Binder.assignment_declaration_name(n)
 
         let name AstNode.name_of(n)
         if name <> null
@@ -2442,6 +2524,47 @@ define Binder
             this.record_unported("name-of-declaration-assigned", k)
         if k = KindClassExpression
             this.record_unported("name-of-declaration-assigned", k)
+        null
+    }
+
+    ; The JS half of ast.GetNonAssignedNameOfDeclaration, lifted out because both
+    ; of its call sites ask it with a different node kind and the switch inside it
+    ; is on neither of them.
+    function assignment_declaration_name(n: pointer[AstNode]) returns pointer[AstNode]
+    {
+        let adk Parser.get_assignment_declaration_kind(n)
+        var wants_left false
+        if adk = JSDeclarationKindProperty
+            set wants_left: true
+        if adk = JSDeclarationKindThisProperty
+            set wants_left: true
+        if adk = JSDeclarationKindExportsProperty
+            set wants_left: true
+        if wants_left
+        {
+            let left AstNode.binary_left_of(n)
+            let name Parser.get_element_or_property_access_name(left)
+            if name <> null
+                return name
+            return left
+        }
+        var wants_arg false
+        if adk = JSDeclarationKindObjectDefinePropertyValue
+            set wants_arg: true
+        if adk = JSDeclarationKindObjectDefinePropertyExports
+            set wants_arg: true
+        if wants_arg
+        {
+            ; `declaration.Arguments()[1]`, and the index is safe by
+            ; construction: only IsBindableObjectDefinePropertyCall answers either
+            ; of those two kinds, and it requires exactly three arguments.
+            let args AstNode.call_arguments_of(n)
+            if args = null
+                return null
+            if args.get_length() < 2
+                return null
+            return *(args.get_buffer() + 1)
+        }
         null
     }
 
@@ -2864,11 +2987,11 @@ define Binder
     ; anybody writing `export`, and so is a ModuleDeclaration the JSDoc reparser
     ; synthesized for a dotted `@typedef` name.
     ;
-    ; ★ `IsExternalOrCommonJSModule(node.Parent)` is asked here as
-    ; `is_external_module`, which is the EXTERNAL half only: the commonJS indicator
-    ; is set DURING the bind, by a `require` call or a `module.exports`
-    ; assignment, and both of those arms are unported — the slice that ports
-    ; bind_call_expression owns the other half of this test.
+    ; ★ `IsExternalOrCommonJSModule(node.Parent)`, and slice 37 is the slice the
+    ; note this replaces named: the commonJS indicator is set DURING the bind, by
+    ; a `require` call or a `module.exports` assignment, and both of those arms
+    ; are ported now — so the question is the DISJUNCTION and the answer moves
+    ; while the walk runs.
     function is_implicitly_exported_jsdoc_declaration(this, n: pointer[AstNode]) returns bool
     {
         let parent AstNode.parent_node_of(n)
@@ -2876,7 +2999,7 @@ define Binder
             return false
         if AstNode.kind_of(parent) <> KindSourceFile
             return false
-        if is_external_module = false
+        if this.is_external_or_common_js_module() = false
             return false
         let k AstNode.kind_of(n)
         if k = KindJSTypeAliasDeclaration
@@ -3120,7 +3243,10 @@ define Binder
         }
         if bk = KindSourceFile
         {
-            if is_external_module
+            ; `IsExternalOrCommonJSModule(b.container.AsSourceFile())` — the
+            ; DISJUNCTION (slice 37), and the container is the file here by the
+            ; arm above.
+            if this.is_external_or_common_js_module()
             {
                 this.declare_module_member(n, symbol_flags, symbol_excludes)
                 return
@@ -3152,7 +3278,12 @@ define Binder
     procedure bind_source_file_if_external_module(this)
     {
         this.set_export_context_flag(file)
-        if is_external_module
+        ; `IsExternalOrCommonJSModule` — the DISJUNCTION (slice 37). It is asked
+        ; from bind()'s SourceFile arm, i.e. before any child has been walked, so
+        ; the second disjunct is still null at every call this port can make; it
+        ; is written as the reference writes it because the site is what decides
+        ; that, not the reachability.
+        if this.is_external_or_common_js_module()
         {
             this.bind_source_file_as_external_module()
             return
@@ -3213,6 +3344,165 @@ define Binder
         }
         set *(buf + 1 + len): "\"" as char
         this.bind_anonymous_declaration(file, SymbolFlagsValueModule, buf, len + 2)
+    }
+
+    ; ── slice 37: the CommonJS module indicator, and the arms that set it ────
+    ;
+    ; ast.IsExternalOrCommonJSModule. `ExternalModuleIndicator != nil ||
+    ; CommonJSModuleIndicator != nil`, and the two halves are asked SEPARATELY
+    ; everywhere: of the ten sites in binder.go, six ask the external half alone
+    ; (three of them to pick which of three strict-mode messages to report) and
+    ; four ask the disjunction. The field's own note has the split; what matters
+    ; at a call site is that this one MOVES during the walk and the other cannot.
+    function is_external_or_common_js_module(this) returns bool
+    {
+        if is_external_module
+            return true
+        common_js_module_indicator <> null
+    }
+
+    ; setCommonJSModuleIndicator. Its answer is the GUARD of the three assignment
+    ; arms below — `module.exports = x` in a file that is already an ES module
+    ; declares nothing — and its side effect is that the file becomes a module
+    ; symbol, named after its path, exactly as an `import` would have made it one.
+    ;
+    ; ★ `b.file.ExternalModuleIndicator != nil && != b.file.AsNode()`: the second
+    ; conjunct singles out the FORCE arm of getExternalModuleIndicator, the only
+    ; arm that answers the file itself, and this port has no compiler options —
+    ; parser.scaly's external_module_indicator carries the same argument for the
+    ; same arm, and the reference's own oracle zeroes the option struct, so it is
+    ; unreachable on BOTH sides of every yardstick. What is left is
+    ; `is_external_module`.
+    procedure set_common_js_module_indicator(this, n: pointer[AstNode]) returns bool
+    {
+        if is_external_module
+            return false
+        if common_js_module_indicator = null
+        {
+            set common_js_module_indicator: n
+            ; `if b.file.ExternalModuleIndicator == nil` — which the return above
+            ; has already guaranteed, so the module symbol is made here without a
+            ; second test rather than under one that cannot be false.
+            this.bind_source_file_as_external_module()
+        }
+        true
+    }
+
+    ; bindModuleExportsAssignment — JSDeclarationKindModuleExports, i.e.
+    ; `module.exports = x` where x is not `exports`. The symbol is declared into
+    ; the FILE symbol's exports under the name getDeclarationName gives a
+    ; BinaryExpression, which is the unprefixed `export=`: a CommonJS default
+    ; export and a TypeScript `export =` are the same symbol, which is the whole
+    ; point of naming them alike.
+    ;
+    ; ★ EXCLUDES is 0 rather than a flag set, so a second `module.exports = …`
+    ; merges instead of reporting a duplicate.
+    procedure bind_module_exports_assignment(this, n: pointer[AstNode])
+    {
+        if this.set_common_js_module_indicator(n) = false
+            return
+        let cs AstNode.symbol_of(file)
+        if cs = null
+            return
+        var flags: int SymbolFlagsProperty
+        if Binder.expression_is_alias(AstNode.binary_right_of(n))
+            set flags: SymbolFlagsAlias
+        let s this.declare_symbol(Symbol.get_exports(host, cs), cs, n, flags, 0)
+        if this.is_unported()
+            return
+        if s = null
+            return
+        Binder.set_value_declaration(s, n)
+    }
+
+    ; bindExportsOrObjectDefineProperty — two kinds through one arm:
+    ; `exports.a = x` / `module.exports.a = x` (ExportsProperty) and
+    ; `Object.defineProperty(exports, "a", …)` (ObjectDefinePropertyExports). The
+    ; name is the PROPERTY's, which get_name_of_declaration answers for both
+    ; shapes, so the arm itself does not have to tell them apart — except in the
+    ; alias test, which reads a binary expression's right operand and therefore
+    ; asks the kind first.
+    ;
+    ; ★ The symbol is a FUNCTION-SCOPED VARIABLE rather than a property, with the
+    ; matching excludes — which do NOT contain FunctionScopedVariable, so two
+    ; `exports.a = …` for one name merge exactly as two `var a` do. What the
+    ; excludes buy is the collision with a CLASS, an enum or a value module of
+    ; that name, and the arm above buys none of that: its excludes are 0.
+    procedure bind_exports_or_object_define_property(this, n: pointer[AstNode])
+    {
+        if this.set_common_js_module_indicator(n) = false
+            return
+        let cs AstNode.symbol_of(file)
+        if cs = null
+            return
+        var flags: int SymbolFlagsFunctionScopedVariable
+        if AstNode.kind_of(n) = KindBinaryExpression
+        {
+            if Binder.expression_is_alias(AstNode.binary_right_of(n))
+                set flags: SymbolFlagsAlias
+        }
+        this.declare_symbol(Symbol.get_exports(host, cs), cs, n, flags, SymbolFlagsFunctionScopedVariableExcludes)
+    }
+
+    ; bindCallExpression. The whole arm is one question — does this file contain a
+    ; `require(...)` call — and the answer makes it a CommonJS module.
+    ;
+    ; ★ The reference's guard is `b.file.CommonJSModuleIndicator == nil &&
+    ; IsRequireCall(node, false)`, and the first conjunct is a pure optimisation:
+    ; setCommonJSModuleIndicator's own null test makes the second call a no-op.
+    ; Transcribed anyway, because it is the reference's comment ("we can skip this
+    ; check if we've already seen the module indicator") rather than an accident.
+    procedure bind_call_expression(this, n: pointer[AstNode])
+    {
+        if common_js_module_indicator <> null
+            return
+        if Parser.is_require_call(n, false) = false
+            return
+        this.set_common_js_module_indicator(n)
+    }
+
+    ; declareCommonJSVariable. `module` and `exports` become function-scoped
+    ; variables of the FILE, declared on the file NODE, once each — and `module`
+    ; additionally gets a member called `exports`, so that `module.exports` in a
+    ; CommonJS file resolves through a symbol rather than through nothing.
+    ;
+    ; ★★ It does NOT go through add_declaration_to_symbol, and the difference is
+    ; observable: that procedure writes `n.symbol`, and the node here is the FILE,
+    ; whose symbol is the module symbol. So the declaration list is built by hand,
+    ; exactly as upstream's newSingleDeclaration does.
+    ;
+    ; ★ Upstream SHARES one declarations slice between the two symbols; a copy of
+    ; a one-element list is the same list to every reader in this port, since
+    ; nothing appends to either afterwards.
+    procedure declare_common_js_variable(this, name: pointer[const_char])
+    {
+        let locals Binder.get_locals(host, file)
+        var nd null as pointer[char]
+        let nl Binder.internal_name_unprefixed(host, name, &nd)
+        if SymbolTable.get(locals, nd, nl) <> null
+            return
+        let s this.new_symbol(SymbolFlagsFunctionScopedVariable | SymbolFlagsModuleExports, nd, nl)
+        let a host.allocate(sizeof Array[pointer[AstNode]], alignof Array[pointer[AstNode]]) as pointer[Array[pointer[AstNode]]]
+        set *a: Array[pointer[AstNode]]()
+        a.add(file)
+        set s.declarations: a
+        set s.value_declaration: file
+        var md null as pointer[char]
+        let ml Binder.internal_name_unprefixed(host, "module", &md)
+        if SymbolTable.names_equal(nd, nl, md, ml)
+        {
+            var ed null as pointer[char]
+            let el Binder.internal_name_unprefixed(host, "exports", &ed)
+            let ep this.new_symbol(SymbolFlagsModuleExports | SymbolFlagsProperty, ed, el)
+            let b2 host.allocate(sizeof Array[pointer[AstNode]], alignof Array[pointer[AstNode]]) as pointer[Array[pointer[AstNode]]]
+            set *b2: Array[pointer[AstNode]]()
+            b2.add(file)
+            set ep.declarations: b2
+            set ep.value_declaration: file
+            set ep.parent: s
+            SymbolTable.set_entry(host, Symbol.get_members(host, s), ed, el, ep)
+        }
+        SymbolTable.set_entry(host, locals, nd, nl, s)
     }
 
     ; ── slice 29: the four arms with a body of their own ────────────────────
@@ -3979,11 +4269,12 @@ define Binder
         if Binder.is_binding_pattern(name)
             return
 
-        ; A `var x = require("m")` in a JavaScript file is an ALIAS, and that arm
-        ; needs the require detection the JS expando machinery brings with it.
-        if Binder.is_variable_declaration_initialized_to_require(n)
+        ; A `var x = require("m")` in a JavaScript file is an ALIAS. Ported in
+        ; slice 37 with the `require` call itself — the predicate's note has why
+        ; the two had to move together.
+        if this.is_variable_declaration_initialized_to_require(n)
         {
-            this.record_unported("variable-initialized-to-require", 0)
+            this.declare_symbol_and_add_to_symbol_table(n, SymbolFlagsAlias, SymbolFlagsAliasExcludes)
             return
         }
         if this.is_block_or_catch_scoped(n)
@@ -5089,12 +5380,65 @@ define Binder
         false
     }
 
-    ; The two JavaScript-only predicates this slice's arms ask about. Both answer
-    ; FALSE and say why: each needs GetAssignmentDeclarationKind, the expando
-    ; machinery of the JS binder, and every call site that could see a true answer
-    ; is already reported as unported.
-    function is_variable_declaration_initialized_to_require(n: pointer[AstNode]) returns bool
-        false
+    ; ast.IsVariableDeclarationInitializedToRequire —
+    ; isVariableDeclarationInitializedWithRequireHelper with allowAccessedRequire
+    ; FALSE, which is the only reading any caller in this port has (the TRUE one
+    ; belongs to GetModuleSpecifierOfBareOrAccessedRequire, a checker function).
+    ;
+    ; ★★★ IT WAS A STAND-IN ANSWERING `false` UNCONDITIONALLY, and slice 37 is
+    ; what made the wrong answer visible rather than what introduced it: the two
+    ; units that carry `const a = require("./a")` were reported for the
+    ; `commonjs-require` marker, so their whole dump was the marker and the alias
+    ; symbol nobody declared could not be seen. Porting the require call turned
+    ; them into a MISMATCH — a `a` bound as a FunctionScopedVariable with a value
+    ; declaration where the reference has an Alias with none, plus a classifiable
+    ; name the reference does not have. §3.5be from the other end: **a stand-in
+    ; guarded by another marker expires when that marker does**, and the guard is
+    ; not visible from the stand-in's own line.
+    ;
+    ; ★ The `allowAccessedRequire` parameter is NOT kept: §3.5ar asks for the
+    ; reference's SIGNATURE where a future caller will need it, and the future
+    ; caller here is the CHECKER, which this port has no plan for — where the
+    ; reference has two exported wrappers over one helper, this keeps the one
+    ; wrapper anything binds through.
+    function is_variable_declaration_initialized_to_require(this, n: pointer[AstNode]) returns bool
+    {
+        var d n
+        ; A BINDING ELEMENT asks about the variable declaration it belongs to —
+        ; Parent is the binding pattern, Parent.Parent the declaration — so
+        ; `const { a } = require("m")` makes every element an alias.
+        if AstNode.kind_of(d) = KindBindingElement
+        {
+            let bp AstNode.parent_node_of(d)
+            if bp = null
+                return false
+            set d: AstNode.parent_node_of(bp)
+            if d = null
+                return false
+        }
+        if Parser.is_in_js_file(d) = false
+            return false
+        if AstNode.kind_of(d) <> KindVariableDeclaration
+            return false
+        ; `init` is a reserved word here, so the local is spelled out.
+        let initializer AstNode.initializer_of(d)
+        if initializer = null
+            return false
+        ; `node.Parent.Parent.ModifierFlags()` — the declaration LIST's parent,
+        ; i.e. the variable statement, since that is where `export` is written.
+        let list AstNode.parent_node_of(d)
+        if list = null
+            return false
+        let stmt AstNode.parent_node_of(list)
+        if this.has_syntactic_modifier(stmt, ModifierFlagsExport)
+            return false
+        if AstNode.type_of(d) <> null
+            return false
+        ; ★ TRUE here, unlike the binder's own `require` arm: an aliasing
+        ; declaration needs a module SPECIFIER it can resolve, while the CommonJS
+        ; indicator only needs the call to exist.
+        Parser.is_require_call(initializer, true)
+    }
 
     ; ast.IsParameterPropertyDeclaration: a parameter carrying an ACCESSIBILITY,
     ; `readonly` or `override` modifier, inside a CONSTRUCTOR — the shape that
