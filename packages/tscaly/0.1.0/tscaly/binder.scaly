@@ -317,6 +317,14 @@ define Binder
     ; path taken. The dump compares it, which makes it a check on the path.
     symbol_count: int
 
+    ; ★ `ast.nextSymbolId`, slice 41 — the counter behind Symbol.id. Upstream's is
+    ; a package-global atomic; this one is a field, i.e. per file, which is the
+    ; divergence Symbol.id's comment argues and §3.5cl records. It is NOT
+    ; symbol_count: that one counts every newSymbol call, this one is drawn from
+    ; only when somebody ASKS for an id, and in the whole reference binder the only
+    ; asker is the private-name minter.
+    next_symbol_id: int
+
     ; `b.classifiableNames`, a SET of names. A SymbolTable stands in for it — the
     ; entries carry a null symbol and only the key matters — because a second
     ; container type would buy nothing and the dump reads it as a sorted name list.
@@ -403,6 +411,7 @@ define Binder
         set b.block_scope_container: null
         set b.last_container: null
         set b.symbol_count: 0
+        set b.next_symbol_id: 0
         set b.classifiable_names: SymbolTable.create(host)
         set b.not_const_enum_only_modules: null
         set b.in_assignment_pattern: false
@@ -2246,6 +2255,86 @@ define Binder
         Symbol.create(host, flags, name_data, name_len)
     }
 
+    ; ── ast.GetSymbolId, slice 41 ────────────────────────────────────────────
+    ;
+    ; ★★★ LAZY, and that is the whole content of the function. Upstream:
+    ;
+    ;     id := symbol.id.Load()
+    ;     if id == 0 { id = nextSymbolId.Add(1); CAS … }
+    ;
+    ; so a symbol draws a number the FIRST time somebody asks for one and keeps
+    ; it, and a symbol nobody asks about never draws one at all. Both halves are
+    ; observable here, because the only asker in the reference binder is the
+    ; private-name minter and the number it draws lands in a symbol NAME: assign at
+    ; symbol CREATION instead and every class in the file shifts the numbers of the
+    ; classes after it; assign twice and the same class gets two names.
+    ;
+    ; The CAS is the parallelism upstream's shared counter needs and this port does
+    ; not have — one binder, one file, one thread — so what is ported is the
+    ; contract (draw once, remember) and not the instruction. §3.10 is the standing
+    ; argument for that direction; §3.5cl is what makes it invisible to the
+    ; yardstick.
+    procedure get_symbol_id(this, s: pointer[Symbol]) returns int
+    {
+        if s.id = 0
+        {
+            set next_symbol_id: next_symbol_id + 1
+            set s.id: next_symbol_id
+        }
+        s.id
+    }
+
+    ; GetSymbolNameForPrivateIdentifier:
+    ;
+    ;     InternalSymbolNamePrefix + "#" + strconv.Itoa(GetSymbolId(sym)) + "@" + description
+    ;
+    ; ★ The PREFIX is the 0xFE byte, so the name is unspellable — the reason every
+    ; other internal name carries it, and here it carries a second weight: `#x` in
+    ; two different classes must be two different symbols, and the class's id is
+    ; what tells them apart.
+    ;
+    ; ★ The `@` is TRANSCRIBED, not reasoned about, and the obvious reason for it is
+    ; wrong: a delimiter between a variable-length number and a description is
+    ; needed in general, but the description here is a PrivateIdentifier's whole
+    ; token and so always begins with its own `#` — the number cannot run into it.
+    ; So the `@` buys no uniqueness and is written because the reference writes it;
+    ; control c8 is what makes that a measurement rather than a preference.
+    ;
+    ; Shaped after anonymous_parameter_name, for its reason: the digits are written
+    ; most-significant-LAST, so their count has to be known before the buffer is
+    ; taken.
+    function private_identifier_name(host: pointer[Page], id: int, desc_data: pointer[char], desc_len: int, out_data: pointer[pointer[char]]) returns int
+    {
+        var digits 1
+        var rest id / 10
+        while rest > 0
+        {
+            set digits: digits + 1
+            set rest: rest / 10
+        }
+        let total digits + desc_len + 3
+        let buf host.allocate(total as size_t, 1) as pointer[char]
+        set *buf: 0xFE as char
+        set *(buf + 1): "#" as char
+        var value id
+        var i digits
+        while i > 0
+        {
+            set *(buf + 1 + i): ((("0" as char) as int) + (value % 10)) as char
+            set value: value / 10
+            set i: i - 1
+        }
+        set *(buf + 2 + digits): "@" as char
+        var j 0
+        while j < desc_len
+        {
+            set *(buf + 3 + digits + j): *(desc_data + j)
+            set j: j + 1
+        }
+        set *out_data: buf
+        total
+    }
+
     ; addDeclarationToSymbol. `AppendIfUnique` is the reference's own append: a
     ; node may reach here twice — a parameter property declares into two tables —
     ; and the declaration list must not carry it twice.
@@ -2783,18 +2872,46 @@ define Binder
                 set *out_len: AstNode.identifier_text_length_of(name)
                 return
             }
-            ; ★ A PRIVATE identifier's text IS stored (its payload is
-            ; IdentifierData), and slice 31 SHARPENED this stand-in rather than
-            ; retiring it: the name is
-            ; `GetSymbolNameForPrivateIdentifier(containingClass.Symbol(), text)`,
-            ; i.e. the prefix, a `#`, the containing class symbol's ID and the
-            ; text — and a SYMBOL ID is the blocker. Upstream assigns those lazily
-            ; by CAS into the shared tree, which is exactly the mechanism §3.10
-            ; diverges from, so the slice that answers this owes a decision about
-            ; symbol identity and not a text.
+            ; ★★★ Slice 41. A PRIVATE identifier is named after the CLASS it sits
+            ; in, not after itself: `GetSymbolNameForPrivateIdentifier(
+            ; containingClass.Symbol(), name.Text())`. The id is what makes `#x` in
+            ; two classes two symbols, and drawing it is what slices 31–40 deferred
+            ; — see get_symbol_id for the decision and §3.5cl for what the numbers
+            ; agree with.
+            ;
+            ; ★★ The NULL class is the reference's own arm and its comment is the
+            ; reason to keep it: *"we can get here in cases where there is already a
+            ; parse error"* — a `#x` outside any class parses, so the walk reaches a
+            ; declaration whose containing class does not exist and the answer is
+            ; `missing`. Without the arm this would be a null receiver two lines
+            ; down; with it, the shape is ANSWERED, which is why the fixtures carry
+            ; it at top level, in a function and in an object literal.
             if nk = KindPrivateIdentifier
             {
-                this.record_unported("declaration-name-private-identifier", 0)
+                let containing_class Binder.get_containing_class(n)
+                if containing_class = null
+                {
+                    set *out_len: Binder.internal_name(host, "missing", out_data)
+                    return
+                }
+
+                ; ★ Where the reference would nil-panic, the marker stands (§3.5bk):
+                ; `containingClass.Symbol()` is read unguarded upstream, on the
+                ; reasoning its comment states — a class-like node has been declared
+                ; by the time its members are bound. A marker rather than a guess,
+                ; so that a shape reaching it reports itself instead of minting
+                ; `%FE#0@x` and comparing equal to nothing.
+                let cs AstNode.symbol_of(containing_class)
+                if cs = null
+                {
+                    this.record_unported("private-identifier-class-unbound", 0)
+                    return
+                }
+
+                let id this.get_symbol_id(cs)
+                let td AstNode.identifier_text_of(name)
+                let tl AstNode.identifier_text_length_of(name)
+                set *out_len: Binder.private_identifier_name(host, id, td, tl, out_data)
                 return
             }
             ; ★★ IsPropertyNameLiteral: an Identifier — answered above — or one of
