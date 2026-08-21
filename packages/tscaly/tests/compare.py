@@ -171,6 +171,22 @@ def compare_one(ctx, name, art, keep, ours_bin, ref_bin, case_file, work):
 
     if ours_rc != 0:
         return "FAIL", f"{art}/{name}: our dumper exited {ours_rc}"
+    # ★★★ EXIT 3 FROM THE ORACLE IS "THE REFERENCE COULD NOT ANSWER THIS UNIT",
+    # and it is a class rather than a failure — but only when it is ARGUED. Only
+    # tests/oracle/types.go uses it: the checker nil-dereferences on some valid
+    # inputs (its header names the shape and bounds it), so there is nothing to
+    # compare against, which is a MISSING MEASUREMENT and not a deviation of ours.
+    #
+    # ★★★ AND IT GOES THROUGH accepted.txt, for slice 26's c4 reason: a column
+    # that cannot fail the run is a column that is not measured. An oracle exiting
+    # 3 on EVERY unit would otherwise read as "no reference answer" 17 807 times
+    # and the run would still say OK. So a known hole is an UPSTREAM entry with
+    # its evidence, and an unknown one is a failure like any other.
+    if ref_rc == 3:
+        if (name, art) in ctx.accepted:
+            return "REFCRASH", f"{art}/{name}"
+        return "FAIL", (f"{art}/{name}: the ORACLE panicked inside the reference"
+                        " (exit 3) and no accepted.txt entry argues it")
     if ref_rc != 0:
         return "FAIL", (f"{art}/{name}: the ORACLE exited {ref_rc}"
                         " — suspect the harness, not the port")
@@ -230,7 +246,7 @@ def _first_line(path):
 # the name" for all of them, and a per-line rule would be a normalisation inside
 # the comparison. Numeric kinds are looked up in tscaly/Kind.scaly when a diff
 # has to be read.
-ARTIFACTS = (("tokens", 4), ("ast", 5), ("jsdoc", 5), ("symbols", 0))
+ARTIFACTS = (("tokens", 4), ("ast", 5), ("jsdoc", 5), ("symbols", 0), ("types", 0))
 
 
 def main():
@@ -331,7 +347,8 @@ def main():
     # ── phase B: the unit list, in the loop's own order ──────────────────────
     counters = {}
     for art, _ in ARTIFACTS:
-        for k in ("matched", "unported", "failed", "accepted", "stale", "timeout"):
+        for k in ("matched", "unported", "failed", "accepted", "stale", "timeout",
+                  "refcrash"):
             counters[f"{k}_{art}"] = 0
     counters["cases_seen"] = 0
     counters["skip_jsx"] = 0
@@ -360,6 +377,7 @@ def main():
     counters["bind_diag_lines"] = 0
     failures = []
     stales = []
+    refcrashes = []
 
     tasks = []          # (order key, unit record, artifact, keep)
     split_failures = []
@@ -459,6 +477,9 @@ def main():
                 counters[f"unported_{art}"] += 1
             elif verdict == "ACCEPTED":
                 counters[f"accepted_{art}"] += 1
+            elif verdict == "REFCRASH":
+                counters[f"refcrash_{art}"] += 1
+                refcrashes.append(message)
             else:
                 # A TIMEOUT is a failure — the totals must not lose it — and also a
                 # class of its own, so it is counted twice on purpose and the report
@@ -511,6 +532,9 @@ def main():
     with open(f"{out}/stales.txt", "w") as fh:
         for s in stales:
             fh.write(s + "\n")
+    with open(f"{out}/refcrashes.txt", "w", errors="surrogateescape") as fh:
+        for r in refcrashes:
+            fh.write(r + "\n")
     return 0
 
 

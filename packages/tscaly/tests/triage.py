@@ -35,7 +35,7 @@ import collections
 import os
 import sys
 
-ARTS = ("tokens", "ast", "jsdoc", "symbols")
+ARTS = ("tokens", "ast", "jsdoc", "symbols", "types")
 
 # ★ The symbols dump has NO trailing name column, so "the last field" would answer
 # an escaped symbol NAME on some lines and a bare number on others — the very trap
@@ -89,6 +89,17 @@ def kind_name(ref_lines, i, art="ast"):
             code = parts[-1].decode("utf-8", "replace")
             return f"bind diagnostic TS{code}"
         return _SYMBOL_RECORDS.get(parts[0] if parts else b"", "<unknown record>")
+    # ★ The types dump is self-naming the same way and for the same reason: a `C`
+    # line ends in an error NUMBER and a `T` line in a type NAME, so "the last
+    # field" would mean two different things. The record letter decides, and a
+    # diagnostic keeps its code because that is the identifying half of it.
+    if art == "types":
+        if parts and parts[0] == b"C":
+            code = parts[-1].decode("utf-8", "replace")
+            return f"check diagnostic TS{code}"
+        if parts and parts[0] == b"T":
+            return "type of a node"
+        return "<unknown record>"
     if parts and parts[0] == b"D":
         code = parts[-1].decode("utf-8", "replace")
         return f"diagnostic TS{code}"
@@ -169,15 +180,18 @@ def main(argv):
     print("=" * 78)
     print("triage of", cases_dir)
     if counters:
-        print("  a run of {} cases: matched {}/{}/{}/{}  unported {}/{}/{}/{}"
-              "  UNEXPLAINED {}/{}/{}/{}   (tokens/ast/jsdoc/symbols)".format(
+        print("  a run of {} cases: matched {}/{}/{}/{}/{}  unported {}/{}/{}/{}/{}"
+              "  UNEXPLAINED {}/{}/{}/{}/{}   (tokens/ast/jsdoc/symbols/types)".format(
                   counters.get("cases_seen", 0),
                   counters.get("matched_tokens", 0), counters.get("matched_ast", 0),
                   counters.get("matched_jsdoc", 0), counters.get("matched_symbols", 0),
+                  counters.get("matched_types", 0),
                   counters.get("unported_tokens", 0), counters.get("unported_ast", 0),
                   counters.get("unported_jsdoc", 0), counters.get("unported_symbols", 0),
+                  counters.get("unported_types", 0),
                   counters.get("failed_tokens", 0), counters.get("failed_ast", 0),
-                  counters.get("failed_jsdoc", 0), counters.get("failed_symbols", 0)))
+                  counters.get("failed_jsdoc", 0), counters.get("failed_symbols", 0),
+                  counters.get("failed_types", 0)))
     print("=" * 78)
 
     unported = {a: collections.Counter() for a in ARTS}

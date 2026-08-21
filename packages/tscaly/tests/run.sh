@@ -218,7 +218,7 @@ submodule_dirty() {
 oracle_stamp() {
   shasum -a 256 "$PKG/tests/oracle/tokens.go"  "$PKG/tests/oracle/ast.go" \
                 "$PKG/tests/oracle/jsdoc.go"   "$PKG/tests/oracle/split.go" \
-                "$PKG/tests/oracle/symbols.go" \
+                "$PKG/tests/oracle/symbols.go" "$PKG/tests/oracle/types.go" \
     | awk '{print $1}'
   git -C "$SUB" rev-parse HEAD 2>/dev/null
   go version 2>/dev/null
@@ -250,27 +250,29 @@ HAVE=
 [ -f "$STAMP" ] && HAVE=$(cat "$STAMP")
 
 oracles_present() {
-  for o in oracle_tokens oracle_ast oracle_jsdoc oracle_split oracle_symbols; do
+  for o in oracle_tokens oracle_ast oracle_jsdoc oracle_split oracle_symbols oracle_types; do
     [ -x "$OUT/$o" ] || return 1
   done
 }
 
 if [ -z "${TSCALY_FORCE_ORACLE:-}" ] && [ "$WANT" = "$HAVE" ] && oracles_present; then
-  : # the five binaries already answer to this stamp
+  : # the six binaries already answer to this stamp
 else
   rm -f "$STAMP"
   mkdir -p "$SUB/oracle/tokens" "$SUB/oracle/ast" "$SUB/oracle/jsdoc" \
-           "$SUB/oracle/split" "$SUB/oracle/symbols"
+           "$SUB/oracle/split" "$SUB/oracle/symbols" "$SUB/oracle/types"
   cp "$PKG/tests/oracle/tokens.go"  "$SUB/oracle/tokens/main.go"
   cp "$PKG/tests/oracle/ast.go"     "$SUB/oracle/ast/main.go"
   cp "$PKG/tests/oracle/jsdoc.go"   "$SUB/oracle/jsdoc/main.go"
   cp "$PKG/tests/oracle/split.go"   "$SUB/oracle/split/main.go"
   cp "$PKG/tests/oracle/symbols.go" "$SUB/oracle/symbols/main.go"
+  cp "$PKG/tests/oracle/types.go"   "$SUB/oracle/types/main.go"
   ( cd "$SUB" && go build -o "$REPO/$OUT/oracle_tokens"  ./oracle/tokens \
               && go build -o "$REPO/$OUT/oracle_ast"     ./oracle/ast \
               && go build -o "$REPO/$OUT/oracle_jsdoc"   ./oracle/jsdoc \
               && go build -o "$REPO/$OUT/oracle_split"   ./oracle/split \
-              && go build -o "$REPO/$OUT/oracle_symbols" ./oracle/symbols ) \
+              && go build -o "$REPO/$OUT/oracle_symbols" ./oracle/symbols \
+              && go build -o "$REPO/$OUT/oracle_types"   ./oracle/types ) \
     > "$OUT/oracle-build.log" 2>&1
   orc=$?
   rm -rf "$SUB/oracle"
@@ -301,7 +303,7 @@ if [ $? -ne 0 ]; then
   red "the tscaly package failed to compile:"; sed 's/^/    /' "$OUT/pkg-build.log"; exit 2
 fi
 
-for prog in tscaly_tokens tscaly_ast tscaly_jsdoc tscaly_symbols; do
+for prog in tscaly_tokens tscaly_ast tscaly_jsdoc tscaly_symbols tscaly_types; do
   "$SCALYC" -c -o "$OUT/$prog.o" "$PKG/0.1.0/$prog.scaly" > "$OUT/$prog-build.log" 2>&1
   if [ $? -ne 0 ]; then
     red "$prog failed to compile:"; sed 's/^/    /' "$OUT/$prog-build.log"; exit 2
@@ -406,6 +408,8 @@ failures=()
 while IFS= read -r l; do [ -n "$l" ] && failures+=("$l"); done < "$OUT/failures.txt"
 stales=()
 while IFS= read -r l; do [ -n "$l" ] && stales+=("$l"); done < "$OUT/stales.txt"
+refcrashes=()
+while IFS= read -r l; do [ -n "$l" ] && refcrashes+=("$l"); done < "$OUT/refcrashes.txt"
 
 # ── report ───────────────────────────────────────────────────────────────────
 
@@ -418,21 +422,30 @@ else
   echo "  TSCALY_STAGE=2 adds the submodule corpus; see TESTPLAN.md's stage table."
 fi
 
+# ★★★ THE FIFTH NUMBER IS THE UNIT TOTAL'S FIFTH TERM, and leaving it out would
+# be the shrinking-total defect this suite keeps finding: a unit the REFERENCE
+# cannot answer (oracle exit 3, see compare.py) belongs to none of the four
+# columns, so a total of four terms silently loses it. The line only appears when
+# the count is non-zero, and the units are named further down.
 report() {
-  local title=$1 m=$2 u=$3 a=$4 f=$5
-  local total=$(( m + u + a + f ))
+  local title=$1 m=$2 u=$3 a=$4 f=$5 r=${6:-0}
+  local total=$(( m + u + a + f + r ))
   echo
   echo "$title — $total units (from $cases_seen cases)"
   echo "  matched            $m"
   echo "  unported           $u   (this slice does not implement the construct)"
   echo "  accepted deviation $a"
   echo "  UNEXPLAINED        $f"
+  if [ "$r" -ne 0 ]; then
+    echo "  no reference answer $r   (the ORACLE could not answer the unit)"
+  fi
 }
 
-report "scanner yardstick" $matched_tokens $unported_tokens $accepted_tokens $failed_tokens
-report "parser yardstick"  $matched_ast    $unported_ast    $accepted_ast    $failed_ast
-report "jsdoc yardstick"   $matched_jsdoc  $unported_jsdoc  $accepted_jsdoc  $failed_jsdoc
-report "binder yardstick"  $matched_symbols $unported_symbols $accepted_symbols $failed_symbols
+report "scanner yardstick" $matched_tokens $unported_tokens $accepted_tokens $failed_tokens $refcrash_tokens
+report "parser yardstick"  $matched_ast    $unported_ast    $accepted_ast    $failed_ast    $refcrash_ast
+report "jsdoc yardstick"   $matched_jsdoc  $unported_jsdoc  $accepted_jsdoc  $failed_jsdoc  $refcrash_jsdoc
+report "binder yardstick"  $matched_symbols $unported_symbols $accepted_symbols $failed_symbols $refcrash_symbols
+report "checker yardstick" $matched_types  $unported_types  $accepted_types  $failed_types  $refcrash_types
 
 echo
 echo "  of those, $symbol_bearing units actually CARRY a symbol, and $bind_diag_units carry a BIND"
@@ -518,9 +531,9 @@ echo "  silence is the failure mode this suite exists to prevent."
 # yardsticks and there were four. A column that cannot fail the run is a column
 # that is not measured — the same sentence this suite keeps writing about the
 # `unported` column, one level up.
-total_stale=$(( stale_tokens + stale_ast + stale_jsdoc + stale_symbols ))
-total_failed=$(( failed_tokens + failed_ast + failed_jsdoc + failed_symbols ))
-total_timeout=$(( timeout_tokens + timeout_ast + timeout_jsdoc + timeout_symbols ))
+total_stale=$(( stale_tokens + stale_ast + stale_jsdoc + stale_symbols + stale_types ))
+total_failed=$(( failed_tokens + failed_ast + failed_jsdoc + failed_symbols + failed_types ))
+total_timeout=$(( timeout_tokens + timeout_ast + timeout_jsdoc + timeout_symbols + timeout_types ))
 
 # A timed-out dump is counted in UNEXPLAINED like any other failure — it IS one —
 # but it is also named separately, because "our dumper did not finish" and "our
@@ -533,6 +546,20 @@ if [ $total_timeout -ne 0 ]; then
   red "$total_timeout dumps did not finish within ${TSCALY_TIMEOUT:-60}s (counted in UNEXPLAINED above)."
   echo "  A non-terminating parse is a defect of its own class; grep 'timed out' in"
   echo "  $OUT/failures.txt for the list."
+fi
+
+total_refcrash=$(( refcrash_tokens + refcrash_ast + refcrash_jsdoc + refcrash_symbols + refcrash_types ))
+
+# ★ NAMED, ALWAYS, AND NEVER SUMMARISED AWAY. A unit the reference cannot answer
+# is a hole in the measurement, so the list IS the point: it has to be possible to
+# read which constructs are unmeasured, and a growing count with no names would be
+# the same silence this suite keeps finding in an unported column nobody reads.
+if [ $total_refcrash -ne 0 ]; then
+  echo
+  echo "$total_refcrash units have NO reference answer — the oracle panicked inside the"
+  echo "  reference and exited 3. Not a port defect and not a pass: an UNMEASURED"
+  echo "  unit. tests/oracle/types.go's header bounds the shape."
+  printf '    %s\n' "${refcrashes[@]}"
 fi
 
 if [ $total_stale -ne 0 ]; then
