@@ -1,0 +1,1717 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; jsnum — the ECMAScript Number conversions the SCANNER needs, and the half of Go's
+; own strconv that internal/jsnum delegates them to.
+;
+; ★★★ WHY THIS IS A MODULE AND NOT A HELPER. A numeric literal's VALUE is not a
+; lexical question. `scanNumber` ends every one of its arms with
+;
+;     s.tokenValue = jsnum.FromString(s.tokenValue).String()
+;
+; — the ECMAScript ToString of the parsed double — so `0.0`, `2.0`, `11e-1`,
+; `0.12e1`, `0xF00D`, `0b110` and `0o23534` are the tokens `0`, `2`, `1`, `1.1`,
+; `1.2`, `61453`, `6` and `10076`. Through slice 43 this port stored the SOURCE
+; slice, named as a stand-in in scanner.scaly with the reference's LIFETIME and
+; not its MEANING (§3.5i). The consequence is not cosmetic: a literal's text is a
+; SYMBOL NAME, so `class C { 0 = 1; 0.0 = 2 }` declares ONE member upstream and
+; would declare two here, and the binder reported `declaration-name-numeric`
+; rather than guess.
+;
+; ★★★ THE CHAIN OF REFERENCES IS THREE DEEP AND ONLY THE FIRST IS TypeScript's.
+; `Number.String()` is `strconv.FormatInt` for a safe integer and otherwise
+; `json.Marshal(float64)`, which is `jsonwire.AppendFloat` — `strconv.AppendFloat`
+; with the shortest precision, under a fixed/exponential rule chosen to be
+; ECMA-262 §7.1.12.1 exactly, plus one textual fix-up (`e-09` → `e-9`).
+; `FromString` is a hand-written breakdown of the string that ends in
+; `strconv.ParseFloat`. So porting jsnum means porting Go's decimal↔binary
+; conversion, and this file is `internal/strconv`'s `decimal.go` in full, plus
+; the `set`/`floatBits` pair out of `atof.go` and the `bigFtoa`/`roundShortest`/
+; `fmtE`/`fmtF` group out of `ftoa.go`.
+;
+; ★★★ IT IS ALL INTEGER ARITHMETIC AND THAT IS DELIBERATE. Go's `decimal` is a
+; big-endian digit array with a decimal point, and every operation on it is a
+; shift, a round or a digit walk; `floatBits` assembles an IEEE bit pattern out
+; of a mantissa and an exponent, and `bigFtoa` takes one apart the same way.
+; So the whole conversion runs without a single floating-point operation, and
+; this port never names Scaly's `double`: a double is a `u64` of BITS here, from
+; `jsnum_from_string` to `jsnum_to_string`. That is not a simplification of the
+; reference — it is what the reference's slow path already is, and it is the half
+; of `strconv` that carries no generated tables.
+;
+; ★★ WHAT IS NOT PORTED, each with the reader that would earn it. Ryū
+; (`ftoa.go`'s fast path) — it answers the same digits as `roundShortest` by
+; construction, which is the whole point of both, and it costs a 617-entry
+; 128-bit table. The `'g'`, `'b'` and `'x'` formats and every `prec >= 0` arm of
+; `bigFtoa` — `AppendFloat` asks for `'e'` or `'f'` with prec −1 and nothing else
+; does. `atof.go`'s `special`, `readFloat`, `atofHex`, `eiselLemire` and the
+; exact-power-of-ten fast paths — they are optimisations or they answer strings
+; `FromString` has already rejected. `jsnum.ParsePseudoBigInt` — see the BigInt
+; note in scanner.scaly, where the stand-in it belongs to now stands alone.
+;
+; ★★ THE INSTRUMENT FOR THIS FILE IS tests/numcheck.sh AND NOT THE FOUR
+; YARDSTICKS. They can see a numeric literal's value in exactly one place — a
+; literal used as a DECLARATION NAME, 27 units of 17 797 — and almost every one of
+; those is a plain small integer, so the shortest round trip, the round-to-even
+; tie, the two boundaries that choose exponential notation, a denormal, Infinity,
+; the sign of negative zero and a radix literal past int64 are between them zero
+; units. numcheck.sh runs one generated corpus through this module and through the
+; reference's own jsnum and diffs the BITS as well as the text; 200 000 inputs are
+; byte-identical. **Read its header before changing anything here**, and expect a
+; change that no yardstick moves to move it.
+;
+; ★ NAMES. Everything here is a free function of the package and therefore shares
+; one namespace with the other modules', so each carries the prefix of the file it
+; came from: `dec_` for decimal.go, `jsnum_` for jsnum's own layer.
+
+; ── the float64 shape ───────────────────────────────────────────────────────
+;
+; ftoa.go's float64info. The three numbers appear in five places between the two
+; directions and every one of them is wrong in a different way if they drift.
+define FLT_MANTBITS: int 52
+define FLT_EXPBITS:  int 11
+define FLT_BIAS:     int -1023
+
+; The bit patterns this file answers with rather than computes.
+;
+; ★ NaN's PAYLOAD is Go's `math.NaN()` — uvnan, 0x7FF8000000000001, and not the
+; quiet NaN a reader would write down. `jsnum_to_string` answers "NaN" for every
+; NaN, so nothing in the port can tell them apart; the cross-check in
+; tests/numcheck.sh compares the BITS, and there the payload is the difference
+; between a green run and 30 red lines.
+define BITS_NAN:     u64 0x7FF8000000000001
+define BITS_INF:     u64 0x7FF0000000000000
+define BITS_NEG_INF: u64 0xFFF0000000000000
+
+; |x| < 1e-6 and |x| >= 1e21 select the exponential form (jsonwire.AppendFloat).
+; The comparison is on the ABSOLUTE value, and for a non-negative double the IEEE
+; bit pattern orders exactly as the value does — so it is an unsigned integer
+; comparison against these two constants, and no float compare is needed.
+define BITS_1E_MINUS_6: u64 0x3EB0C6F7A0B5ED8D
+define BITS_1E21:       u64 0x444B1AE4D6E2EF50
+
+; ── the multiprecision decimal (internal/strconv/decimal.go) ────────────────
+;
+; "For floating-point formatting only; not general purpose. Only operations are
+; assign and (binary) left/right shift. Can do binary floating point in
+; multiprecision decimal precisely because 2 divides 10; cannot do decimal
+; floating point in multiprecision binary precisely."
+;
+; ★ `d [800]byte` is a Go ARRAY inside the struct — the value carries its own
+; storage. Here it is a pointer to storage the caller owns, because a Scaly
+; structure property cannot be a fixed-size array; every caller declares
+; `var digits char[DEC_CAP]` on its own frame and hands over `&digits[0]`, so the
+; scratch still dies with the call and nothing is allocated on any page. The 800
+; is the reference's and is not a round number: the exact decimal expansion of the
+; smallest denormal is 751 digits, and a shift can add a few.
+define DEC_CAP: int 800
+
+define Decimal
+(
+    d:     pointer[char]
+    nd:    int
+    dp:    int
+    neg:   bool
+    trunc: bool
+)
+
+; Go's `new(decimal)` — zeroed but for the storage.
+procedure dec_init(a: pointer[Decimal], storage: pointer[char])
+{
+    set a.d: storage
+    set a.nd: 0
+    set a.dp: 0
+    set a.neg: false
+    set a.trunc: false
+}
+
+; trim trailing zeros from number. (They are meaningless; the decimal point is
+; tracked independent of the number of digits.)
+procedure dec_trim(a: pointer[Decimal])
+{
+    while (a.nd > 0) and ((*(a.d + (a.nd - 1)) as int) = (("0" as char) as int))
+        set a.nd: a.nd - 1
+    if a.nd = 0
+        set a.dp: 0
+}
+
+; Assign v to a.
+procedure dec_assign(a: pointer[Decimal], value: u64)
+{
+    var buf char[24]
+
+    ; Write reversed decimal in buf.
+    var n 0
+    var v value
+    while v > (0 as u64)
+    {
+        let v1 v / (10 as u64)
+        set v: v - ((10 as u64) * v1)
+        set buf[n]: ((v as int) + (("0" as char) as int)) as char
+        set n: n + 1
+        set v: v1
+    }
+
+    ; Reverse again to produce forward decimal in a.d.
+    set a.nd: 0
+    set n: n - 1
+    while n >= 0
+    {
+        set *(a.d + a.nd): buf[n]
+        set a.nd: a.nd + 1
+        set n: n - 1
+    }
+    set a.dp: a.nd
+    dec_trim(a)
+}
+
+; Maximum shift that we can do in one pass without overflow: a uint has 64 bits
+; here and we have to be able to accommodate 9<<k.
+define DEC_MAX_SHIFT: int 60
+
+; Binary shift right (/ 2) by k bits. k <= DEC_MAX_SHIFT to avoid overflow.
+;
+; ★ The reference's first loop is `for ; n>>k == 0; r++` with a `break` out of
+; an inner loop that has already made the condition false — so the flag a
+; straight transcription would need is not needed: falling out of the inner loop
+; falls out of the outer one on its own.
+procedure dec_right_shift(a: pointer[Decimal], k: int)
+{
+    var r 0
+    var w 0
+    let ks k as u64
+    var n: u64 0
+
+    ; Pick up enough leading digits to cover first shift.
+    while (n >> ks) = (0 as u64)
+    {
+        if r >= a.nd
+        {
+            if n = (0 as u64)
+            {
+                ; a == 0; shouldn't get here, but handle anyway.
+                set a.nd: 0
+                return
+            }
+            while (n >> ks) = (0 as u64)
+            {
+                set n: n * (10 as u64)
+                set r: r + 1
+            }
+        }
+        else
+        {
+            let c (*(a.d + r) as int) as u64
+            set n: ((n * (10 as u64)) + c) - ((("0" as char) as int) as u64)
+            set r: r + 1
+        }
+    }
+    set a.dp: a.dp - (r - 1)
+
+    let mask ((1 as u64) << ks) - (1 as u64)
+
+    ; Pick up a digit, put down a digit.
+    while r < a.nd
+    {
+        let c (*(a.d + r) as int) as u64
+        let dig n >> ks
+        set n: n & mask
+        set *(a.d + w): ((dig as int) + (("0" as char) as int)) as char
+        set w: w + 1
+        set n: ((n * (10 as u64)) + c) - ((("0" as char) as int) as u64)
+        set r: r + 1
+    }
+
+    ; Put down extra digits.
+    while n > (0 as u64)
+    {
+        let dig n >> ks
+        set n: n & mask
+        if w < DEC_CAP
+        {
+            set *(a.d + w): ((dig as int) + (("0" as char) as int)) as char
+            set w: w + 1
+        }
+        else
+        {
+            if dig > (0 as u64)
+                set a.trunc: true
+        }
+        set n: n * (10 as u64)
+    }
+
+    set a.nd: w
+    dec_trim(a)
+}
+
+; Cheat sheet for left shift: table indexed by shift count giving the number of
+; new digits that will be introduced by that shift, and the leading digits of
+; 5^k below which one fewer digit is added. leftcheats[4] = {2, "625"}: shifting
+; by 4 adds two digits when the prefix is "625".."999" and one otherwise.
+; Credit for this trick goes to Ken.
+define DEC_LEFT_DELTA: int[] [
+    0, 1, 1, 1, 2, 2, 2, 3, 3, 3,
+    4, 4, 4, 4, 5, 5, 5, 6, 6, 6,
+    7, 7, 7, 7, 8, 8, 8, 9, 9, 9,
+    10, 10, 10, 10, 11, 11, 11, 12, 12, 12,
+    13, 13, 13, 13, 14, 14, 14, 15, 15, 15,
+    16, 16, 16, 16, 17, 17, 17, 18, 18, 18,
+    19,
+]
+
+; The cutoff halves of the same table. A `define X: T[]` literal takes integer
+; elements only, so the strings are a run of independent `if`s that RETURN —
+; which is also what §3.9b prescribes: a chain would nest one planner level per
+; arm, and there are sixty of them.
+function dec_left_cutoff(k: int) returns pointer[const_char]
+{
+    if k = 1
+        return "5"
+    if k = 2
+        return "25"
+    if k = 3
+        return "125"
+    if k = 4
+        return "625"
+    if k = 5
+        return "3125"
+    if k = 6
+        return "15625"
+    if k = 7
+        return "78125"
+    if k = 8
+        return "390625"
+    if k = 9
+        return "1953125"
+    if k = 10
+        return "9765625"
+    if k = 11
+        return "48828125"
+    if k = 12
+        return "244140625"
+    if k = 13
+        return "1220703125"
+    if k = 14
+        return "6103515625"
+    if k = 15
+        return "30517578125"
+    if k = 16
+        return "152587890625"
+    if k = 17
+        return "762939453125"
+    if k = 18
+        return "3814697265625"
+    if k = 19
+        return "19073486328125"
+    if k = 20
+        return "95367431640625"
+    if k = 21
+        return "476837158203125"
+    if k = 22
+        return "2384185791015625"
+    if k = 23
+        return "11920928955078125"
+    if k = 24
+        return "59604644775390625"
+    if k = 25
+        return "298023223876953125"
+    if k = 26
+        return "1490116119384765625"
+    if k = 27
+        return "7450580596923828125"
+    if k = 28
+        return "37252902984619140625"
+    if k = 29
+        return "186264514923095703125"
+    if k = 30
+        return "931322574615478515625"
+    if k = 31
+        return "4656612873077392578125"
+    if k = 32
+        return "23283064365386962890625"
+    if k = 33
+        return "116415321826934814453125"
+    if k = 34
+        return "582076609134674072265625"
+    if k = 35
+        return "2910383045673370361328125"
+    if k = 36
+        return "14551915228366851806640625"
+    if k = 37
+        return "72759576141834259033203125"
+    if k = 38
+        return "363797880709171295166015625"
+    if k = 39
+        return "1818989403545856475830078125"
+    if k = 40
+        return "9094947017729282379150390625"
+    if k = 41
+        return "45474735088646411895751953125"
+    if k = 42
+        return "227373675443232059478759765625"
+    if k = 43
+        return "1136868377216160297393798828125"
+    if k = 44
+        return "5684341886080801486968994140625"
+    if k = 45
+        return "28421709430404007434844970703125"
+    if k = 46
+        return "142108547152020037174224853515625"
+    if k = 47
+        return "710542735760100185871124267578125"
+    if k = 48
+        return "3552713678800500929355621337890625"
+    if k = 49
+        return "17763568394002504646778106689453125"
+    if k = 50
+        return "88817841970012523233890533447265625"
+    if k = 51
+        return "444089209850062616169452667236328125"
+    if k = 52
+        return "2220446049250313080847263336181640625"
+    if k = 53
+        return "11102230246251565404236316680908203125"
+    if k = 54
+        return "55511151231257827021181583404541015625"
+    if k = 55
+        return "277555756156289135105907917022705078125"
+    if k = 56
+        return "1387778780781445675529539585113525390625"
+    if k = 57
+        return "6938893903907228377647697925567626953125"
+    if k = 58
+        return "34694469519536141888238489627838134765625"
+    if k = 59
+        return "173472347597680709441192448139190673828125"
+    if k = 60
+        return "867361737988403547205962240695953369140625"
+    ""
+}
+
+; Is the leading prefix of a.d[0:a.nd] lexicographically less than s?
+function dec_prefix_is_less_than(a: pointer[Decimal], s: pointer[const_char]) returns bool
+{
+    var i 0
+    while true
+    {
+        let c (*(s + i) as int)
+        if c = 0
+            return false
+        if i >= a.nd
+            return true
+        let b (*(a.d + i) as int)
+        if b <> c
+            return b < c
+        set i: i + 1
+    }
+    false
+}
+
+; Binary shift left (* 2) by k bits. k <= DEC_MAX_SHIFT to avoid overflow.
+procedure dec_left_shift(a: pointer[Decimal], k: int)
+{
+    var delta DEC_LEFT_DELTA[k]
+    if dec_prefix_is_less_than(a, dec_left_cutoff(k))
+        set delta: delta - 1
+
+    let ks k as u64
+    var r a.nd
+    var w a.nd + delta
+
+    ; Pick up a digit, put down a digit.
+    var n: u64 0
+    set r: r - 1
+    while r >= 0
+    {
+        set n: n + ((((*(a.d + r) as int) - (("0" as char) as int)) as u64) << ks)
+        let quo n / (10 as u64)
+        let rem n - ((10 as u64) * quo)
+        set w: w - 1
+        if w < DEC_CAP
+            set *(a.d + w): ((rem as int) + (("0" as char) as int)) as char
+        else
+        {
+            if rem <> (0 as u64)
+                set a.trunc: true
+        }
+        set n: quo
+        set r: r - 1
+    }
+
+    ; Put down extra digits.
+    while n > (0 as u64)
+    {
+        let quo n / (10 as u64)
+        let rem n - ((10 as u64) * quo)
+        set w: w - 1
+        if w < DEC_CAP
+            set *(a.d + w): ((rem as int) + (("0" as char) as int)) as char
+        else
+        {
+            if rem <> (0 as u64)
+                set a.trunc: true
+        }
+        set n: quo
+    }
+
+    set a.nd: a.nd + delta
+    if a.nd >= DEC_CAP
+        set a.nd: DEC_CAP
+    set a.dp: a.dp + delta
+    dec_trim(a)
+}
+
+; Binary shift left (k > 0) or right (k < 0).
+procedure dec_shift(a: pointer[Decimal], k: int)
+{
+    if a.nd = 0
+        return
+    if k > 0
+    {
+        var m k
+        while m > DEC_MAX_SHIFT
+        {
+            dec_left_shift(a, DEC_MAX_SHIFT)
+            set m: m - DEC_MAX_SHIFT
+        }
+        dec_left_shift(a, m)
+        return
+    }
+    if k < 0
+    {
+        var m k
+        while m < (0 - DEC_MAX_SHIFT)
+        {
+            dec_right_shift(a, DEC_MAX_SHIFT)
+            set m: m + DEC_MAX_SHIFT
+        }
+        dec_right_shift(a, 0 - m)
+    }
+}
+
+; If we chop a at nd digits, should we round up?
+function dec_should_round_up(a: pointer[Decimal], nd: int) returns bool
+{
+    if nd < 0
+        return false
+    if nd >= a.nd
+        return false
+    if ((*(a.d + nd) as int) = (("5" as char) as int)) and ((nd + 1) = a.nd)
+    {
+        ; exactly halfway - round to even; if we truncated, a little higher than
+        ; what's recorded - always round up
+        if a.trunc
+            return true
+        if nd <= 0
+            return false
+        return (((*(a.d + (nd - 1)) as int) - (("0" as char) as int)) % 2) <> 0
+    }
+    ; not halfway - digit tells all
+    (*(a.d + nd) as int) >= (("5" as char) as int)
+}
+
+; Round a down to nd digits (or fewer).
+procedure dec_round_down(a: pointer[Decimal], nd: int)
+{
+    if nd < 0
+        return
+    if nd >= a.nd
+        return
+    set a.nd: nd
+    dec_trim(a)
+}
+
+; Round a up to nd digits (or fewer).
+procedure dec_round_up(a: pointer[Decimal], nd: int)
+{
+    if nd < 0
+        return
+    if nd >= a.nd
+        return
+
+    var i nd - 1
+    while i >= 0
+    {
+        let c (*(a.d + i) as int)
+        if c < (("9" as char) as int)
+        {
+            set *(a.d + i): (c + 1) as char
+            set a.nd: i + 1
+            return
+        }
+        set i: i - 1
+    }
+
+    ; Number is all 9s. Change to single 1 with adjusted decimal point.
+    set *(a.d): "1" as char
+    set a.nd: 1
+    set a.dp: a.dp + 1
+}
+
+; Round a to nd digits (or fewer). If nd is zero, it means we're rounding just to
+; the left of the digits, as in 0.09 -> 0.1.
+procedure dec_round(a: pointer[Decimal], nd: int)
+{
+    if nd < 0
+        return
+    if nd >= a.nd
+        return
+    if dec_should_round_up(a, nd)
+        dec_round_up(a, nd)
+    else
+        dec_round_down(a, nd)
+}
+
+; Extract integer part, rounded appropriately. No guarantees about overflow.
+function dec_rounded_integer(a: pointer[Decimal]) returns u64
+{
+    if a.dp > 20
+        return 0xFFFFFFFFFFFFFFFF
+    var n: u64 0
+    var i 0
+    while (i < a.dp) and (i < a.nd)
+    {
+        set n: (n * (10 as u64)) + (((*(a.d + i) as int) - (("0" as char) as int)) as u64)
+        set i: i + 1
+    }
+    while i < a.dp
+    {
+        set n: n * (10 as u64)
+        set i: i + 1
+    }
+    if dec_should_round_up(a, a.dp)
+        set n: n + (1 as u64)
+    n
+}
+
+; ── decimal ← text (internal/strconv/atof.go's `set`) ───────────────────────
+;
+; ★ The `_` arm is the reference's own: "readFloat already checked underscores".
+; Here nothing has — see the SEPARATOR note at jsnum_from_string, which is why
+; that arm is load-bearing rather than transcribed.
+function dec_set(a: pointer[Decimal], s: pointer[char], slen: int) returns bool
+{
+    var i 0
+    set a.neg: false
+    set a.trunc: false
+
+    ; optional sign
+    if i >= slen
+        return false
+    let sign (*(s + i) as int)
+    if sign = (("+" as char) as int)
+        set i: i + 1
+    if sign = (("-" as char) as int)
+    {
+        set i: i + 1
+        set a.neg: true
+    }
+
+    ; digits
+    var sawdot false
+    var sawdigits false
+    while i < slen
+    {
+        let c (*(s + i) as int)
+        if c = (("_" as char) as int)
+        {
+            set i: i + 1
+            continue
+        }
+        if c = (("." as char) as int)
+        {
+            if sawdot
+                return false
+            set sawdot: true
+            set a.dp: a.nd
+            set i: i + 1
+            continue
+        }
+        if (c >= (("0" as char) as int)) and (c <= (("9" as char) as int))
+        {
+            set sawdigits: true
+            if (c = (("0" as char) as int)) and (a.nd = 0)
+            {
+                ; ignore leading zeros
+                set a.dp: a.dp - 1
+                set i: i + 1
+                continue
+            }
+            if a.nd < DEC_CAP
+            {
+                set *(a.d + a.nd): c as char
+                set a.nd: a.nd + 1
+            }
+            else
+            {
+                if c <> (("0" as char) as int)
+                    set a.trunc: true
+            }
+            set i: i + 1
+            continue
+        }
+        break
+    }
+    if not sawdigits
+        return false
+    if not sawdot
+        set a.dp: a.nd
+
+    ; optional exponent moves decimal point. If we read a very large, very long
+    ; number, just be sure to move the decimal point by a lot (say, 100000). It
+    ; doesn't matter if it's not the exact number.
+    if i < slen
+    {
+        if ((*(s + i) as int) | 0x20) = (("e" as char) as int)
+        {
+            set i: i + 1
+            if i >= slen
+                return false
+            var esign 1
+            let es (*(s + i) as int)
+            if es = (("+" as char) as int)
+                set i: i + 1
+            if es = (("-" as char) as int)
+            {
+                set i: i + 1
+                set esign: 0 - 1
+            }
+            if i >= slen
+                return false
+            if (*(s + i) as int) < (("0" as char) as int)
+                return false
+            if (*(s + i) as int) > (("9" as char) as int)
+                return false
+            var e 0
+            while i < slen
+            {
+                let c (*(s + i) as int)
+                if c = (("_" as char) as int)
+                {
+                    set i: i + 1
+                    continue
+                }
+                if c < (("0" as char) as int)
+                    break
+                if c > (("9" as char) as int)
+                    break
+                if e < 10000
+                    set e: ((e * 10) + c) - (("0" as char) as int)
+                set i: i + 1
+            }
+            set a.dp: a.dp + (e * esign)
+        }
+    }
+
+    i = slen
+}
+
+; ── decimal → the IEEE bit pattern (atof.go's `floatBits`) ──────────────────
+
+define DEC_POWTAB: int[] [1, 3, 6, 9, 13, 16, 19, 23, 26]
+define DEC_POWTAB_LEN: int 9
+
+; The `out:` label of the reference's goto chain.
+function dec_assemble(mant: u64, exp: int, neg: bool) returns u64
+{
+    var bits mant & (((1 as u64) << (FLT_MANTBITS as u64)) - (1 as u64))
+    set bits: bits | ((((exp - FLT_BIAS) & ((1 << FLT_EXPBITS) - 1)) as u64) << (FLT_MANTBITS as u64))
+    if neg
+        set bits: bits | (((1 as u64) << (FLT_MANTBITS as u64)) << (FLT_EXPBITS as u64))
+    bits
+}
+
+; Its `overflow:` label — ±Inf.
+function dec_assemble_overflow(neg: bool) returns u64
+    dec_assemble(0 as u64, ((1 << FLT_EXPBITS) - 1) + FLT_BIAS, neg)
+
+function dec_float_bits(a: pointer[Decimal]) returns u64
+{
+    ; Zero is always a special case.
+    if a.nd = 0
+        return dec_assemble(0 as u64, FLT_BIAS, a.neg)
+
+    ; Obvious overflow/underflow. These bounds are for 64-bit floats.
+    if a.dp > 310
+        return dec_assemble_overflow(a.neg)
+    if a.dp < (0 - 330)
+        return dec_assemble(0 as u64, FLT_BIAS, a.neg)
+
+    ; Scale by powers of two until in range [0.5, 1.0)
+    var exp 0
+    while a.dp > 0
+    {
+        var n 27
+        if a.dp < DEC_POWTAB_LEN
+            set n: DEC_POWTAB[a.dp]
+        dec_shift(a, 0 - n)
+        set exp: exp + n
+    }
+    while true
+    {
+        if a.dp > 0
+            break
+        if a.dp = 0
+        {
+            if (*(a.d) as int) >= (("5" as char) as int)
+                break
+        }
+        var n 27
+        if (0 - a.dp) < DEC_POWTAB_LEN
+            set n: DEC_POWTAB[0 - a.dp]
+        dec_shift(a, n)
+        set exp: exp - n
+    }
+
+    ; Our range is [0.5,1) but floating point range is [1,2).
+    set exp: exp - 1
+
+    ; Minimum representable exponent is FLT_BIAS+1. If the exponent is smaller,
+    ; move it up and adjust a accordingly.
+    if exp < (FLT_BIAS + 1)
+    {
+        let n (FLT_BIAS + 1) - exp
+        dec_shift(a, 0 - n)
+        set exp: exp + n
+    }
+
+    if (exp - FLT_BIAS) >= ((1 << FLT_EXPBITS) - 1)
+        return dec_assemble_overflow(a.neg)
+
+    ; Extract 1+FLT_MANTBITS bits.
+    dec_shift(a, 1 + FLT_MANTBITS)
+    var mant dec_rounded_integer(a)
+
+    ; Rounding might have added a bit; shift down.
+    if mant = ((2 as u64) << (FLT_MANTBITS as u64))
+    {
+        set mant: mant >> (1 as u64)
+        set exp: exp + 1
+        if (exp - FLT_BIAS) >= ((1 << FLT_EXPBITS) - 1)
+            return dec_assemble_overflow(a.neg)
+    }
+
+    ; Denormalized?
+    if (mant & ((1 as u64) << (FLT_MANTBITS as u64))) = (0 as u64)
+        set exp: FLT_BIAS
+
+    dec_assemble(mant, exp, a.neg)
+}
+
+; ── the bits → text direction (internal/strconv/ftoa.go) ────────────────────
+;
+; ★ `roundShortest` rounds d (= mant * 2^exp) to the shortest number of digits
+; that will let the original floating point value be precisely reconstructed —
+; which is the whole of ECMAScript's "k is as small as possible" clause, reached
+; here through Go's json encoder rather than written out of the spec.
+procedure ftoa_round_shortest(d: pointer[Decimal], mant: u64, exp: int)
+{
+    ; If mantissa is zero, the number is zero; stop now.
+    if mant = (0 as u64)
+    {
+        set d.nd: 0
+        return
+    }
+
+    ; We may see at once that the number is already shortest: the closest shorter
+    ; number is at least 10^(dp-nd) away and the bounds below are at most
+    ; 2^(exp-mantbits), so 332/100*(dp-nd) >= exp-mantbits settles it
+    ; (log2(10) > 3.32).
+    let minexp FLT_BIAS + 1
+    if exp > minexp
+    {
+        if (332 * (d.dp - d.nd)) >= (100 * (exp - FLT_MANTBITS))
+            return
+    }
+
+    ; d = mant << (exp - mantbits); the next highest float is mant+1 << the same,
+    ; so the upper bound is halfway between: mant*2+1 << exp-mantbits-1.
+    var updigits char[DEC_CAP]
+    var upper Decimal()
+    dec_init(&upper, &updigits[0])
+    dec_assign(&upper, (mant * (2 as u64)) + (1 as u64))
+    dec_shift(&upper, (exp - FLT_MANTBITS) - 1)
+
+    ; The next lowest float is mant-1 << exp-mantbits, unless mant-1 drops the
+    ; significant bit and exp is not the minimum exp, in which case it is
+    ; mant*2-1 << exp-mantbits-1. Either way call it mantlo << explo-mantbits, and
+    ; the lower bound is halfway between.
+    var mantlo: u64 0
+    var explo 0
+    if (mant > ((1 as u64) << (FLT_MANTBITS as u64))) or (exp = minexp)
+    {
+        set mantlo: mant - (1 as u64)
+        set explo: exp
+    }
+    else
+    {
+        set mantlo: (mant * (2 as u64)) - (1 as u64)
+        set explo: exp - 1
+    }
+    var lodigits char[DEC_CAP]
+    var lower Decimal()
+    dec_init(&lower, &lodigits[0])
+    dec_assign(&lower, (mantlo * (2 as u64)) + (1 as u64))
+    dec_shift(&lower, (explo - FLT_MANTBITS) - 1)
+
+    ; The upper and lower bounds are possible outputs only if the original
+    ; mantissa is even, so that IEEE round-to-even would round to the original
+    ; mantissa and not the neighbors.
+    let inclusive (mant % (2 as u64)) = (0 as u64)
+
+    ; upperdelta 0: the digits of d and upper are the same so far. 1: a difference
+    ; of 1 was seen and since then only 9s for d and 0s for upper, so rounding up
+    ; may fall outside an exclusive bound. 2: the difference is greater than 1 and
+    ; rounding up falls within the bound.
+    var upperdelta 0
+
+    let zero ("0" as char) as int
+    let nine ("9" as char) as int
+
+    ; Walk along until d has distinguished itself from upper and lower. lower, d
+    ; and upper may have their decimal points at different places; upper is the
+    ; longest, so ui starts at 0 and li and mi may start negative.
+    var ui 0
+    while true
+    {
+        let mi (ui - upper.dp) + d.dp
+        if mi >= d.nd
+            break
+        let li (ui - upper.dp) + lower.dp
+        var l zero
+        if (li >= 0) and (li < lower.nd)
+            set l: *(lower.d + li) as int
+        var m zero
+        if mi >= 0
+            set m: *(d.d + mi) as int
+        var u zero
+        if ui < upper.nd
+            set u: *(upper.d + ui) as int
+
+        ; Okay to round down (truncate) if lower has a different digit or if lower
+        ; is inclusive and is exactly the result of rounding down.
+        var okdown l <> m
+        if not okdown
+        {
+            if inclusive and ((li + 1) = lower.nd)
+                set okdown: true
+        }
+
+        if upperdelta = 0
+        {
+            if (m + 1) < u
+                set upperdelta: 2
+            else
+            {
+                if m <> u
+                    set upperdelta: 1
+            }
+        }
+        else
+        {
+            if upperdelta = 1
+            {
+                if (m <> nine) or (u <> zero)
+                    set upperdelta: 2
+            }
+        }
+
+        ; Okay to round up if upper has a different digit and either upper is
+        ; inclusive or upper is bigger than the result of rounding up.
+        var okup upperdelta > 0
+        if okup
+        {
+            if not inclusive
+            {
+                if upperdelta <= 1
+                {
+                    if (ui + 1) >= upper.nd
+                        set okup: false
+                }
+            }
+        }
+
+        ; If it's okay to do either, then round to the nearest one. If it's okay
+        ; to do only one, do it.
+        if okdown and okup
+        {
+            dec_round(d, mi + 1)
+            return
+        }
+        if okdown
+        {
+            dec_round_down(d, mi + 1)
+            return
+        }
+        if okup
+        {
+            dec_round_up(d, mi + 1)
+            return
+        }
+        set ui: ui + 1
+    }
+}
+
+; %e: -d.ddddde±dd
+;
+; ★ The reference's `fmt` parameter chooses between 'e' and 'E' and nothing
+; else; only `AppendFloat` reaches this and it always passes 'e'. §3.5ar — the
+; parameter would be a claim about the SIGNATURE rather than the body, so it is
+; the literal instead.
+function ftoa_fmt_e(out: pointer[char], neg: bool, d: pointer[Decimal], prec: int) returns int
+{
+    var w 0
+
+    ; sign
+    if neg
+    {
+        set *(out + w): "-" as char
+        set w: w + 1
+    }
+
+    ; first digit
+    var ch "0" as char
+    if d.nd <> 0
+        set ch: *(d.d)
+    set *(out + w): ch
+    set w: w + 1
+
+    ; .moredigits
+    if prec > 0
+    {
+        set *(out + w): "." as char
+        set w: w + 1
+        var i 1
+        var m d.nd
+        if (prec + 1) < m
+            set m: prec + 1
+        while i < m
+        {
+            set *(out + w): *(d.d + i)
+            set w: w + 1
+            set i: i + 1
+        }
+        while i <= prec
+        {
+            set *(out + w): "0" as char
+            set w: w + 1
+            set i: i + 1
+        }
+    }
+
+    ; e±
+    set *(out + w): "e" as char
+    set w: w + 1
+    var exp d.dp - 1
+    if d.nd = 0
+        set exp: 0
+    if exp < 0
+    {
+        set *(out + w): "-" as char
+        set exp: 0 - exp
+    }
+    else
+        set *(out + w): "+" as char
+    set w: w + 1
+
+    ; dd or ddd
+    if exp < 10
+    {
+        set *(out + w): "0" as char
+        set *(out + (w + 1)): (exp + (("0" as char) as int)) as char
+        return w + 2
+    }
+    if exp < 100
+    {
+        set *(out + w): ((exp / 10) + (("0" as char) as int)) as char
+        set *(out + (w + 1)): ((exp % 10) + (("0" as char) as int)) as char
+        return w + 2
+    }
+    set *(out + w): ((exp / 100) + (("0" as char) as int)) as char
+    set *(out + (w + 1)): (((exp / 10) % 10) + (("0" as char) as int)) as char
+    set *(out + (w + 2)): ((exp % 10) + (("0" as char) as int)) as char
+    w + 3
+}
+
+; %f: -ddddddd.ddddd
+function ftoa_fmt_f(out: pointer[char], neg: bool, d: pointer[Decimal], prec: int) returns int
+{
+    var w 0
+
+    ; sign
+    if neg
+    {
+        set *(out + w): "-" as char
+        set w: w + 1
+    }
+
+    ; integer, padded with zeros as needed.
+    if d.dp > 0
+    {
+        var m d.nd
+        if d.dp < m
+            set m: d.dp
+        var i 0
+        while i < m
+        {
+            set *(out + w): *(d.d + i)
+            set w: w + 1
+            set i: i + 1
+        }
+        while m < d.dp
+        {
+            set *(out + w): "0" as char
+            set w: w + 1
+            set m: m + 1
+        }
+    }
+    else
+    {
+        set *(out + w): "0" as char
+        set w: w + 1
+    }
+
+    ; fraction
+    if prec > 0
+    {
+        set *(out + w): "." as char
+        set w: w + 1
+        var i 0
+        while i < prec
+        {
+            var ch "0" as char
+            let j d.dp + i
+            if (j >= 0) and (j < d.nd)
+                set ch: *(d.d + j)
+            set *(out + w): ch
+            set w: w + 1
+            set i: i + 1
+        }
+    }
+
+    w
+}
+
+; genericFtoa + bigFtoa, restricted to the shortest precision and the two formats
+; jsonwire.AppendFloat asks for. Inf and NaN are answered by jsnum_to_string
+; before this is reached, which is why the reference's first switch arm is absent
+; rather than stubbed.
+function ftoa_shortest(bits: u64, exponential: bool, out: pointer[char]) returns int
+{
+    let neg (bits >> ((FLT_EXPBITS + FLT_MANTBITS) as u64)) <> (0 as u64)
+    var exp ((bits >> (FLT_MANTBITS as u64)) as int) & ((1 << FLT_EXPBITS) - 1)
+    var mant bits & (((1 as u64) << (FLT_MANTBITS as u64)) - (1 as u64))
+
+    if exp = 0
+        set exp: exp + 1                                        ; denormalized
+    else
+        set mant: mant | ((1 as u64) << (FLT_MANTBITS as u64))  ; implicit top bit
+    set exp: exp + FLT_BIAS
+
+    var digits char[DEC_CAP]
+    var d Decimal()
+    dec_init(&d, &digits[0])
+    dec_assign(&d, mant)
+    dec_shift(&d, exp - FLT_MANTBITS)
+    ftoa_round_shortest(&d, mant, exp)
+
+    if exponential
+        return ftoa_fmt_e(out, neg, &d, d.nd - 1)
+    var prec d.nd - d.dp
+    if prec < 0
+        set prec: 0
+    ftoa_fmt_f(out, neg, &d, prec)
+}
+
+; ── jsnum's own two entry points ────────────────────────────────────────────
+;
+; The longest text either direction can produce. The 'f' form is bounded by the
+; rule that selects it — |x| < 1e21 gives at most 21 integer digits, |x| >= 1e-6
+; at most five leading fraction zeros, and the shortest round trip at most 17
+; significant digits — so 1 + 21 + 1 + 22 = 45; the 'e' form is at most 24 and
+; "-Infinity" is 9. Every caller declares this much and no more.
+define JSNUM_MAX_TEXT: int 64
+
+function jsnum_put(out: pointer[char], lit: pointer[const_char]) returns int
+{
+    var i 0
+    while true
+    {
+        let c (*(lit + i) as int)
+        if c = 0
+            return i
+        set *(out + i): c as char
+        set i: i + 1
+    }
+    i
+}
+
+function jsnum_range_equals(s: pointer[char], off: int, slen: int, lit: pointer[const_char]) returns bool
+{
+    var i 0
+    while i < slen
+    {
+        let c (*(lit + i) as int)
+        if c = 0
+            return false
+        if (*(s + (off + i)) as int) <> c
+            return false
+        set i: i + 1
+    }
+    (*(lit + i) as int) = 0
+}
+
+; utf8.DecodeRuneInString over a byte range. RuneError with size 1 for every
+; invalid, truncated, overlong or surrogate encoding, which is Go's answer too.
+function jsnum_decode_rune(s: pointer[char], stop: int, i: int, out_size: pointer[int]) returns int
+{
+    set *out_size: 1
+    if i >= stop
+        return 0xFFFD
+    let b0 (*(s + i) as int)
+    if b0 < 0x80
+        return b0
+    if b0 < 0xC2
+        return 0xFFFD
+    if b0 < 0xE0
+    {
+        if (i + 1) >= stop
+            return 0xFFFD
+        let b1 (*(s + (i + 1)) as int)
+        if (b1 & 0xC0) <> 0x80
+            return 0xFFFD
+        set *out_size: 2
+        return ((b0 & 0x1F) << 6) | (b1 & 0x3F)
+    }
+    if b0 < 0xF0
+    {
+        if (i + 2) >= stop
+            return 0xFFFD
+        let b1 (*(s + (i + 1)) as int)
+        let b2 (*(s + (i + 2)) as int)
+        if (b1 & 0xC0) <> 0x80
+            return 0xFFFD
+        if (b2 & 0xC0) <> 0x80
+            return 0xFFFD
+        let r (((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6)) | (b2 & 0x3F)
+        if r < 0x800
+            return 0xFFFD
+        if (r >= 0xD800) and (r <= 0xDFFF)
+            return 0xFFFD
+        set *out_size: 3
+        return r
+    }
+    if b0 < 0xF5
+    {
+        if (i + 3) >= stop
+            return 0xFFFD
+        let b1 (*(s + (i + 1)) as int)
+        let b2 (*(s + (i + 2)) as int)
+        let b3 (*(s + (i + 3)) as int)
+        if (b1 & 0xC0) <> 0x80
+            return 0xFFFD
+        if (b2 & 0xC0) <> 0x80
+            return 0xFFFD
+        if (b3 & 0xC0) <> 0x80
+            return 0xFFFD
+        let r ((((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12)) | ((b2 & 0x3F) << 6)) | (b3 & 0x3F)
+        if r < 0x10000
+            return 0xFFFD
+        if r > 0x10FFFF
+            return 0xFFFD
+        set *out_size: 4
+        return r
+    }
+    0xFFFD
+}
+
+; utf8.DecodeLastRuneInString, arm for arm — including the `start = end - 1` reset
+; when no start byte is found within UTFMax, which makes the following size test
+; fail and answer RuneError.
+function jsnum_decode_last_rune(s: pointer[char], off: int, stop: int, out_size: pointer[int]) returns int
+{
+    set *out_size: 0
+    if stop <= off
+        return 0xFFFD
+    var start stop - 1
+    let r0 (*(s + start) as int)
+    if r0 < 0x80
+    {
+        set *out_size: 1
+        return r0
+    }
+    var lim stop - 4
+    if lim < off
+        set lim: off
+    set start: start - 1
+    while start >= lim
+    {
+        if ((*(s + start) as int) & 0xC0) <> 0x80
+            break
+        set start: start - 1
+    }
+    if start < lim
+        set start: stop - 1
+    var sz 0
+    let r jsnum_decode_rune(s, stop, start, &sz)
+    if (start + sz) <> stop
+    {
+        set *out_size: 1
+        return 0xFFFD
+    }
+    set *out_size: sz
+    r
+}
+
+; jsnum's isStrWhiteSpace, which the file says is deliberately NOT
+; stringutil.IsWhiteSpaceLike: it is ECMAScript's LineTerminator plus WhiteSpace,
+; and WhiteSpace pulls in the whole Zs category — of which U+0085, the one the
+; scanner's own single-line set carries, is NOT a member.
+function jsnum_is_zs(r: int) returns bool
+{
+    if r = 0x0020
+        return true
+    if r = 0x00A0
+        return true
+    if r = 0x1680
+        return true
+    if (r >= 0x2000) and (r <= 0x200A)
+        return true
+    if r = 0x202F
+        return true
+    if r = 0x205F
+        return true
+    r = 0x3000
+}
+
+function jsnum_is_str_white_space(r: int) returns bool
+{
+    ; LineTerminator
+    if r = 0x000A
+        return true
+    if r = 0x000D
+        return true
+    if r = 0x2028
+        return true
+    if r = 0x2029
+        return true
+    ; WhiteSpace
+    if r = 0x0009
+        return true
+    if r = 0x000B
+        return true
+    if r = 0x000C
+        return true
+    if r = 0xFEFF
+        return true
+    jsnum_is_zs(r)
+}
+
+function jsnum_is_digit(c: int) returns bool
+    (c >= (("0" as char) as int)) and (c <= (("9" as char) as int))
+
+function jsnum_is_number_rune(r: int) returns bool
+{
+    if jsnum_is_digit(r)
+        return true
+    if (r >= (("a" as char) as int)) and (r <= (("f" as char) as int))
+        return true
+    if (r >= (("A" as char) as int)) and (r <= (("F" as char) as int))
+        return true
+    if r = (("." as char) as int)
+        return true
+    if r = (("-" as char) as int)
+        return true
+    if r = (("+" as char) as int)
+        return true
+    if r = (("x" as char) as int)
+        return true
+    if r = (("X" as char) as int)
+        return true
+    if r = (("o" as char) as int)
+        return true
+    r = (("O" as char) as int)
+}
+
+function jsnum_digit_value(c: int) returns int
+{
+    if jsnum_is_digit(c)
+        return c - (("0" as char) as int)
+    if (c >= (("a" as char) as int)) and (c <= (("f" as char) as int))
+        return (c - (("a" as char) as int)) + 10
+    (c - (("A" as char) as int)) + 10
+}
+
+function jsnum_all_digits_base(s: pointer[char], off: int, slen: int, base: int) returns bool
+{
+    var i 0
+    while i < slen
+    {
+        let c (*(s + (off + i)) as int)
+        if base = 16
+        {
+            if not jsnum_is_digit(c)
+            {
+                if not ((c >= (("a" as char) as int)) and (c <= (("f" as char) as int)))
+                {
+                    if not ((c >= (("A" as char) as int)) and (c <= (("F" as char) as int)))
+                        return false
+                }
+            }
+        }
+        else
+        {
+            if not jsnum_is_digit(c)
+                return false
+            if (c - (("0" as char) as int)) >= base
+                return false
+        }
+        set i: i + 1
+    }
+    true
+}
+
+; The number of DECIMAL digits this port will build for a radix literal. A value
+; of 400 decimal digits is at least 10^399, so anything longer is past the
+; largest double and answers +Inf — which is what big.Int's Float64 answers for
+; it too.
+define JSNUM_RADIX_DEC_CAP: int 400
+
+; The exact integer a radix literal names, as an IEEE bit pattern.
+;
+; ★★★ THE REFERENCE SPLITS THIS IN TWO AND THE SPLIT IS NOT OBSERVABLE.
+; `tryParseInt` reads the digits with `strconv.ParseInt(rest, base, 64)` and
+; converts the int64 to a Number, and on RANGE error falls back to
+; `big.Int.SetString(s, 0)` and `Float64()`. Both are "the exact integer, rounded
+; to the nearest double, ties to even" — Go's int64→float64 conversion is
+; specified as round-to-even and big.Float's is too — so ONE conversion answers
+; both arms, and this port builds the exact decimal expansion and hands it to the
+; same `dec_set`/`dec_float_bits` pair every other value goes through.
+function jsnum_radix_to_bits(s: pointer[char], off: int, slen: int, base: int) returns u64
+{
+    ; The exact value in base 10, least significant digit first.
+    var dig char[JSNUM_RADIX_DEC_CAP]
+    var dlen 0
+    var i 0
+    while i < slen
+    {
+        var carry jsnum_digit_value(*(s + (off + i)) as int)
+        var j 0
+        while j < dlen
+        {
+            let t ((dig[j] as int) * base) + carry
+            set dig[j]: (t % 10) as char
+            set carry: t / 10
+            set j: j + 1
+        }
+        while carry > 0
+        {
+            if dlen >= JSNUM_RADIX_DEC_CAP
+                return BITS_INF
+            set dig[dlen]: (carry % 10) as char
+            set carry: carry / 10
+            set dlen: dlen + 1
+        }
+        set i: i + 1
+    }
+    if dlen = 0
+        return 0 as u64
+
+    var txt char[JSNUM_RADIX_DEC_CAP]
+    var k 0
+    while k < dlen
+    {
+        set txt[k]: ((dig[(dlen - 1) - k] as int) + (("0" as char) as int)) as char
+        set k: k + 1
+    }
+
+    var buf char[DEC_CAP]
+    var d Decimal()
+    dec_init(&d, &buf[0])
+    if not dec_set(&d, &txt[0], dlen)
+        return BITS_NAN
+    dec_float_bits(&d)
+}
+
+; tryParseInt, reduced to its three RADIX arms.
+;
+; ★★★ THE DECIMAL ARM IS PROVABLY THE GENERAL PATH and is therefore not written
+; twice. It trims leading zeros, tests `isAllDigits` and parses base 10 — and the
+; float route that follows a `false` answer does exactly the same thing to exactly
+; the same strings: `parseFloatString` trims the same leading zeros and rejects
+; the same non-digits, and `ParseFloat` of an integer string is the exact integer
+; rounded to nearest-even, which is what int64→float64 is. The RADIX arms are the
+; only ones the float route cannot answer, because `x`, `o` and `b` are not
+; digits, so those are the only ones here.
+function jsnum_try_parse_int(s: pointer[char], off: int, slen: int, out_bits: pointer[u64]) returns bool
+{
+    if slen <= 2
+        return false
+    if (*(s + off) as int) <> (("0" as char) as int)
+        return false
+    let c1 (*(s + (off + 1)) as int) | 0x20
+    var base 0
+    if c1 = (("b" as char) as int)
+        set base: 2
+    if c1 = (("o" as char) as int)
+        set base: 8
+    if c1 = (("x" as char) as int)
+        set base: 16
+    if base = 0
+        return false
+
+    if not jsnum_all_digits_base(s, off + 2, slen - 2, base)
+    {
+        set *out_bits: BITS_NAN
+        return true
+    }
+    set *out_bits: jsnum_radix_to_bits(s, off + 2, slen - 2, base)
+    true
+}
+
+; jsnum.FromString — ECMAScript's StringToNumber, answering the double's BITS.
+;
+; ★★ NO SEPARATOR EVER REACHES THIS, AND `decimal.set`'s TWO `_` ARMS ARE DEAD
+; CODE ON BOTH SIDES. The scanner removes them while it builds the raw value,
+; which is where the reference removes them too — and even if one got through,
+; `isNumberRune` below does not admit `_`, so the answer would be NaN before any
+; decimal was built. The arms are ported because `decimal.set` is ported arm for
+; arm, and in Go they ARE live: its other caller is `ParseFloat`, whose
+; `readFloat` validates separators first, which is what their comment there says.
+; Measured rather than argued: slice 44's c9 removes them and is UNGATED on the
+; four yardsticks AND on tests/numcheck.sh, which feeds jsnum raw strings.
+;
+; ★★ PARSE-FLOAT-STRING IS NOT PORTED and the equivalence is exact rather than
+; approximate. It cuts the string at `.` and `e`, trims leading zeros from the
+; integer part and trailing zeros from the fraction, substitutes "0" for an empty
+; integer or fraction part, normalises the exponent's sign and leading zeros, and
+; rejects anything that is then not all digits — and every one of those is
+; something `decimal.set` already does to the ORIGINAL string: it ignores leading
+; zeros (decrementing dp), it tracks the point itself so a trailing `.` and an
+; absent fraction are the same number, it reads the exponent's sign and clamps its
+; magnitude, and it answers `false` on the first byte that belongs to none of
+; those, which is the NaN the rewrite would have produced. The two shapes where
+; the STRING this port hands over differs from the reference's — a kept leading
+; zero and a kept empty fraction, both only in the separator branch of the
+; scanner — are absorbed by those same arms, and the VALUE is the same in each.
+function jsnum_from_string(s: pointer[char], slen: int) returns u64
+{
+    ; s = strings.TrimFunc(s, isStrWhiteSpace)
+    var off 0
+    var len slen
+    while len > 0
+    {
+        var sz 0
+        let r jsnum_decode_rune(s, off + len, off, &sz)
+        if not jsnum_is_str_white_space(r)
+            break
+        set off: off + sz
+        set len: len - sz
+    }
+    while len > 0
+    {
+        var sz 0
+        let r jsnum_decode_last_rune(s, off, off + len, &sz)
+        if not jsnum_is_str_white_space(r)
+            break
+        set len: len - sz
+    }
+
+    if len = 0
+        return 0 as u64
+    if jsnum_range_equals(s, off, len, "Infinity")
+        return BITS_INF
+    if jsnum_range_equals(s, off, len, "+Infinity")
+        return BITS_INF
+    if jsnum_range_equals(s, off, len, "-Infinity")
+        return BITS_NEG_INF
+
+    var i 0
+    while i < len
+    {
+        var sz 0
+        let r jsnum_decode_rune(s, off + len, off + i, &sz)
+        if not jsnum_is_number_rune(r)
+            return BITS_NAN
+        set i: i + sz
+    }
+
+    var ib: u64 0
+    if jsnum_try_parse_int(s, off, len, &ib)
+        return ib
+
+    ; Cut this off first so we can ensure -0 is returned as -0.
+    var negative false
+    if (*(s + off) as int) = (("-" as char) as int)
+    {
+        set negative: true
+        set off: off + 1
+        set len: len - 1
+    }
+    else
+    {
+        if (*(s + off) as int) = (("+" as char) as int)
+        {
+            set off: off + 1
+            set len: len - 1
+        }
+    }
+
+    ; The reference decodes a rune here; every non-ASCII one was refused above, so
+    ; the byte IS the rune. An empty rest decodes to RuneError, which is neither.
+    if len = 0
+        return BITS_NAN
+    let first (*(s + off) as int)
+    if not jsnum_is_digit(first)
+    {
+        if first <> (("." as char) as int)
+            return BITS_NAN
+    }
+
+    var digits char[DEC_CAP]
+    var d Decimal()
+    dec_init(&d, &digits[0])
+    if not dec_set(&d, s + off, len)
+        return BITS_NAN
+    var bits dec_float_bits(&d)
+    if negative
+        set bits: bits | ((1 as u64) << (63 as u64))
+    bits
+}
+
+; Is this double a safe integer in the sense of Number.String's fast path —
+; `MinSafeInteger <= n && n <= MaxSafeInteger && int64(n) == float64(n)` — and if
+; so, what is |int64(n)|?
+;
+; ★★ THE FAST PATH IS NOT AN OPTIMISATION, it decides one answer: `int64(n)`
+; loses the sign of NEGATIVE ZERO, so -0 prints "0" here and would print "-0"
+; through the json encoder, whose own doc says so. ECMAScript's ToString(-0) is
+; "0", so the fast path is the arm that makes this right.
+;
+; ★ The four cases are the bit pattern's, and each is the reference's condition
+; read off it: a subnormal is an integer only when it is ±0; an exponent above the
+; mantissa's width is at least 2^53 and so past MaxSafeInteger; at exactly the
+; mantissa's width the mantissa IS the value; below it the value is an integer
+; exactly when the bits it drops are zero.
+function jsnum_safe_integer(bits: u64, out_mag: pointer[u64]) returns bool
+{
+    let expfield ((bits >> (FLT_MANTBITS as u64)) as int) & ((1 << FLT_EXPBITS) - 1)
+    let frac bits & (((1 as u64) << (FLT_MANTBITS as u64)) - (1 as u64))
+    if expfield = 0
+    {
+        if frac <> (0 as u64)
+            return false
+        set *out_mag: 0 as u64
+        return true
+    }
+    let m frac | ((1 as u64) << (FLT_MANTBITS as u64))
+    let e (expfield - FLT_MANTBITS) + FLT_BIAS
+    if e > 0
+        return false
+    if e = 0
+    {
+        set *out_mag: m
+        return true
+    }
+    let k 0 - e
+    if k > FLT_MANTBITS
+        return false
+    if (m & (((1 as u64) << (k as u64)) - (1 as u64))) <> (0 as u64)
+        return false
+    set *out_mag: m >> (k as u64)
+    true
+}
+
+function jsnum_format_uint(v: u64, out: pointer[char]) returns int
+{
+    if v = (0 as u64)
+    {
+        set *out: "0" as char
+        return 1
+    }
+    var tmp char[24]
+    var n 0
+    var x v
+    while x > (0 as u64)
+    {
+        let q x / (10 as u64)
+        set tmp[n]: (((x - (q * (10 as u64))) as int) + (("0" as char) as int)) as char
+        set n: n + 1
+        set x: q
+    }
+    var w 0
+    var i n - 1
+    while i >= 0
+    {
+        set *(out + w): tmp[i]
+        set w: w + 1
+        set i: i - 1
+    }
+    w
+}
+
+; jsnum.Number.String — the ECMAScript Number-to-String, written into `out` (at
+; most JSNUM_MAX_TEXT bytes) and answering its length.
+function jsnum_to_string(bits: u64, out: pointer[char]) returns int
+{
+    let expfield ((bits >> (FLT_MANTBITS as u64)) as int) & ((1 << FLT_EXPBITS) - 1)
+    let frac bits & (((1 as u64) << (FLT_MANTBITS as u64)) - (1 as u64))
+    let neg (bits >> (63 as u64)) <> (0 as u64)
+
+    if expfield = ((1 << FLT_EXPBITS) - 1)
+    {
+        if frac <> (0 as u64)
+            return jsnum_put(out, "NaN")
+        if neg
+            return jsnum_put(out, "-Infinity")
+        return jsnum_put(out, "Infinity")
+    }
+
+    var mag: u64 0
+    if jsnum_safe_integer(bits, &mag)
+    {
+        var w 0
+        if neg
+        {
+            if mag <> (0 as u64)
+            {
+                set *out: "-" as char
+                set w: 1
+            }
+        }
+        return w + jsnum_format_uint(mag, out + w)
+    }
+
+    ; jsonwire.AppendFloat: the 'e' form for |x| < 1e-6 or |x| >= 1e21, the 'f'
+    ; form otherwise — the rule chosen upstream to be ECMA-262 §7.1.12.1 exactly.
+    let absbits bits & 0x7FFFFFFFFFFFFFFF
+    var exponential false
+    if absbits <> (0 as u64)
+    {
+        if absbits < BITS_1E_MINUS_6
+            set exponential: true
+        if absbits >= BITS_1E21
+            set exponential: true
+    }
+    var n ftoa_shortest(bits, exponential, out)
+
+    ; Clean up e-09 to e-9. Only a NEGATIVE exponent can be one digit here: the
+    ; 'e' form is chosen for |x| >= 1e21, whose exponent is never below 21.
+    if exponential
+    {
+        if n >= 4
+        {
+            if (*(out + (n - 4)) as int) = (("e" as char) as int)
+            {
+                if (*(out + (n - 3)) as int) = (("-" as char) as int)
+                {
+                    if (*(out + (n - 2)) as int) = (("0" as char) as int)
+                    {
+                        set *(out + (n - 2)): *(out + (n - 1))
+                        set n: n - 1
+                    }
+                }
+            }
+        }
+    }
+    n
+}
