@@ -170,11 +170,16 @@ define Checker
     ; need (getSymbolOfDeclaration, the tables) comes through it.
     b: pointer[Binder]
 
-    ; ★ NOT here yet, and deliberately: the RE-SCANNING SCANNER and the
-    ; `hasParseDiagnostics` flag that every grammarError* helper needs. Both are
-    ; one line (the binder has both), and both would be fields no arm of this slice
-    ; reads — §3.5be's shape. They arrive with the first grammar check, which is
-    ; the same slice that owes the diagnostic SORT below.
+    ; ★ THE RE-SCANNING SCANNER IS THE BINDER'S, AND THAT IS AN ARGUMENT RATHER
+    ; THAN A SAVING. grammarErrorOnFirstToken reports at
+    ; scanner.GetRangeOfTokenAtPosition, which the reference builds a FRESH
+    ; scanner for; the binder ported that in slice 31 as
+    ; `range_of_token_at_position` and wrote out why a shared scanner is the same
+    ; answer — it carries no diagnostic sink, `skip_trivia_at` does not touch
+    ; scanner state, and the language variant is set from the file name at
+    ; construction. All three still hold when the sharer is one phase further on,
+    ; and the binder is finished with it by the time a checker exists. A second
+    ; scanner over the same text would be a second thing to keep in step.
 
     ; sourceFile.IsDeclarationFile, read by the checkUnusedRenamedBindingElements
     ; guard.
@@ -223,6 +228,17 @@ define Checker
     non_primitive_type: pointer[Type]
     unique_literal_type: pointer[Type]
 
+    ; c.nodeLinks[node].hasReportedStatementInAmbientContext, as a SET of the
+    ; nodes that have it. The reference keeps a links record per node and this
+    ; slice reads exactly one bit off it, so a set is the whole of it; the record
+    ; arrives with the first arm that needs a second field.
+    ;
+    ; ★ Linear membership, deliberately. The set only ever holds nodes in an
+    ; AMBIENT context that have already reported, which is a handful per file even
+    ; in a `.d.ts` — and the reference's own map is keyed by pointer identity,
+    ; which is what this compares.
+    reported_ambient: pointer[Array[pointer[AstNode]]]
+
     ; The unported report, in the parser's and the binder's shape: the FIRST
     ; construct this slice does not implement, its tag, and a detail (a kind, in
     ; almost every case). The dump is suppressed once this is set — an incomplete
@@ -250,6 +266,9 @@ define Checker
         set *dl: DiagnosticList(host)
         set c.diagnostics: dl
         set c.type_count: 0
+        let ra host.allocate(sizeof Array[pointer[AstNode]], alignof Array[pointer[AstNode]]) as pointer[Array[pointer[AstNode]]]
+        set *ra: Array[pointer[AstNode]]()
+        set c.reported_ambient: ra
         set c.unported_pos: 0 - 1
         set c.unported_tag: null
         set c.unported_detail: 0
@@ -577,16 +596,54 @@ define Checker
     ; type is errorType, printed `any` — which is what the reference answers for
     ; it in every unit of the corpus.
     ;
-    ; ★ The kinds this list is MISSING are not a mystery either, and that is the
-    ; point of the report: the statement kinds almost certainly belong here (a
-    ; VariableStatement is not a declaration node — the reference's own grammar
-    ; check ORs `decl.Kind == KindVariableStatement` beside IsDeclarationNode,
-    ; which is the proof), but "almost certainly" is not the standard above, and
-    ; the honest way to admit them is with IsDeclarationNode ported rather than
-    ; with a second enumeration by hand.
+    ; ★★★ SLICE 48 ADDS TWO, AND THE WAY IT EARNS THEM IS THE POINT. Slice 47's
+    ; note here read *the statement kinds almost certainly belong, but "almost
+    ; certainly" is not the standard, and the honest way to admit them is with
+    ; IsDeclarationNode ported rather than with a second enumeration by hand*.
+    ; It is ported now (DeclarationKinds.scaly, derived from the reference's own
+    ; struct graph and verified against its own DeclarationData()), so
+    ; `is_declaration` answers the tenth predicate instead of a paragraph, and
+    ; that is what the two admissions below rest on.
+    ;
+    ; KindEmptyStatement (243) and KindDebuggerStatement (260). The proof is the
+    ; end-of-file token's, re-run for a STATEMENT, and it must hold in every
+    ; context — a `;` can be the body of an `if`, an arm of a case clause or a
+    ; statement of a block, not only a top-level element:
+    ;
+    ;   IsPartOfTypeNode        ported, and answers false: neither kind is in
+    ;                           [FirstTypeNode, LastTypeNode] nor in the switch.
+    ;   IsDeclaration           PORTED as of this slice, and false: neither kind
+    ;                           is among the fifty-six.
+    ;   IsExpressionNode        the switch lists no statement kind and its default
+    ;                           is false.
+    ;   TryGetClassImplementing…  requires an ExpressionWithTypeArguments.
+    ;   IsTypeDeclaration       a six-kind list plus the import/export type-only
+    ;                           arms; a statement is in none of them.
+    ;   IsTypeDeclarationName   requires KindIdentifier.
+    ;   IsDeclarationNameOrImportPropertyName  either the parent is an
+    ;                           import/export specifier and the node must then be
+    ;                           an identifier or a string literal, or it reduces to
+    ;                           IsDeclarationName, whose last test is
+    ;                           `parent.Name() == node` — and a declaration's Name()
+    ;                           is a name node, never a statement.
+    ;   IsBindingElement / IsBindingPattern   three kinds, none of them these.
+    ;   isInRightSideOfImportOrExportAssignment  the parent must be an
+    ;                           ImportEqualsDeclaration whose ModuleReference this
+    ;                           is, or an ExportAssignment whose Expression it is;
+    ;                           both slots take an entity name or an expression.
+    ;   IsMetaProperty(parent)  a MetaProperty's children are tokens.
+    ;   IsImportAttributes      one kind.
+    ;
+    ; So both reach the fallthrough and answer errorType, printed `any` — which is
+    ; what the reference answers for them in every unit of the corpus, and what
+    ; `checker_ambient_statements_only.d.ts` is there to hold it to.
     function kind_has_ported_type_arm(k: int) returns bool
     {
         if k = KindEndOfFile
+            return true
+        if k = KindEmptyStatement
+            return true
+        if k = KindDebuggerStatement
             return true
         false
     }
@@ -716,17 +773,22 @@ define Checker
     ; header), so the whole suggestion/unused branch is not entered, and what is
     ; left is checkSourceFile followed by the collection's sorted view.
     procedure get_diagnostics(this)
+    {
         this.check_source_file()
+        ; GetDiagnosticsForFile sorts the collection before answering — see
+        ; DiagnosticList.sort_by_position for the comparison and for why this list
+        ; sorts while the parser's does not.
+        diagnostics.sort_by_position()
+    }
 
     ; checkSourceFile. The `links.typeChecked` once-guard is dropped for the
     ; binder's reason: a Checker here is one object, used once, on the caller's
     ; page.
     procedure check_source_file(this)
     {
-        ; Grammar checking.
+        ; Grammar checking. The result is discarded upstream too — the bool is
+        ; there for the `&&` inside checkGrammarSourceFile and nothing reads it.
         this.check_grammar_source_file()
-        if this.is_unported()
-            return
 
         ; `c.renamedBindingElementsInTypes = nil` — the list
         ; checkVariableLikeDeclaration appends to and
@@ -792,25 +854,99 @@ define Checker
         this.check_source_element_worker(node)
     }
 
-    ; ★★★ checkSourceElementWorker, and NOTHING OF ITS SWITCH IS PORTED YET, so
-    ; this is one report rather than sixty. Three things stand in front of the
-    ; switch and all three are why:
+    ; ★★★ checkSourceElementWorker. THREE ARMS OF ITS SIXTY ARE PORTED, and what
+    ; had to be settled before ANY of them could be was the two steps that stand in
+    ; FRONT of the switch and run for every node.
     ;
-    ;   - `node.EagerJSDoc(nil)` → checkJSDocComments for every comment and every
-    ;     tag. Ported JSDoc TREES exist here (the third yardstick compares them),
-    ;     so this one is reachable machinery rather than a hole — but its
-    ;     diagnostics are the checker's, not the parse's.
-    ;   - checkSourceElementUnreachable, which needs the flow graph.
-    ;   - the switch itself, whose arms reach the grammar checks (2 202 lines), the
-    ;     relater (5 006) and the whole type machinery.
+    ; ★★★ THE REACHABILITY CHECK PRODUCES NOTHING THIS YARDSTICK COMPARES, and
+    ; that is read off the reference rather than hoped: checkSourceElementUnreachable
+    ; ends in `c.addErrorOrSuggestion(c.compilerOptions.AllowUnreachableCode ==
+    ; core.TSFalse, diagnostic)`, and AllowUnreachableCode is UNSET under this
+    ; harness (the oracle passes SkipDefaultLibCheck and NoErrorTruncation and
+    ; nothing else), so the flag is TSUnknown, `== TSFalse` is false, and the
+    ; diagnostic goes to `c.suggestionDiagnostics` with CategorySuggestion. The
+    ; oracle calls GetDiagnostics, which reads `c.diagnostics`. Its only other
+    ; effect is `c.withinUnreachableCode`, whose three readers are the guard
+    ; itself and the save/restore around it. So TS7027 cannot appear in a C
+    ; section at all here — which is why an arm may be claimed without the flow
+    ; graph, and why this is stated at the line rather than left as a hole. ★It is
+    ; conditional on the OPTION: a slice that lets `@allowUnreachableCode: false`
+    ; through would make the whole family observable and owe the flow graph.
     ;
-    ; The detail is the KIND, which makes the unported column a histogram over the
-    ; reference's own switch — the work list for every slice after this one, read
-    ; off the corpus rather than guessed. ★And it is the FIRST thing to report in
-    ; almost every unit, which is the coupling the header measures: the C section
-    ; gates the T section, so this one line is what the next slices dismantle.
+    ; ★★ THE JSDOC PASS IS GATED ON THE FLAG THE REFERENCE GATES IT ON.
+    ; `node.EagerJSDoc(nil)` answers nil unless NodeFlagsHasJSDoc is set, so a node
+    ; without the flag cannot enter the loop and the step is a no-op we can prove
+    ; rather than assume. With the flag set it reports: checkJSDocComment acts only
+    ; on the three @link kinds and resolves with ignoreErrors, so it very probably
+    ; adds nothing either — but *very probably* is not the standard the kind
+    ; inventory below is held to, and resolveJSDocMemberName reaches
+    ; getTypeOfSymbol, which reports at ITS own sites. The tighter gate (walk the
+    ; comment parts and admit a JSDoc that carries no link) is a refinement with a
+    ; measurement attached, not a guess.
+    ;
+    ; ★ The kind test comes FIRST, before both, and the order is ours rather than
+    ; the reference's: for a kind whose arm is not ported the unit is unported
+    ; either way, and the tag should name what actually blocks it. Putting the
+    ; JSDoc gate in front would relabel a VariableStatement carrying a doc comment
+    ; as `check-jsdoc-comments`, which fragments the histogram this column exists
+    ; to be.
     procedure check_source_element_worker(this, node: pointer[AstNode])
-        this.record_unported("check", AstNode.kind_of(node))
+    {
+        let k AstNode.kind_of(node)
+        if Checker.kind_has_ported_check_arm(k) = false
+        {
+            this.record_unported("check", k)
+            return
+        }
+        if (AstNode.flags_of(node) & NodeFlagsHasJSDoc) <> 0
+        {
+            this.record_unported("check-jsdoc-comments", k)
+            return
+        }
+
+        if k = KindExpressionStatement
+        {
+            this.check_expression_statement(node)
+            return
+        }
+        ; case ast.KindEmptyStatement:    c.checkGrammarStatementInAmbientContext(node)
+        ; case ast.KindDebuggerStatement: c.checkGrammarStatementInAmbientContext(node)
+        ;
+        ; Two arms whose whole body is that one call — so they are COMPLETE, which
+        ; is the first time anything in this file can say so.
+        this.check_grammar_statement_in_ambient_context(node)
+    }
+
+    function kind_has_ported_check_arm(k: int) returns bool
+    {
+        if k = KindExpressionStatement
+            return true
+        if k = KindEmptyStatement
+            return true
+        if k = KindDebuggerStatement
+            return true
+        false
+    }
+
+    ; checkExpressionStatement, whole:
+    ;
+    ;   c.checkGrammarStatementInAmbientContext(node)
+    ;   c.checkExpression(node.Expression())
+    ;
+    ; ★★ THE SECOND LINE IS THE CHECKER'S WHOLE EXPRESSION DIMENSION, and the
+    ; report is placed there rather than on the statement so that the unported
+    ; column stops saying `ExpressionStatement` — a kind nobody can act on — and
+    ; starts naming the EXPRESSION kinds the corpus actually holds. That is the
+    ; same move slice 47 made when it put the kind on `check`: this column is the
+    ; work list, and a work list is only as useful as its resolution.
+    procedure check_expression_statement(this, node: pointer[AstNode])
+    {
+        this.check_grammar_statement_in_ambient_context(node)
+        let e AstNode.expression_of(node)
+        if e = null
+            return
+        this.record_unported("check-expression", AstNode.kind_of(e))
+    }
 
     ; checkDeferredNodes. The reference walks sourceFileLinks.deferredNodes — the
     ; function and class BODIES that checkExpression parks so that a recursive
@@ -837,6 +973,39 @@ define Checker
     {
     }
 
+    ; ── the grammar checks ──────────────────────────────────────────────────
+    ;
+    ; c.hasParseDiagnostics(sourceFile), whole: `len(sourceFile.Diagnostics()) > 0`.
+    ; ★ It is the PARSE list and not the JS-SYNTAX one: sf.Diagnostics() does not
+    ; include the second list (tscaly_ast.scaly's dump has them as separate
+    ; sections for exactly that reason), so a file whose only complaint is a
+    ; TS8000-series JS-syntax error still gets its grammar checks.
+    function has_parse_diagnostics(this) returns bool
+        AstNode.diagnostic_count(file) > 0
+
+    ; grammarErrorOnFirstToken, whole. The span is the FIRST TOKEN at the node's
+    ; own pos — not GetErrorRangeForNode, so no declaration name and no
+    ; trivia-skip-then-name is involved — which is the same distinction
+    ; binder.error_on_first_token draws one phase earlier.
+    ;
+    ; ★★ THE PARSE-DIAGNOSTIC GUARD IS NOT A TIDINESS PASS. A file that failed to
+    ; parse has a tree the grammar checks would read as a stream of violations, so
+    ; the reference suppresses ALL of them and answers false — and the caller reads
+    ; that false as *no grammar error here*, which is how `checkVariableStatement`'s
+    ; `!c.checkGrammarModifiers(node) && …` chain keeps running. A port that
+    ; reported anyway would add diagnostics on exactly the units the parser
+    ; yardstick already calls broken.
+    function grammar_error_on_first_token(this, n: pointer[AstNode], code: int) returns bool
+    {
+        if this.has_parse_diagnostics()
+            return false
+        var start 0
+        var stop 0
+        b.range_of_token_at_position(AstNode.pos_of(n), &start, &stop)
+        diagnostics.add_direct(start, stop, code)
+        true
+    }
+
     ; ── the grammar check the file itself gets ───────────────────────────────
     ;
     ; checkGrammarSourceFile, whole:
@@ -844,33 +1013,180 @@ define Checker
     ;   return node.Flags&ast.NodeFlagsAmbient != 0 &&
     ;       c.checkGrammarTopLevelElementsForRequiredDeclareModifier(node)
     ;
-    ; ★★ THE SECOND HALF IS REPORTED RATHER THAN APPROXIMATED, and the reason is a
-    ; measurement about the reference's own code: its loop is guarded by
-    ; `ast.IsDeclarationNode(decl) || decl.Kind == KindVariableStatement`, and
-    ; IsDeclarationNode is `node.DeclarationData() != nil` — a property of the node
-    ; LAYOUT (which of the reference's structs embed DeclarationBase, 44 of them,
-    ; three being BASES that expand into further kinds), not a list anyone can read
-    ; off a switch. A hand-written kind list here would be a silent wrong answer in
-    ; both directions: a missing kind drops a TS1046 the reference reports, an extra
-    ; one invents a diagnostic where a plain statement stands.
-    ;
-    ; ★ So the report is placed as tightly as the condition allows: an ambient file
-    ; with NO top-level statements cannot reach the loop body, which is what keeps
-    ; an empty `.d.ts` comparable. And what defers the arm is EXACTLY
-    ; IsDeclarationNode — the reporting half needs nothing this port lacks, since
-    ; grammarErrorOnFirstToken is `hasParseDiagnostics` (a field here) plus
-    ; scanner.GetRangeOfTokenAtPosition, which the binder ported in slice 31 and
-    ; which this concept would keep a scanner of its own for. So this line is the
-    ; checker dimension's first bill from the ast module, and it is one predicate.
+    ; ★★★ SLICE 47 DEFERRED THE SECOND HALF ON ONE PREDICATE AND SAID SO, AND
+    ; THIS IS THAT BILL PAID. `ast.IsDeclarationNode` is `node.DeclarationData()
+    ; != nil` — a property of the node LAYOUT, not a list anyone can read off a
+    ; switch — so its note read *a hand-written kind list here would be a silent
+    ; wrong answer in both directions: a missing kind drops a TS1046 the reference
+    ; reports, an extra one invents a diagnostic where a plain statement stands*.
+    ; It is now DERIVED (DeclarationKinds.scaly, generated by closing the
+    ; reference's struct-embedding graph over DeclarationBase and verified against
+    ; the reference's own DeclarationData()), and the derivation is what shows how
+    ; right the deferral was: seven of the fifty-six kinds are ones no reader would
+    ; have guessed, BinaryExpression and ObjectLiteralExpression among them.
     function check_grammar_source_file(this) returns bool
     {
         if (AstNode.flags_of(file) & NodeFlagsAmbient) = 0
             return false
-        if AstNode.list_count(AstNode.statements_of(file)) = 0
-            return false
-        this.record_unported("grammar-source-file-declare", 0)
+        this.check_grammar_top_level_elements_for_required_declare_modifier()
+    }
+
+    ; ★ The OR is the reference's own, and it is the proof that a VariableStatement
+    ; is NOT a declaration node: upstream writes `ast.IsDeclarationNode(decl) ||
+    ; decl.Kind == ast.KindVariableStatement`, which would be dead text if the
+    ; predicate already admitted it. The derived table agrees — 244 is absent from
+    ; it — so the two readings of the reference confirm each other.
+    function check_grammar_top_level_elements_for_required_declare_modifier(this) returns bool
+    {
+        let stmts AstNode.statements_of(file)
+        let n AstNode.list_count(stmts)
+        var i 0
+        while i < n
+        {
+            let decl AstNode.child_in_list(stmts, i)
+            var considered AstNode.is_declaration_node(decl)
+            if AstNode.kind_of(decl) = KindVariableStatement
+                set considered: true
+            if considered
+            {
+                if this.check_grammar_top_level_element_for_required_declare_modifier(decl)
+                    return true
+            }
+            set i: i + 1
+        }
         false
     }
+
+    ; checkGrammarTopLevelElementForRequiredDeclareModifier. The reference's own
+    ; comment on the grammar it enforces is worth keeping, because the exempt list
+    ; below is not derivable from anything else:
+    ;
+    ;   A declare modifier is required for any top level .d.ts declaration except
+    ;   export=, export default, export as namespace, interfaces and imports:
+    ;
+    ;     DeclarationElement:
+    ;        ExportAssignment
+    ;        export_opt   InterfaceDeclaration
+    ;        export_opt   TypeAliasDeclaration
+    ;        export_opt   ImportDeclaration
+    ;        export_opt   ExternalImportDeclaration
+    ;        export_opt   AmbientDeclaration
+    function check_grammar_top_level_element_for_required_declare_modifier(this, node: pointer[AstNode]) returns bool
+    {
+        if Checker.kind_is_exempt_from_declare_modifier(AstNode.kind_of(node))
+            return false
+        var exempting: int ModifierFlagsAmbient | ModifierFlagsExport | ModifierFlagsDefault
+        if b.has_syntactic_modifier(node, exempting)
+            return false
+        this.grammar_error_on_first_token(node, DiagTop_level_declarations_in_d_ts_files_must_start_with_either_a_declare_or_export_modifier)
+    }
+
+    ; The kind half of the condition above, as a function for the reason
+    ; ast.scaly's is_kind_with_type_slot_for_part_of_type_node is one.
+    function kind_is_exempt_from_declare_modifier(k: int) returns bool
+    {
+        if k = KindInterfaceDeclaration
+            return true
+        if k = KindTypeAliasDeclaration
+            return true
+        if k = KindImportDeclaration
+            return true
+        if k = KindJSImportDeclaration
+            return true
+        if k = KindImportEqualsDeclaration
+            return true
+        if k = KindExportDeclaration
+            return true
+        if k = KindExportAssignment
+            return true
+        if k = KindNamespaceExportDeclaration
+            return true
+        false
+    }
+
+    ; ── checkGrammarStatementInAmbientContext ────────────────────────────────
+    ;
+    ; The whole body of the EmptyStatement and DebuggerStatement arms and the first
+    ; line of the ExpressionStatement one, which is why a slice aimed at the
+    ; statement histogram starts here.
+    ;
+    ; ★★ THE ONCE-BIT IS THE POINT OF THE FUNCTION, not bookkeeping around it. The
+    ; reference's own comment: *If we are in a block, we only want to really report
+    ; an error once to prevent noisiness* — so the bit lives on the BLOCK for the
+    ; second diagnostic and on the NODE for the first, and a port that dropped it
+    ; would emit one TS1036 per statement of an ambient block instead of one per
+    ; block. ★And the bit is set to the RESULT of the report, not unconditionally:
+    ; when grammarErrorOnFirstToken is suppressed by a parse diagnostic, nothing is
+    ; marked and the next statement asks again — which is the same answer, since
+    ; the suppression is a property of the file rather than of the statement.
+    ;
+    ; ★ The else branch of the reference is an assertion it has commented out
+    ; ("we must be parented by a statement ... our parent will have already done
+    ; it"), so there is nothing to port there and the function falls through.
+    function check_grammar_statement_in_ambient_context(this, node: pointer[AstNode]) returns bool
+    {
+        if (AstNode.flags_of(node) & NodeFlagsAmbient) = 0
+            return false
+        let parent AstNode.parent_node_of(node)
+        if this.has_reported_ambient(node) = false
+        {
+            var in_signature AstNode.is_function_like(parent)
+            if Checker.is_accessor_kind(AstNode.kind_of(parent))
+                set in_signature: true
+            if in_signature
+            {
+                let reported this.grammar_error_on_first_token(node, DiagAn_implementation_cannot_be_declared_in_ambient_contexts)
+                if reported
+                    this.mark_reported_ambient(node)
+                return reported
+            }
+        }
+        var in_block false
+        let pk AstNode.kind_of(parent)
+        if pk = KindBlock
+            set in_block: true
+        if pk = KindModuleBlock
+            set in_block: true
+        if pk = KindSourceFile
+            set in_block: true
+        if in_block
+        {
+            if this.has_reported_ambient(parent) = false
+            {
+                let reported this.grammar_error_on_first_token(node, DiagStatements_are_not_allowed_in_ambient_contexts)
+                if reported
+                    this.mark_reported_ambient(parent)
+                return reported
+            }
+        }
+        false
+    }
+
+    ; ast.IsAccessor, which is two kinds.
+    function is_accessor_kind(k: int) returns bool
+    {
+        if k = KindGetAccessor
+            return true
+        if k = KindSetAccessor
+            return true
+        false
+    }
+
+    function has_reported_ambient(this, n: pointer[AstNode]) returns bool
+    {
+        let len reported_ambient.get_length() as int
+        var i 0
+        while i < len
+        {
+            if *(reported_ambient.get_buffer() + i) = n
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    procedure mark_reported_ambient(this, n: pointer[AstNode])
+        reported_ambient.add(n)
 
     ; ── the diagnostics, as GetDiagnosticsForFile answers them ──────────────
     ;

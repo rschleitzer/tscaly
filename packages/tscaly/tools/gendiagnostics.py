@@ -50,6 +50,20 @@ SOURCES = [
     # the symbols yardstick compares them. Widening this list is exactly the
     # arrangement the header describes for the phase after the parser.
     os.path.join(SUB, "internal/binder/binder.go"),
+    # Slice 48. The CHECKER's grammar checks are its own file, and the first two
+    # of them are ported here — checkGrammarSourceFile's declare-modifier walk and
+    # checkGrammarStatementInAmbientContext. Widening the list by this file rather
+    # than by the three messages those two report is the arrangement the header
+    # describes: the rule is mechanical and per-FILE, so that the next grammar arm
+    # is a port and not a second edit here. It costs 181 entries with no reader
+    # yet, which is the same bargain internal/binder/binder.go was: 21 of its codes
+    # are what the corpus actually reports.
+    #
+    # ★ internal/checker/checker.go is deliberately NOT here. It references some
+    # 1 000 messages, i.e. the whole table, at which point the generator's own
+    # argument for being selective ("a table nothing reads is a table nobody
+    # checks") stops meaning anything. It joins when an arm of checker.go reports.
+    os.path.join(SUB, "internal/checker/grammarchecks.go"),
 ]
 DST = os.path.join(REPO, "packages/tscaly/0.1.0/tscaly/DiagnosticCodes.scaly")
 
