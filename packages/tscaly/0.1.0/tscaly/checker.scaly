@@ -1,0 +1,901 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; checker — the type half of the reference's internal/checker.
+;
+; ── What this module is FOR, and what a slice of it is ──────────────────────
+;
+; The checker answers two questions about a bound tree, and the fifth yardstick
+; compares both (tests/oracle/types.go, TESTPLAN.md's *The fifth yardstick*):
+;
+;   C  the SEMANTIC DIAGNOSTICS of one file — GetDiagnostics, which runs the
+;      whole check of the file and answers out of the checker's own sorted list
+;   T  the TYPE of every node the reference's own baseline walker may ask about —
+;      GetTypeAtLocation plus TypeToString
+;
+; Neither is reachable through any earlier artifact, which is why the yardstick is
+; a fifth one rather than a section of the fourth: a type is not in the tree and
+; not on a symbol. It is computed on demand, memoised inside the checker and never
+; written back, so a port that computes NO types and a port that computes WRONG
+; ones compare exactly equal on the first four, in both directions.
+;
+; ── The dimension's size, and what that decides ─────────────────────────────
+;
+; ★★★ internal/checker is 59 971 lines against the 12 540 of scanner + parser +
+; binder — measured at slice 46, which projects 88 000–141 000 lines of Scaly, two
+; to three times the whole port to date. So this file will be built over many
+; slices, and the SKELETON's job is to make every one of them an ARM: the type
+; representation, the intrinsic types, the printer's keyword arms, the file-level
+; check, the diagnostic list with the reference's sort, and — the part that earns
+; its keep — a REPORT at every arm that is not ported, so tests/triage.py names
+; the arm that unlocks the most units next. That is the binder's arrangement
+; (§3.5bw) one dimension over.
+;
+; ── What is NOT ported, and why each omission is a decision ─────────────────
+;
+; ★★★ THE FLOW GRAPH IS NOT PORTED, AND IT IS THE CHECKER THAT NEEDS IT. The
+; binder's own header says so — it builds none, and *its reader is the checker* —
+; and this file is that reader arriving. Two things depend on it. Reachability:
+; checkSourceElementWorker begins with checkSourceElementUnreachable, which asks
+; either NodeFlagsUnreachable (a flag the binder sets from currentFlow and this
+; port does not set) or the node's FlowNode (which does not exist here), so a port
+; without it cannot know that a statement is dead and would silently produce no
+; TS7027. Narrowing: every identifier READ goes through getFlowTypeOfReference, so
+; the T section of any expression that mentions a variable depends on it — and
+; TS2454 *used before being assigned* is the corpus's second most common
+; diagnostic at 6 462. Both are therefore reported rather than approximated: an
+; approximated answer here is a wrong answer that looks like a right one, which is
+; the class §3.5bw records for is_in_top_level_context.
+;
+; ★★ THE RELATER AND THE NODEBUILDER ARE NOT PORTED EITHER, and each is a
+; dimension rather than a gap. relater.go (5 006 lines) is assignability, which
+; even `var x: string = 1` needs; nodebuilderimpl.go (3 585) is the type PRINTER,
+; of which this file ports the keyword arms only — the twenty lines of
+; typeToTypeNodeHelper that answer an INTRINSIC — because those are the only type
+; shapes anything here can produce.
+;
+; ★★★ AND THE COUPLING THE SKELETON MEASURED, because it decides how this
+; dimension advances: THE C SECTION GATES THE T SECTION. One dump is one
+; comparison, so a unit counts as matched only when both halves agree — and the C
+; half is complete only when the check of EVERY statement in the unit is ported.
+; Measured over the whole corpus: 7 300 of 17 810 units — 41 % — have an EMPTY C
+; section, and not one of them can be claimed without porting the checks that PROVE
+; it empty. So the
+; 1 230 663 type answers of the corpus wait behind its 63 127 diagnostics, and the
+; checker dimension advances at the speed of checkSourceElement. ★The escape hatch
+; is named here rather than taken: the ORACLE's output would not change by one
+; byte if the comparison were SPLIT into two yardsticks (C and T), because the two
+; sections are already separate lines — it is compare.py, triage.py, run.sh and
+; ctl.sh that would each gain a column (slice 46's rule: all four in one commit,
+; or the first battery lies). That is a harness decision with a measured argument
+; behind it, and it belongs to whichever slice finds the coupling is actually
+; holding the type machinery back.
+;
+; ── What the harness fixes, and what our side therefore inherits ────────────
+;
+; The oracle builds a STUB program: no module resolution, the per-case
+; @target/@lib/@module directives ignored, and the lib set fixed to lib.es5.d.ts
+; (priced at slice 46 as a 3 % diagnostic delta against the reference's default
+; closure). Two of those three are symmetric for free here, because this port has
+; no program layer at all. The third is not: this side reads NO lib, so every
+; global name is unresolved — which is invisible while no arm resolves a name, and
+; is the first thing the slice that ports name resolution has to answer. It is
+; written down here so that slice does not discover it as a diff.
+;
+; ★ compilerOptions: the harness sets SkipDefaultLibCheck and NoErrorTruncation
+; and nothing else, so every option this file would read is at its default —
+; strictNullChecks false, exactOptionalPropertyTypes false, noImplicitAny false,
+; NoUnusedLocals/NoUnusedParameters false (hence checkUnused false at
+; getDiagnostics). Each place that matters says which option it is reading and
+; what its default answers, so that an options record arriving later is a
+; substitution rather than a search.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use tscaly.ast.AstNode
+use tscaly.binder.Binder
+use tscaly.Diagnostics.DiagnosticList
+
+; ── ObjectFlags: two bits, deliberately not a table ─────────────────────────
+;
+; ★★ The reference's ObjectFlags is a 40-entry uint32 enum in
+; internal/checker/types.go, and it is NOT generated beside TypeFlags for a reason
+; that is about the enum rather than about effort: its bit positions are REUSED.
+; `1 << 22` is ObjectFlagsContainsSpread on a type with TypeFlagsObject,
+; ObjectFlagsIsGenericTypeComputed on a union or intersection, and the comments in
+; the source are what say which — so a flat table of names would read as 40
+; independent bits and be wrong in exactly the way a reader cannot see. It also
+; carries a FORWARD reference (ObjectFlagsObjectTypeKindMask names
+; ObjectFlagsInstantiationExpressionType, declared below it), which gentypeflags.py
+; would refuse rather than resolve.
+;
+; So the two bits the intrinsic block below actually SETS are declared here, with
+; their positions from the source, and the table arrives with the slice that needs
+; the object types — where the reuse discipline can be ported with it.
+define ObjectFlagsNone: int 0
+define ObjectFlagsContainsWideningType: int 1 << 16   ; Type is or contains undefined or null widening type
+define ObjectFlagsNonInferrableType: int 1 << 18      ; Type is or contains anyFunctionType or silentNeverType
+
+; ── Type ────────────────────────────────────────────────────────────────────
+;
+; The reference's `Type` is a tag struct plus an interface-typed payload
+; (IntrinsicType, LiteralType, ObjectType, UnionType, …), which is the shape
+; CLAUDE.md §3.1 turns into a sum type. This slice produces exactly ONE payload
+; kind — the intrinsic — so the record carries the intrinsic's own field directly
+; and the union arrives with the second payload, which is the first point at which
+; a `choose` can distinguish anything.
+;
+; ★ `id` is not compared by the yardstick: the dump prints a type's STRING, never
+; its identity. It is kept because the reference's ids are assigned in creation
+; order and several of its caches are keyed on them, so a port that dropped the
+; counter would have to invent one later at every such site.
+define Type
+(
+    id: int
+    flags: int
+    object_flags: int
+
+    ; IntrinsicType.intrinsicName. A static C string in every case the reference
+    ; has: "any", "error", "unresolved", "intrinsic", "unknown", "undefined",
+    ; "null", "string", "number", "bigint", "symbol", "void", "never", "object".
+    intrinsic_name: pointer[const_char]
+)
+{
+    init(i: int, f: int, of: int, nm: pointer[const_char])
+    {
+        set id: i
+        set flags: f
+        set object_flags: of
+        set intrinsic_name: nm
+    }
+}
+
+; ── SemanticMeaning ────────────────────────────────────────────────────────
+;
+; ast.SemanticMeaning: which of the three declaration SPACES a declaration
+; declares into. Three bits, no complement, so a hand-port is the whole table.
+define SemanticMeaningNone: int 0
+define SemanticMeaningValue: int 1 << 0
+define SemanticMeaningType: int 1 << 1
+define SemanticMeaningNamespace: int 1 << 2
+define SemanticMeaningAll: int SemanticMeaningValue | SemanticMeaningType | SemanticMeaningNamespace
+
+define Checker
+(
+    host: pointer[Page]
+    file: pointer[AstNode]
+
+    ; The bind. The checker asks it two questions in this slice — is this file a
+    ; module, and does it own a symbol — and everything the type machinery will
+    ; need (getSymbolOfDeclaration, the tables) comes through it.
+    b: pointer[Binder]
+
+    ; ★ NOT here yet, and deliberately: the RE-SCANNING SCANNER and the
+    ; `hasParseDiagnostics` flag that every grammarError* helper needs. Both are
+    ; one line (the binder has both), and both would be fields no arm of this slice
+    ; reads — §3.5be's shape. They arrive with the first grammar check, which is
+    ; the same slice that owes the diagnostic SORT below.
+
+    ; sourceFile.IsDeclarationFile, read by the checkUnusedRenamedBindingElements
+    ; guard.
+    is_declaration_file: bool
+
+    ; c.diagnostics — the checker's OWN collection, which is neither the parse's
+    ; nor the bind's. Appended through add_direct: the reference's addDiagnostic
+    ; has no dedup (that is the PARSER's parseErrorAtRange), and its
+    ; serializationLevel guard cannot fire here because nothing recurses into the
+    ; printer.
+    diagnostics: pointer[DiagnosticList]
+
+    ; nextTypeId, in creation order.
+    type_count: int
+
+    ; ── the intrinsic types, in the reference's own creation order ───────────
+    ;
+    ; NewChecker builds these before anything else, and the ORDER is theirs
+    ; because the ids are assigned along it. What is missing from the run is named
+    ; at initialize_intrinsic_types.
+    any_type: pointer[Type]
+    auto_type: pointer[Type]
+    wildcard_type: pointer[Type]
+    blocked_string_type: pointer[Type]
+    error_type: pointer[Type]
+    unresolved_type: pointer[Type]
+    non_inferrable_any_type: pointer[Type]
+    intrinsic_marker_type: pointer[Type]
+    unknown_type: pointer[Type]
+    undefined_type: pointer[Type]
+    undefined_widening_type: pointer[Type]
+    missing_type: pointer[Type]
+    undefined_or_missing_type: pointer[Type]
+    optional_type: pointer[Type]
+    null_type: pointer[Type]
+    null_widening_type: pointer[Type]
+    string_type: pointer[Type]
+    number_type: pointer[Type]
+    bigint_type: pointer[Type]
+    es_symbol_type: pointer[Type]
+    void_type: pointer[Type]
+    never_type: pointer[Type]
+    silent_never_type: pointer[Type]
+    implicit_never_type: pointer[Type]
+    unreachable_never_type: pointer[Type]
+    non_primitive_type: pointer[Type]
+    unique_literal_type: pointer[Type]
+
+    ; The unported report, in the parser's and the binder's shape: the FIRST
+    ; construct this slice does not implement, its tag, and a detail (a kind, in
+    ; almost every case). The dump is suppressed once this is set — an incomplete
+    ; port that answered a well-formed dump would be reporting agreement it has
+    ; not earned.
+    unported_pos: int
+    unported_tag: pointer[const_char]
+    unported_detail: int
+)
+{
+    ; ── entry ───────────────────────────────────────────────────────────────
+    ;
+    ; checker.NewChecker, minus the forty-method Program: the oracle's stub answers
+    ; every resolution question with nothing, and this side has no program layer to
+    ; answer them from either, so the two agree by having the same hole. See the
+    ; header for what that costs and where it will first be visible.
+    function create(host: pointer[Page], file: pointer[AstNode], file_name: String, b: pointer[Binder]) returns pointer[Checker]
+    {
+        let c host.allocate(sizeof Checker, alignof Checker) as pointer[Checker]
+        set c.host: host
+        set c.file: file
+        set c.b: b
+        set c.is_declaration_file: is_declaration_file_name(file_name)
+        let dl host.allocate(sizeof DiagnosticList, alignof DiagnosticList) as pointer[DiagnosticList]
+        set *dl: DiagnosticList(host)
+        set c.diagnostics: dl
+        set c.type_count: 0
+        set c.unported_pos: 0 - 1
+        set c.unported_tag: null
+        set c.unported_detail: 0
+        c.initialize_intrinsic_types()
+        c
+    }
+
+    ; ── the unported report ─────────────────────────────────────────────────
+    ;
+    ; The binder's mechanism, verbatim in intent: the FIRST report wins, so the
+    ; tag names the construct that stopped the check rather than the last one
+    ; noticed. `pos` is 0 rather than a real position for the same reason the
+    ; binder's is — the dump's consumer wants the TAG, and a checker report is
+    ; about a construct rather than about a place in the text.
+    procedure record_unported(this, tag: pointer[const_char], detail: int)
+    {
+        if unported_pos < 0
+        {
+            set unported_pos: 0
+            set unported_tag: tag
+            set unported_detail: detail
+        }
+    }
+
+    function is_unported(this) returns bool
+        unported_pos >= 0
+
+    function unported_at(c: pointer[Checker]) returns int
+        c.unported_pos
+
+    function unported_tag_at(c: pointer[Checker]) returns pointer[const_char]
+        c.unported_tag
+
+    function unported_detail_at(c: pointer[Checker]) returns int
+        c.unported_detail
+
+    ; ── the intrinsic types ─────────────────────────────────────────────────
+
+    ; newType, reduced to what an intrinsic needs. The reference threads a payload
+    ; interface through here; this slice has one payload kind (see Type's note).
+    function new_intrinsic_type_ex(this, flags: int, intrinsic_name: pointer[const_char], object_flags: int) returns pointer[Type]
+    {
+        set type_count: type_count + 1
+        let t host.allocate(sizeof Type, alignof Type) as pointer[Type]
+        set *t: Type(type_count, flags, object_flags, intrinsic_name)
+        t
+    }
+
+    function new_intrinsic_type(this, flags: int, intrinsic_name: pointer[const_char]) returns pointer[Type]
+        this.new_intrinsic_type_ex(flags, intrinsic_name, ObjectFlagsNone)
+
+    ; createWideningType. Its whole body is `if c.strictNullChecks { return
+    ; nonWideningType }` and then a fresh intrinsic carrying
+    ; ObjectFlagsContainsWideningType — and strictNullChecks is FALSE under this
+    ; harness's options (see the header), so the second branch is the one that
+    ; runs. It is written as the reference's conditional anyway, with the option
+    ; spelled as a constant, so an options record arriving later is a substitution.
+    function create_widening_type(this, non_widening_type: pointer[Type]) returns pointer[Type]
+    {
+        if Checker.strict_null_checks()
+            return non_widening_type
+        this.new_intrinsic_type_ex(non_widening_type.flags, non_widening_type.intrinsic_name, ObjectFlagsContainsWideningType)
+    }
+
+    ; The two compilerOptions this slice reads, as functions rather than fields:
+    ; there is no options record yet, and a field would claim one exists. Each
+    ; answers the DEFAULT, which is what the oracle's stub program sets (it passes
+    ; SkipDefaultLibCheck and NoErrorTruncation and nothing else).
+    function strict_null_checks() returns bool
+        false
+
+    function exact_optional_property_types() returns bool
+        false
+
+    ; NewChecker's intrinsic block. The order is the reference's, because the type
+    ; ids are assigned along it.
+    ;
+    ; ★★ WHAT IS MISSING FROM THE RUN, and each omission is one mechanism rather
+    ; than one type: the BOOLEAN family (regularFalseType, falseType,
+    ; regularTrueType, trueType) needs newLiteralType, i.e. a value payload on
+    ; Type — §3.5be's rule says a field with no reader is DECLARED rather than
+    ; ported, and nothing in this slice can produce a literal type, so the payload
+    ; arrives with the arm that does. booleanType, stringOrNumberType,
+    ; stringNumberSymbolType, numberOrBigIntType and templateConstraintType need
+    ; getUnionType; numericStringType needs getTemplateLiteralType; and the
+    ; fifteen empty/marker OBJECT types need newAnonymousType and newTypeParameter.
+    ; Every one of them is reachable only from an arm that reports, so their
+    ; absence cannot be observed — which is exactly why it is listed here instead.
+    procedure initialize_intrinsic_types(this)
+    {
+        set any_type: this.new_intrinsic_type(TypeFlagsAny, "any")
+        set auto_type: this.new_intrinsic_type_ex(TypeFlagsAny, "any", ObjectFlagsNonInferrableType)
+        set wildcard_type: this.new_intrinsic_type(TypeFlagsAny, "any")
+        set blocked_string_type: this.new_intrinsic_type(TypeFlagsAny, "any")
+        ; ★ errorType's intrinsic NAME is "error" and its printed form is "any":
+        ; the printer branches on TypeFlagsAny and never reads the name except to
+        ; recognise intrinsicMarkerType. That is why a `T … any` line in the dump
+        ; is most often this type rather than anyType — see get_type_of_node's
+        ; fallthrough.
+        set error_type: this.new_intrinsic_type(TypeFlagsAny, "error")
+        set unresolved_type: this.new_intrinsic_type(TypeFlagsAny, "unresolved")
+        set non_inferrable_any_type: this.new_intrinsic_type_ex(TypeFlagsAny, "any", ObjectFlagsContainsWideningType)
+        set intrinsic_marker_type: this.new_intrinsic_type(TypeFlagsAny, "intrinsic")
+        set unknown_type: this.new_intrinsic_type(TypeFlagsUnknown, "unknown")
+        set undefined_type: this.new_intrinsic_type(TypeFlagsUndefined, "undefined")
+        set undefined_widening_type: this.create_widening_type(undefined_type)
+        set missing_type: this.new_intrinsic_type(TypeFlagsUndefined, "undefined")
+        ; core.IfElse(c.exactOptionalPropertyTypes, c.missingType, c.undefinedType)
+        set undefined_or_missing_type: undefined_type
+        if Checker.exact_optional_property_types()
+            set undefined_or_missing_type: missing_type
+        set optional_type: this.new_intrinsic_type(TypeFlagsUndefined, "undefined")
+        set null_type: this.new_intrinsic_type(TypeFlagsNull, "null")
+        set null_widening_type: this.create_widening_type(null_type)
+        set string_type: this.new_intrinsic_type(TypeFlagsString, "string")
+        set number_type: this.new_intrinsic_type(TypeFlagsNumber, "number")
+        set bigint_type: this.new_intrinsic_type(TypeFlagsBigInt, "bigint")
+        set es_symbol_type: this.new_intrinsic_type(TypeFlagsESSymbol, "symbol")
+        set void_type: this.new_intrinsic_type(TypeFlagsVoid, "void")
+        set never_type: this.new_intrinsic_type(TypeFlagsNever, "never")
+        set silent_never_type: this.new_intrinsic_type_ex(TypeFlagsNever, "never", ObjectFlagsNonInferrableType)
+        set implicit_never_type: this.new_intrinsic_type(TypeFlagsNever, "never")
+        set unreachable_never_type: this.new_intrinsic_type(TypeFlagsNever, "never")
+        set non_primitive_type: this.new_intrinsic_type(TypeFlagsNonPrimitive, "object")
+        ; Special `never` flagged by union reduction to behave as a literal.
+        set unique_literal_type: this.new_intrinsic_type(TypeFlagsNever, "never")
+    }
+
+    ; ── the type printer ────────────────────────────────────────────────────
+    ;
+    ; TypeToString → typeToString → typeToStringEx → nodeBuilder.TypeToTypeNode →
+    ; the emit printer. THIS PORTS THE KEYWORD ARMS OF THAT WORKER AND NOTHING
+    ; ELSE, and the boundary is not arbitrary: those arms answer a bare keyword
+    ; that the printer prints unchanged, so they are the shapes for which the
+    ; nodebuilder and the printer are both identity. Every other arm builds a NODE
+    ; and needs a printer, which is a dimension of its own (3 585 + 486 lines).
+    ;
+    ; ★ THE ORDER OF THE TESTS IS THE REFERENCE'S, and it is load-bearing rather
+    ; than stylistic: the flags are not disjoint. A fresh boolean literal carries
+    ; TypeFlagsBooleanLiteral, and an enum literal carries StringLiteral or
+    ; NumberLiteral as well as EnumLiteral, so testing Void before the literal
+    ; flags would answer a keyword for a literal type. Every arm this slice does
+    ; not port therefore stands IN PLACE, reporting, rather than being left out.
+    ;
+    ; ★ Two things typeToStringEx does before the worker are no-ops here and say
+    ; so at their line: the serializationLevel cutoff (nothing recurses into the
+    ; printer, so the level is always 0) and the truncation (NoErrorTruncation is
+    ; set by the harness, which is the whole reason the oracle passes it — a
+    ; truncated name would make the T section depend on a display budget).
+    ;
+    ; Answers a static C string, which is what every ported arm produces. The arm
+    ; that first needs composition is the one that widens this to a builder.
+    function type_to_string(this, t: pointer[Type]) returns pointer[const_char]
+    {
+        if t = null
+        {
+            ; The reference PANICS here ("should always get typenode"), because a
+            ; nil type reaches the worker only with FlagsAllowEmptyUnionOrIntersection
+            ; set and typeToString does not set it. Reported rather than trapped:
+            ; the dump's caller skips a nil type exactly as the oracle does, so
+            ; this is unreachable from the walk and a report says so without
+            ; inventing a keyword.
+            this.record_unported("type-to-string-null", 0)
+            return null
+        }
+
+        ; getReducedType, which the worker calls when FlagsNoTypeReduction is
+        ; absent — as it is here. It is the identity on everything but a union or
+        ; an intersection with a possibly-never member, and both of those report
+        ; below, so the call is the identity for every type this slice can hold.
+        if (t.flags & TypeFlagsAny) <> 0
+        {
+            ; t.alias — the type-alias name a type may carry — is not represented
+            ; yet, and cannot be: an alias is set by getTypeFromTypeNode, which
+            ; reports. The arm stands here so the next reader sees where it goes.
+            if t = unresolved_type
+            {
+                ; The reference wraps the keyword in a SYNTHETIC LEADING COMMENT
+                ; ("/*unresolved*/ any") and prints it with a printer that keeps
+                ; comments, where every other type is printed with one that
+                ; removes them. That is a printer feature rather than a name, so
+                ; it reports.
+                this.record_unported("type-to-string-unresolved", 0)
+                return null
+            }
+            if t = intrinsic_marker_type
+                return "intrinsic"
+            return "any"
+        }
+        if (t.flags & TypeFlagsUnknown) <> 0
+            return "unknown"
+        if (t.flags & TypeFlagsString) <> 0
+            return "string"
+        if (t.flags & TypeFlagsNumber) <> 0
+            return "number"
+        if (t.flags & TypeFlagsBigInt) <> 0
+            return "bigint"
+        ; `t.flags&Boolean != 0 && t.alias == nil` — booleanType is a UNION of the
+        ; two boolean literals, so this arm needs getUnionType before it can ever
+        ; be entered, and no boolean type exists here to enter it with.
+        if (t.flags & TypeFlagsBoolean) <> 0
+        {
+            this.record_unported("type-to-string-boolean", 0)
+            return null
+        }
+        if (t.flags & TypeFlagsEnumLike) <> 0
+        {
+            this.record_unported("type-to-string-enum", 0)
+            return null
+        }
+        if (t.flags & TypeFlagsStringLiteral) <> 0
+        {
+            this.record_unported("type-to-string-string-literal", 0)
+            return null
+        }
+        if (t.flags & TypeFlagsNumberLiteral) <> 0
+        {
+            this.record_unported("type-to-string-number-literal", 0)
+            return null
+        }
+        if (t.flags & TypeFlagsBigIntLiteral) <> 0
+        {
+            this.record_unported("type-to-string-bigint-literal", 0)
+            return null
+        }
+        if (t.flags & TypeFlagsBooleanLiteral) <> 0
+        {
+            this.record_unported("type-to-string-boolean-literal", 0)
+            return null
+        }
+        if (t.flags & TypeFlagsUniqueESSymbol) <> 0
+        {
+            this.record_unported("type-to-string-unique-symbol", 0)
+            return null
+        }
+        if (t.flags & TypeFlagsVoid) <> 0
+            return "void"
+        if (t.flags & TypeFlagsUndefined) <> 0
+            return "undefined"
+        if (t.flags & TypeFlagsNull) <> 0
+            return "null"
+        if (t.flags & TypeFlagsNever) <> 0
+            return "never"
+        if (t.flags & TypeFlagsESSymbol) <> 0
+            return "symbol"
+        if (t.flags & TypeFlagsNonPrimitive) <> 0
+            return "object"
+        ; Everything past this point is the this-type, the alias, and the object /
+        ; union / intersection / instantiable machinery — the rest of
+        ; nodebuilderimpl.
+        this.record_unported("type-to-string", t.flags)
+        null
+    }
+
+    ; ── GetTypeAtLocation ───────────────────────────────────────────────────
+    ;
+    ; getTypeOfNode, transcribed as a CHAIN because that is what it is: fifteen
+    ; predicates in a fixed order, ending in errorType. A kind switch would be a
+    ; different function — several of the predicates depend on a node's PARENT, not
+    ; on its kind — so the shape is kept and the arms report.
+    ;
+    ; ★★★ AND THE GATE IN THE MIDDLE IS THE HONEST PART. Ten of those predicates
+    ; are not ported (IsExpressionNode, IsDeclarationNode, IsTypeDeclaration,
+    ; IsTypeDeclarationName, IsDeclarationNameOrImportPropertyName,
+    ; IsBindingPattern, isInRightSideOfImportOrExportAssignment, IsMetaProperty,
+    ; IsImportAttributes, and the class-extends pair), and a chain that skipped a
+    ; predicate it cannot evaluate would fall through to errorType and answer
+    ; `any` — a well-formed WRONG answer, on the most common line the yardstick
+    ; compares (`any` is 43 % of the corpus's 1 230 663 type answers, so a wrong
+    ; `any` is the single easiest way for this port to look right). So a kind
+    ; INVENTORY stands in front of them, listing the kinds for which every
+    ; unported predicate is provably false; every other kind reports with its own
+    ; number as the detail, which is the histogram tests/triage.py groups.
+    function get_type_of_node(this, node: pointer[AstNode]) returns pointer[Type]
+    {
+        let k AstNode.kind_of(node)
+
+        ; `ast.IsSourceFile(node) && !ast.IsExternalOrCommonJSModule(...)`. The
+        ; walk never asks about the source file itself (both dumpers skip it), so
+        ; this arm is unreachable from the yardstick and is ported because it is
+        ; one line and because the next reader would otherwise have to prove that
+        ; again.
+        if k = KindSourceFile
+        {
+            if b.is_external_or_common_js_module() = false
+                return error_type
+        }
+
+        ; "We cannot answer semantic questions within a with block, do not proceed
+        ; any further" — the reference's own comment. The flag is the parser's, so
+        ; this arm is complete.
+        if (AstNode.flags_of(node) & NodeFlagsInWithStatement) <> 0
+            return error_type
+
+        if Checker.kind_has_ported_type_arm(k) = false
+        {
+            this.record_unported("type-of-node", k)
+            return null
+        }
+
+        ; The chain's own end: "if we get here, the node is not something we have
+        ; a type for". Reached by exactly the kinds the inventory admits.
+        error_type
+    }
+
+    ; ★★★ THE INVENTORY, AND WHAT ADMITTING A KIND COSTS. A kind belongs here only
+    ; when every predicate of getTypeOfNode that this slice cannot evaluate is
+    ; provably false for it — in EVERY context, since the predicates read parents.
+    ; Slice 47 admits exactly one, and writes the proof out because the next slice
+    ; will extend the list and needs the standard:
+    ;
+    ; KindEndOfFile (1). It is the SourceFile's endOfFileToken, so its parent is
+    ; always the source file. IsPartOfTypeNode: the kind is outside
+    ; [FirstTypeNode, LastTypeNode] and is in none of the switch's cases.
+    ; IsExpressionNode: not in its list, and its default is false.
+    ; TryGetClassImplementingOrExtendingExpressionWithTypeArguments requires an
+    ; ExpressionWithTypeArguments. IsTypeDeclaration and IsDeclarationNode are
+    ; properties of the node LAYOUT and the endOfFileToken is a plain token node.
+    ; IsTypeDeclarationName and IsDeclarationNameOrImportPropertyName both require
+    ; the node to BE a name, i.e. an identifier or a literal.
+    ; IsBindingElement / IsBindingPattern: the two binding kinds.
+    ; isInRightSideOfImportOrExportAssignment walks up from an entity NAME.
+    ; IsMetaProperty(node.Parent) is false because the parent is the source file.
+    ; IsImportAttributes is one kind. So the token reaches the fallthrough and its
+    ; type is errorType, printed `any` — which is what the reference answers for
+    ; it in every unit of the corpus.
+    ;
+    ; ★ The kinds this list is MISSING are not a mystery either, and that is the
+    ; point of the report: the statement kinds almost certainly belong here (a
+    ; VariableStatement is not a declaration node — the reference's own grammar
+    ; check ORs `decl.Kind == KindVariableStatement` beside IsDeclarationNode,
+    ; which is the proof), but "almost certainly" is not the standard above, and
+    ; the honest way to admit them is with IsDeclarationNode ported rather than
+    ; with a second enumeration by hand.
+    function kind_has_ported_type_arm(k: int) returns bool
+    {
+        if k = KindEndOfFile
+            return true
+        false
+    }
+
+    ; ── ast.GetMeaningFromDeclaration ───────────────────────────────────────
+    ;
+    ; ★★ IT LIVES HERE AND UPSTREAM HAS IT IN internal/ast, and the reason is this
+    ; port's own layout rather than a preference: its ModuleDeclaration arm asks
+    ; GetModuleInstanceState, which the reference keeps in `ast` and slice 31 put on
+    ; the BINDER (it needs the visited set and the ancestor chain that the binder
+    ; carries). The `ast` module is declared before `binder`, so a function in
+    ; ast.scaly could not reach it — a module-level name from a module declared
+    ; LATER is a hard `unknown identifier` and, in call-argument position, a
+    ; silently dropped call. So the one arm that needs the binder decides where the
+    ; whole function goes, and it goes with its dependency.
+    ;
+    ; Its reader is the type walk's exclusion for an IDENTIFIER: a name that
+    ; declares nothing into the VALUE space is not asked for its type, with the
+    ; type-alias name as the one exception.
+    function get_meaning_from_declaration(this, node: pointer[AstNode]) returns int
+    {
+        if node = null
+            return SemanticMeaningAll
+        let k AstNode.kind_of(node)
+
+        if Checker.kind_declares_a_value_only(k)
+            return SemanticMeaningValue
+        if Checker.kind_declares_a_type_only(k)
+            return SemanticMeaningType
+        if k = KindEnumMember
+            return SemanticMeaningValue | SemanticMeaningType
+        if k = KindClassDeclaration
+            return SemanticMeaningValue | SemanticMeaningType
+
+        if k = KindModuleDeclaration
+        {
+            if Binder.is_ambient_module(node)
+                return SemanticMeaningNamespace | SemanticMeaningValue
+            if b.get_module_instance_state(node) = ModuleInstanceStateInstantiated
+                return SemanticMeaningNamespace | SemanticMeaningValue
+            return SemanticMeaningNamespace
+        }
+
+        ; The reference's list here returns SemanticMeaningAll, which is also the
+        ; function's default — the kinds are enumerated upstream to say that the
+        ; answer is deliberate, and the enumeration changes no answer, so it is a
+        ; comment here rather than eight more comparisons: EnumDeclaration,
+        ; NamedImports, ImportSpecifier, ImportEqualsDeclaration, ImportDeclaration,
+        ; JSImportDeclaration, ExportAssignment, ExportDeclaration. ★ And the
+        ; SourceFile arm — "an external module can be a Value" — answers
+        ; Namespace|Value, which IS different from the default and is therefore
+        ; below rather than in this comment.
+        if k = KindSourceFile
+            return SemanticMeaningNamespace | SemanticMeaningValue
+
+        SemanticMeaningAll
+    }
+
+    ; The two long `case` lists of GetMeaningFromDeclaration, as functions for the
+    ; reason ast.scaly's is_kind_with_type_slot_for_part_of_type_node is one.
+    function kind_declares_a_value_only(k: int) returns bool
+    {
+        if k = KindVariableDeclaration
+            return true
+        if k = KindParameter
+            return true
+        if k = KindBindingElement
+            return true
+        if k = KindPropertyDeclaration
+            return true
+        if k = KindPropertySignature
+            return true
+        if k = KindPropertyAssignment
+            return true
+        if k = KindShorthandPropertyAssignment
+            return true
+        if k = KindMethodDeclaration
+            return true
+        if k = KindMethodSignature
+            return true
+        if k = KindConstructor
+            return true
+        if k = KindGetAccessor
+            return true
+        if k = KindSetAccessor
+            return true
+        if k = KindFunctionDeclaration
+            return true
+        if k = KindFunctionExpression
+            return true
+        if k = KindArrowFunction
+            return true
+        if k = KindCatchClause
+            return true
+        if k = KindJsxAttribute
+            return true
+        false
+    }
+
+    function kind_declares_a_type_only(k: int) returns bool
+    {
+        if k = KindTypeParameter
+            return true
+        if k = KindInterfaceDeclaration
+            return true
+        if k = KindTypeAliasDeclaration
+            return true
+        if k = KindJSTypeAliasDeclaration
+            return true
+        if k = KindTypeLiteral
+            return true
+        false
+    }
+
+    ; checker.IsTypeAny, which the type walk's class-extends workaround asks: the
+    ; reference re-asks the node itself when the parent's answer is `any`.
+    function is_type_any(t: pointer[Type]) returns bool
+    {
+        if t = null
+            return false
+        (t.flags & TypeFlagsAny) <> 0
+    }
+
+    ; ── GetDiagnostics ──────────────────────────────────────────────────────
+    ;
+    ; getDiagnostics: checkUnused is false under this harness's options (see the
+    ; header), so the whole suggestion/unused branch is not entered, and what is
+    ; left is checkSourceFile followed by the collection's sorted view.
+    procedure get_diagnostics(this)
+        this.check_source_file()
+
+    ; checkSourceFile. The `links.typeChecked` once-guard is dropped for the
+    ; binder's reason: a Checker here is one object, used once, on the caller's
+    ; page.
+    procedure check_source_file(this)
+    {
+        ; Grammar checking.
+        this.check_grammar_source_file()
+        if this.is_unported()
+            return
+
+        ; `c.renamedBindingElementsInTypes = nil` — the list
+        ; checkVariableLikeDeclaration appends to and
+        ; checkUnusedRenamedBindingElements reads. Neither end is ported, so there
+        ; is nothing here to clear; the two are named together at the read below.
+
+        this.check_source_elements(AstNode.statements_of(file))
+        if this.is_unported()
+            return
+
+        this.check_deferred_nodes()
+        if this.is_unported()
+            return
+
+        if b.is_external_or_common_js_module()
+        {
+            ; checkExternalModuleExports plus registerForUnusedIdentifiersCheck.
+            ; The second is observable only through checkUnusedIdentifiers, which
+            ; checkUnused gates off here, so what this arm owes is the first: the
+            ; module's export table walked for a name exported twice with
+            ; different meanings. It needs the module symbol's exports and
+            ; getSymbolFlags, so it reports — and note it is reached only AFTER
+            ; every statement has been checked, which is why a module's dump is
+            ; usually stopped by one of its statements rather than by this line.
+            this.record_unported("check-external-module-exports", 0)
+            return
+        }
+
+        if is_declaration_file = false
+            this.check_unused_renamed_binding_elements()
+
+        this.produce_deferred_diagnostics()
+    }
+
+    procedure check_source_elements(this, nodes: pointer[Array[pointer[AstNode]]])
+    {
+        if nodes = null
+            return
+        var i 0
+        while i < AstNode.list_count(nodes)
+        {
+            ; The reference breaks on cancellation; a report is this port's
+            ; equivalent stopping condition and there is nothing to gain from
+            ; checking the rest of a file whose dump is already suppressed.
+            if this.is_unported()
+                return
+            this.check_source_element(AstNode.child_in_list(nodes, i))
+            set i: i + 1
+        }
+    }
+
+    ; checkSourceElement's whole body is the save/restore of two registers around
+    ; checkSourceElementWorker plus `c.instantiationCount = 0`. currentNode is read
+    ; by the instantiation-depth machinery and withinUnreachableCode by the
+    ; reachability check — neither of which exists here, for the reason the header
+    ; gives — so the saves have nothing to save yet and the worker is called
+    ; directly. The function is kept because every arm of the checker calls it and
+    ; the registers arrive with the flow graph.
+    procedure check_source_element(this, node: pointer[AstNode])
+    {
+        if node = null
+            return
+        this.check_source_element_worker(node)
+    }
+
+    ; ★★★ checkSourceElementWorker, and NOTHING OF ITS SWITCH IS PORTED YET, so
+    ; this is one report rather than sixty. Three things stand in front of the
+    ; switch and all three are why:
+    ;
+    ;   - `node.EagerJSDoc(nil)` → checkJSDocComments for every comment and every
+    ;     tag. Ported JSDoc TREES exist here (the third yardstick compares them),
+    ;     so this one is reachable machinery rather than a hole — but its
+    ;     diagnostics are the checker's, not the parse's.
+    ;   - checkSourceElementUnreachable, which needs the flow graph.
+    ;   - the switch itself, whose arms reach the grammar checks (2 202 lines), the
+    ;     relater (5 006) and the whole type machinery.
+    ;
+    ; The detail is the KIND, which makes the unported column a histogram over the
+    ; reference's own switch — the work list for every slice after this one, read
+    ; off the corpus rather than guessed. ★And it is the FIRST thing to report in
+    ; almost every unit, which is the coupling the header measures: the C section
+    ; gates the T section, so this one line is what the next slices dismantle.
+    procedure check_source_element_worker(this, node: pointer[AstNode])
+        this.record_unported("check", AstNode.kind_of(node))
+
+    ; checkDeferredNodes. The reference walks sourceFileLinks.deferredNodes — the
+    ; function and class BODIES that checkExpression parks so that a recursive
+    ; reference does not force an `any`. Nothing ported defers anything, so the
+    ; set is empty by construction; the call stands where the reference has it,
+    ; because the arm that first defers a body must find the drain already in
+    ; place rather than add it silently.
+    procedure check_deferred_nodes(this)
+    {
+    }
+
+    ; checkUnusedRenamedBindingElements, over the list checkVariableLikeDeclaration
+    ; fills. Empty by construction here for the same reason: its only writer is a
+    ; binding-element arm that reports.
+    procedure check_unused_renamed_binding_elements(this)
+    {
+    }
+
+    ; produceDeferredDiagnostics, over deferredDiagnosticCallbacks. Empty for the
+    ; same reason again — addDeferredDiagnostic's callers are all inside arms that
+    ; report — and kept for the same reason: a diagnostic that is deferred and
+    ; never produced is invisible, so the drain belongs in place from the start.
+    procedure produce_deferred_diagnostics(this)
+    {
+    }
+
+    ; ── the grammar check the file itself gets ───────────────────────────────
+    ;
+    ; checkGrammarSourceFile, whole:
+    ;
+    ;   return node.Flags&ast.NodeFlagsAmbient != 0 &&
+    ;       c.checkGrammarTopLevelElementsForRequiredDeclareModifier(node)
+    ;
+    ; ★★ THE SECOND HALF IS REPORTED RATHER THAN APPROXIMATED, and the reason is a
+    ; measurement about the reference's own code: its loop is guarded by
+    ; `ast.IsDeclarationNode(decl) || decl.Kind == KindVariableStatement`, and
+    ; IsDeclarationNode is `node.DeclarationData() != nil` — a property of the node
+    ; LAYOUT (which of the reference's structs embed DeclarationBase, 44 of them,
+    ; three being BASES that expand into further kinds), not a list anyone can read
+    ; off a switch. A hand-written kind list here would be a silent wrong answer in
+    ; both directions: a missing kind drops a TS1046 the reference reports, an extra
+    ; one invents a diagnostic where a plain statement stands.
+    ;
+    ; ★ So the report is placed as tightly as the condition allows: an ambient file
+    ; with NO top-level statements cannot reach the loop body, which is what keeps
+    ; an empty `.d.ts` comparable. And what defers the arm is EXACTLY
+    ; IsDeclarationNode — the reporting half needs nothing this port lacks, since
+    ; grammarErrorOnFirstToken is `hasParseDiagnostics` (a field here) plus
+    ; scanner.GetRangeOfTokenAtPosition, which the binder ported in slice 31 and
+    ; which this concept would keep a scanner of its own for. So this line is the
+    ; checker dimension's first bill from the ast module, and it is one predicate.
+    function check_grammar_source_file(this) returns bool
+    {
+        if (AstNode.flags_of(file) & NodeFlagsAmbient) = 0
+            return false
+        if AstNode.list_count(AstNode.statements_of(file)) = 0
+            return false
+        this.record_unported("grammar-source-file-declare", 0)
+        false
+    }
+
+    ; ── the diagnostics, as GetDiagnosticsForFile answers them ──────────────
+    ;
+    ; ★★★ AND THE ONE THING THIS SLICE OWES THE NEXT ONE IS A SORT IT DOES NOT
+    ; WRITE. GetDiagnosticsForFile sorts the collection before answering, so a port
+    ; that emitted in DISCOVERY order would differ from the reference as a wrong
+    ; SPAN on every line after the first — a difference that reads as a checker
+    ; defect and is a missing sort. (tests/checktypes.py checks that invariant on
+    ; the oracle's side for exactly this reason, and slice 46's c2 proves it can
+    ; fail: 213 findings.) It is NOT written here because no arm of this slice
+    ; produces a diagnostic — the list is empty in every unit — and a sort with
+    ; nothing to sort is machinery no instrument can reach, which is the shape
+    ; §3.5be argues against. The FIRST arm that reports owes it, and what it owes
+    ; is written out so it is a transcription rather than a rediscovery:
+    ;
+    ;   CompareDiagnostics is path, then pos, then end, then code, then the message
+    ;   ARGUMENTS and the message chain, and the sort is STABLE. The path is one
+    ;   file here. The arguments cannot be compared — this port carries no message
+    ;   text — and they cannot MATTER either: two diagnostics agreeing on pos, end
+    ;   and code are the same three numbers in the dump, so any order between them
+    ;   prints identically. That is the argument for stopping at the code, and it
+    ;   is an argument rather than an approximation.
+    function diagnostic_count(c: pointer[Checker]) returns int
+        c.diagnostics.length()
+
+    function diagnostic_at(c: pointer[Checker], i: int, out_pos: pointer[int], out_end: pointer[int], out_code: pointer[int]) returns bool
+        c.diagnostics.at(i, out_pos, out_end, out_code)
+}

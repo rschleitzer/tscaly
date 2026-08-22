@@ -1,0 +1,399 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; TypeDump — our half of the CHECKER yardstick's dump.
+;
+; ★★★ THIS IS NOT A PORT OF ANYTHING, in the same sense SymbolDump is not: the
+; format is OURS, invented with tests/oracle/types.go and described in
+; TESTPLAN.md's *The fifth yardstick*, and this file is its second producer. Two
+; sections, in this order:
+;
+;   C <pos> <end> <code>                 one line per checker diagnostic
+;   T <kind> <pos> <end> <typeString>    one line per node the type walk asks about
+;
+; It lives inside the package rather than in the dumper PROGRAM for SymbolDump's
+; reason: it walks the tree and holds a builder, and a generic instance handed to a
+; program root reads back as garbage (root CLAUDE.md). The program asks for the
+; whole dump in one call and prints nothing itself.
+;
+; ── The WALK is transcribed, and that is a contract rather than a convenience ─
+;
+; ★★★ `forEachASTNode` and `skipForType` are the reference's own baseline walker
+; (testutil/tsbaseline/type_symbol_baseline.go), and the oracle transcribes them
+; for a reason that applies to this side identically: GetTypeAtLocation at EVERY
+; node nil-dereferences inside the reference, so the exclusions are what keep the
+; oracle alive — *"don't try to get the type of something that is already a type"*,
+; with the type-alias name as its exception. And on THIS side the same list is what
+; decides which nodes appear in the T section: a port whose predicate differed
+; would show up as a shifted list of positions with no clue which test moved. So
+; the two halves of the yardstick transcribe the same walker, and each says so.
+;
+; ★ The one exclusion that is NOT the reference's is the nameless type-only import
+; clause, and it is the oracle's own guard against a crash inside the checker
+; (`import type { A } from './x'` is a nil dereference through a public API). It is
+; mirrored here because a node the oracle cannot ask about must not appear on this
+; side either — the exclusion is part of the FORMAT, not of the reference.
+;
+; ★★ The walk is RECURSIVE here where the reference uses an explicit stack with a
+; reversal. That is the same order — the stack version pushes the children reversed
+; precisely so that popping yields pre-order — and the Reparsed filtering is
+; preserved exactly, including the property that a node the outer condition rejects
+; has its CHILDREN skipped too (the reference's `if` wraps both the append and the
+; child push). Recursion is this port's shape for a walk because Scaly's only
+; escaping-closure form is `return \x: …`, so a fresh visitor closure per level is
+; what the escape checker exists to reject (see ast.scaly and tscaly_ast.scaly).
+;
+; ★ `elem.Parent` is asked of the NODE rather than threaded through the walk,
+; because the reference asks it of the node and because slice 26 measured that the
+; two are the same thing: over 1 467 387 nodes, a node's Parent is exactly its
+; parent in the ForEachChild walk. The source file, which has none, is the only
+; node whose parent is read at all — and it is not, because both conditions
+; short-circuit on `Reparsed == 0` first, which the reference relies on for the
+; same reason (a nil deref otherwise).
+;
+; ── What suppresses the dump ────────────────────────────────────────────────
+;
+; Either half may meet something this slice does not implement, and then NOTHING
+; is printed: the checker's report is the unit's whole answer. That is the
+; parser's and the binder's arrangement, and the reason is theirs — a partial dump
+; would be claiming agreement it has not earned. So `write` answers false and the
+; program root prints the UNPORTED line from the checker's own fields.
+
+use scaly.memory.Page
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use scaly.io.Console
+use tscaly.ast.AstNode
+use tscaly.checker.Checker
+use tscaly.checker.Type
+
+define TypeDump
+(
+    host: pointer[Page]
+    out: pointer[StringBuilder]
+    c: pointer[Checker]
+    file: pointer[AstNode]
+
+    ; ── the walk-only mode, and why the instrument exists ───────────────────
+    ;
+    ; ★★★ WITHOUT IT THE WALK IS UNMEASURED, AND THAT IS THE CHECKER DIMENSION'S
+    ; OWN COUPLING SEEN FROM THE CONTROL SIDE. The C section gates the T section
+    ; (checker.scaly's header has the measurement), so a unit whose statements are
+    ; unported never reaches the walk at all — and in slice 47 that is 1 030 of
+    ; 1 038 units. So everything transcribed here beyond the end-of-file token —
+    ; forEachASTNode's two Reparsed conditions, skipForType's four exclusions,
+    ; ast.IsPartOfTypeNode's twenty arms, GetMeaningFromDeclaration's six, the
+    ; nameless-import guard — would be code no control could turn red, which is
+    ; exactly what PathCheck and NumCheck exist to prevent one dimension down: *an
+    ; unexercised arm is indistinguishable from a correct one*.
+    ;
+    ; In this mode the walk prints the NODE LIST it would ask about and asks for no
+    ; types, so it cannot report and runs on every unit of the corpus:
+    ;
+    ;   W <kind> <pos> <end>
+    ;
+    ; and tests/walkcheck.sh diffs that against the `T <kind> <pos> <end>` prefix
+    ; of the reference's own dump, unit for unit. ★ What it deliberately does NOT
+    ; check is the TYPE — the third field of a T line is not in a W line at all —
+    ; because that is the yardstick's job and an instrument that pretended to
+    ; answer it would be worse than none (tests/checktypes.py's own boundary, from
+    ; the other side).
+    walk_only: bool
+)
+{
+    ; The entry point the dumper program calls: a checked file in, one dump out,
+    ; written to stdout in one write. Answers false when the check reported
+    ; something this slice does not implement, in which case nothing is printed.
+    function write(host: pointer[Page], c: pointer[Checker], file: pointer[AstNode]) returns bool
+        TypeDump.emit(host, c, file, false)
+
+    ; The instrument's entry point: the same walk, printing the node list. Always
+    ; answers true — nothing in this mode can report.
+    function write_walk(host: pointer[Page], c: pointer[Checker], file: pointer[AstNode]) returns bool
+        TypeDump.emit(host, c, file, true)
+
+    function emit(host: pointer[Page], c: pointer[Checker], file: pointer[AstNode], walk_only: bool) returns bool
+    {
+        let d host.allocate(sizeof TypeDump, alignof TypeDump) as pointer[TypeDump]
+        set d.host: host
+        set d.walk_only: walk_only
+        ; `StringBuilder^host()` and NOT allocate-then-assign: its init allocates
+        ; through Page.get(this), so building it as a temporary first writes a bump
+        ; pointer over a page header somewhere in arbitrary memory and the crash
+        ; lands at the NEXT allocation (root CLAUDE.md; SymbolDump's own note has
+        ; the measurement).
+        let sb StringBuilder^host()
+        set d.out: sb
+        set d.c: c
+        set d.file: file
+
+        ; ── C: the checker's diagnostics ───────────────────────────────────
+        ;
+        ; Read back through the collection's sorted view. Empty in every unit of
+        ; this slice, because no ported arm reports — checker.scaly's
+        ; diagnostic_count note has the argument for why the SORT is owed by the
+        ; slice that changes that rather than written here. ★ The instrument has no
+        ; C section at all: its caller does not run the check, so a count read here
+        ; would be a count of nothing and the section would say something the
+        ; instrument does not measure.
+        if walk_only = false
+        {
+            var i 0
+            while i < Checker.diagnostic_count(c)
+            {
+                var pos 0
+                var stop 0
+                var code 0
+                Checker.diagnostic_at(c, i, &pos, &stop, &code)
+                d.out.append("C ")
+                d.out.append(pos)
+                d.out.append(" " as char)
+                d.out.append(stop)
+                d.out.append(" " as char)
+                d.out.append(code)
+                d.out.append("\n" as char)
+                set i: i + 1
+            }
+        }
+
+        ; ── T: the type of every node the walk may ask about ───────────────
+        d.walk(file)
+        if Checker.unported_at(c) >= 0
+            return false
+
+        let s d.out.to_string()
+        Console.print(s.to_c_string())
+        true
+    }
+
+    ; forEachASTNode, transcribed. The two conditions are the reference's, in its
+    ; order, and each is spelled out at its own lines because they are not the same
+    ; condition: the OUTER one decides whether to descend, the INNER one whether to
+    ; ask about this node — a reparsed node under an `as` or `satisfies` is asked
+    ; about, and a reparsed node that merely CONTAINS one is descended into without
+    ; being asked.
+    procedure walk(this, elem: pointer[AstNode])
+    {
+        if elem = null
+            return
+        if c.is_unported()
+            return
+
+        let reparsed (AstNode.flags_of(elem) & NodeFlagsReparsed) <> 0
+        let k AstNode.kind_of(elem)
+
+        ; elem.Flags&Reparsed == 0 || elem.Kind == As || elem.Kind == Satisfies ||
+        ;   ((parent.Kind == Satisfies || parent.Kind == As) && elem == parent.Expression())
+        var descend false
+        if reparsed = false
+            set descend: true
+        if k = KindAsExpression
+            set descend: true
+        if k = KindSatisfiesExpression
+            set descend: true
+        if descend = false
+        {
+            let p AstNode.parent_node_of(elem)
+            if p <> null
+            {
+                let pk AstNode.kind_of(p)
+                var under_assertion false
+                if pk = KindSatisfiesExpression
+                    set under_assertion: true
+                if pk = KindAsExpression
+                    set under_assertion: true
+                if under_assertion
+                {
+                    if AstNode.expression_of(p) = elem
+                        set descend: true
+                }
+            }
+        }
+        if descend = false
+            return
+
+        ; elem.Flags&Reparsed == 0 || parent.Kind == As || parent.Kind == Satisfies
+        var ask false
+        if reparsed = false
+            set ask: true
+        if ask = false
+        {
+            let p AstNode.parent_node_of(elem)
+            if p <> null
+            {
+                let pk AstNode.kind_of(p)
+                if pk = KindAsExpression
+                    set ask: true
+                if pk = KindSatisfiesExpression
+                    set ask: true
+            }
+        }
+        if ask
+            this.visit(elem)
+        if c.is_unported()
+            return
+
+        var i 0
+        let count AstNode.child_count(elem)
+        while i < count
+        {
+            this.walk(AstNode.child_at(elem, i))
+            if c.is_unported()
+                return
+            set i: i + 1
+        }
+    }
+
+    ; The oracle's per-node body: skip the unit itself and the excluded shapes, ask
+    ; for the type, print one line.
+    procedure visit(this, node: pointer[AstNode])
+    {
+        if node = file
+            return
+        if this.skip_for_type(node)
+            return
+        ; The oracle's own exclusion; see the header.
+        if TypeDump.is_nameless_type_only_import_clause(node)
+            return
+
+        ; The instrument stops here: the node IS in the list, and what it would be
+        ; asked is not what the instrument measures.
+        if walk_only
+        {
+            out.append("W ")
+            out.append(AstNode.kind_of(node))
+            out.append(" " as char)
+            out.append(AstNode.pos_of(node))
+            out.append(" " as char)
+            out.append(AstNode.end_of(node))
+            out.append("\n" as char)
+            return
+        }
+
+        var t null as pointer[Type]
+
+        ; The reference's base-class workaround, verbatim in intent: ask the
+        ; ExpressionWithTypeArguments so that `class D extends C` reports `C` and
+        ; not `typeof C`.
+        let p AstNode.parent_node_of(node)
+        if AstNode.is_expression_with_type_arguments_in_class_extends_clause(p)
+        {
+            set t: c.get_type_of_node(p)
+            if c.is_unported()
+                return
+        }
+
+        var reask false
+        if t = null
+            set reask: true
+        if Checker.is_type_any(t)
+            set reask: true
+        if reask
+        {
+            set t: c.get_type_of_node(node)
+            if c.is_unported()
+                return
+        }
+
+        ; The reference SKIPS a nil type. Ours cannot be nil without a report — a
+        ; ported arm of getTypeOfNode always answers a type — so reaching here with
+        ; nil would be a defect in this file rather than a node with no type.
+        if t = null
+            return
+
+        let name c.type_to_string(t)
+        if c.is_unported()
+            return
+        if name = null
+            return
+
+        out.append("T ")
+        out.append(AstNode.kind_of(node))
+        out.append(" " as char)
+        out.append(AstNode.pos_of(node))
+        out.append(" " as char)
+        out.append(AstNode.end_of(node))
+        out.append(" " as char)
+        ; ★ The oracle ESCAPES the type string (backslash, newline, carriage
+        ; return, tab), because a type name is not a token and the dump's last
+        ; field may contain spaces but not a line break. Every name this slice can
+        ; produce is one of fourteen static KEYWORDS, none of which contains a
+        ; character that needs escaping — so there is nothing to escape yet, and
+        ; the escape belongs to the slice whose printer can compose a name. Said
+        ; here rather than left to be discovered, because a missing escape is a
+        ; corrupt dump rather than a wrong line.
+        out.append(name)
+        out.append("\n" as char)
+    }
+
+    ; skipForType, transcribed from writeTypeOrSymbol's non-symbol half.
+    function skip_for_type(this, node: pointer[AstNode]) returns bool
+    {
+        if AstNode.is_part_of_type_node(node)
+            return true
+
+        let k AstNode.kind_of(node)
+        ; An `as`/`satisfies` whose TYPE is reparsed is a JSDoc-derived assertion,
+        ; i.e. syntax that is not in the source.
+        var assertion false
+        if k = KindAsExpression
+            set assertion: true
+        if k = KindSatisfiesExpression
+            set assertion: true
+        if assertion
+        {
+            let ty AstNode.type_of(node)
+            if ty <> null
+            {
+                if (AstNode.flags_of(ty) & NodeFlagsReparsed) <> 0
+                    return true
+            }
+        }
+
+        ; An IDENTIFIER that declares nothing into the VALUE space is not asked
+        ; about — with the type-alias NAME as the exception, which is the one place
+        ; a type declaration's name does have a type worth printing.
+        if k = KindIdentifier
+        {
+            let p AstNode.parent_node_of(node)
+            if (c.get_meaning_from_declaration(p) & SemanticMeaningValue) = 0
+            {
+                var is_alias_name false
+                if AstNode.is_type_or_js_type_alias_declaration(p)
+                {
+                    if AstNode.name_of(p) = node
+                        set is_alias_name: true
+                }
+                if is_alias_name = false
+                    return true
+            }
+        }
+
+        k = KindOmittedExpression
+    }
+
+    ; ★★★ THE ONE EXCLUSION THAT IS OURS, mirrored from tests/oracle/types.go
+    ; because a node the ORACLE will not ask about must not appear on this side
+    ; either. `import type { A } from './x'` — a type-only import clause with named
+    ; bindings and no name — is an ast.IsTypeDeclaration whose
+    ; getSymbolOfDeclaration answers nil (the SPECIFIERS carry the symbols), and
+    ; getDeclaredTypeOfSymbol then dereferences it: SIGSEGV, from one line of valid
+    ; TypeScript through a public API. The reference's own type baseline never meets
+    ; it because the corpus cases carrying that syntax declare
+    ; `@noTypesAndSymbols: true`.
+    ;
+    ; ★ It is written to the SHAPE and not to `GetSymbolAtLocation() == nil`, which
+    ; is a different question and would drop a nameless `export default class {}`'s
+    ; type as well. The three neighbouring spellings are all fine and each says why
+    ; this one is not: a value import is no type declaration, a default type import
+    ; has a name and therefore a symbol, and the nameless default class has one too
+    ; ("default"). Bounded by measurement on the oracle's side: 0 failures over
+    ; 2 867 files.
+    function is_nameless_type_only_import_clause(node: pointer[AstNode]) returns bool
+    {
+        if AstNode.kind_of(node) <> KindImportClause
+            return false
+        if AstNode.is_type_only_of(node) = false
+            return false
+        AstNode.name_of(node) = null
+    }
+}
