@@ -11,8 +11,10 @@
 # check is a reader's eye.
 #
 # ★ WHICH messages: exactly the ones the reference's SCANNER and PARSER
-# reference, deduped — `grep -o 'diagnostics\.[A-Za-z_0-9]*'` over scanner.go and
-# parser.go. That rule is mechanical and it is the reason this generator does not
+# reference, deduped — a `diagnostics.NAME` scrape over scanner.go and
+# parser.go. ★The scrape must refuse a match preceded by a dot: `diagnostics` is
+# also the name of a FIELD (`c.diagnostics.Add`), and slice 50 paid for that when
+# checker.go joined. That rule is mechanical and it is the reason this generator does not
 # emit all ~2400 codes: a table nothing reads is a table nobody checks, and the
 # two files named here are precisely the port's surface. A message that a later
 # slice needs (the checker's) will be picked up by widening the SOURCES list,
@@ -59,17 +61,31 @@ SOURCES = [
     # yet, which is the same bargain internal/binder/binder.go was: 21 of its codes
     # are what the corpus actually reports.
     #
-    # ★ internal/checker/checker.go is deliberately NOT here. It references some
-    # 1 000 messages, i.e. the whole table, at which point the generator's own
-    # argument for being selective ("a table nothing reads is a table nobody
-    # checks") stops meaning anything. It joins when an arm of checker.go reports.
     os.path.join(SUB, "internal/checker/grammarchecks.go"),
+    # Slice 50. checker.go joins, on the condition the note that stood here set:
+    # *it joins when an arm of checker.go reports*. The import/export/module family
+    # is that arm — every one of its five arms names its illegal-context message
+    # in checker.go, and so do `Only ambient modules can use quoted names`, the
+    # module-keyword advice and the two namespace-export reports. So the table
+    # grows 337 -> 947 codes, and the selectivity argument that kept this file out
+    # is spent rather than overruled: it said a table nothing reads is a table
+    # nobody checks, and the reader has arrived.
+    #
+    # ★★ AND WIDENING IT FOUND A DEFECT IN THE SCRAPE THAT ONLY THIS FILE COULD
+    # SHOW: the old regex was `\bdiagnostics\.NAME`, and `\b` matches after a DOT,
+    # so a FIELD named `diagnostics` reads as the PACKAGE. checker.go has one —
+    # `c.diagnostics.Add`, `.Lookup`, `.GetGlobalDiagnostics` — and those three
+    # arrived as message names that are not in the table. They were REPORTED rather
+    # than skipped, which is the arrangement the note below the `Message` discard
+    # describes and the reason the defect cost nothing. The lookbehind is proven
+    # neutral on the five older sources: the same 337 names, as a set.
+    os.path.join(SUB, "internal/checker/checker.go"),
 ]
 DST = os.path.join(REPO, "packages/tscaly/0.1.0/tscaly/DiagnosticCodes.scaly")
 
 # var X_0_expected = &Message{code: 1005, category: CategoryError, key: "...", text: "..."}
 ENTRY = re.compile(r'^var (\w+) = &Message\{code: (\d+), category: Category(\w+),')
-USE = re.compile(r"\bdiagnostics\.([A-Za-z_][A-Za-z_0-9]*)\b")
+USE = re.compile(r"(?<![.\w])diagnostics\.([A-Za-z_][A-Za-z_0-9]*)\b")
 
 
 def main():
@@ -137,7 +153,9 @@ def main():
     out.append("; show — a wrong message with a right code passes here.")
     out.append(";")
     out.append("; The set is exactly the messages the reference's scanner.go, parser.go,")
-    out.append("; jsdoc.go and binder.go reference, deduped. The NAMES are the reference's own")
+    out.append("; jsdoc.go, binder.go, grammarchecks.go and checker.go reference, deduped —")
+    out.append("; refusing a match preceded by a dot, because `diagnostics` is also a FIELD")
+    out.append("; name. The NAMES are the reference's own")
     out.append("; Go identifiers with a")
     out.append("; `Diag` prefix and nothing else changed, so a site in our scanner spells the")
     out.append("; same name as the site in theirs and the two can be diffed by grep.")

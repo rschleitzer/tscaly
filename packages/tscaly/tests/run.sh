@@ -335,9 +335,19 @@ rm -f "$OUT/.built-from-patched-tree"
 # selected the JSX variant and expired the moment both do — the same shape as the
 # .json exclusion slice 19 closed. Both sides now derive the kind from the unit's
 # NAME and clamp it, and .tsx clamps to itself.
+#
+# ★★★ .js FIXTURES JOINED IN SLICE 50, and the reason is that the JSDOC REPARSER
+# had no local fixture at all: it runs only for a JavaScript file, and this
+# collector took `*.ts` and `*.tsx` only — so every one of its constructs was
+# witnessed exclusively by submodule corpus cases. Slice 50 found a reparser
+# defect (finish_reparsed_node did not re-parent its children) through one such
+# case, `compiler_jsDocTypedefTagNamespace[1]`, and a defect whose only gate is a
+# corpus case is a defect whose gate can move under a pin bump. Both sides already
+# derive the script kind from the unit's NAME, which is what makes this a one-line
+# widening rather than a mode.
 cases=()
 while IFS= read -r f; do cases+=("$f"); done < <(
-  find "$PKG/tests/fixtures" -name '*.ts' -o -name '*.tsx' 2>/dev/null | sort
+  find "$PKG/tests/fixtures" \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' \) 2>/dev/null | sort
   find "$SUB/testdata/tests/cases/compiler" "$SUB/testdata/tests/cases/conformance" \
     \( -name '*.ts' -o -name '*.tsx' \) 2>/dev/null | sort
   if [ "$STAGE" -ge 2 ]; then
