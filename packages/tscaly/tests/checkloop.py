@@ -58,17 +58,28 @@ def read_manifest(path):
 def ref_lines(path, mode):
     # diagcheck reads the reference's C lines; walkcheck rewrites its T lines into
     # the W shape the dumper prints. Both are the awk/grep the shell ran per unit.
+    # ★ The prefix test comes before the split, so an uninteresting line costs one
+    # comparison instead of a tokenisation. It is strictly less work and its effect
+    # was NOT measurable: this instrument reads ~220 MB of reference dumps, so its
+    # wall time is decided by the PAGE CACHE — timings of the UNCHANGED code spanned
+    # 4 s to 128 s depending on what the box had just done. ★That replaces a comment
+    # which claimed the change was worth 60 s, a number taken from two runs in
+    # different cache states. **On a box whose I/O state you are not controlling,
+    # one timing is not a measurement** — the steady-state figures in CLAUDE.md are
+    # the minimum of three alternating rounds for exactly this reason.
     out = []
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                if mode == "diags":
+            if mode == "diags":
+                for line in fh:
                     if line.startswith("C "):
                         out.append(line.rstrip("\n"))
-                else:
-                    f = line.split()
-                    if f and f[0] == "T" and len(f) >= 4:
-                        out.append("W %s %s %s" % (f[1], f[2], f[3]))
+            else:
+                for line in fh:
+                    if line.startswith("T "):
+                        f = line.split(" ", 4)
+                        if len(f) >= 4:
+                            out.append("W %s %s %s" % (f[1], f[2], f[3]))
     except OSError:
         pass
     return out
@@ -112,6 +123,7 @@ def main():
     binary = sys.argv[3]
     work = sys.argv[4]
     filt = sys.argv[5] if len(sys.argv) > 5 else ""
+    tree_bin = sys.argv[6] if len(sys.argv) > 6 else ""
     flag = "--diags" if mode == "diags" else "--walk"
 
     jobs = []                       # (case_key, idx, unit_path, ref)
@@ -148,8 +160,31 @@ def main():
                 continue
             jobs.append((case_key, idx, unit_path, ref))
 
+    # ★★★ THE SIDECAR IS READ WHERE IT EXISTS AND THE PROCESS IS SPAWNED WHERE IT
+    # DOES NOT (slice 58). run.sh's `types` dump now runs the dumper in
+    # `--sections` mode and drops the two instrument answers beside the artifact,
+    # so the 17 892 processes this loop used to start are 17 892 file reads — the
+    # parse and the bind behind each one had already been performed in the same
+    # minute. Proven equal over the whole corpus before the switch.
+    #
+    # ★★ THE FALLBACK IS NOT A CONVENIENCE. The sidecar is missing whenever this
+    # instrument is pointed at a BIN other than the one that produced the tree —
+    # which is exactly what every control-battery row does — so the spawn path
+    # stays, and it stays the DEFAULT whenever `BIN` is not the tree's own dumper.
+    # A cached answer from the wrong binary is the one failure this whole file
+    # exists to make impossible.
+    sidecar_name = "types.diags" if mode == "diags" else "types.walk"
+    use_sidecar = os.path.realpath(binary) == os.path.realpath(tree_bin) if tree_bin else False
+
     def run(job):
         case_key, idx, unit_path, ref = job
+        if use_sidecar:
+            side = os.path.join(os.path.dirname(ref), sidecar_name)
+            try:
+                with open(side, "r", errors="replace") as fh:
+                    return job, 0, fh.read(), ""
+            except OSError:
+                pass
         p = subprocess.run([binary, flag, unit_path], capture_output=True, text=True)
         return job, p.returncode, p.stdout, p.stderr
 

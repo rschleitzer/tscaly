@@ -128,10 +128,100 @@ def run_capture(argv, out_path, err_path, timeout=None):
 # scalyls' `*.scaly` walk time out; a cache is derived data with no reason to sit
 # in that walk's path.
 
-_REF_MAGIC = b"TSCALYREF1\n"
+_REF_MAGIC = b"TSCALYREF2\n"
 
 
-def ref_cache_path(ctx, art, case_file):
+class UnitRefCache:
+    """The five reference answers of ONE unit, in one file.
+
+    ★★★ ONE ENTRY PER UNIT AND NOT PER (UNIT, ARTIFACT), because the cost that
+    hurt was file CREATION and not bytes. The first version wrote 89 460 entries
+    for a stage-2 run and the profile put 37 % of the compare phase in `ref` —
+    serving a cache — while the cold run paid +22 % CPU to write it. Five answers
+    in one file is a 5x cut in opens on both paths, and it is the same arithmetic
+    that makes `/usr/bin/true` a 1.58 ms program: on this platform a small file
+    costs about 4 ms to create no matter what is in it.
+
+    ★★ AN ENTRY IS ALL-OR-NOTHING. A unit whose five answers are not all present
+    is not stored, so a partial file can never be read back as a complete one —
+    and a TIMEOUT is never stored at all, because it is a statement about this
+    machine at this moment rather than about the reference.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.have = {}
+        self.fresh = {}
+        self.spoiled = False
+
+    def load(self):
+        if self.path is None:
+            return
+        try:
+            with open(self.path, "rb") as fh:
+                blob = fh.read()
+        except OSError:
+            return
+        if not blob.startswith(_REF_MAGIC):
+            return
+        body = blob[len(_REF_MAGIC):]
+        try:
+            while body:
+                head, body = body.split(b"\n", 1)
+                art, rc_s, n_s, e_s = head.split(b" ")
+                rc, n, e = int(rc_s), int(n_s), int(e_s)
+                if n + e > len(body):
+                    self.have = {}
+                    return
+                self.have[art.decode()] = (rc, body[:n], body[n:n + e])
+                body = body[n + e:]
+        except ValueError:
+            self.have = {}
+
+    def get(self, art):
+        return self.have.get(art)
+
+    def put(self, art, rc, out, err):
+        self.fresh[art] = (rc, out, err)
+
+    def store(self, arts):
+        if self.path is None or self.spoiled or not self.fresh:
+            return
+        merged = dict(self.have)
+        merged.update(self.fresh)
+        if any(a not in merged for a in arts):
+            return
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = "%s.%d.tmp" % (self.path, threading.get_ident())
+            with open(tmp, "wb") as fh:
+                fh.write(_REF_MAGIC)
+                for a in arts:
+                    rc, out, err = merged[a]
+                    fh.write(b"%s %d %d %d\n" % (a.encode(), rc, len(out), len(err)))
+                    fh.write(out)
+                    fh.write(err)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+
+
+def ref_cache_path(ctx, case_file):
+    """The key: the oracle STAMP, the exact path, and the exact bytes.
+
+    ★★★ THE PATH IS PART OF IT AND LEAVING IT OUT WAS THE FIRST THING THIS CACHE
+    GOT WRONG — §3.5ai, *a file's NAME is an input to the parse*, walked into by
+    the person who had been editing that section's neighbours the same afternoon.
+    The oracle picks the ScriptKind and the `.d.ts` ambient flag out of the FILE
+    NAME, so two units with identical bytes and different names have different
+    answers. Keyed on bytes alone the very first run reported **189 hits into an
+    empty cache** — the corpus is full of tiny identical fixtures — and went RED on
+    four yardsticks at once.
+
+    ★★ The ARTIFACT is no longer in the key because it is inside the ENTRY; the
+    five oracle binaries are covered by the stamp like everything else about the
+    reference.
+    """
     if ctx.refcache is None:
         return None
     try:
@@ -139,69 +229,14 @@ def ref_cache_path(ctx, art, case_file):
             unit = fh.read()
     except OSError:
         return None
-    # ★★★ THE PATH IS PART OF THE KEY AND LEAVING IT OUT WAS THE FIRST THING THIS
-    # CACHE GOT WRONG — §3.5ai, *a file's NAME is an input to the parse*, walked
-    # into by the person who wrote that section's neighbours. The oracle picks the
-    # ScriptKind and the `.d.ts` ambient flag out of the FILE NAME, so two units
-    # with identical bytes and different names have different answers. Keyed on
-    # bytes alone the very first run reported **189 hits into an empty cache** —
-    # the corpus is full of tiny identical fixtures — and went RED on four
-    # yardsticks at once. Key on the exact argv the process receives plus the
-    # exact bytes it reads, which together are the whole of its input.
     h = hashlib.sha256()
     h.update(ctx.refkey)
-    h.update(b"\0")
-    h.update(art.encode())
     h.update(b"\0")
     h.update(case_file.encode("utf-8", "surrogateescape"))
     h.update(b"\0")
     h.update(unit)
     k = h.hexdigest()
     return os.path.join(ctx.refcache, k[:2], k)
-
-
-def ref_cache_load(path, out_path, err_path):
-    """Answer (rc, stdout) from a cache entry, or None. Writes the two files."""
-    try:
-        with open(path, "rb") as fh:
-            blob = fh.read()
-    except OSError:
-        return None
-    if not blob.startswith(_REF_MAGIC):
-        return None
-    body = blob[len(_REF_MAGIC):]
-    try:
-        head, body = body.split(b"\n", 1)
-        rc_s, len_s = head.split(b" ")
-        rc, n = int(rc_s), int(len_s)
-    except ValueError:
-        return None
-    if n > len(body):
-        return None
-    out, err = body[:n], body[n:]
-    with open(out_path, "wb") as fh:
-        fh.write(out)
-    with open(err_path, "wb") as fh:
-        fh.write(err)
-    return rc, out
-
-
-def ref_cache_store(path, rc, out, err):
-    # Written through a unique temporary and renamed: two threads may miss on the
-    # same key, and a half-written entry read by the next run is exactly the stale
-    # answer this whole comment is about. `os.replace` is atomic on both platforms
-    # this runs on.
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = "%s.%d.tmp" % (path, threading.get_ident())
-        with open(tmp, "wb") as fh:
-            fh.write(_REF_MAGIC)
-            fh.write(b"%d %d\n" % (rc, len(out)))
-            fh.write(out)
-            fh.write(err)
-        os.replace(tmp, path)
-    except OSError:
-        pass
 
 
 # ── the classifications, moved off `tr` and `case` ───────────────────────────
@@ -284,22 +319,70 @@ def _tick(ctx, slot, t0):
         ctx.profile[slot] = ctx.profile.get(slot, 0.0) + dt
 
 
-def compare_one(ctx, name, art, keep, ours_bin, ref_bin, case_file, work):
+# ★★★ THE `types` ARTIFACT IS DUMPED IN `--sections` MODE, WHICH IS WHERE
+# diagcheck's AND walkcheck's 35 784 PROCESSES WENT. Both instruments used to
+# spawn this same program once per unit — 216 s on stage 2 — to recompute a parse
+# and a bind that had just been performed in the same minute. One invocation now
+# prints all three answers and this writes the two extra ones beside the dump;
+# the instruments read files.
+#
+# ★★ The DUMP section is what lands in `types.ours`, and it is byte-identical to
+# what plain mode prints — proven over the whole corpus before the switch, along
+# with the other two sections, against the three separate invocations. See
+# tscaly_types.scaly for why each section gets a FRESH Checker in its own mode's
+# order, and for the one-stream rule the first attempt broke.
+_SEP_DIAGS = b"==== TSCALY-SECTION diags\n"
+_SEP_DUMP = b"==== TSCALY-SECTION dump\n"
+
+
+def compare_one(ctx, name, art, keep, ours_bin, ref_bin, case_file, work, uc):
     _t = time.time()
-    ours_rc, ours_out = run_capture(
-        [ours_bin, case_file], f"{work}/{art}.ours", f"{work}/{art}.ours.err",
-        ctx.timeout)
+    if art == "types" and ctx.sections:
+        rc, blob = run_capture([ours_bin, "--sections", case_file],
+                               f"{work}/{art}.sections", f"{work}/{art}.ours.err",
+                               ctx.timeout)
+        if rc is TIMED_OUT or _SEP_DIAGS not in blob or _SEP_DUMP not in blob:
+            # A malformed sections blob is a harness failure and never a verdict:
+            # fall back to the three-mode behaviour rather than compare a fragment.
+            ours_rc, ours_out = run_capture(
+                [ours_bin, case_file], f"{work}/{art}.ours", f"{work}/{art}.ours.err",
+                ctx.timeout)
+            for suffix in (".diags", ".walk"):
+                try:
+                    os.unlink(f"{work}/{art}{suffix}")
+                except OSError:
+                    pass
+        else:
+            walk, rest = blob.split(_SEP_DIAGS, 1)
+            diags, dump = rest.split(_SEP_DUMP, 1)
+            with open(f"{work}/{art}.walk", "wb") as fh:
+                fh.write(walk)
+            with open(f"{work}/{art}.diags", "wb") as fh:
+                fh.write(diags)
+            with open(f"{work}/{art}.ours", "wb") as fh:
+                fh.write(dump)
+            ours_rc, ours_out = rc, dump
+        try:
+            os.unlink(f"{work}/{art}.sections")
+        except OSError:
+            pass
+    else:
+        ours_rc, ours_out = run_capture(
+            [ours_bin, case_file], f"{work}/{art}.ours", f"{work}/{art}.ours.err",
+            ctx.timeout)
     _tick(ctx, "ours", _t)
 
     # ★ The ORDER above is load-bearing and the cache does not change it: both
     # sides are produced before either exit code is read, so `jsdoc.ref` exists
     # even when our dumper failed. A cache HIT still writes both files.
     _t = time.time()
-    ref_path = ref_cache_path(ctx, art, case_file)
-    hit = ref_cache_load(ref_path, f"{work}/{art}.ref",
-                         f"{work}/{art}.ref.err") if ref_path else None
+    hit = uc.get(art)
     if hit is not None:
-        ref_rc, ref_out = hit
+        ref_rc, ref_out, ref_err = hit
+        with open(f"{work}/{art}.ref", "wb") as fh:
+            fh.write(ref_out)
+        with open(f"{work}/{art}.ref.err", "wb") as fh:
+            fh.write(ref_err)
         with ctx.ref_lock:
             ctx.ref_hits += 1
     else:
@@ -310,10 +393,13 @@ def compare_one(ctx, name, art, keep, ours_bin, ref_bin, case_file, work):
             ctx.ref_misses += 1
         # ★ A TIMEOUT IS NOT AN ANSWER AND IS NEVER CACHED — it is a statement
         # about this machine at this moment, and storing one would make a
-        # transient hang permanent for every later run.
-        if ref_path and ref_rc is not TIMED_OUT:
+        # transient hang permanent for every later run. It also SPOILS the unit's
+        # entry, so the other four answers are not written behind a hole.
+        if ref_rc is TIMED_OUT:
+            uc.spoiled = True
+        else:
             with open(f"{work}/{art}.ref.err", "rb") as fh:
-                ref_cache_store(ref_path, ref_rc, ref_out, fh.read())
+                uc.put(art, ref_rc, ref_out, fh.read())
     _tick(ctx, "ref", _t)
     _t = time.time()
 
@@ -423,6 +509,9 @@ def main():
     # ★ The key material is run.sh's own oracle STAMP, handed down rather than
     # recomputed here: one definition of *which reference is this*, in the place
     # that already refuses to run against a dirty submodule.
+    # ★ The escape hatch exists so the switch can be A/B-ed against itself, which
+    # is the only thing that licenses it (see compare_one).
+    ctx.sections = not os.environ.get("TSCALY_NO_SECTIONS")
     ctx.prof_lock = threading.Lock()
     ctx.profile = {} if os.environ.get("TSCALY_PROFILE") else None
     ctx.wall = {}
@@ -614,21 +703,48 @@ def main():
             for art, keep in ARTIFACTS:
                 tasks.append(((ci, ui, art), key, art, keep, written, work))
 
-    # ── phase C: every (unit, artifact) on the pool ──────────────────────────
-    def do_compare(task):
-        _, key, art, keep, written, work = task
-        ours_bin, ref_bin = bins[art]
-        verdict = compare_one(ctx, key, art, keep, ours_bin, ref_bin, written, work)
-        tick(len(tasks), 3000, "compare")
-        return verdict
+    # ── phase C: every UNIT on the pool, its five artifacts inside ───────────
+    #
+    # ★★★ THE POOL'S ITEM IS A UNIT AND NOT AN ARTIFACT, so that the reference
+    # cache is ONE file per unit — see UnitRefCache for why file count is the cost
+    # that matters. The five artifacts of a unit then run in ARTIFACTS order inside
+    # one task, which is also the order phase D reads them back in; 17 892 tasks
+    # over ten threads is parallelism to spare, and the profile's ratio of in-task
+    # time to phase wall (7.5x on stage 2) is what says so rather than an argument.
+    #
+    # ★ `tasks` keeps its per-artifact shape because phase D, accepted.txt and
+    # every number in this file's tables are keyed on `(ci, ui, art)`. Only the
+    # SCHEDULING is grouped.
+    unit_groups = {}
+    for t in tasks:
+        unit_groups.setdefault(t[0][:2], []).append(t)
+    unit_jobs = [unit_groups[k] for k in sorted(unit_groups)]
+    art_names = [a for a, _ in ARTIFACTS]
+
+    def do_unit(group):
+        uc = UnitRefCache(ref_cache_path(ctx, group[0][4]) if group else None)
+        uc.load()
+        out = []
+        for task in group:
+            _, key, art, keep, written, work = task
+            ours_bin, ref_bin = bins[art]
+            out.append(compare_one(ctx, key, art, keep, ours_bin, ref_bin,
+                                   written, work, uc))
+            tick(len(tasks), 3000, "compare")
+        _t = time.time()
+        uc.store(art_names)
+        _tick(ctx, "refstore", _t)
+        return out
 
     _phase_t0 = time.time()
     with ThreadPoolExecutor(max_workers=jobs) as pool:
-        verdicts = list(pool.map(do_compare, tasks))
+        grouped = list(pool.map(do_unit, unit_jobs))
+    flat_tasks = [t for g in unit_jobs for t in g]
+    verdicts = [v for g in grouped for v in g]
 
     # ── phase D: accumulate in the loop's order ─────────────────────────────
     results = {}
-    for task, (verdict, message) in zip(tasks, verdicts):
+    for task, (verdict, message) in zip(flat_tasks, verdicts):
         results[task[0]] = (verdict, message, task[1], task[3], task[5])
 
     split_fail_by_case = dict(split_failures)

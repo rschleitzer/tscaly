@@ -100,7 +100,7 @@ mkdir -p "$WORK"
 # interpreter. The verdicts, the counters and failures.txt are byte-identical
 # across the change; that check is the whole licence for it.
 
-eval "$(python3 "$(dirname "$0")/checkloop.py" walk "$CASES" "$BIN" "$WORK" "$FILTER" \
+eval "$(python3 "$(dirname "$0")/checkloop.py" walk "$CASES" "$BIN" "$WORK" "$FILTER" "$OUT/tscaly_types" \
         | sed 's/^\([a-z]*\) \(.*\)$/\1=\2/')" || {
   red "the unit loop failed"
   exit 2
