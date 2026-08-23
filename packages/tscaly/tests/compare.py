@@ -47,6 +47,7 @@
 import os
 import re
 import shutil
+import hashlib
 import subprocess
 import sys
 import threading
@@ -96,6 +97,110 @@ def run_capture(argv, out_path, err_path, timeout=None):
     with open(err_path, "wb") as fh:
         fh.write(proc.stderr)
     return proc.returncode, proc.stdout
+
+
+# ── the REFERENCE cache ──────────────────────────────────────────────────────
+#
+# ★★★ HALF THE DUMP WORK IS THE ORACLE, AND THE ORACLE IS A PURE FUNCTION.
+# Measured over 300 units, ten-wide: both sides 11.22 ms/unit, our side 5.52,
+# the oracle 5.28 — so the reference costs 94 s of a stage-2 run and it computes
+# the SAME ANSWER every time. Checked rather than assumed: all five oracles are
+# byte-identical across two runs on the same unit.
+#
+# ★★★ THE KEY IS THE STAMP THAT ALREADY EXISTS, which is what makes this safe
+# rather than clever. run.sh's `oracle_stamp` is the hashes of the six oracle
+# sources, the submodule HEAD sha and the Go version — i.e. the complete statement
+# of *which reference is this* — and the run REFUSES to start at all if the
+# submodule is dirty, so no edited lib file can ever reach a key. The unit's own
+# BYTES are the other half; a path is not enough, because a case can be rewritten
+# without moving.
+#
+# ★★ WHAT A STALE ENTRY WOULD COST is the reason the key is over-specified rather
+# than minimal: a wrong `.ref` is not a crash, it is a comparison against the
+# wrong reference — the whole suite going green or red for a reason no diff
+# explains. Every input the oracle reads is either in the stamp or in the unit.
+# `TSCALY_NO_REFCACHE=1` turns it off, and the hit/miss counts are printed,
+# because a cache whose hit rate is invisible is a cache nobody can debug.
+#
+# ★ It lives OUTSIDE `packages/` by default. The root CLAUDE.md records that a
+# 443 317-file artifact tree under `packages/` reddens the LSP suite by making
+# scalyls' `*.scaly` walk time out; a cache is derived data with no reason to sit
+# in that walk's path.
+
+_REF_MAGIC = b"TSCALYREF1\n"
+
+
+def ref_cache_path(ctx, art, case_file):
+    if ctx.refcache is None:
+        return None
+    try:
+        with open(case_file, "rb") as fh:
+            unit = fh.read()
+    except OSError:
+        return None
+    # ★★★ THE PATH IS PART OF THE KEY AND LEAVING IT OUT WAS THE FIRST THING THIS
+    # CACHE GOT WRONG — §3.5ai, *a file's NAME is an input to the parse*, walked
+    # into by the person who wrote that section's neighbours. The oracle picks the
+    # ScriptKind and the `.d.ts` ambient flag out of the FILE NAME, so two units
+    # with identical bytes and different names have different answers. Keyed on
+    # bytes alone the very first run reported **189 hits into an empty cache** —
+    # the corpus is full of tiny identical fixtures — and went RED on four
+    # yardsticks at once. Key on the exact argv the process receives plus the
+    # exact bytes it reads, which together are the whole of its input.
+    h = hashlib.sha256()
+    h.update(ctx.refkey)
+    h.update(b"\0")
+    h.update(art.encode())
+    h.update(b"\0")
+    h.update(case_file.encode("utf-8", "surrogateescape"))
+    h.update(b"\0")
+    h.update(unit)
+    k = h.hexdigest()
+    return os.path.join(ctx.refcache, k[:2], k)
+
+
+def ref_cache_load(path, out_path, err_path):
+    """Answer (rc, stdout) from a cache entry, or None. Writes the two files."""
+    try:
+        with open(path, "rb") as fh:
+            blob = fh.read()
+    except OSError:
+        return None
+    if not blob.startswith(_REF_MAGIC):
+        return None
+    body = blob[len(_REF_MAGIC):]
+    try:
+        head, body = body.split(b"\n", 1)
+        rc_s, len_s = head.split(b" ")
+        rc, n = int(rc_s), int(len_s)
+    except ValueError:
+        return None
+    if n > len(body):
+        return None
+    out, err = body[:n], body[n:]
+    with open(out_path, "wb") as fh:
+        fh.write(out)
+    with open(err_path, "wb") as fh:
+        fh.write(err)
+    return rc, out
+
+
+def ref_cache_store(path, rc, out, err):
+    # Written through a unique temporary and renamed: two threads may miss on the
+    # same key, and a half-written entry read by the next run is exactly the stale
+    # answer this whole comment is about. `os.replace` is atomic on both platforms
+    # this runs on.
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = "%s.%d.tmp" % (path, threading.get_ident())
+        with open(tmp, "wb") as fh:
+            fh.write(_REF_MAGIC)
+            fh.write(b"%d %d\n" % (rc, len(out)))
+            fh.write(out)
+            fh.write(err)
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 # ── the classifications, moved off `tr` and `case` ───────────────────────────
@@ -159,9 +264,29 @@ def compare_one(ctx, name, art, keep, ours_bin, ref_bin, case_file, work):
     ours_rc, ours_out = run_capture(
         [ours_bin, case_file], f"{work}/{art}.ours", f"{work}/{art}.ours.err",
         ctx.timeout)
-    ref_rc, ref_out = run_capture(
-        [ref_bin, case_file], f"{work}/{art}.ref", f"{work}/{art}.ref.err",
-        ctx.timeout)
+
+    # ★ The ORDER above is load-bearing and the cache does not change it: both
+    # sides are produced before either exit code is read, so `jsdoc.ref` exists
+    # even when our dumper failed. A cache HIT still writes both files.
+    ref_path = ref_cache_path(ctx, art, case_file)
+    hit = ref_cache_load(ref_path, f"{work}/{art}.ref",
+                         f"{work}/{art}.ref.err") if ref_path else None
+    if hit is not None:
+        ref_rc, ref_out = hit
+        with ctx.ref_lock:
+            ctx.ref_hits += 1
+    else:
+        ref_rc, ref_out = run_capture(
+            [ref_bin, case_file], f"{work}/{art}.ref", f"{work}/{art}.ref.err",
+            ctx.timeout)
+        with ctx.ref_lock:
+            ctx.ref_misses += 1
+        # ★ A TIMEOUT IS NOT AN ANSWER AND IS NEVER CACHED — it is a statement
+        # about this machine at this moment, and storing one would make a
+        # transient hang permanent for every later run.
+        if ref_path and ref_rc is not TIMED_OUT:
+            with open(f"{work}/{art}.ref.err", "rb") as fh:
+                ref_cache_store(ref_path, ref_rc, ref_out, fh.read())
 
     if ours_rc is TIMED_OUT:
         return "TIMEOUT", f"{art}/{name}: our dumper timed out after {ctx.timeout}s"
@@ -260,6 +385,23 @@ def main():
     jobs = int(os.environ.get("TSCALY_JOBS") or min(16, os.cpu_count() or 8))
     stage = int(os.environ.get("TSCALY_STAGE") or 1)
     ctx.timeout = float(os.environ.get("TSCALY_TIMEOUT") or 60)
+
+    # ── the reference cache ──────────────────────────────────────────────────
+    #
+    # ★ The key material is run.sh's own oracle STAMP, handed down rather than
+    # recomputed here: one definition of *which reference is this*, in the place
+    # that already refuses to run against a dirty submodule.
+    ctx.ref_lock = threading.Lock()
+    ctx.ref_hits = 0
+    ctx.ref_misses = 0
+    ctx.refcache = None
+    ctx.refkey = b""
+    stamp = os.environ.get("TSCALY_ORACLE_STAMP", "")
+    cachedir = os.environ.get("TSCALY_REFCACHE", "")
+    if stamp and cachedir and not os.environ.get("TSCALY_NO_REFCACHE"):
+        ctx.refkey = hashlib.sha256(stamp.encode()).digest()
+        ctx.refcache = cachedir
+        os.makedirs(cachedir, exist_ok=True)
 
     bins = {art: (f"{out}/tscaly_{art}", f"{out}/oracle_{art}") for art, _ in ARTIFACTS}
     split_bin = f"{out}/oracle_split"
@@ -526,6 +668,18 @@ def main():
     with open(f"{out}/counters.sh", "w") as fh:
         for k in sorted(counters):
             fh.write(f"{k}={counters[k]}\n")
+        # ★ A cache whose hit rate is invisible is a cache nobody can debug — and
+        # a MISS count that does not fall to zero on a second identical run is the
+        # first sign that the key is picking up something it should not.
+        # ★ OFF is its own value and not "0 hits". With TSCALY_NO_REFCACHE=1 the
+        # cache is never consulted, so a miss count would read as a cache that
+        # answered nothing rather than one that was not asked — the difference a
+        # reader needs when a run is slower than expected.
+        if ctx.refcache is None:
+            fh.write("refcache=off\n")
+        else:
+            fh.write(f"refcache_hits={ctx.ref_hits}\n")
+            fh.write(f"refcache_misses={ctx.ref_misses}\n")
     with open(f"{out}/failures.txt", "w", errors="surrogateescape") as fh:
         for f in failures:
             fh.write(f + "\n")

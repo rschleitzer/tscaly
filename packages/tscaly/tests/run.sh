@@ -388,6 +388,23 @@ while IFS= read -r f; do cases+=("$f"); done < <(
 # TSCALY_JOBS overrides the pool size; the default is the core count, measured
 # rather than reasoned — see compare.py, where going wider is slower rather than
 # neutral.
+
+# ★★★ THE REFERENCE DUMPS ARE CACHED, keyed on `$WANT` — the very stamp two
+# hundred lines above decides whether the six oracle binaries need rebuilding.
+# That stamp is the hashes of the six oracle sources, the submodule HEAD sha and
+# the Go version, and this script REFUSES TO RUN AT ALL against a dirty submodule,
+# so it is the complete statement of *which reference is this*; the unit's own
+# BYTES are the rest of the key. Half a stage-2 run's dump work is the oracle
+# side (measured: 5.28 ms/unit of 11.22 ten-wide, i.e. 94 s) and it computes the
+# same answer every time — checked, not assumed: all five oracles are
+# byte-identical across two runs on one unit.
+#
+# ★ It lives at $REPO/.tscaly-refcache, OUTSIDE `packages/`, because the root
+# CLAUDE.md records a 443 317-file artifact tree under `packages/` reddening the
+# LSP suite through scalyls' `*.scaly` walk — derived data has no business in that
+# walk's path. `TSCALY_REFCACHE` moves it; `TSCALY_NO_REFCACHE=1` turns it off,
+# and the run prints its hit and miss counts, because a cache whose hit rate is
+# invisible is a cache nobody can debug.
 #
 # ★ `${cases[@]+"${cases[@]}"}` and not `"${cases[@]}"`: macOS ships bash 3.2,
 # where an EMPTY array under `set -u` is an "unbound variable" error rather than
@@ -401,6 +418,8 @@ TSCALY_TS_PREFIX="$TS/tests/cases/" \
 TSCALY_STAGE="$STAGE" \
 TSCALY_PKG_PREFIX="$PKG/tests/" \
 TSCALY_FILTER="$FILTER" \
+TSCALY_ORACLE_STAMP="$WANT" \
+TSCALY_REFCACHE="${TSCALY_REFCACHE:-$REPO/.tscaly-refcache}" \
 python3 "$PKG/tests/compare.py" <<EOF_CASES
 $(printf '%s\n' ${cases[@]+"${cases[@]}"})
 EOF_CASES
