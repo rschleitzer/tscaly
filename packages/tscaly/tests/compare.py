@@ -335,12 +335,17 @@ _SEP_DIAGS = b"==== TSCALY-SECTION diags\n"
 _SEP_DUMP = b"==== TSCALY-SECTION dump\n"
 
 
-def compare_one(ctx, name, art, keep, ours_bin, ref_bin, case_file, work, uc):
+def compare_one(ctx, name, art, keep, ours_bin, ref_bin, case_file, work, uc, ours_pre=None):
     _t = time.time()
-    if art == "types" and ctx.sections:
-        rc, blob = run_capture([ours_bin, "--sections", case_file],
-                               f"{work}/{art}.sections", f"{work}/{art}.ours.err",
-                               ctx.timeout)
+    if art == "types" and (ctx.sections or ours_pre is not None):
+        if ours_pre is not None:
+            rc, blob = 0, ours_pre
+            with open(f"{work}/{art}.ours.err", "wb"):
+                pass
+        else:
+            rc, blob = run_capture([ours_bin, "--sections", case_file],
+                                   f"{work}/{art}.sections", f"{work}/{art}.ours.err",
+                                   ctx.timeout)
         if rc is TIMED_OUT or _SEP_DIAGS not in blob or _SEP_DUMP not in blob:
             # A malformed sections blob is a harness failure and never a verdict:
             # fall back to the three-mode behaviour rather than compare a fragment.
@@ -366,11 +371,17 @@ def compare_one(ctx, name, art, keep, ours_bin, ref_bin, case_file, work, uc):
             os.unlink(f"{work}/{art}.sections")
         except OSError:
             pass
+    elif ours_pre is not None:
+        ours_rc, ours_out = 0, ours_pre
+        with open(f"{work}/{art}.ours", "wb") as fh:
+            fh.write(ours_pre)
+        with open(f"{work}/{art}.ours.err", "wb"):
+            pass
     else:
         ours_rc, ours_out = run_capture(
             [ours_bin, case_file], f"{work}/{art}.ours", f"{work}/{art}.ours.err",
             ctx.timeout)
-    _tick(ctx, "ours", _t)
+    _tick(ctx, "ours:" + art, _t)
 
     # ★ The ORDER above is load-bearing and the cache does not change it: both
     # sides are produced before either exit code is read, so `jsdoc.ref` exists
@@ -400,7 +411,7 @@ def compare_one(ctx, name, art, keep, ours_bin, ref_bin, case_file, work, uc):
         else:
             with open(f"{work}/{art}.ref.err", "rb") as fh:
                 uc.put(art, ref_rc, ref_out, fh.read())
-    _tick(ctx, "ref", _t)
+    _tick(ctx, "ref:" + art, _t)
     _t = time.time()
 
     if ours_rc is TIMED_OUT:
@@ -442,7 +453,7 @@ def compare_one(ctx, name, art, keep, ours_bin, ref_bin, case_file, work, uc):
     if _has_line_prefix(ours_out, b"UNPORTED "):
         return "UNPORTED", None
 
-    _tick(ctx, "verdict", _t)
+    _tick(ctx, "verdict:" + art, _t)
     _t = time.time()
     cut = cut_fields(ref_out, keep) if keep > 0 else ref_out
     with open(f"{work}/{art}.ref.cut", "wb") as fh:
@@ -450,7 +461,7 @@ def compare_one(ctx, name, art, keep, ours_bin, ref_bin, case_file, work, uc):
 
     is_acc = (name, art) in ctx.accepted
 
-    _tick(ctx, "cut", _t)
+    _tick(ctx, "cut:" + art, _t)
     if cut == ours_out:
         # A deviation that no longer deviates. Left unreported, accepted.txt rots
         # into a list of things that used to be true.
@@ -512,6 +523,7 @@ def main():
     # ★ The escape hatch exists so the switch can be A/B-ed against itself, which
     # is the only thing that licenses it (see compare_one).
     ctx.sections = not os.environ.get("TSCALY_NO_SECTIONS")
+    ctx.combined = not os.environ.get("TSCALY_NO_COMBINED")
     ctx.prof_lock = threading.Lock()
     ctx.profile = {} if os.environ.get("TSCALY_PROFILE") else None
     ctx.wall = {}
@@ -721,20 +733,66 @@ def main():
     unit_jobs = [unit_groups[k] for k in sorted(unit_groups)]
     art_names = [a for a, _ in ARTIFACTS]
 
+    # ★★★ ONE PROCESS PER UNIT FOR ALL FIVE ARTIFACTS, which is where 58 % of a
+    # dumper's cost went: measured over 17 900 units ten-wide, `/usr/bin/true`
+    # costs 16.3 s and the heaviest dumper 28.0 s, so five processes pay the
+    # process five times and repeat the same scan, parse and bind four times over.
+    # See tscaly_dump.scaly for the decomposition, for why this is NOT the
+    # cross-unit batching TESTPLAN refuses, and for the ordering the shared parse
+    # forces (the binder mutates the tree).
+    #
+    # ★★ THE FALLBACK IS PER UNIT AND SILENT ON PURPOSE: a non-zero rc or a blob
+    # that does not carry all four separators drops that unit to the five separate
+    # programs, so a defect in the combined driver degrades to the slower path
+    # rather than to a wrong verdict. `TSCALY_NO_COMBINED=1` takes the slow path
+    # for everything, and that is the A/B the whole-corpus proof was run through.
+    _COMBINED_SEPS = [b"==== TSCALY-DUMP ast\n", b"==== TSCALY-DUMP jsdoc\n",
+                      b"==== TSCALY-DUMP symbols\n", b"==== TSCALY-DUMP types\n"]
+
+    def combined_sections(case_file, work):
+        rc, blob = run_capture([f"{out}/tscaly_dump", case_file],
+                               f"{work}/combined", f"{work}/combined.err",
+                               ctx.timeout)
+        # Both scratch files go: the blob is held in memory and the stderr capture
+        # is empty on every unit of both corpora. A file nobody reads is 17 892
+        # more entries in a tree the root CLAUDE.md already records as able to
+        # redden the LSP suite.
+        for scratch in ("combined", "combined.err"):
+            try:
+                os.unlink(f"{work}/{scratch}")
+            except OSError:
+                pass
+        if rc is TIMED_OUT or rc != 0:
+            return None
+        parts, rest = [], blob
+        for sp in _COMBINED_SEPS:
+            if sp not in rest:
+                return None
+            a, rest = rest.split(sp, 1)
+            parts.append(a)
+        parts.append(rest)
+        return dict(zip(art_names, parts))
+
     def do_unit(group):
         uc = UnitRefCache(ref_cache_path(ctx, group[0][4]) if group else None)
         uc.load()
-        out = []
+        pre = None
+        if ctx.combined and group:
+            _t = time.time()
+            pre = combined_sections(group[0][4], group[0][5])
+            _tick(ctx, "combined", _t)
+        out_v = []
         for task in group:
             _, key, art, keep, written, work = task
             ours_bin, ref_bin = bins[art]
-            out.append(compare_one(ctx, key, art, keep, ours_bin, ref_bin,
-                                   written, work, uc))
+            out_v.append(compare_one(ctx, key, art, keep, ours_bin, ref_bin,
+                                     written, work, uc,
+                                     pre.get(art) if pre else None))
             tick(len(tasks), 3000, "compare")
         _t = time.time()
         uc.store(art_names)
         _tick(ctx, "refstore", _t)
-        return out
+        return out_v
 
     _phase_t0 = time.time()
     with ThreadPoolExecutor(max_workers=jobs) as pool:

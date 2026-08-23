@@ -303,7 +303,7 @@ if [ $? -ne 0 ]; then
   red "the tscaly package failed to compile:"; sed 's/^/    /' "$OUT/pkg-build.log"; exit 2
 fi
 
-for prog in tscaly_tokens tscaly_ast tscaly_jsdoc tscaly_symbols tscaly_types; do
+for prog in tscaly_tokens tscaly_ast tscaly_jsdoc tscaly_symbols tscaly_types tscaly_dump; do
   "$SCALYC" -c -o "$OUT/$prog.o" "$PKG/0.1.0/$prog.scaly" > "$OUT/$prog-build.log" 2>&1
   if [ $? -ne 0 ]; then
     red "$prog failed to compile:"; sed 's/^/    /' "$OUT/$prog-build.log"; exit 2
