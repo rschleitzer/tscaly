@@ -11,7 +11,8 @@
 // side and the reference answers TS2307 on each; a subsequence test is green
 // either way. What separates a port that took the branch from one that skipped
 // it is the unported TAG — `resolve-external-module-name` for the first line,
-// `check-import-binding` for the second — and the battery's PIN is the only
+// `check-import-binding` for the second, which slice 59 moved on to
+// `check-alias-symbol` — and the battery's PIN is the only
 // instrument that reads it. §3.5be's rule from the other side: the mechanism is
 // reachable, so it is built; the thing that makes it OBSERVABLE is named here.
 //
