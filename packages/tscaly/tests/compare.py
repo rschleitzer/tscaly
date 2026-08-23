@@ -48,6 +48,7 @@ import os
 import re
 import shutil
 import hashlib
+import time
 import subprocess
 import sys
 import threading
@@ -260,14 +261,40 @@ def load_accepted(path):
 # when our dumper failed — which is what the jsdoc-bearing count depends on.
 
 
+# ── TSCALY_PROFILE: where a run's wall time actually goes ────────────────────
+#
+# ★★★ IT EXISTS BECAUSE THREE MICRO-BENCHMARKS IN A ROW WERE WRONG, each in the
+# flattering direction. Sampling 200 of 18 876 cases said our five dumps cost 78 s
+# over the corpus; the profile says 2 037 s across threads. A sample that size
+# misses the SIZE TAIL by construction — ten cases are 48 % of the corpus's bytes
+# — and, worse, the benchmark ran the dumper with `capture_output` while the real
+# run has it WRITE TWO FILES per artifact. Both errors point the same way, and
+# nobody re-checks a number that says the thing is cheap.
+#
+# ★ The two phase timers are wall; the in-task slots are summed ACROSS THREADS, so
+# their total over the phase's wall time is the effective parallelism — 7.5x on
+# stage 2, which is what says the pool is not the thing to fix. Opt-in, on stderr,
+# and the report it accompanies is byte-identical to an unprofiled run's.
+
+def _tick(ctx, slot, t0):
+    if ctx.profile is None:
+        return
+    dt = time.time() - t0
+    with ctx.prof_lock:
+        ctx.profile[slot] = ctx.profile.get(slot, 0.0) + dt
+
+
 def compare_one(ctx, name, art, keep, ours_bin, ref_bin, case_file, work):
+    _t = time.time()
     ours_rc, ours_out = run_capture(
         [ours_bin, case_file], f"{work}/{art}.ours", f"{work}/{art}.ours.err",
         ctx.timeout)
+    _tick(ctx, "ours", _t)
 
     # ★ The ORDER above is load-bearing and the cache does not change it: both
     # sides are produced before either exit code is read, so `jsdoc.ref` exists
     # even when our dumper failed. A cache HIT still writes both files.
+    _t = time.time()
     ref_path = ref_cache_path(ctx, art, case_file)
     hit = ref_cache_load(ref_path, f"{work}/{art}.ref",
                          f"{work}/{art}.ref.err") if ref_path else None
@@ -287,6 +314,8 @@ def compare_one(ctx, name, art, keep, ours_bin, ref_bin, case_file, work):
         if ref_path and ref_rc is not TIMED_OUT:
             with open(f"{work}/{art}.ref.err", "rb") as fh:
                 ref_cache_store(ref_path, ref_rc, ref_out, fh.read())
+    _tick(ctx, "ref", _t)
+    _t = time.time()
 
     if ours_rc is TIMED_OUT:
         return "TIMEOUT", f"{art}/{name}: our dumper timed out after {ctx.timeout}s"
@@ -327,12 +356,15 @@ def compare_one(ctx, name, art, keep, ours_bin, ref_bin, case_file, work):
     if _has_line_prefix(ours_out, b"UNPORTED "):
         return "UNPORTED", None
 
+    _tick(ctx, "verdict", _t)
+    _t = time.time()
     cut = cut_fields(ref_out, keep) if keep > 0 else ref_out
     with open(f"{work}/{art}.ref.cut", "wb") as fh:
         fh.write(cut)
 
     is_acc = (name, art) in ctx.accepted
 
+    _tick(ctx, "cut", _t)
     if cut == ours_out:
         # A deviation that no longer deviates. Left unreported, accepted.txt rots
         # into a list of things that used to be true.
@@ -391,6 +423,9 @@ def main():
     # ★ The key material is run.sh's own oracle STAMP, handed down rather than
     # recomputed here: one definition of *which reference is this*, in the place
     # that already refuses to run against a dirty submodule.
+    ctx.prof_lock = threading.Lock()
+    ctx.profile = {} if os.environ.get("TSCALY_PROFILE") else None
+    ctx.wall = {}
     ctx.ref_lock = threading.Lock()
     ctx.ref_hits = 0
     ctx.ref_misses = 0
@@ -482,8 +517,10 @@ def main():
         tick(len(selected), 1000, "split")
         return rc
 
+    _phase_t0 = time.time()
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         split_rcs = list(pool.map(do_split, selected))
+    ctx.wall["split"] = time.time() - _phase_t0
     progress["done"] = 0
 
     # ── phase B: the unit list, in the loop's own order ──────────────────────
@@ -585,6 +622,7 @@ def main():
         tick(len(tasks), 3000, "compare")
         return verdict
 
+    _phase_t0 = time.time()
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         verdicts = list(pool.map(do_compare, tasks))
 
@@ -664,6 +702,8 @@ def main():
             except OSError:
                 pass
 
+    ctx.wall["compare"] = time.time() - _phase_t0
+
     # ── the results, for the report in run.sh ───────────────────────────────
     with open(f"{out}/counters.sh", "w") as fh:
         for k in sorted(counters):
@@ -675,6 +715,14 @@ def main():
         # cache is never consulted, so a miss count would read as a cache that
         # answered nothing rather than one that was not asked — the difference a
         # reader needs when a run is slower than expected.
+        if ctx.profile is not None:
+            tot = sum(ctx.profile.values())
+            print("\n  --- TSCALY_PROFILE ---", file=sys.stderr)
+            for k, v in sorted(ctx.wall.items()):
+                print("  phase %-10s %8.1f s wall" % (k, v), file=sys.stderr)
+            for k, v in sorted(ctx.profile.items(), key=lambda kv: -kv[1]):
+                print("  in-task %-9s %8.1f s cpu-across-threads (%4.1f%%)"
+                      % (k, v, v * 100.0 / tot if tot else 0), file=sys.stderr)
         if ctx.refcache is None:
             fh.write("refcache=off\n")
         else:
