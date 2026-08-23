@@ -317,7 +317,13 @@ p = sys.argv[1]; s = open(p).read()
 # made five signature kinds and two member kinds reachable at once. TS1098 and
 # TS2300 of checker_type_literal_members.ts go with it, and so does the index
 # signature's report, whose fixture falls back to the type literal's own stop.
-old = """        this.check_source_elements(AstNode.type_literal_members_of(node))"""
+#
+# ★ THE ANCHOR MOVED IN SLICE 62 and it is updated here rather than left to fail:
+# `type_literal_members_of` was replaced by the reference's own `member_list_of`
+# (§3.5br), and an old battery whose patch cannot apply reports *the row measures
+# nothing* — a loud failure, but an instrument that has quietly stopped measuring
+# what its header claims. Renaming an accessor means walking the batteries.
+old = """        this.check_source_elements(AstNode.member_list_of(node))"""
 new = """        this.check_source_elements(null)"""
 assert s.count(old) == 1, s.count(old)
 open(p, "w").write(s.replace(old, new))
