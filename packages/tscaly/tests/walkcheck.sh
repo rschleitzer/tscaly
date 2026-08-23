@@ -70,70 +70,41 @@ if [ ! -x "$BIN" ]; then
   exit 1
 fi
 
-WORK=$OUT/walkcheck
+# ★★★ THE SCRATCH FILES CARRY THE PID, AND THAT IS NOT TIDINESS — IT IS A DEFECT
+# THIS INSTRUMENT HAD (slice 58). `ref.txt` and `ours.txt` are rewritten once per
+# unit, so TWO runs of this script against the same tree interleave their writes
+# and every comparison after the first collision is between one run's reference
+# and the other run's answer. Measured: a second run started while the first was
+# still going reported **5 260 of 17 888 units differing**, with diffs that read
+# exactly like a broken walk — whole node lists replaced, one line truncated
+# mid-field — and the same command alone answered 17 888 / 17 888. The FAILURE
+# DIRECTORY is per-run for the same reason; only the summary is shared, and it is
+# written last.
+#
+# ★ It is the "shared scratch is a silent coupling" class the LSP suite paid for,
+# turned one notch: there the collision was between two TESTS, here between two
+# runs of one instrument — so nothing in the script names a second party and
+# there is no fixture to isolate. What makes it findable at all is that a battery
+# and a manual check are the ordinary way this gets used.
+WORK=$OUT/walkcheck.$$
 rm -rf "$WORK"
 mkdir -p "$WORK"
 
-units=0
-matched=0
-failed=0
-skipped=0
-other=0
 : > "$WORK/failures.txt"
+# ★★★ THE UNIT LOOP MOVED INTO ONE PYTHON PROCESS ON EVERY CORE (slice 58), and
+# nothing about WHAT is measured moved with it — see tests/checkloop.py for the
+# argument, and for why a POOL is safe where the batch-mode dumper TESTPLAN
+# refused was not. Measured on this tree: the dumper answers a unit in 5.3 ms warm
+# and this loop spent ~22 ms on it, because per unit the shell ran an awk or a
+# grep, the dumper, a grep -c, a cmp — and, in diagcheck, a whole python3
+# interpreter. The verdicts, the counters and failures.txt are byte-identical
+# across the change; that check is the whole licence for it.
 
-for manifest in "$CASES"/*/units.manifest; do
-  case_dir=$(dirname "$manifest")
-  case_key=$(basename "$case_dir")
-  if [ -n "$FILTER" ]; then
-    case "$case_key" in
-      *"$FILTER"*) ;;
-      *) continue ;;
-    esac
-  fi
-  # index<TAB>path<TAB>display-name
-  while IFS=$'\t' read -r idx unit_path unit_name; do
-    [ -n "${idx:-}" ] || continue
-    # ★ THE SAME SUFFIX FILTER compare.py's classify_unit applies, and asked of the
-    # same field: a corpus case may hold a unit that is not a TypeScript source at
-    # all (`/a.tsbuildinfo`), the yardstick does not compare it, and neither may
-    # this. Found by the instrument's first run — it reported ONE differing unit
-    # over 1 038 and the difference was the missing filter, i.e. the harness rather
-    # than the walk. Counted as not-compared rather than skipped in silence.
-    case $(printf '%s' "$unit_name" | tr 'A-Z' 'a-z') in
-      *.ts|*.mts|*.cts|*.tsx|*.jsx|*.js|*.cjs|*.mjs|*.json) ;;
-      *) other=$((other + 1)); continue ;;
-    esac
-    ref="$case_dir/$idx/types.ref"
-    # A unit the ORACLE could not answer (it exits 3, see accepted.txt) has no
-    # node list to compare against. Counted, never skipped silently.
-    if [ ! -s "$ref" ] && [ -s "$case_dir/$idx/types.ref.err" ]; then
-      skipped=$((skipped + 1))
-      continue
-    fi
-    [ -f "$unit_path" ] || { skipped=$((skipped + 1)); continue; }
-    units=$((units + 1))
-    awk '$1=="T"{print "W", $2, $3, $4}' "$ref" > "$WORK/ref.txt"
-    "$BIN" --walk "$unit_path" > "$WORK/ours.txt" 2> "$WORK/ours.err"
-    rc=$?
-    if [ "$rc" != 0 ]; then
-      failed=$((failed + 1))
-      {
-        echo "=== $case_key[$idx] — our walk exited $rc"
-        head -5 "$WORK/ours.err"
-      } >> "$WORK/failures.txt"
-      continue
-    fi
-    if cmp -s "$WORK/ours.txt" "$WORK/ref.txt"; then
-      matched=$((matched + 1))
-    else
-      failed=$((failed + 1))
-      {
-        echo "=== $case_key[$idx] — $unit_path"
-        diff "$WORK/ref.txt" "$WORK/ours.txt" | head -20
-      } >> "$WORK/failures.txt"
-    fi
-  done < "$manifest"
-done
+eval "$(python3 "$(dirname "$0")/checkloop.py" walk "$CASES" "$BIN" "$WORK" "$FILTER" \
+        | sed 's/^\([a-z]*\) \(.*\)$/\1=\2/')" || {
+  red "the unit loop failed"
+  exit 2
+}
 
 echo
 echo "walkcheck — the type walk's NODE LIST against the reference's own"
@@ -149,4 +120,7 @@ if [ "$failed" != 0 ]; then
   red "WALKCHECK: $failed of $units units disagree — see $WORK/failures.txt"
   exit 1
 fi
+# ★ The per-run scratch directory is removed on a GREEN run and KEPT on a red
+# one, because its whole content is then the report the last line points at.
+rm -rf "$WORK"
 green "WALKCHECK: OK"
