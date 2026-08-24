@@ -37,18 +37,46 @@
 # copy of the tree before a single build is spent (slice 57), and the restore is
 # proven with `cmp` and survives a kill (slice 58).
 #
-# ★★★ THIS BATTERY IS MEASURED ON THE STAGE-2 TREE, which every battery before it was
-# not, and two of its rows are the reason. g03 and g17 were both UNGATED against the
-# whole 17 950-unit corpus and are gated by one fixture line each — a verdict that can
-# only be read as *the corpus does not hold this input* if the corpus was actually
-# asked. It costs the run: 7 min for the tree plus ~25 min for the thirty-one rows,
-# against ~90 s at stage 1. Run it at stage 1 for a quick regression and at stage 2
-# before believing an UNGATED verdict.
+# ★★★ THE RECORDED VERDICTS ARE FROM THE STAGE-2 TREE, which every battery before this
+# one was not run on, and two of its rows are the reason: g03 and g17 come back UNGATED
+# against all 17 950 corpus units, and *the corpus does not hold this input* is a claim
+# you may only make if the corpus was asked.
+#
+# ★★★ BUT ITERATE AT STAGE 1 AND CONFIRM AT STAGE 2 **ONCE** — THIS BATTERY WAS RUN
+# THE OTHER WAY ROUND AND IT COST ABOUT NINETY MINUTES OF WALL TIME FOR NOTHING.
+# diagcheck is the per-row cost and it scales with the corpus: 1 192 units at stage 1,
+# 17 961 at stage 2, so a row goes from ~2 s to ~50 s and the battery from ~90 s to
+# 25–45 min. Both of the UNGATED rows above are ungated at stage 1 as well — stage 1
+# is a SUBSET — so every fixture iteration belongs there, and the whole point of the
+# stage-2 pass is the single sentence *and the corpus does not hold it either*. It was
+# run three times at stage 2 because each round turned up one more fixture correction;
+# at stage 1 those three rounds are six minutes.
+#
+# ★★★ AND THAT IS MEASURED, NOT ARGUED: the whole battery was run on BOTH trees and
+# **all thirty-one verdicts agree class for class** — the same seventeen diagcheck RED,
+# the same three PIN-RED, the same six ungated-with-a-number and the same five silent
+# rows (g04, g05, g13, g16, g19). Only the magnitudes differ, because they are counts
+# over the corpus: g20 is RED 89 at stage 2 and RED 7 at stage 1, g01 RED 12 against
+# RED 1. **A battery's colours are a property of the patches; only its numbers are a
+# property of the corpus.** Stage 1: 31 rows in **2 min 3 s**, and two consecutive runs
+# produced byte-identical verdict lines.
+#
+# ★★ AND THE THIRD RUN TOOK TWICE AS LONG AS THE FIRST FOR THE SAME 31 ROWS AND THE
+# SAME VERDICTS — 22 min against 44 — because four stage-2 runs had created and deleted
+# ~450 000 artifact files in between and the box's indexer never caught up. That is
+# §3.5ck's tax, arriving in a suite that does not name it.
+#
+# ★ ORDER, and it follows from the two paragraphs above: **battery BEFORE the
+# before/after arithmetic.** A fixture correction changes the corpus, which invalidates
+# the `before` snapshot — so taking the arithmetic first means taking it twice.
 #
 # Usage (nothing may edit the tree while this runs — §3.5y):
 #
-#   TSCALY_STAGE=2 packages/tscaly/tests/run.sh       # the artifact tree, first
-#   packages/tscaly/tests/controls-slice64.sh 2>&1 | tee /tmp/battery64.log
+#   packages/tscaly/tests/run.sh                      # stage 1, ~12 s
+#   packages/tscaly/tests/controls-slice64.sh 2>&1 | tee /tmp/battery64.log   # ~90 s
+#   ...iterate the fixtures here until no row is silent without an argument...
+#   TSCALY_STAGE=2 packages/tscaly/tests/run.sh       # ~7 min, ONCE
+#   packages/tscaly/tests/controls-slice64.sh 2>&1 | tee /tmp/battery64-s2.log
 
 set -u
 cd "$(dirname "$0")/../../.."
