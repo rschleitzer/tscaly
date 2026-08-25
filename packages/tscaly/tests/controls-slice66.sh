@@ -34,6 +34,14 @@
 # and the plain one answer the SAME tag on purpose: the difference between them is
 # a `this` type nothing can print, and the row that would gate it says so.
 #
+# ★★★ CORRECTED BY SLICE 67 (§3.5dm): that sentence was right about the tags and
+# wrong about the cause. NodeFlagsContainsThis had NO WRITER anywhere in this port
+# — the binder listed b.seenThisKeyword among its flow-only omissions — so the
+# `this` fixture was not "a difference that cannot be printed", it was no
+# difference at all, and g09 below was ungated because the line it breaks was
+# DEAD. Slice 67 gives the flag a writer; controls-slice67.sh's g16 is this row
+# run again, and it is red.
+#
 # ★★★ ITERATE AT STAGE 1 AND CONFIRM AT STAGE 2 ONCE — slice 64's rule. Measured
 # here: 18 rows in ~2 min at stage 1.
 #
