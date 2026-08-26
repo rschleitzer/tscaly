@@ -14,7 +14,8 @@
 // prediction *the reader that earns them is the CHECKER … a case clause*. This is
 // that reader. Without the arm the report is dropped silently, because
 // grammar_error_on_node answers false and record_unported keeps the FIRST tag, which
-// the `switch (1)` above has already spent on check-expression.
+// the `switch (1)` above has already spent — on check-expression before slice 70
+// and on get-number-literal-type since.
 //
 // ★★ THE SPAN IS `default:`, EIGHT CHARACTERS — trivia-skipped start to the first
 // STATEMENT's Pos, which is BEFORE that statement's own leading trivia. Neither

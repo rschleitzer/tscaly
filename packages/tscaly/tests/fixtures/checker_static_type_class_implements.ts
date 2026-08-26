@@ -9,8 +9,9 @@
 // is only ever asked about an INTERFACE, and an interface cannot carry an
 // `implements` clause — so the token test cannot distinguish anything until a
 // class asks". Slice 67 is the class asking. With that test broken the walk
-// hands this class its `implements` element as a base and the tag moves to
-// check-expression, which is what turns the argument into a row.
+// hands this class its `implements` element as a base and the tag moves — to
+// check-expression before slice 70 and to check-identifier since, the `implements`
+// element being an identifier — which is what turns the argument into a row.
 //
 // ★ `Shape` is declared after `P` because record_unported is first-wins per unit
 // and interfaces hoist.

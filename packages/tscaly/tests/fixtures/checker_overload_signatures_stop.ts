@@ -11,8 +11,9 @@
 // is why the row was EMPTY on the whole corpus before this fixture existed, and it
 // is a measurement of the corpus rather than of the slice.
 //
-// ★ Slice 69 ported that arm, and the sentence holds with a different tag behind
-// it: an overload set with a parameter now reports `check-expression`, or an
-// implicit-any diagnostic on the way to it.
+// ★ Slice 69 ported that arm and slice 70 the dispatch behind it, and the sentence
+// holds with a different tag each time: an overload set with a parameter now
+// reports whichever expression arm its parameter's initializer reaches — or an
+// implicit-any diagnostic on the way there.
 function s(): void;
 function s(): void { }
