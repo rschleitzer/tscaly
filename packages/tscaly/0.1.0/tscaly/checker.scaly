@@ -149,10 +149,25 @@ define ObjectFlagsMembersResolved: int 1 << 21        ; Members have been resolv
 define ObjectFlagsClassOrInterface: int ObjectFlagsClass | ObjectFlagsInterface
 
 ; ★ ObjectFlagsPropagatingFlags, whose only reader is getPropagatingFlagsOfTypes.
-; ObjectFlagsRequiresWidening and ObjectFlagsObjectTypeKindMask are NOT declared:
-; the first has no reader here, and the second NAMES two of the reused bits, so
-; it cannot be written before they are.
+; ObjectFlagsObjectTypeKindMask is still NOT declared: it NAMES two of the reused
+; bits, so it cannot be written before they are.
 define ObjectFlagsPropagatingFlags: int ObjectFlagsContainsWideningType | ObjectFlagsContainsObjectOrArrayLiteral | ObjectFlagsNonInferrableType
+
+; ★ ObjectFlagsRequiresWidening arrives in slice 69, where getWidenedType is its
+; reader — the note above listed it as having none. It is the gate that decides
+; whether widening has anything to do at all.
+define ObjectFlagsRequiresWidening: int ObjectFlagsContainsWideningType | ObjectFlagsContainsObjectOrArrayLiteral
+
+; ── WideningKind ────────────────────────────────────────────────────────────
+;
+; The reference's four-member iota, declared WHOLE because reportImplicitAny
+; branches on GeneratorYield and every caller names one of the four. Slice 69
+; passes Normal from its single call site; the other three arrive with the return
+; type and the generator.
+define WideningKindNormal: int 0
+define WideningKindFunctionReturn: int 1
+define WideningKindGeneratorNext: int 2
+define WideningKindGeneratorYield: int 3
 
 ; ── the type payloads ───────────────────────────────────────────────────────
 ;
@@ -841,6 +856,22 @@ define Checker
     unported_pos: int
     unported_tag: pointer[const_char]
     unported_detail: int
+
+    ; ★★★ THE COUNT OF REPORTS, AND SLICE 69 IS WHAT MADE IT NECESSARY. The FLAG
+    ; answers *has this unit stopped*, which is what every caller before this slice
+    ; needed — they compare it before and after a call to decide whether to carry
+    ; on. It cannot answer *did THIS call stop*, because record_unported is
+    ; first-wins: after the first report the flag no longer moves, and
+    ; check_source_elements deliberately keeps walking (slice 49's expiry).
+    ;
+    ; ★★★ THAT DIFFERENCE ONLY CHANGES AN ANSWER WHERE A NULL IS AMBIGUOUS, and
+    ; slice 69 is the first place it is: getTypeForVariableLikeDeclaration answers
+    ; nil BOTH for *nothing can be inferred* — which the widener turns into `any`
+    ; plus an implicit-any diagnostic — and for a stop. Measured: with the flag
+    ; comparison, every declaration after a file's first report INVENTED a TS7005,
+    ; and diagcheck went red on 377 units. The count is monotone, so `mark before,
+    ; mark after` is exact.
+    unported_count: int
 )
 {
     ; ── entry ───────────────────────────────────────────────────────────────
@@ -892,6 +923,7 @@ define Checker
         set c.unported_pos: 0 - 1
         set c.unported_tag: null
         set c.unported_detail: 0
+        set c.unported_count: 0
         c.initialize_intrinsic_types()
         c
     }
@@ -905,6 +937,9 @@ define Checker
     ; about a construct rather than about a place in the text.
     procedure record_unported(this, tag: pointer[const_char], detail: int)
     {
+        ; Incremented OUTSIDE the first-wins guard, which is the whole point of it
+        ; — see the field's own note.
+        set unported_count: unported_count + 1
         if unported_pos < 0
         {
             set unported_pos: 0
@@ -915,6 +950,11 @@ define Checker
 
     function is_unported(this) returns bool
         unported_pos >= 0
+
+    ; The monotone report count, for the callers that need *did THIS call stop*
+    ; rather than *has this unit stopped*.
+    function unported_mark(this) returns int
+        unported_count
 
     function unported_at(c: ref[Checker]) returns int
         c.unported_pos
@@ -2051,10 +2091,7 @@ define Checker
             return null
         }
         if (f & (SymbolFlagsVariable | SymbolFlagsProperty)) <> 0
-        {
-            this.record_unported("get-type-of-variable-or-parameter-or-property", 0)
-            return null
-        }
+            return this.get_type_of_variable_or_parameter_or_property(symbol)
         if (f & (SymbolFlagsFunction | SymbolFlagsMethod | SymbolFlagsClass | SymbolFlagsEnum | SymbolFlagsValueModule)) <> 0
             return this.get_type_of_func_class_enum_module(symbol)
         if (f & SymbolFlagsEnumMember) <> 0
@@ -2167,6 +2204,1247 @@ define Checker
         if AstNode.kind_of(n) <> KindModuleDeclaration
             return false
         AstNode.body_of(n) = null
+    }
+
+    ; ── slice 69: getTypeOfVariableOrParameterOrProperty ─────────────────────
+    ;
+    ; ★★★ THIS IS THE WORK LIST'S HEAD AND IT IS ONE FUNCTION WITH ONE FORK. Slice
+    ; 67 named it and slice 68 walked past it; what stands here is the ANNOTATED
+    ; half of a variable-like declaration's type, the widening that follows it, and
+    ; the IMPLICIT-ANY family the un-annotated half reports instead. The
+    ; INITIALIZER half is a stop, because it is checkExpression — a dimension
+    ; rather than a step.
+    ;
+    ; ★★ THE MEMO IS PART OF THE SEMANTICS HERE, not a speed-up. Everything behind
+    ; this function can REPORT — the implicit-any diagnostics below are its whole
+    ; product — so a second computation of one symbol's type is a duplicated line,
+    ; and diagcheck's relation is a SUBSEQUENCE. The reference guards the write
+    ; with isParameterOfContextSensitiveSignature and the guard is transcribed.
+    ;
+    ; ★ `t == nil` is the reference's panic ("Unexpected nil type") and is this
+    ; port's STOP: a worker that reported answers null, and the caller tells the
+    ; two apart by is_unported(), which is this file's idiom everywhere.
+    function get_type_of_variable_or_parameter_or_property(this, symbol: ref[Symbol]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let links this.value_symbol_link_of(symbol)
+        if links.resolved_type = null
+        {
+            let t this.get_type_of_variable_or_parameter_or_property_worker(symbol)
+            if t = null
+                return null
+            ; "For a contextually typed parameter it is possible that a type has
+            ; already been assigned … we need to _prefer_ that type, but it won't
+            ; be assigned until contextual typing is complete" — the reference's own
+            ; comment, and the RE-READ of links.resolvedType is what it is about.
+            if links.resolved_type = null
+            {
+                let sensitive this.is_parameter_of_context_sensitive_signature(symbol)
+                if this.unported_mark() <> mark
+                    return null
+                if sensitive = false
+                    set links.resolved_type: t
+            }
+            return t
+        }
+        links.resolved_type
+    }
+
+    ; isParameterOfContextSensitiveSignature.
+    ;
+    ; ★★★ THE FIRST CONJUNCT IS THE WHOLE OF IT TODAY, AND THAT IS A PROVABLE
+    ; UNREACHABILITY RATHER THAN A GAP. isContextSensitiveFunctionOrObjectLiteral
+    ; Method opens `IsFunctionExpressionOrArrowFunction(fn) || IsObjectLiteralMethod
+    ; (fn)`, and NO ARM OF THIS PORT WALKS A PARAMETER OF ANY OF THE THREE: a
+    ; function expression and an arrow function are EXPRESSIONS, so the only route
+    ; into their parameter list is checkExpression, which stops; an object-literal
+    ; method is reached the same way. What this port does walk — a function or
+    ; method DECLARATION, a signature, a function TYPE node — fails the test at its
+    ; first term. So the report below stands in place and cannot fire, which is why
+    ; it is a report and not a guess: the slice that ports checkExpression is the
+    ; slice that makes it observable.
+    function is_parameter_of_context_sensitive_signature(this, symbol: ref[Symbol]) returns bool
+    {
+        let vd Symbol.value_declaration_of(symbol)
+        if vd = null
+            return false
+        var decl vd as ref[AstNode]
+        if AstNode.kind_of(decl) = KindBindingElement
+        {
+            let up Checker.walk_up_binding_elements_and_patterns(decl)
+            if up = null
+                return false
+            set decl: up as ref[AstNode]
+        }
+        if AstNode.kind_of(decl) <> KindParameter
+            return false
+        let fn AstNode.parent_node_of(decl)
+        if fn = null
+            return false
+        this.is_context_sensitive_function_or_object_literal_method(fn as ref[AstNode])
+    }
+
+    ; ast.WalkUpBindingElementsAndPatterns — from a binding element up through the
+    ; patterns to the variable declaration or parameter that roots them. It is the
+    ; same climb Binder.get_root_declaration makes and is written here because the
+    ; reference's spelling at this call site is the walk rather than the root.
+    function walk_up_binding_elements_and_patterns(binding: ref[AstNode]) returns ref[AstNode]?
+    {
+        var node AstNode.parent_node_of(binding)
+        while node <> null
+        {
+            let n node as ref[AstNode]
+            if AstNode.kind_of(n) = KindBindingElement
+            {
+                set node: AstNode.parent_node_of(n)
+                continue
+            }
+            if AstNode.is_binding_pattern(n)
+            {
+                set node: AstNode.parent_node_of(n)
+                continue
+            }
+            return n
+        }
+        null
+    }
+
+    function is_context_sensitive_function_or_object_literal_method(this, fn: ref[AstNode]) returns bool
+    {
+        let k AstNode.kind_of(fn)
+        var admits false
+        if k = KindFunctionExpression
+            set admits: true
+        if k = KindArrowFunction
+            set admits: true
+        if Checker.is_object_literal_method(fn)
+            set admits: true
+        if admits = false
+            return false
+        ; isContextSensitiveFunctionLikeDeclaration — three syntactic walks over
+        ; expressions (HasContextSensitiveParameters, the return-expression walk and
+        ; the yield one). See the header: no input reaches this line today.
+        this.record_unported("is-context-sensitive-function-like-declaration", k)
+        false
+    }
+
+    ; ast.IsObjectLiteralMethod — a MethodDeclaration whose parent is an object
+    ; literal, which is what separates it from a class member of the same kind.
+    function is_object_literal_method(n: ref[AstNode]) returns bool
+    {
+        if AstNode.kind_of(n) <> KindMethodDeclaration
+            return false
+        Checker.kind_or_unknown(AstNode.parent_node_of(n)) = KindObjectLiteralExpression
+    }
+
+    ; getTypeOfVariableOrParameterOrPropertyWorker.
+    ;
+    ; ★★ THE RESOLUTION PUSH IS THE REFERENCE'S CIRCULARITY GUARD AND IT IS LIVE
+    ; HERE: `var x: typeof x` pushes, re-enters through its own annotation and the
+    ; second push finds the cycle. Both exits — the failed push and the failed pop
+    ; — go through reportCircularityError, which is a DIAGNOSTIC and therefore this
+    ; slice's product rather than a stop.
+    ;
+    ; ★★ EVERY REPORTING EXIT AFTER THE PUSH POPS FIRST, and that line is OURS
+    ; rather than the reference's — slice 67's g19 priced the same shape: a report
+    ; is an exit the reference does not have, so its unwinding is ours to write,
+    ; and a leaked frame can only bite a LATER push in the same file.
+    ;
+    ; ★ Two arms of the reference's prefix have no input here and say so at their
+    ; line rather than being left out: `symbol == c.requireSymbol` (this port has no
+    ; require symbol — it comes from a lib this compilation does not load) and the
+    ; JSON source file (a SourceFile is a value declaration only for a JSON module,
+    ; which needs a program).
+    function get_type_of_variable_or_parameter_or_property_worker(this, symbol: ref[Symbol]) returns ref[Type]?
+    {
+        ; ★★★ THE MARK, NOT THE FLAG — see unported_count's own note. The flag says
+        ; whether the UNIT has stopped and this chapter has to know whether THIS
+        ; call did, because its nil is ambiguous. Both wrong readings were built and
+        ; measured: an absolute is_unported() test made every declaration after a
+        ; file's first report a silent no-op, and a before/after test on the FLAG
+        ; invented a TS7005 for each of them (377 units red).
+        let mark this.unported_mark()
+        let f Symbol.flags_of(symbol)
+        if (f & SymbolFlagsPrototype) <> 0
+        {
+            ; getTypeOfPrototypeProperty — the declared type of the symbol's PARENT,
+            ; instantiated with `any` per type parameter. The parent walk is
+            ; getParentOfSymbol, which this port does not have.
+            this.record_unported("get-type-of-prototype-property", 0)
+            return null
+        }
+        ; `symbol == c.requireSymbol` — see the header.
+        let vd Symbol.value_declaration_of(symbol)
+        if vd = null
+        {
+            ; debug.Assert(symbol.ValueDeclaration != nil). An assertion is a claim
+            ; that the input is impossible, so it is reported rather than trapped
+            ; (§3.5v) — the treatment typeResolutionHasProperty's tail gets.
+            this.record_unported("value-declaration-of-variable-symbol", f)
+            return null
+        }
+        let declaration vd as ref[AstNode]
+        let dk AstNode.kind_of(declaration)
+        if dk = KindSourceFile
+        {
+            ; isJsonSourceFile — see the header.
+            this.record_unported("get-type-of-json-source-file", 0)
+            return null
+        }
+        if this.push_type_resolution(symbol, null, TypeSystemPropertyNameType) = false
+            return this.report_circularity_error(symbol)
+        if (f & SymbolFlagsModuleExports) <> 0
+        {
+            ; The `module.exports` symbol: its own `exports` member resolves through
+            ; resolveExternalModuleSymbol and everything else becomes an anonymous
+            ; type over the symbol's MEMBERS — newAnonymousType with a member table,
+            ; which is the object-type dimension rather than this one.
+            this.pop_type_resolution_defensively()
+            this.record_unported("get-type-of-module-exports", 0)
+            return null
+        }
+        var result: ref[Type]? null
+        var variable_like false
+        if dk = KindParameter
+            set variable_like: true
+        if dk = KindPropertyDeclaration
+            set variable_like: true
+        if dk = KindPropertySignature
+            set variable_like: true
+        if dk = KindVariableDeclaration
+            set variable_like: true
+        if dk = KindBindingElement
+            set variable_like: true
+        if variable_like = false
+        {
+            ; The eight remaining arms, each of them an EXPRESSION check or a
+            ; declaration kind this port does not reach: PropertyAssignment,
+            ; ShorthandPropertyAssignment, MethodDeclaration (an object-literal
+            ; method), ExportAssignment, the two assignment-declaration kinds
+            ; (BinaryExpression and CallExpression), JsxAttribute and EnumMember.
+            ; The reference's default arm is a panic.
+            this.pop_type_resolution_defensively()
+            this.record_unported("get-type-of-variable-worker-arm", dk)
+            return null
+        }
+        set result: this.get_widened_type_for_variable_like_declaration(declaration, true)
+        if this.unported_mark() <> mark
+        {
+            this.pop_type_resolution_defensively()
+            return null
+        }
+        if this.pop_type_resolution() = false
+            return this.report_circularity_error(symbol)
+        result
+    }
+
+    ; The unwinding the header names. It is not popTypeResolution's own answer that
+    ; matters here — the frame is being discarded because the unit is over — so the
+    ; result is deliberately dropped.
+    procedure pop_type_resolution_defensively(this)
+    {
+        let popped this.pop_type_resolution()
+    }
+
+    ; reportCircularityError. Its two message ARGUMENTS are symbolToString calls
+    ; and no instrument this package has compares one (slice 68's note), so the
+    ; reports are their code and their location alone.
+    ;
+    ; ★ The alias branch needs getDeclarationOfAliasSymbol and sits behind a symbol
+    ; flag this arm cannot carry — getTypeOfSymbol routes an alias to its own arm —
+    ; so it is reported rather than written: the caller that can reach it is
+    ; getTypeOfAlias, which is a work-list row of its own.
+    function report_circularity_error(this, symbol: ref[Symbol]) returns ref[Type]?
+    {
+        let vd Symbol.value_declaration_of(symbol)
+        if vd = null
+        {
+            if (Symbol.flags_of(symbol) & SymbolFlagsAlias) <> 0
+            {
+                this.record_unported("get-declaration-of-alias-symbol", 0)
+                return null
+            }
+            ; "Circularities could also result from parameters in function
+            ; expressions that end up having themselves as contextual types … we
+            ; have already reported an implicit any error so we don't report
+            ; anything here."
+            return any_type
+        }
+        let declaration vd as ref[AstNode]
+        if AstNode.type_of(declaration) <> null
+        {
+            this.error_on_node(declaration, DiagX_0_is_referenced_directly_or_indirectly_in_its_own_type_annotation)
+            return error_type
+        }
+        if Checker.no_implicit_any()
+        {
+            var report true
+            if AstNode.kind_of(declaration) = KindParameter
+            {
+                if AstNode.initializer_of(declaration) = null
+                    set report: false
+            }
+            if report
+                this.error_on_node(declaration, DiagX_0_implicitly_has_type_any_because_it_does_not_have_a_type_annotation_and_is_referenced_directly_or_indirectly_in_its_own_initializer)
+        }
+        any_type
+    }
+
+    ; getWidenedTypeForVariableLikeDeclaration — one line upstream, and the two
+    ; halves it composes are the whole of this slice.
+    function get_widened_type_for_variable_like_declaration(this, declaration: ref[AstNode], report_errors: bool) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let t this.get_type_for_variable_like_declaration(declaration, true)
+        if this.unported_mark() <> mark
+            return null
+        this.widen_type_for_variable_like_declaration(t, declaration, report_errors)
+    }
+
+    ; getTypeForVariableLikeDeclaration — "the inferred type for a variable,
+    ; parameter, or property declaration".
+    ;
+    ; ★★★ ITS ANSWER IS NULLABLE IN THE REFERENCE TOO, so this port's two nulls
+    ; MEAN different things here: `null` with is_unported() set is a stop, and
+    ; `null` without it is the reference's own *"No type specified and nothing can
+    ; be inferred"* — which the widener turns into `any` plus an implicit-any
+    ; report. Every caller therefore compares is_unported() rather than the value.
+    ;
+    ; ★★ THE checkMode PARAMETER IS NOT CARRIED. Its two readers upstream are
+    ; checkExpressionEx on a for-in right-hand side and checkDeclarationInitializer,
+    ; and both are stops in this slice — so the parameter would be a claim about a
+    ; signature nothing can exercise (§3.5ar). includeOptionality IS carried,
+    ; because the reference calls this with both values.
+    function get_type_for_variable_like_declaration(this, declaration: ref[AstNode], include_optionality: bool) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let dk AstNode.kind_of(declaration)
+        if dk = KindVariableDeclaration
+        {
+            ; "A variable declared in a for..in statement is of type string, or of
+            ; type keyof T when the right hand expression is of a type parameter
+            ; type." The GRANDPARENT is the statement, because the parent is the
+            ; declaration LIST.
+            let parent AstNode.parent_node_of(declaration)
+            let gk Checker.kind_or_unknown(AstNode.parent_node_of(parent))
+            if gk = KindForInStatement
+            {
+                this.record_unported("get-index-type", gk)
+                return null
+            }
+            if gk = KindForOfStatement
+            {
+                this.record_unported("check-right-hand-side-of-for-of", gk)
+                return null
+            }
+        }
+        else
+        {
+            if dk = KindBindingElement
+            {
+                this.record_unported("get-type-for-binding-element-parent", dk)
+                return null
+            }
+        }
+        var is_property false
+        if dk = KindPropertyDeclaration
+        {
+            if b.has_syntactic_modifier(declaration, ModifierFlagsAccessor) = false
+                set is_property: true
+        }
+        if dk = KindPropertySignature
+            set is_property: true
+        var is_optional false
+        if include_optionality
+            set is_optional: Checker.is_optional_declaration(declaration)
+        ; Use type from type annotation if one is present.
+        let declared_type this.try_get_type_from_type_node(declaration)
+        if this.unported_mark() <> mark
+            return null
+        if Checker.is_catch_clause_variable_declaration_or_binding_element(declaration)
+        {
+            if declared_type <> null
+            {
+                let dt declared_type as ref[Type]
+                ; "If the catch clause is explicitly annotated with any or unknown,
+                ; accept it, otherwise error." The error IS the errorType it
+                ; returns; the diagnostic about it belongs to a caller.
+                if (dt.flags & TypeFlagsAnyOrUnknown) <> 0
+                    return dt
+                return error_type
+            }
+            ; "If the catch clause is not explicitly annotated, treat it as though
+            ; it were explicitly annotated with unknown or any, depending on
+            ; useUnknownInCatchVariables."
+            if Checker.use_unknown_in_catch_variables()
+                return unknown_type
+            return any_type
+        }
+        if declared_type <> null
+            return this.add_optionality_ex(declared_type as ref[Type], is_property, is_optional)
+        if Checker.no_implicit_any()
+        {
+            if dk = KindVariableDeclaration
+            {
+                var eligible true
+                if AstNode.is_binding_pattern(AstNode.name_of(declaration))
+                    set eligible: false
+                if (b.combined_modifier_flags(declaration) & ModifierFlagsExport) <> 0
+                    set eligible: false
+                if (AstNode.flags_of(declaration) & NodeFlagsAmbient) <> 0
+                    set eligible: false
+                if eligible
+                {
+                    ; "use control flow tracked 'any' type for non-ambient,
+                    ; non-exported var or let variables with no initializer or a
+                    ; 'null' or 'undefined' initializer"
+                    let initializer AstNode.initializer_of(declaration)
+                    if (Binder.combined_node_flags(declaration) & NodeFlagsConstant) = 0
+                    {
+                        if initializer = null
+                            return auto_type
+                        if this.is_null_or_undefined(initializer as ref[AstNode])
+                            return auto_type
+                        if this.unported_mark() <> mark
+                            return null
+                    }
+                    ; "Use control flow tracked 'any[]' type for non-ambient,
+                    ; non-exported variables with an empty array literal
+                    ; initializer."
+                    if initializer <> null
+                    {
+                        if Checker.is_empty_array_literal(initializer as ref[AstNode])
+                        {
+                            ; autoArrayType is createArrayType(anyType), which needs
+                            ; the global Array — from a lib this compilation does
+                            ; not load.
+                            this.record_unported("auto-array-type", dk)
+                            return null
+                        }
+                    }
+                }
+            }
+        }
+        ; ★★★ THE PARAMETER ARM FALLS THROUGH, AND THAT IS THE WHOLE OF TS7006.
+        ; Its four questions all answer NOTHING for an ordinary parameter — a set
+        ; accessor's paired getter, a JSDoc full signature, a contextual `this` and
+        ; a contextual parameter type — and the reference then carries on to the
+        ; initializer arm and finally to `return nil`, which is what makes the
+        ; widener report. A stop covering the block whole was written first and
+        ; MEASURED: it takes the slice's largest report family with it, because
+        ; `function f(a) {}` reaches every one of the four and is refused by all of
+        ; them at a SYNTACTIC test.
+        if dk = KindParameter
+        {
+            if AstNode.symbol_of(declaration) = null
+            {
+                ; "parameters of function types defined in JSDoc in TS files don't
+                ; have symbols" — a real nil answer rather than a stop.
+                return null
+            }
+            let fnp AstNode.parent_node_of(declaration)
+            if fnp = null
+                return null
+            let fn fnp as ref[AstNode]
+            let fk AstNode.kind_of(fn)
+            ; "For a parameter of a set accessor, use the type of the get accessor
+            ; if one is present"
+            if fk = KindSetAccessor
+            {
+                var bindable false
+                if b.has_dynamic_name(fn) = false
+                    set bindable: true
+                if this.unported_mark() <> mark
+                    return null
+                if bindable = false
+                {
+                    ; hasLateBindableName, whose answer is checkComputedPropertyName
+                    ; or checkExpressionCached — an expression either way.
+                    this.record_unported("has-late-bindable-name", fk)
+                    return null
+                }
+                let acc_sym this.symbol_of_declaration(fn)
+                if this.unported_mark() <> mark
+                    return null
+                if acc_sym <> null
+                {
+                    let getter Checker.declaration_of_kind(acc_sym as ref[Symbol], KindGetAccessor)
+                    if getter <> null
+                    {
+                        ; getSignatureFromDeclaration, and then either the getter's
+                        ; `this` parameter's type or the signature's return type.
+                        this.record_unported("get-signature-from-declaration", KindGetAccessor)
+                        return null
+                    }
+                }
+            }
+            ; getParameterTypeOfFullSignature → getSignatureOfFullSignatureType,
+            ; whose three conjuncts are all syntactic: a JavaScript file, one of
+            ; four function-like kinds, and a FullSignature slot that is filled. A
+            ; TypeScript file answers nothing at the first term.
+            if Parser.is_in_js_file(fn)
+            {
+                var full_kind false
+                if fk = KindFunctionDeclaration
+                    set full_kind: true
+                if fk = KindMethodDeclaration
+                    set full_kind: true
+                if fk = KindFunctionExpression
+                    set full_kind: true
+                if fk = KindArrowFunction
+                    set full_kind: true
+                if full_kind
+                {
+                    if AstNode.full_signature_of(fn) <> null
+                    {
+                        this.record_unported("get-signature-of-full-signature-type", fk)
+                        return null
+                    }
+                }
+            }
+            ; "Use contextual parameter type if one is available". The branch is
+            ; chosen on the SYMBOL's name rather than on the syntax, which is the
+            ; reference's spelling — InternalSymbolNameThis is the unprefixed word
+            ; `this` (ast/symbol.go), so it is one of the few internal names that
+            ; is not behind the 0xFE prefix.
+            var contextual: ref[Type]? null
+            var this_data null as pointer[char]
+            let this_len Binder.internal_name_unprefixed(host, "this", &this_data)
+            let psym AstNode.symbol_of(declaration)
+            var is_this_symbol false
+            if psym <> null
+            {
+                let ps psym as ref[Symbol]
+                if SymbolTable.names_equal(Symbol.name_data_of(ps), Symbol.name_len_of(ps), this_data, this_len)
+                    set is_this_symbol: true
+            }
+            if is_this_symbol
+                set contextual: this.get_contextual_this_parameter_type(fn)
+            else
+                set contextual: this.get_contextually_typed_parameter_type(declaration)
+            if this.unported_mark() <> mark
+                return null
+            if contextual <> null
+                return this.add_optionality_ex(contextual as ref[Type], false, is_optional)
+        }
+        ; "Use the type of the initializer expression if one is present and the
+        ; declaration is not a parameter of a contextually typed function."
+        if AstNode.initializer_of(declaration) <> null
+        {
+            this.record_unported("check-declaration-initializer", dk)
+            return null
+        }
+        if Checker.no_implicit_any()
+        {
+            if dk = KindPropertyDeclaration
+            {
+                ; The control-flow analysis of `this.xxx` assignments in the
+                ; constructor or in a static block. Two of its arms are flow types
+                ; and the third is getTypeOfPropertyInBaseClass; the arm can also
+                ; answer NOTHING, which is why it is a stop rather than a
+                ; fallthrough — the difference is observable in the report.
+                this.record_unported("get-flow-type-in-constructor", dk)
+                return null
+            }
+        }
+        if dk = KindJsxAttribute
+        {
+            ; "if JSX attribute doesn't have initializer, by default the attribute
+            ; will have boolean value of true". trueType needs newLiteralType, i.e.
+            ; the value payload initialize_intrinsic_types names as missing.
+            this.record_unported("jsx-attribute-true-type", dk)
+            return null
+        }
+        if AstNode.is_binding_pattern(AstNode.name_of(declaration))
+        {
+            this.record_unported("get-type-from-binding-pattern", dk)
+            return null
+        }
+        ; "No type specified and nothing can be inferred."
+        null
+    }
+
+    ; widenTypeForVariableLikeDeclaration.
+    ;
+    ; ★★★ THE NIL BRANCH IS THIS SLICE'S PRODUCT. A declaration with no annotation,
+    ; no initializer and nothing to infer from gets `any` AND AN IMPLICIT-ANY
+    ; DIAGNOSTIC — TS7005/7006/7008/7019/7031 — which is the first family of
+    ; reports this port produces from the TYPE side rather than from a grammar
+    ; check.
+    ;
+    ; ★★ THE THREE TESTS ON THE NON-NIL SIDE ARE LIVE CODE WITH NO INPUT, and each
+    ; names the term that is zero rather than being dropped: `t.flags&ESSymbol`
+    ; reaches isGlobalSymbolConstructor, whose global symbol comes from a lib this
+    ; compilation does not load; `t.flags&UniqueESSymbol` is set only by
+    ; getESSymbolLikeTypeForNode, which no ported arm calls; and
+    ; reportErrorsFromWidening stands behind ObjectFlagsContainsWideningType, which
+    ; no type this slice can make carries — create_widening_type answers the
+    ; NON-widening type under strictNullChecks, which is its own header's finding.
+    function widen_type_for_variable_like_declaration(this, t: ref[Type]?, declaration: ref[AstNode], report_errors: bool) returns ref[Type]?
+    {
+        if t <> null
+        {
+            let ty t as ref[Type]
+            if (ty.flags & TypeFlagsESSymbol) <> 0
+            {
+                ; isGlobalSymbolConstructor — see the header.
+                this.record_unported("is-global-symbol-constructor", 0)
+                return null
+            }
+            if report_errors
+            {
+                if (ty.object_flags & ObjectFlagsContainsWideningType) <> 0
+                {
+                    ; reportErrorsFromWidening — see the header.
+                    this.record_unported("report-errors-from-widening", 0)
+                    return null
+                }
+            }
+            if (ty.flags & TypeFlagsUniqueESSymbol) <> 0
+            {
+                ; the unique-symbol rewrite — see the header.
+                this.record_unported("unique-es-symbol-widening", 0)
+                return null
+            }
+            return this.get_widened_type(ty)
+        }
+        ; "Rest parameters default to type any[], other parameters default to type
+        ; any"
+        if AstNode.kind_of(declaration) = KindParameter
+        {
+            if AstNode.dot_dot_dot_token_of(declaration) <> null
+            {
+                ; anyArrayType — createArrayType over the global Array again.
+                this.record_unported("any-array-type", KindParameter)
+                return null
+            }
+        }
+        ; "Report implicit any errors unless this is a private property within an
+        ; ambient declaration"
+        if report_errors
+        {
+            if this.declaration_belongs_to_private_ambient_member(declaration) = false
+                this.report_implicit_any(declaration, any_type, WideningKindNormal)
+        }
+        any_type
+    }
+
+    ; getContextuallyTypedParameterType. ★★★ ITS FIRST LINE IS THE WHOLE FUNCTION
+    ; TODAY: isContextSensitiveFunctionOrObjectLiteralMethod refuses every
+    ; parameter this port walks (see its own header), so the IIFE branch and the
+    ; contextual-signature branch behind it are unreachable rather than unwritten.
+    function get_contextually_typed_parameter_type(this, parameter: ref[AstNode]) returns ref[Type]?
+    {
+        let fn AstNode.parent_node_of(parameter)
+        if fn = null
+            return null
+        if this.is_context_sensitive_function_or_object_literal_method(fn as ref[AstNode]) = false
+            return null
+        ; getEffectiveCallArguments / getContextualSignature — the call dimension.
+        this.record_unported("get-contextual-signature", KindParameter)
+        null
+    }
+
+    ; getContextualThisParameterType, and every one of its tests is syntactic until
+    ; the one that reports.
+    ;
+    ; ★★ noImplicitThis IS TRUE, so the second half of this function is LIVE — it
+    ; is a strict-FAMILY option, the fourth one strict_null_checks' header names.
+    ; What keeps it quiet is the shape: an object-literal container or an
+    ; `obj.xxx = function (…)` assignment, both of which stop, and everything else
+    ; answers nothing.
+    function get_contextual_this_parameter_type(this, fn: ref[AstNode]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        if AstNode.kind_of(fn) = KindArrowFunction
+            return null
+        if this.is_context_sensitive_function_or_object_literal_method(fn)
+        {
+            this.record_unported("get-contextual-signature", AstNode.kind_of(fn))
+            return null
+        }
+        if this.unported_mark() <> mark
+            return null
+        var considered: bool Checker.no_implicit_this()
+        if Parser.is_in_js_file(fn)
+            set considered: true
+        if considered
+        {
+            if Checker.containing_object_literal(fn) <> null
+            {
+                ; getApparentTypeOfContextualType and the ThisType<T> lookup behind
+                ; it, then checkExpressionCached on the literal itself.
+                this.record_unported("get-this-type-of-object-literal", AstNode.kind_of(fn))
+                return null
+            }
+            ; "In an assignment of the form 'obj.xxx = function(...)' or
+            ; 'obj[xxx] = function(...)', the contextual type for 'this' is 'obj'."
+            let parent Checker.walk_up_parenthesized_expressions(AstNode.parent_node_of(fn))
+            if Parser.is_assignment_expression_node(parent)
+            {
+                let target AstNode.binary_left_of(parent as ref[AstNode])
+                if Parser.is_access_expression(target)
+                {
+                    this.record_unported("check-expression-cached", AstNode.kind_of(target as ref[AstNode]))
+                    return null
+                }
+            }
+        }
+        null
+    }
+
+    ; getContainingObjectLiteral — two shapes, and the second reaches one level
+    ; further up (a function EXPRESSION is the property assignment's initializer,
+    ; so the literal is its grandparent).
+    function containing_object_literal(f: ref[AstNode]) returns ref[AstNode]?
+    {
+        let k AstNode.kind_of(f)
+        var member false
+        if k = KindMethodDeclaration
+            set member: true
+        if k = KindGetAccessor
+            set member: true
+        if k = KindSetAccessor
+            set member: true
+        let parent AstNode.parent_node_of(f)
+        if member
+        {
+            if Checker.kind_or_unknown(parent) = KindObjectLiteralExpression
+                return parent
+            return null
+        }
+        if k = KindFunctionExpression
+        {
+            if Checker.kind_or_unknown(parent) = KindPropertyAssignment
+                return AstNode.parent_node_of(parent)
+        }
+        null
+    }
+
+    ; ast.WalkUpParenthesizedExpressions.
+    function walk_up_parenthesized_expressions(node: ref[AstNode]?) returns ref[AstNode]?
+    {
+        var n node
+        while n <> null
+        {
+            if AstNode.kind_of(n as ref[AstNode]) <> KindParenthesizedExpression
+                return n
+            set n: AstNode.parent_node_of(n)
+        }
+        null
+    }
+
+    ; getWidenedType / getWidenedTypeWithContext, reduced to the gate that decides
+    ; whether there is anything to do. ObjectFlagsRequiresWidening is the union of
+    ; the two "contains" bits, and no type this slice makes carries either — so the
+    ; identity arm is the ported one and the five widening arms (any/nullable, the
+    ; object literal, the union, the intersection and the array or tuple) stand
+    ; behind one report. The memo on CachedTypeKindWidened goes with them: it keys
+    ; a computation that cannot run.
+    function get_widened_type(this, t: ref[Type]) returns ref[Type]?
+    {
+        if (t.object_flags & ObjectFlagsRequiresWidening) <> 0
+        {
+            this.record_unported("get-widened-type", t.flags)
+            return null
+        }
+        t
+    }
+
+    ; addOptionalityEx. getOptionalType is a UNION and this port has none, so the
+    ; optional half is one report — and it stands behind strictNullChecks, which is
+    ; TRUE here, so `x?: string` reaches it and `x: string` does not.
+    function add_optionality_ex(this, t: ref[Type], is_property: bool, is_optional: bool) returns ref[Type]?
+    {
+        if Checker.strict_null_checks()
+        {
+            if is_optional
+            {
+                ; getOptionalType's own first test is against undefinedOrMissingType
+                ; or undefinedType, which is a plain identity — but its answer is
+                ; getUnionType in every other case, and is_property is what selects
+                ; between the two sentinels. Reported whole rather than half.
+                this.record_unported("get-optional-type", t.flags)
+                return null
+            }
+        }
+        t
+    }
+
+    ; ── getTypeFromTypeNode, and the arms that need no printer ───────────────
+    ;
+    ; ★★★ THE KEYWORD ARMS ARE PORTED AND NOTHING ELSE, and the boundary is the one
+    ; type_to_string already draws: an intrinsic answers a NAME the printer prints
+    ; unchanged, and every other arm makes a type the printer cannot render. So the
+    ; two halves of the checker dimension are cut at the same place, on purpose —
+    ; porting an arm here whose result the T section cannot print would move a unit
+    ; from an honest UNPORTED to a FAIL.
+    ;
+    ; ★ The `get-type-from-type-node` tag is NOT new: eleven call sites in this file
+    ; already report it, and they keep reporting it for the arms below that stay
+    ; unported. What changes is that the tag names the ARMS rather than the
+    ; function.
+    function try_get_type_from_type_node(this, node: ref[AstNode]) returns ref[Type]?
+    {
+        let type_node AstNode.type_of(node)
+        if type_node = null
+            return null
+        this.get_type_from_type_node(type_node as ref[AstNode])
+    }
+
+    function get_type_from_type_node(this, node: ref[AstNode]) returns ref[Type]?
+    {
+        let t this.get_type_from_type_node_worker(node)
+        if t = null
+            return null
+        this.get_conditional_flow_type_of_type(t as ref[Type], node)
+    }
+
+    function get_type_from_type_node_worker(this, node: ref[AstNode]) returns ref[Type]?
+    {
+        let k AstNode.kind_of(node)
+        if k = KindAnyKeyword
+            return any_type
+        if k = KindJSDocAllType
+            return any_type
+        if k = KindUnknownKeyword
+            return unknown_type
+        if k = KindStringKeyword
+            return string_type
+        if k = KindNumberKeyword
+            return number_type
+        if k = KindBigIntKeyword
+            return bigint_type
+        if k = KindSymbolKeyword
+            return es_symbol_type
+        if k = KindVoidKeyword
+            return void_type
+        if k = KindUndefinedKeyword
+            return undefined_type
+        if k = KindNullKeyword
+            return null_type
+        if k = KindNeverKeyword
+            return never_type
+        if k = KindObjectKeyword
+            return non_primitive_type
+        if k = KindIntrinsicKeyword
+            return intrinsic_marker_type
+        ; ★ KindBooleanKeyword IS NOT HERE, and its absence is a measurement rather
+        ; than an omission: booleanType is a UNION of the two boolean literal types,
+        ; and initialize_intrinsic_types' header already names it among the types
+        ; this port cannot make. So the keyword reports with its neighbours, and the
+        ; same sentence retires the TypePredicate arm — two lines answering voidType
+        ; or booleanType, of which the second is that missing union.
+        ;
+        ; ★ ParenthesizedType and the three JSDoc wrappers RECURSE into
+        ; getTypeFromTypeNode and would work; they are left out deliberately,
+        ; because each is a one-line forward whose value is exactly the inner arm's,
+        ; so porting them buys nothing this slice can print and costs a row the work
+        ; list would then have to explain twice.
+        this.record_unported("get-type-from-type-node", k)
+        null
+    }
+
+    ; getConditionalFlowTypeOfType — the substitution walk from a type NODE up to
+    ; its enclosing statement.
+    ;
+    ; ★★★ ITS ONLY EFFECT IS THE CONSTRAINT LIST, so the walk is transcribed and
+    ; the two places that would APPEND report instead. That is what makes the port
+    ; exact rather than conservative: ending the walk early (or late) changes which
+    ; ancestors are examined, and a report at the append is the one point where the
+    ; reference's answer stops being `t`.
+    ;
+    ; ★ `covariant` flips on a PARAMETER parent and is read only by the first arm,
+    ; whose guard is `covariant || t is a type variable`. No type this slice makes
+    ; is a type variable, so the flag is what decides — and it is transcribed
+    ; rather than folded away, because an annotation reached through one parameter
+    ; list is one flip.
+    function get_conditional_flow_type_of_type(this, t: ref[Type], node: ref[AstNode]) returns ref[Type]?
+    {
+        var n: ref[AstNode]? node
+        var covariant true
+        while n <> null
+        {
+            let cur n as ref[AstNode]
+            if Checker.is_statement(cur)
+                return t
+            if AstNode.kind_of(cur) = KindJSDoc
+                return t
+            let p AstNode.parent_node_of(cur)
+            if p = null
+                return t
+            let parent p as ref[AstNode]
+            let pk AstNode.kind_of(parent)
+            if pk = KindParameter
+            {
+                if covariant
+                    set covariant: false
+                else
+                    set covariant: true
+            }
+            var conditional_true false
+            if pk = KindConditionalType
+            {
+                if AstNode.conditional_true_type_of(parent) = cur
+                    set conditional_true: true
+            }
+            var substitutes false
+            if conditional_true
+            {
+                ; "Always substitute on type parameters, regardless of variance,
+                ; since even in contravariant positions they may rely on
+                ; substituted constraints to be valid"
+                if covariant
+                    set substitutes: true
+                if (t.flags & TypeFlagsTypeVariable) <> 0
+                    set substitutes: true
+            }
+            if substitutes
+            {
+                this.record_unported("get-implied-constraint", pk)
+                return null
+            }
+            if conditional_true = false
+            {
+                if (t.flags & TypeFlagsTypeParameter) <> 0
+                {
+                    if pk = KindMappedType
+                    {
+                        this.record_unported("get-type-parameter-from-mapped-type", pk)
+                        return null
+                    }
+                }
+            }
+            set n: parent
+        }
+        t
+    }
+
+    ; ── the predicates this chapter needed ───────────────────────────────────
+
+    ; ast.IsCatchClauseVariableDeclarationOrBindingElement.
+    function is_catch_clause_variable_declaration_or_binding_element(declaration: ref[AstNode]) returns bool
+    {
+        let root Binder.get_root_declaration(declaration)
+        if root = null
+            return false
+        let n root as ref[AstNode]
+        if AstNode.kind_of(n) <> KindVariableDeclaration
+            return false
+        Checker.kind_or_unknown(AstNode.parent_node_of(n)) = KindCatchClause
+    }
+
+    ; isEmptyArrayLiteral.
+    function is_empty_array_literal(expression: ref[AstNode]) returns bool
+    {
+        if AstNode.kind_of(expression) <> KindArrayLiteralExpression
+            return false
+        let elements AstNode.elements_of(expression)
+        if elements = null
+            return true
+        AstNode.list_count(elements) = 0
+    }
+
+    ; declarationBelongsToPrivateAmbientMember, and isPrivateWithinAmbient with it.
+    ; A method rather than a static because the modifier flags live on the binder.
+    function declaration_belongs_to_private_ambient_member(this, declaration: ref[AstNode]) returns bool
+    {
+        let root Binder.get_root_declaration(declaration)
+        if root = null
+            return false
+        var member root as ref[AstNode]
+        if AstNode.kind_of(member) = KindParameter
+        {
+            let p AstNode.parent_node_of(member)
+            if p = null
+                return false
+            set member: p as ref[AstNode]
+        }
+        var private_name false
+        if b.has_syntactic_modifier(member, ModifierFlagsPrivate)
+            set private_name: true
+        if AstNode.is_private_identifier_class_element_declaration(member)
+            set private_name: true
+        if private_name = false
+            return false
+        (AstNode.flags_of(member) & NodeFlagsAmbient) <> 0
+    }
+
+    ; isNullOrUndefined. Its Identifier arm compares the RESOLVED symbol against
+    ; the undefined symbol, a name resolution this port does not have — so
+    ; `let x = null` answers true, `let x = 1` answers false and `let x = y`
+    ; reports.
+    function is_null_or_undefined(this, node: ref[AstNode]) returns bool
+    {
+        let expr Checker.skip_parentheses(node)
+        let k AstNode.kind_of(expr)
+        if k = KindNullKeyword
+            return true
+        if k = KindIdentifier
+        {
+            this.record_unported("get-resolved-symbol", k)
+            return false
+        }
+        false
+    }
+
+    ; ast.SkipParentheses, without the JSDoc-type-assertion exemption: that arm
+    ; asks IsJSDocTypeAssertion, whose answer only ever KEEPS more parentheses. It
+    ; is named rather than written because its one reader here is the test above,
+    ; which reports on the very shape it would preserve.
+    function skip_parentheses(node: ref[AstNode]) returns ref[AstNode]
+    {
+        var n node
+        while AstNode.kind_of(n) = KindParenthesizedExpression
+        {
+            let e AstNode.expression_of(n)
+            if e = null
+                return n
+            set n: e as ref[AstNode]
+        }
+        n
+    }
+
+    ; ast.IsStatement — the two kind lists plus the Block test, transcribed. It is
+    ; the TERMINATOR of getConditionalFlowTypeOfType's walk and therefore decides
+    ; which ancestors that walk examines at all.
+    function is_statement(node: ref[AstNode]) returns bool
+    {
+        let k AstNode.kind_of(node)
+        if Checker.is_statement_kind_but_not_declaration_kind(k)
+            return true
+        if Checker.is_declaration_statement_kind(k)
+            return true
+        Checker.is_block_statement(node)
+    }
+
+    function is_statement_kind_but_not_declaration_kind(k: int) returns bool
+    {
+        if k = KindBreakStatement
+            return true
+        if k = KindContinueStatement
+            return true
+        if k = KindDebuggerStatement
+            return true
+        if k = KindDoStatement
+            return true
+        if k = KindExpressionStatement
+            return true
+        if k = KindEmptyStatement
+            return true
+        if k = KindForInStatement
+            return true
+        if k = KindForOfStatement
+            return true
+        if k = KindForStatement
+            return true
+        if k = KindIfStatement
+            return true
+        if k = KindLabeledStatement
+            return true
+        if k = KindReturnStatement
+            return true
+        if k = KindSwitchStatement
+            return true
+        if k = KindThrowStatement
+            return true
+        if k = KindTryStatement
+            return true
+        if k = KindVariableStatement
+            return true
+        if k = KindWhileStatement
+            return true
+        if k = KindWithStatement
+            return true
+        k = KindNotEmittedStatement
+    }
+
+    function is_declaration_statement_kind(k: int) returns bool
+    {
+        if k = KindFunctionDeclaration
+            return true
+        if k = KindMissingDeclaration
+            return true
+        if k = KindClassDeclaration
+            return true
+        if k = KindInterfaceDeclaration
+            return true
+        if k = KindTypeAliasDeclaration
+            return true
+        if k = KindJSTypeAliasDeclaration
+            return true
+        if k = KindEnumDeclaration
+            return true
+        if k = KindModuleDeclaration
+            return true
+        if k = KindImportDeclaration
+            return true
+        if k = KindJSImportDeclaration
+            return true
+        if k = KindImportEqualsDeclaration
+            return true
+        if k = KindExportDeclaration
+            return true
+        if k = KindExportAssignment
+            return true
+        k = KindNamespaceExportDeclaration
+    }
+
+    ; isBlockStatement — a Block that is neither a try or catch body nor the
+    ; Block-like body of a function. Its two parent tests are why IsStatement is
+    ; asked of the NODE rather than of the kind.
+    function is_block_statement(node: ref[AstNode]) returns bool
+    {
+        if AstNode.kind_of(node) <> KindBlock
+            return false
+        let pk Checker.kind_or_unknown(AstNode.parent_node_of(node))
+        if pk = KindTryStatement
+            return false
+        if pk = KindCatchClause
+            return false
+        Checker.is_function_block(node) = false
+    }
+
+    function is_function_block(node: ref[AstNode]) returns bool
+    {
+        if AstNode.kind_of(node) <> KindBlock
+            return false
+        AstNode.is_function_like(AstNode.parent_node_of(node))
+    }
+
+    ; ast.IsCheckJSEnabledForFile. ★★★ ITS FIRST TERM IS THE FIELD THE PARSER USED
+    ; TO DROP, and the note it dropped it under named this function as the reader
+    ; (parser.scaly, extract_pragmas). checkJs is unset under this harness, so the
+    ; second term is false and the whole answer is the directive: a JavaScript file
+    ; without `// @ts-check` gets no implicit-any diagnostic at all.
+    function is_check_js_enabled_for_file(this) returns bool
+    {
+        let d AstNode.check_js_directive_of(file)
+        if d <> CheckJsDirectiveNone
+            return d = CheckJsDirectiveEnabled
+        Checker.check_js()
+    }
+
+    ; reportImplicitAny, whole but for the two things no instrument compares.
+    ;
+    ; ★★★ THE MESSAGE ARGUMENTS ARE NOT BUILT, and here that saves a CALL rather
+    ; than a paragraph: `typeAsString := c.TypeToString(c.getWidenedType(t))` runs
+    ; BEFORE the switch upstream, and the dump's C line is `C pos end code`. Slice
+    ; 68 wrote the rule down; this is the first place it changes what the code does.
+    ; The `t` parameter is kept because it is the reference's signature and because
+    ; the slice that gives this port a message renderer needs it back.
+    ;
+    ; ★★ noImplicitAny IS TRUE UNDER THIS HARNESS, so every `errorOrSuggestion(c.
+    ; noImplicitAny, …)` here is an ERROR and the five SUGGESTION codes (7043,
+    ; 7044, 7045, 7047, 7050) are dead. They are named rather than written: this
+    ; port has no suggestion list, and the reference routes a suggestion to one
+    ; GetDiagnosticsForFile does not return — so writing them would be inventing a
+    ; line no instrument could ever see, which is the single failure diagcheck's
+    ; subsequence relation exists to catch.
+    ;
+    ; ★ THE TS7051 BRANCH IS THE ONE STOP. It fires for a parameter of a call
+    ; signature, a method signature or a function type whose name reads as a TYPE,
+    ; and the second disjunct of that test is resolveName. The FIRST disjunct is
+    ; decidable here (the name is a type keyword) — but it is not asked separately,
+    ; because a report has to stand where EITHER disjunct can send the reference,
+    ; and a `||` cannot be half-evaluated into a different answer.
+    procedure report_implicit_any(this, declaration: ref[AstNode], t: ref[Type], widening_kind: int)
+    {
+        if Parser.is_in_js_file(declaration)
+        {
+            ; "Only report implicit any errors/suggestions in TS and ts-check JS
+            ; files"
+            if this.is_check_js_enabled_for_file() = false
+                return
+        }
+        let dk AstNode.kind_of(declaration)
+        var code 0
+        if dk = KindBinaryExpression
+            set code: DiagMember_0_implicitly_has_an_1_type
+        if dk = KindPropertyDeclaration
+            set code: DiagMember_0_implicitly_has_an_1_type
+        if dk = KindPropertySignature
+            set code: DiagMember_0_implicitly_has_an_1_type
+        if dk = KindParameter
+        {
+            if Checker.kind_or_unknown(AstNode.name_of(declaration)) = KindIdentifier
+            {
+                let parent AstNode.parent_node_of(declaration)
+                let pk Checker.kind_or_unknown(parent)
+                var signature_like false
+                if pk = KindCallSignature
+                    set signature_like: true
+                if pk = KindMethodSignature
+                    set signature_like: true
+                if pk = KindFunctionType
+                    set signature_like: true
+                if signature_like
+                {
+                    if Checker.parameter_index_of(parent as ref[AstNode], declaration) >= 0
+                    {
+                        this.record_unported("resolve-name", KindParameter)
+                        return
+                    }
+                }
+            }
+            if AstNode.dot_dot_dot_token_of(declaration) <> null
+                set code: DiagRest_parameter_0_implicitly_has_an_any_type
+            else
+                set code: DiagParameter_0_implicitly_has_an_1_type
+        }
+        if dk = KindBindingElement
+            set code: DiagBinding_element_0_implicitly_has_an_1_type
+        if Checker.kind_is_function_like_implicit_any(dk)
+        {
+            if AstNode.name_of(declaration) = null
+            {
+                if widening_kind = WideningKindGeneratorYield
+                    this.error_on_node(declaration, DiagGenerator_implicitly_has_yield_type_0_Consider_supplying_a_return_type_annotation)
+                else
+                    this.error_on_node(declaration, DiagFunction_expression_which_lacks_return_type_annotation_implicitly_has_an_0_return_type)
+                return
+            }
+            if (AstNode.flags_of(declaration) & NodeFlagsReparsed) <> 0
+            {
+                this.error_on_node(declaration, DiagThis_overload_implicitly_returns_the_type_0_because_it_lacks_a_return_type_annotation)
+                return
+            }
+            if widening_kind = WideningKindGeneratorYield
+                set code: DiagX_0_which_lacks_return_type_annotation_implicitly_has_an_1_yield_type
+            else
+                set code: DiagX_0_which_lacks_return_type_annotation_implicitly_has_an_1_return_type
+        }
+        if dk = KindMappedType
+        {
+            this.error_on_node(declaration, DiagMapped_object_type_implicitly_has_an_any_template_type)
+            return
+        }
+        ; The switch's DEFAULT arm, and it is reached by every kind none of the
+        ; labels above named — which is why the variable starts at 0 rather than at
+        ; the default code: a kind that IS named and left the code at 0 would be a
+        ; missing arm, and this way there is no such shape.
+        if code = 0
+            set code: DiagVariable_0_implicitly_has_an_1_type
+        this.error_on_node(declaration, code)
+    }
+
+    ; The reference's fifth switch label, as a predicate: the seven function-like
+    ; kinds whose implicit `any` is a RETURN type rather than a value type.
+    function kind_is_function_like_implicit_any(k: int) returns bool
+    {
+        if k = KindFunctionDeclaration
+            return true
+        if k = KindMethodDeclaration
+            return true
+        if k = KindMethodSignature
+            return true
+        if k = KindGetAccessor
+            return true
+        if k = KindSetAccessor
+            return true
+        if k = KindFunctionExpression
+            return true
+        k = KindArrowFunction
     }
 
     ; ── the base constructor type ───────────────────────────────────────────
@@ -2451,6 +3729,30 @@ define Checker
 
     function exact_optional_property_types() returns bool
         false
+
+    ; ★★ SLICE 69 NEEDS THREE MORE, and they split along exactly the line
+    ; strict_null_checks' header draws. noImplicitAny and useUnknownInCatch
+    ; Variables are strict-FAMILY options read through GetStrictOptionValue, so an
+    ; unset value falls through to `Strict != TSFalse` and both answer TRUE — which
+    ; is what makes this slice produce diagnostics at all. checkJs is a plain
+    ; equality against TSTrue and answers FALSE, which is why a JavaScript file
+    ; without `// @ts-check` gets none of them.
+    ;
+    ; ★ check_signature_declaration's header already stated noImplicitAny's value
+    ; and called the two arms behind it *"live code behind a live option"*; this is
+    ; the slice that reads it.
+    function no_implicit_any() returns bool
+        true
+
+    function use_unknown_in_catch_variables() returns bool
+        true
+
+    function check_js() returns bool
+        false
+
+    ; noImplicitThis — the fourth strict-family option, TRUE for the same reason.
+    function no_implicit_this() returns bool
+        true
 
     ; NewChecker's intrinsic block. The order is the reference's, because the type
     ; ids are assigned along it.

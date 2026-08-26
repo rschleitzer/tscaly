@@ -760,6 +760,13 @@ define Parser
     ; lifetime is the whole parse.
     source_flags: int
 
+    ; The pragma pass's CheckJsDirective accumulator (checker slice 69). It lives
+    ; on the parser and is handed to the SourceFile at the end of process_pragmas,
+    ; because the reference's `context` is per-PASS and the reparse path runs the
+    ; pass twice. LAST write wins, and extract_pragmas has the reading that got
+    ; that backwards once.
+    check_js_directive: int
+
     ; ★★★ The reference's `p.scriptKind`, and slice 19 is the first slice for
     ; which a parse has more than one of them. It is an ARGUMENT to
     ; ParseSourceFile upstream — never derived inside the parser — because the
@@ -847,6 +854,7 @@ define Parser
         set this.top_level_statement_index: 0
         set this.is_declaration_file: false
         set this.source_flags: NodeFlagsNone
+        set this.check_js_directive: CheckJsDirectiveNone
         set this.script_kind: ScriptKindTS
         set this.language_variant_jsx: false
         set this.has_deprecated_tag: false
@@ -1628,7 +1636,7 @@ define Parser
         ; reparse and stamp it on a node the reference does not. The reference
         ; builds it too, and for its own additional reason: finishSourceFile
         ; computes the external-module indicator the decision below reads.
-        let file this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(statements, eof, diagnostics, this.js_diagnostics_for_file(), list_ranges))), pos)
+        let file this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(statements, eof, diagnostics, this.js_diagnostics_for_file(), list_ranges, CheckJsDirectiveNone))), pos)
         if file = null
             return null
 
@@ -1644,7 +1652,7 @@ define Parser
         ; SourceFile's directive lists at its top and never touches p.diagnostics
         ; — so a file carrying both a top-level await and a bad `<reference>`
         ; reports that reference TWICE. Faithful, and pinned by the fixture.
-        this.process_pragmas()
+        this.process_pragmas(file)
 
         ; Now the whole file is in hand, which is when the reference decides
         ; whether to re-parse — see parse_top_level_statement.
@@ -1672,7 +1680,7 @@ define Parser
                     ; (ast.scaly's new_node_list says so). The `end` is right
                     ; regardless: the last rewind put the scanner back at the end
                     ; of the file, so node_pos() answers what it answered above.
-                    let reparsed_file this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(reparsed, eof, diagnostics, this.js_diagnostics_for_file(), list_ranges))), pos)
+                    let reparsed_file this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(reparsed, eof, diagnostics, this.js_diagnostics_for_file(), list_ranges, CheckJsDirectiveNone))), pos)
                     if reparsed_file = null
                         return null
                     ; finishSourceFile runs a SECOND time on the reparse result,
@@ -1681,7 +1689,7 @@ define Parser
                     ; first did not (an `import.meta` inside a statement the
                     ; reparse rewrote).
                     set reparsed_file.flags: reparsed_file.flags | source_flags
-                    this.process_pragmas()
+                    this.process_pragmas(reparsed_file)
                     return reparsed_file
                 }
             }
@@ -1830,7 +1838,7 @@ define Parser
             set eof: this.parse_expected_token(KindEndOfFile)
         }
 
-        let file this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(statements, eof, diagnostics, this.js_diagnostics_for_file(), list_ranges))), pos)
+        let file this.finish_node(this.new_node(KindSourceFile, NodeData.SourceFile(SourceFileData(statements, eof, diagnostics, this.js_diagnostics_for_file(), list_ranges, CheckJsDirectiveNone))), pos)
         if file = null
             return null
 
@@ -1857,7 +1865,7 @@ define Parser
         ; whose first line is a `///` comment therefore gets the same directive
         ; diagnostics — which is the reference's behaviour and not obviously the
         ; intended one, so it is stated rather than quietly narrowed.
-        this.process_pragmas()
+        this.process_pragmas(file)
         file
     }
 
@@ -14778,8 +14786,15 @@ define Parser
     ; ★★ The pragma scan reads the LEADING comment ranges of position 0, so it
     ; stops at the first thing that is neither whitespace nor a comment: a
     ; `/// <reference …>` below the first statement is not a pragma at all.
-    procedure process_pragmas(this)
+    ;
+    ; ★ The comments arrive in SOURCE ORDER, which is what makes CheckJsDirective's
+    ; last-wins rule an unconditional overwrite here — see extract_pragmas.
+    procedure process_pragmas(this, file: ref[AstNode])
     {
+        ; processPragmasIntoFields resets the SourceFile's directive slots at its
+        ; top, and the reparse path runs the whole pass a second time — so the
+        ; accumulator is cleared here rather than at the start of the parse.
+        set check_js_directive: CheckJsDirectiveNone
         let ranges this.cparts_new()
         this.collect_comment_ranges(0, false, ranges)
         let count (ranges.get_length() as int) / 2
@@ -14791,6 +14806,7 @@ define Parser
             set i: i + 1
             this.extract_pragmas(s, e)
         }
+        AstNode.set_check_js_directive(file, check_js_directive)
     }
 
     ; extractPragmas' single-line arm, and then the `reference` arm of
@@ -14854,10 +14870,42 @@ define Parser
             return
         }
 
-        ; `@ts-check` / `@ts-nocheck`. Recognised and then dropped: the field it
-        ; sets is CheckJsDirective, whose reader is the checker.
+        ; `@ts-check` / `@ts-nocheck`, and any other single-line `@` pragma, which
+        ; the reference discards at exactly this test (`if !(pragmaName ==
+        ; "ts-check" || pragmaName == "ts-nocheck") { return nil }`).
+        ;
+        ; ★★★ THE LAST DIRECTIVE WINS, AND THE PORT'S OWN NOTE USED TO SAY THAT
+        ; NOTHING HERE READS THAT. processPragmasIntoFields keeps `if context.
+        ; CheckJsDirective == nil || pragma.TextRange.Pos() > context.CheckJs
+        ; Directive.Range.Pos()` under the comment *"_last_ of either nocheck or
+        ; check in a file is the winner"*, and the per-comment processing this port
+        ; does gives that for free: comment ranges arrive in source order, so the
+        ; position test is monotone and an unconditional overwrite is the same
+        ; answer.
+        ;
+        ; ★★★ A FALSE FRIEND WAS BUILT AND MEASURED HERE FIRST, and it is §3.5's
+        ; struct-embedding entry read from the wrong side. This arm constructs its
+        ; Pragma as `ast.Pragma{CommentRange: commentRange, Name: pragmaName}` — no
+        ; TextRange — so `pragma.TextRange.Pos()` looks like a zero value, which
+        ; would make the test false for every input and the FIRST directive the
+        ; winner. It is not: `Pragma` EMBEDS `CommentRange`, which embeds
+        ; `core.TextRange`, so `pragma.TextRange` IS the comment's own range,
+        ; PROMOTED. A named field in this port cannot be promoted, so nothing in the
+        ; ported text carries the hint — and the wrong reading was caught by the
+        ; fixture checker_implicit_any_js_first_wins.js, whose two directives are
+        ; the only input that can tell the two rules apart.
         if this.pragma_match(pos, comment_end, "@")
+        {
+            let name_end this.pragma_extract_name(pos + 1, comment_end)
+            var found: int CheckJsDirectiveNone
+            if this.pragma_name_is(pos + 1, name_end, "ts-check")
+                set found: CheckJsDirectiveEnabled
+            if this.pragma_name_is(pos + 1, name_end, "ts-nocheck")
+                set found: CheckJsDirectiveDisabled
+            if found <> CheckJsDirectiveNone
+                set check_js_directive: found
             return
+        }
     }
 
     ; processPragmasIntoFields' `reference` arm. Its four cases are ORDERED and

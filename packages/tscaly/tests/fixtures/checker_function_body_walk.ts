@@ -5,8 +5,10 @@
 // and the `var` inside it is the first construct in the unit that reports at all.
 //
 // Without the walk this unit answers `get-return-type-from-annotation`, the tag
-// of the line AFTER the body; with it, `get-type-of-variable-or-parameter-or-
-// property`, from inside. The difference between the two IS the walk.
+// of the line AFTER the body; with it, a tag from INSIDE. ★Slice 69 moved which
+// one: the inside tag was `get-type-of-variable-or-parameter-or-property` and is
+// now `check-declaration-initializer`, one function deeper. What the fixture
+// witnesses is unchanged — a tag from inside the body rather than after it.
 function w(): void {
     var v = 1;
 }
