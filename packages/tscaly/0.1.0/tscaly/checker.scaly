@@ -92,6 +92,7 @@
 use scaly.memory.Page
 use scaly.containers.Array
 use scaly.containers.String
+use scaly.containers.StringBuilder
 use tscaly.ast.AstNode
 use tscaly.ast.Symbol
 use tscaly.parser.Parser
@@ -344,11 +345,79 @@ define TypeParameterData
     }
 }
 
+; LiteralType — the payload of every string, number, bigint and boolean literal
+; type, slice 71.
+;
+; ★★★ THE REFERENCE'S `value` IS A GO `any` AND IT IS THREE SLOTS HERE, NOT A
+; FOUR-ARM UNION, and the precedent is this file's own: TypeResolution's
+; `TypeSystemEntity` is likewise an `any` held as slots (see its note). The
+; argument is the same and it is stronger here — the reference never *asks* the
+; value what it is. Its four readers are `getStringLiteralValue`,
+; `getNumberLiteralValue`, `getBigIntLiteralValue` and `getBooleanLiteralValue`,
+; each an unchecked type ASSERTION whose correctness is the type's own FLAG. So
+; the discriminator is `Type.flags`, exactly as upstream, and a second one in the
+; payload would be a thing to keep in step for no reader.
+;
+; ★ `text` is BORROWED, never copied: every value that reaches here is an
+; `AstNode.literal_text_of`, i.e. a run of bytes on the page the parse owns, and
+; the checker does not outlive the parse. The bigint arm is the one exception in
+; SPIRIT rather than in kind — its digits are computed by ParsePseudoBigInt into a
+; buffer this file allocates on the checker's own page.
+;
+; ★★ `regular_type` and `fresh_type` are the reference's own two slots and they
+; are what makes a literal type a PAIR. The regular type is created first and
+; points at itself; the fresh type is minted lazily by getFreshTypeOfLiteralType,
+; points BACK at the regular one, and points at itself as its own fresh type.
+; Both booleans break the pattern by being built eagerly and in the other order
+; (see initialize_intrinsic_types).
+;
+; ★★★ ONE OF THE TWO SLOTS HAS NO READER YET AND ITS READERS ARE NAMED RATHER
+; THAN WRITTEN (§3.5ao/§3.5be). `fresh_type` is read by
+; getFreshTypeOfLiteralType, which every one of the five arms calls;
+; `regular_type` is read by `getRegularTypeOfLiteralType` and
+; `isFreshLiteralType`, and NEITHER is ported here — the first is called by
+; getRegularTypeOfExpression and getWidenedLiteralType, the second by
+; getWidenedLiteralType, and all three of those are behind the same door.
+; ★Transcribing the two anyway was tried and reverted, and the reason is this
+; file's own instrument rather than tidiness: getRegularTypeOfLiteralType's UNION
+; arm carries a `record_unported`, and a work-list row in a function nothing
+; calls is a row that can never appear — the product of these slices IS the work
+; list, so a phantom entry in it is worse than a missing function.
+define LiteralTypeData
+(
+    ; StringLiteral: the cooked text of the literal. BigIntLiteral:
+    ; PseudoBigInt.Base10Value — the absolute value in base 10, no leading zeros,
+    ; and EMPTY for zero, which is the reference's own representation and the
+    ; reason pseudo_big_int_to_string has a length test rather than a value test.
+    text: pointer[char]
+    text_length: int
+    ; NumberLiteral: the IEEE-754 bits of the jsnum.Number.
+    bits: u64
+    ; BigIntLiteral: PseudoBigInt.Negative.
+    negative: bool
+    ; BooleanLiteral: the value.
+    bool_value: bool
+    regular_type: ref[Type]?
+    fresh_type: ref[Type]?
+)
+{
+    init(t: pointer[char], tl: int, b: u64, neg: bool, bv: bool)
+    {
+        set text: t
+        set text_length: tl
+        set bits: b
+        set negative: neg
+        set bool_value: bv
+        set regular_type: null
+        set fresh_type: null
+    }
+}
+
 ; ★★★ THE ORDER-OF-DECLARATION AUFLAGE that ast.scaly's NodeData carries applies
 ; here too and is stated now rather than when it bites: the tag IS the jump-table
-; index, and AArch64 needs ≥14 contiguous tags per dispatch level. Four arms are
+; index, and AArch64 needs ≥14 contiguous tags per dispatch level. Five arms are
 ; far below that, so every `choose` over this union lowers to a compare chain
-; today — which is correct and cheap at four. The arm that makes the union big
+; today — which is correct and cheap at five. The arm that makes the union big
 ; enough to care is the one that must re-read the root CLAUDE.md's `Insn` note.
 ; One row of c.declaredTypeLinks. `interface_checked` is checkInterfaceDeclaration's
 ; own once-bit and lives here because the reference keeps it in the same links
@@ -453,6 +522,7 @@ define TypeData union
     Reference: TypeReferenceData
     TypeParameter: TypeParameterData
     Anonymous: AnonymousTypeData
+    Literal: LiteralTypeData
 )
 
 ; ── Type ────────────────────────────────────────────────────────────────────
@@ -787,6 +857,52 @@ define Checker
     non_primitive_type: ref[Type]
     unique_literal_type: ref[Type]
 
+    ; ── the boolean literal pair, slice 71 ──────────────────────────────────
+    ;
+    ; ★★ FOUR TYPES FOR TWO VALUES, and the asymmetry with every other literal is
+    ; the reference's: `false` and `true` are the only literal types built EAGERLY,
+    ; in NewChecker, and they are built REGULAR-FIRST-THEN-FRESH rather than lazily
+    ; through getFreshTypeOfLiteralType. `c.falseType` is what `case
+    ; ast.KindFalseKeyword` answers, and it is the FRESH one.
+    ;
+    ; ★★★ `booleanType` IS STILL MISSING AND STILL NAMED, which is what keeps
+    ; type_to_string's Boolean arm reporting: it is `getUnionType([regularFalse,
+    ; regularTrue])`, and a union is a dimension away. So this slice makes the two
+    ; boolean LITERAL types without making the type they union into — the same cut
+    ; slice 69 drew when it ported getTypeFromTypeNode's keyword arms and left
+    ; `boolean` out.
+    regular_false_type: ref[Type]
+    false_type: ref[Type]
+    regular_true_type: ref[Type]
+    true_type: ref[Type]
+
+    ; ── the three intern tables, slice 71 ───────────────────────────────────
+    ;
+    ; c.stringLiteralTypes, c.numberLiteralTypes, c.bigintLiteralTypes. The
+    ; reference keys three Go maps on the VALUE; these are association lists
+    ; scanned linearly, which is `reported_ambient`'s idiom and this file's
+    ; standing answer to a small per-file map.
+    ;
+    ; ★★ WHAT THE TABLE BUYS IS IDENTITY, NOT AN ANSWER — two occurrences of `"a"`
+    ; in one file must be the SAME type, because every relation the checker will
+    ; grow (isTypeIdenticalTo, containsType, the union reducer) compares types by
+    ; pointer. Nothing in this slice can observe a hit, and that is exactly why the
+    ; table is built now rather than when a reader appears: a literal type minted
+    ; twice is indistinguishable from one minted once until the day it is not.
+    ;
+    ; ★★★ THE NUMBER TABLE IS KEYED ON THE BIT PATTERN AND THEREFORE NEEDS NO
+    ; SEPARATE NaN CELL, which is a divergence from the reference that is provably
+    ; the same answer (§3.5ag). `c.nanType` exists upstream because NaN != NaN in
+    ; IEEE-754 and a Go map lookup on a NaN key therefore always misses; a bit
+    ; comparison does not miss, and every NaN this port can make is jsnum's single
+    ; canonical BITS_NAN. ★The sibling fact is why the arm is unreachable from this
+    ; slice at all: a NumericLiteral's text is a number the scanner accepted, so
+    ; `jsnum_from_string` of it is neither NaN nor negative zero — the two inputs a
+    ; value-keyed table and a bit-keyed table would disagree about.
+    string_literal_types: ref[Array[ref[Type]?]]
+    number_literal_types: ref[Array[ref[Type]?]]
+    bigint_literal_types: ref[Array[ref[Type]?]]
+
     ; c.nodeLinks[node].hasReportedStatementInAmbientContext, as a SET of the
     ; nodes that have it. The reference keeps a links record per node and this
     ; slice reads exactly one bit off it, so a set is the whole of it; the record
@@ -967,6 +1083,15 @@ define Checker
         set c.unported_detail: 0
         set c.unported_count: 0
         set c.suggestion_count: 0
+        let sl host.allocate(sizeof Array[ref[Type]?], alignof Array[ref[Type]?]) as pointer[Array[ref[Type]?]]
+        set *sl: Array[ref[Type]?]()
+        set c.string_literal_types: sl
+        let nl host.allocate(sizeof Array[ref[Type]?], alignof Array[ref[Type]?]) as pointer[Array[ref[Type]?]]
+        set *nl: Array[ref[Type]?]()
+        set c.number_literal_types: nl
+        let bl host.allocate(sizeof Array[ref[Type]?], alignof Array[ref[Type]?]) as pointer[Array[ref[Type]?]]
+        set *bl: Array[ref[Type]?]()
+        set c.bigint_literal_types: bl
         c.initialize_intrinsic_types()
         c
     }
@@ -1099,6 +1224,222 @@ define Checker
     ; newTypeParameter. Four lines in the reference and four here.
     function new_type_parameter(this, sym: ref[Symbol]?) returns ref[Type]
         this.new_type(TypeFlagsTypeParameter, ObjectFlagsNone, sym, TypeData.TypeParameter(TypeParameterData()))
+
+    ; ── literal types (slice 71) ────────────────────────────────────────────
+    ;
+    ; newLiteralType, and the two-slot dance at its tail is the reference's:
+    ; `regularType` is the argument when one is given and the NEW TYPE ITSELF
+    ; otherwise, so a regular literal type is its own regular type and a fresh one
+    ; points back at the regular one it was minted from.
+    ;
+    ; ★ The reference passes ONE `value any` here; this takes the three slots
+    ; LiteralTypeData holds, and each caller fills the one its flags name (see the
+    ; record's note for why the flags are the discriminator).
+    function new_literal_type(this, flags: int, text: pointer[char], text_length: int, bits: u64, negative: bool, bool_value: bool, regular_type: ref[Type]?) returns ref[Type]
+    {
+        let t this.new_type(flags, ObjectFlagsNone, null, TypeData.Literal(LiteralTypeData(text, text_length, bits, negative, bool_value)))
+        if regular_type = null
+            Checker.set_literal_regular_type(t, t)
+        else
+            Checker.set_literal_regular_type(t, regular_type)
+        t
+    }
+
+    ; The LiteralType accessors — `AsLiteralType().value` and its two links, as
+    ; questions about the union TAG, exactly as this file's other payload
+    ; accessors are. Each answers a zero for an arm that is not Literal, where the
+    ; reference's unchecked assertion would panic.
+    function literal_text_of(t: ref[Type]) returns pointer[char]
+    {
+        choose t.data
+            when d: Literal
+                return d.text
+        null
+    }
+
+    function literal_text_length_of(t: ref[Type]) returns int
+    {
+        choose t.data
+            when d: Literal
+                return d.text_length
+        0
+    }
+
+    function literal_bits_of(t: ref[Type]) returns u64
+    {
+        choose t.data
+            when d: Literal
+                return d.bits
+        0 as u64
+    }
+
+    function literal_negative_of(t: ref[Type]) returns bool
+    {
+        choose t.data
+            when d: Literal
+                return d.negative
+        false
+    }
+
+    ; getBooleanLiteralValue.
+    function literal_bool_of(t: ref[Type]) returns bool
+    {
+        choose t.data
+            when d: Literal
+                return d.bool_value
+        false
+    }
+
+    function literal_regular_type_of(t: ref[Type]) returns ref[Type]?
+    {
+        choose t.data
+            when d: Literal
+                return d.regular_type
+        null
+    }
+
+    function literal_fresh_type_of(t: ref[Type]) returns ref[Type]?
+    {
+        choose t.data
+            when d: Literal
+                return d.fresh_type
+        null
+    }
+
+    ; The two writers. Copy the arm out, mutate the copy, put the whole arm back —
+    ; a `when` binding is a COPY and the direct spelling stores through the
+    ; payload's first eight bytes (root CLAUDE.md).
+    procedure set_literal_regular_type(t: ref[Type], rt: ref[Type]?)
+    {
+        choose t.data
+            when l: Literal
+            {
+                var d l
+                set d.regular_type: rt
+                set t.data: TypeData.Literal(d)
+            }
+    }
+
+    procedure set_literal_fresh_type(t: ref[Type], ft: ref[Type]?)
+    {
+        choose t.data
+            when l: Literal
+            {
+                var d l
+                set d.fresh_type: ft
+                set t.data: TypeData.Literal(d)
+            }
+    }
+
+    ; getFreshTypeOfLiteralType. The fresh type is minted ONCE per regular type and
+    ; cached on it; it carries the same flags and value, points back at the regular
+    ; type, and — the line that makes isFreshLiteralType work at all — points at
+    ; ITSELF as its own fresh type.
+    ;
+    ; ★ `f.symbol = t.symbol` is the reference's and is ported even though every
+    ; literal type this slice mints has a null symbol: the arm that gives one a
+    ; symbol is getEnumLiteralType, and a copy that silently dropped it would be
+    ; found the day that arm lands rather than here.
+    function get_fresh_type_of_literal_type(this, t: ref[Type]) returns ref[Type]
+    {
+        if (t.flags & TypeFlagsFreshable) = 0
+            return t
+        let cached Checker.literal_fresh_type_of(t)
+        if cached <> null
+            return cached as ref[Type]
+        let f this.new_literal_type(t.flags, Checker.literal_text_of(t), Checker.literal_text_length_of(t), Checker.literal_bits_of(t), Checker.literal_negative_of(t), Checker.literal_bool_of(t), t)
+        set f.symbol: t.symbol
+        Checker.set_literal_fresh_type(f, f)
+        Checker.set_literal_fresh_type(t, f)
+        f
+    }
+
+    ; getStringLiteralType. The table is scanned linearly and compared on the
+    ; BYTES, which is what a Go map keyed on a string compares.
+    function get_string_literal_type(this, text: pointer[char], text_length: int) returns ref[Type]
+    {
+        let len string_literal_types.get_length() as int
+        var i 0
+        while i < len
+        {
+            let row *(string_literal_types.get_buffer() + i)
+            if row <> null
+            {
+                let t row as ref[Type]
+                if Checker.literal_text_length_of(t) = text_length
+                {
+                    if Checker.text_equals(Checker.literal_text_of(t), text, text_length)
+                        return t
+                }
+            }
+            set i: i + 1
+        }
+        let t this.new_literal_type(TypeFlagsStringLiteral, text, text_length, 0 as u64, false, false, null)
+        string_literal_types.add(t)
+        t
+    }
+
+    ; getNumberLiteralType — see the table's own note for why the NaN cell the
+    ; reference keeps beside it is not here.
+    function get_number_literal_type(this, bits: u64) returns ref[Type]
+    {
+        let len number_literal_types.get_length() as int
+        var i 0
+        while i < len
+        {
+            let row *(number_literal_types.get_buffer() + i)
+            if row <> null
+            {
+                let t row as ref[Type]
+                if Checker.literal_bits_of(t) = bits
+                    return t
+            }
+            set i: i + 1
+        }
+        let t this.new_literal_type(TypeFlagsNumberLiteral, null, 0, bits, false, false, null)
+        number_literal_types.add(t)
+        t
+    }
+
+    ; getBigIntLiteralType. The key is the whole PseudoBigInt — the sign AND the
+    ; digits — because that is what a Go map keyed on the struct compares.
+    function get_bigint_literal_type(this, text: pointer[char], text_length: int, negative: bool) returns ref[Type]
+    {
+        let len bigint_literal_types.get_length() as int
+        var i 0
+        while i < len
+        {
+            let row *(bigint_literal_types.get_buffer() + i)
+            if row <> null
+            {
+                let t row as ref[Type]
+                if Checker.literal_negative_of(t) = negative
+                {
+                    if Checker.literal_text_length_of(t) = text_length
+                    {
+                        if Checker.text_equals(Checker.literal_text_of(t), text, text_length)
+                            return t
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        let t this.new_literal_type(TypeFlagsBigIntLiteral, text, text_length, 0 as u64, negative, false, null)
+        bigint_literal_types.add(t)
+        t
+    }
+
+    function text_equals(a: pointer[char], b: pointer[char], n: int) returns bool
+    {
+        var i 0
+        while i < n
+        {
+            if (*(a + i) as int) <> (*(b + i) as int)
+                return false
+            set i: i + 1
+        }
+        true
+    }
 
     ; ── the payload accessors ───────────────────────────────────────────────
     ;
@@ -3872,6 +4213,23 @@ define Checker
         set non_primitive_type: this.new_intrinsic_type(TypeFlagsNonPrimitive, "object")
         ; Special `never` flagged by union reduction to behave as a literal.
         set unique_literal_type: this.new_intrinsic_type(TypeFlagsNever, "never")
+
+        ; ★★★ THE BOOLEAN PAIR IS BUILT HERE AND IN THE REFERENCE'S OWN ORDER,
+        ; which is REGULAR then FRESH and then two writes that close the cycle —
+        ; `regularFalseType.freshType = falseType` and
+        ; `falseType.freshType = falseType`. It is the one literal type
+        ; getFreshTypeOfLiteralType never mints, so the eight lines below are the
+        ; only place in this port where that function's postcondition is
+        ; established by hand. ★Six lines of NewChecker are transcribed and the
+        ; SEVENTH is not: `c.booleanType = c.getUnionType(...)` needs a union.
+        set regular_false_type: this.new_literal_type(TypeFlagsBooleanLiteral, null, 0, 0 as u64, false, false, null)
+        set false_type: this.new_literal_type(TypeFlagsBooleanLiteral, null, 0, 0 as u64, false, false, regular_false_type)
+        Checker.set_literal_fresh_type(regular_false_type, false_type)
+        Checker.set_literal_fresh_type(false_type, false_type)
+        set regular_true_type: this.new_literal_type(TypeFlagsBooleanLiteral, null, 0, 0 as u64, false, true, null)
+        set true_type: this.new_literal_type(TypeFlagsBooleanLiteral, null, 0, 0 as u64, false, true, regular_true_type)
+        Checker.set_literal_fresh_type(regular_true_type, true_type)
+        Checker.set_literal_fresh_type(true_type, true_type)
     }
 
     ; ── the type printer ────────────────────────────────────────────────────
@@ -3896,9 +4254,21 @@ define Checker
     ; set by the harness, which is the whole reason the oracle passes it — a
     ; truncated name would make the T section depend on a display budget).
     ;
-    ; Answers a static C string, which is what every ported arm produces. The arm
-    ; that first needs composition is the one that widens this to a builder.
-    function type_to_string(this, t: ref[Type]?) returns pointer[const_char]
+    ; ★★★ IT IS A BUILDER SINCE SLICE 71, AND THE ARM THAT WIDENED IT IS THE ONE
+    ; THIS FUNCTION'S OWN HEADER NAMED: *"the arm that first needs composition is
+    ; the one that widens this to a builder"*. Four of the arms below now compose
+    ; a name out of a VALUE — a quoted and escaped string, a number's
+    ; ECMAScript-to-String, a bigint's digits plus `n`, and the two boolean
+    ; keywords — so a `pointer[const_char]` can no longer be the answer.
+    ;
+    ; ★★ THE CALLER OWNS THE BUFFER AND MUST HAND IN A SCRATCH ONE. The answer is
+    ; written into `out` and the function reports `false` when it cannot name the
+    ; type — by which point it may already have written part of a name, so `out`
+    ; must not be the caller's real sink. TypeDump obeys this at its one call site
+    ; and says so. ★A `String` return would have been the smaller change and the
+    ; worse one: the name is appended to a builder either way, so a String would be
+    ; an allocation and a copy per node of the walk.
+    function type_to_string(this, t: ref[Type]?, out: ref[StringBuilder]) returns bool
     {
         if t = null
         {
@@ -3909,7 +4279,7 @@ define Checker
             ; this is unreachable from the walk and a report says so without
             ; inventing a keyword.
             this.record_unported("type-to-string-null", 0)
-            return null
+            return false
         }
 
         ; getReducedType, which the worker calls when FlagsNoTypeReduction is
@@ -3929,75 +4299,373 @@ define Checker
                 ; removes them. That is a printer feature rather than a name, so
                 ; it reports.
                 this.record_unported("type-to-string-unresolved", 0)
-                return null
+                return false
             }
             if t = intrinsic_marker_type
-                return "intrinsic"
-            return "any"
+                return Checker.write_keyword(out, "intrinsic")
+            return Checker.write_keyword(out, "any")
         }
         if (t.flags & TypeFlagsUnknown) <> 0
-            return "unknown"
+            return Checker.write_keyword(out, "unknown")
         if (t.flags & TypeFlagsString) <> 0
-            return "string"
+            return Checker.write_keyword(out, "string")
         if (t.flags & TypeFlagsNumber) <> 0
-            return "number"
+            return Checker.write_keyword(out, "number")
         if (t.flags & TypeFlagsBigInt) <> 0
-            return "bigint"
+            return Checker.write_keyword(out, "bigint")
         ; `t.flags&Boolean != 0 && t.alias == nil` — booleanType is a UNION of the
         ; two boolean literals, so this arm needs getUnionType before it can ever
-        ; be entered, and no boolean type exists here to enter it with.
+        ; be entered, and no boolean type exists here to enter it with. ★Slice 71
+        ; makes the two boolean LITERAL types and still not this one, which is why
+        ; the arm four below it is live and this one is not.
         if (t.flags & TypeFlagsBoolean) <> 0
         {
             this.record_unported("type-to-string-boolean", 0)
-            return null
+            return false
         }
         if (t.flags & TypeFlagsEnumLike) <> 0
         {
             this.record_unported("type-to-string-enum", 0)
-            return null
+            return false
         }
+        ; ★★★ THE STRING LITERAL IS THE ONLY ARM WITH AN ESCAPE, and it is a port
+        ; of the PRINTER rather than of the nodebuilder. The builder makes a
+        ; synthetic StringLiteral node and adds EFNoAsciiEscaping to it; the
+        ; printer then cannot reach an original source text (the node is
+        ; synthesized) and falls into getLiteralText's StringLiteral arm, which is
+        ; a double quote, escapeStringWorker, and a double quote. The emit flag is
+        ; what makes NeverAsciiEscape true, which is the one bit of the worker's
+        ; behaviour that would otherwise depend on it.
         if (t.flags & TypeFlagsStringLiteral) <> 0
         {
-            this.record_unported("type-to-string-string-literal", 0)
-            return null
+            Checker.write_string_literal_name(out, Checker.literal_text_of(t), Checker.literal_text_length_of(t))
+            return true
         }
+        ; The number's own String(). ★The reference's arm SPLITS a negative value
+        ; into a PrefixUnaryExpression over the digits without the sign, which is
+        ; two nodes printing the one text `-N` — so the split is a property of the
+        ; node tree it builds and not of the name, and the name is the whole
+        ; String() either way (§3.5ag).
         if (t.flags & TypeFlagsNumberLiteral) <> 0
         {
-            this.record_unported("type-to-string-number-literal", 0)
-            return null
+            var nb char[JSNUM_MAX_TEXT]
+            let nn jsnum_to_string(Checker.literal_bits_of(t), &nb[0])
+            out.append(&nb[0], nn as size_t)
+            return true
         }
+        ; pseudoBigIntToString(value) + "n".
         if (t.flags & TypeFlagsBigIntLiteral) <> 0
         {
-            this.record_unported("type-to-string-bigint-literal", 0)
-            return null
+            Checker.write_pseudo_big_int(out, t)
+            out.append("n" as char)
+            return true
         }
         if (t.flags & TypeFlagsBooleanLiteral) <> 0
         {
-            this.record_unported("type-to-string-boolean-literal", 0)
-            return null
+            if Checker.literal_bool_of(t)
+                return Checker.write_keyword(out, "true")
+            return Checker.write_keyword(out, "false")
         }
         if (t.flags & TypeFlagsUniqueESSymbol) <> 0
         {
             this.record_unported("type-to-string-unique-symbol", 0)
-            return null
+            return false
         }
         if (t.flags & TypeFlagsVoid) <> 0
-            return "void"
+            return Checker.write_keyword(out, "void")
         if (t.flags & TypeFlagsUndefined) <> 0
-            return "undefined"
+            return Checker.write_keyword(out, "undefined")
         if (t.flags & TypeFlagsNull) <> 0
-            return "null"
+            return Checker.write_keyword(out, "null")
         if (t.flags & TypeFlagsNever) <> 0
-            return "never"
+            return Checker.write_keyword(out, "never")
         if (t.flags & TypeFlagsESSymbol) <> 0
-            return "symbol"
+            return Checker.write_keyword(out, "symbol")
         if (t.flags & TypeFlagsNonPrimitive) <> 0
-            return "object"
+            return Checker.write_keyword(out, "object")
         ; Everything past this point is the this-type, the alias, and the object /
         ; union / intersection / instantiable machinery — the rest of
         ; nodebuilderimpl.
         this.record_unported("type-to-string", t.flags)
-        null
+        false
+    }
+
+    ; The fourteen keyword arms, which used to BE the answer and are now the
+    ; degenerate case of composing one.
+    function write_keyword(out: ref[StringBuilder], name: pointer[const_char]) returns bool
+    {
+        out.append(name)
+        true
+    }
+
+    ; PseudoBigInt.String(): the empty Base10Value is the value ZERO, and a
+    ; non-empty one is prefixed with a minus when the sign is set. The length test
+    ; is the reference's and is not interchangeable with a digit test — see
+    ; bigint_literal_arm for why zero is stored empty in the first place.
+    procedure write_pseudo_big_int(out: ref[StringBuilder], t: ref[Type])
+        Checker.write_pseudo_big_int_value(out, Checker.literal_text_of(t), Checker.literal_text_length_of(t), Checker.literal_negative_of(t))
+
+    ; ★★ THE THREE COMPOSING BODIES ARE STATICS OVER BYTES rather than over a
+    ; Type, and that is what lets tests/litcheck.sh measure THIS code instead of a
+    ; copy of it. An instrument that re-implements what it checks agrees with
+    ; itself, which is the one thing a second producer must not do — and the first
+    ; draft of that battery did exactly that until g17 refused to apply and said
+    ; so.
+    procedure write_pseudo_big_int_value(out: ref[StringBuilder], text: pointer[char], n: int, negative: bool)
+    {
+        if n = 0
+        {
+            out.append("0" as char)
+            return
+        }
+        if negative
+            out.append("-" as char)
+        out.append(text, n as size_t)
+    }
+
+    ; The string literal's whole name: a double quote, the escape worker, a double
+    ; quote.
+    procedure write_string_literal_name(out: ref[StringBuilder], text: pointer[char], n: int)
+    {
+        out.append("\"" as char)
+        Checker.escape_string_worker(out, text, n)
+        out.append("\"" as char)
+    }
+
+    ; `jsnum.ParsePseudoBigInt(text)` followed by NewPseudoBigInt's
+    ; `strings.TrimLeft(value, "0")` — the two steps between a bigint literal's
+    ; TEXT and the digits a PseudoBigInt holds, with the all-zero case answering
+    ; the EMPTY string the reference represents zero as. Answers the length and
+    ; writes the START OFFSET into `out` through `out_start`, or -1 when
+    ; ParsePseudoBigInt refuses the text.
+    function pseudo_big_int_digits(text: pointer[char], n: int, out: pointer[char], out_start: pointer[int]) returns int
+    {
+        set *out_start: 0
+        let m jsnum_parse_pseudo_big_int(text, n, out)
+        if m < 0
+            return 0 - 1
+        var i 0
+        while i < m
+        {
+            if (*(out + i) as int) <> (("0" as char) as int)
+                break
+            set i: i + 1
+        }
+        set *out_start: i
+        m - i
+    }
+
+    ; ── printer/utilities.go's escapeStringWorker ───────────────────────────
+    ;
+    ; Narrowed to its ONE caller (§3.5br) and the narrowing is stated so the next
+    ; reader can widen it honestly: the quote character is always the double quote
+    ; (nodeBuilder passes isSingleQuote false and never sets
+    ; FlagsUseSingleQuotesForStringLiteralType), and the flags are always
+    ; NeverAsciiEscape and never JsxAttributeEscape (the emit flag the builder adds
+    ; is exactly EFNoAsciiEscaping). So the three arms that read `quoteChar ==
+    ; backtick`, the whole JSX branch and the `ch > 0x7f` half of the default test
+    ; are all decided here rather than carried.
+    ;
+    ; ★★ WHAT SURVIVES THE NARROWING IS THE PART THAT ACTUALLY BITES: the canonical
+    ; escapes, the sub-0x20 controls, the three line-ish code points U+2028,
+    ; U+2029 and U+0085, and the SURROGATE cases — a lone surrogate and a
+    ; supplementary code point both become `\uXXXX` sequences, uppercase hex, and a
+    ; supplementary one becomes TWO of them.
+    ;
+    ; ★★★ THE DECODER IS `DecodeJSStringRune` AND NOT PLAIN UTF-8, which is the one
+    ; place this could have been silently wrong: the scanner writes a lone
+    ; surrogate out as its three-byte sentinel (see value_put_codepoint), and Go's
+    ; own utf8 decoder REFUSES that encoding and answers RuneError — so a port
+    ; reaching for the ordinary decoder would print U+FFFD where the reference
+    ; prints `\uD800`.
+    procedure escape_string_worker(out: ref[StringBuilder], s: pointer[char], slen: int)
+    {
+        var i 0
+        while i < slen
+        {
+            var size 0
+            let ch Checker.decode_js_string_rune(s, slen, i, &size)
+
+            var escape false
+            if (ch >= 0xD800) and (ch <= 0xDFFF)
+                set escape: true
+            if ch = 0xFFFD
+            {
+                ; `ch == utf8.RuneError && size == 1` — a stray byte that is not
+                ; valid UTF-8. A REAL U+FFFD in the text decodes with size 3 and is
+                ; not escaped, which is why the size is part of the test.
+                if size = 1
+                    set escape: true
+            }
+            if ch = 0x5C
+                set escape: true
+            if ch = 0x22
+                set escape: true
+            if ch = 0x2028
+                set escape: true
+            if ch = 0x2029
+                set escape: true
+            if ch = 0x0085
+                set escape: true
+            if ch = 0x0D
+                set escape: true
+            if ch = 0x0A
+                set escape: true
+            if ch <= 0x1F
+                set escape: true
+
+            if escape = false
+            {
+                out.append(s + i, size as size_t)
+                set i: i + size
+                continue
+            }
+
+            ; ★★★ THE REFERENCE'S SUPPLEMENTARY-PLANE ARM IS NOT HERE AND THE
+            ; BATTERY IS WHY. `ch > 0xffff` encodes a surrogate PAIR by hand, and
+            ; under this narrowing nothing can reach it: a code point above
+            ; 0x7f is escaped only by the default test's second disjunct, which
+            ; NeverAsciiEscape switches off, and none of the other conditions can
+            ; be true above 0xffff. It was transcribed first and removed after
+            ; g13 came back UNGATED — the row now breaks the NARROWING instead,
+            ; which is the condition that actually decides this. ★A LONE
+            ; surrogate is a different matter and IS escaped: it fails the
+            ; UTF-8 decoder's own range test rather than the ascii one.
+            if (ch >= 0xD800) and (ch <= 0xDFFF)
+            {
+                Checker.write_utf16_escape(out, ch)
+                set i: i + size
+                continue
+            }
+            if ch = 0
+            {
+                ; "If the null character is followed by digits, print as a hex
+                ; escape to prevent the result from parsing as an octal".
+                var digit false
+                if (i + size) < slen
+                {
+                    let nx *(s + (i + size)) as int
+                    if (nx >= 0x30) and (nx <= 0x39)
+                        set digit: true
+                }
+                if digit
+                    out.append("\\x00")
+                else
+                    out.append("\\0")
+                set i: i + size
+                continue
+            }
+            Checker.write_escaped_char(out, ch)
+            set i: i + size
+        }
+    }
+
+    ; escapedCharsMap, plus encodeUtf16EscapeSequence as its default. `$` and the
+    ; backtick are in the reference's table and unreachable here — both are escaped
+    ; only when the quote character is a backtick.
+    procedure write_escaped_char(out: ref[StringBuilder], ch: int)
+    {
+        if ch = 0x09
+        {
+            out.append("\\t")
+            return
+        }
+        if ch = 0x0B
+        {
+            out.append("\\v")
+            return
+        }
+        if ch = 0x0C
+        {
+            out.append("\\f")
+            return
+        }
+        if ch = 0x08
+        {
+            out.append("\\b")
+            return
+        }
+        if ch = 0x0D
+        {
+            out.append("\\r")
+            return
+        }
+        if ch = 0x0A
+        {
+            out.append("\\n")
+            return
+        }
+        if ch = 0x5C
+        {
+            out.append("\\\\")
+            return
+        }
+        if ch = 0x22
+        {
+            out.append("\\\"")
+            return
+        }
+        if ch = 0x2028
+        {
+            out.append("\\u2028")
+            return
+        }
+        if ch = 0x2029
+        {
+            out.append("\\u2029")
+            return
+        }
+        if ch = 0x0085
+        {
+            out.append("\\u0085")
+            return
+        }
+        Checker.write_utf16_escape(out, ch)
+    }
+
+    ; encodeUtf16EscapeSequence — `\u` and FOUR UPPERCASE hex digits, zero-padded.
+    ; Every code point that reaches it is below 0x10000, and that is now a
+    ; property of the CALLERS rather than a hope — see escape_string_worker, whose
+    ; supplementary-plane arm is unreachable under this narrowing and is therefore
+    ; not written.
+    procedure write_utf16_escape(out: ref[StringBuilder], ch: int)
+    {
+        out.append("\\u")
+        var shift 12
+        while shift >= 0
+        {
+            let d (ch >> shift) & 0xF
+            if d < 10
+                out.append((d + 0x30) as char)
+            else
+                out.append(((d - 10) + 0x41) as char)
+            set shift: shift - 4
+        }
+    }
+
+    ; stringutil.DecodeJSStringRune. The three-byte SENTINEL for a lone surrogate
+    ; is recognised FIRST — `ED A0..BF 80..BF` — and everything else is Go's own
+    ; utf8.DecodeRuneInString, which jsnum already ports arm for arm.
+    function decode_js_string_rune(s: pointer[char], stop: int, i: int, out_size: pointer[int]) returns int
+    {
+        if (i + 2) < stop
+        {
+            let b0 *(s + i) as int
+            if b0 = 0xED
+            {
+                let b1 *(s + (i + 1)) as int
+                let b2 *(s + (i + 2)) as int
+                if (b1 >= 0xA0) and (b1 <= 0xBF)
+                {
+                    if (b2 >= 0x80) and (b2 <= 0xBF)
+                    {
+                        set *out_size: 3
+                        return (0xD000 | ((b1 & 0x3F) << 6)) | (b2 & 0x3F)
+                    }
+                }
+            }
+        }
+        jsnum_decode_rune(s, stop, i, out_size)
     }
 
     ; ── GetTypeAtLocation ───────────────────────────────────────────────────
@@ -5381,41 +6049,30 @@ define Checker
         if k = KindNullKeyword
             return null_widening_type
         if k = KindStringLiteral
-        {
-            this.string_literal_arm(node, k)
-            return null
-        }
+            return this.string_literal_arm(node)
         if k = KindNoSubstitutionTemplateLiteral
-        {
-            this.string_literal_arm(node, k)
-            return null
-        }
-        ; The grammar check runs and the TYPE is the stop, which is the reference's
-        ; order: `c.checkGrammarNumericLiteral(...)` then the literal type.
+            return this.string_literal_arm(node)
+        ; The grammar check runs FIRST and the type second, which is the
+        ; reference's order: `c.checkGrammarNumericLiteral(...)` then
+        ; `getFreshTypeOfLiteralType(getNumberLiteralType(jsnum.FromString(
+        ; node.Text())))`.
         if k = KindNumericLiteral
         {
             this.check_grammar_numeric_literal(node)
-            this.record_unported("get-number-literal-type", k)
-            return null
+            let bits jsnum_from_string(AstNode.literal_text_of(node), AstNode.literal_text_length_of(node))
+            return this.get_fresh_type_of_literal_type(this.get_number_literal_type(bits))
         }
         if k = KindBigIntLiteral
         {
             this.check_grammar_bigint_literal(node)
-            this.record_unported("get-bigint-literal-type", k)
-            return null
+            return this.bigint_literal_arm(node)
         }
-        ; c.trueType / c.falseType. Both are FRESH boolean literal types, i.e. the
-        ; same mechanism the three literal arms above wait for — see the header.
+        ; c.trueType / c.falseType — the FRESH member of each boolean pair, built
+        ; eagerly in initialize_intrinsic_types.
         if k = KindTrueKeyword
-        {
-            this.record_unported("boolean-literal-type", k)
-            return null
-        }
+            return true_type
         if k = KindFalseKeyword
-        {
-            this.record_unported("boolean-literal-type", k)
-            return null
-        }
+            return false_type
         if k = KindTemplateExpression
         {
             this.record_unported("check-template-expression", k)
@@ -5649,8 +6306,46 @@ define Checker
     ; NO test — the set does not exist, so a test against it would be a test
     ; against a literal false. The reader that changes that is the inference
     ; dimension, and it arrives with the set.
-    procedure string_literal_arm(this, node: ref[AstNode], k: int)
-        this.record_unported("get-string-literal-type", k)
+    function string_literal_arm(this, node: ref[AstNode]) returns ref[Type]?
+        this.get_fresh_type_of_literal_type(this.get_string_literal_type(AstNode.literal_text_of(node), AstNode.literal_text_length_of(node)))
+
+    ; `getFreshTypeOfLiteralType(getBigIntLiteralType(jsnum.NewPseudoBigInt(
+    ; jsnum.ParsePseudoBigInt(node.Text()), false)))`, which is three routines
+    ; deep and is written out because two of the three do something to the digits.
+    ;
+    ; ★★★ ParsePseudoBigInt IS THE STAND-IN SLICE 44 NAMED THIS ARM AS THE READER
+    ; OF, and it is earned here (§3.5p). The scanner's own call on it is earned in
+    ; the same commit — see set_bigint_token_value, and the note there for why the
+    ; two together are belt and braces rather than a doubled conversion.
+    ;
+    ; ★★ NewPseudoBigInt TRIMS LEADING ZEROS AND ZERO IS THE EMPTY STRING, which is
+    ; not tidiness: `PseudoBigInt`'s own comment says *"The value zero is
+    ; represented as an empty string"*, and pseudo_big_int_to_string reads exactly
+    ; that — a length test, not a value test. A port that stored `"0"` here would
+    ; print `0n` correctly and compare UNEQUAL to a zero that came the other way.
+    ;
+    ; ★ `negative` is false at this call site and always will be: a minus sign is a
+    ; PrefixUnaryExpression, so the literal itself never carries one. The slot is
+    ; filled from the argument rather than hard-coded because ParseValidBigInt —
+    ; the type-position entry point, unported — is the caller that passes true.
+    function bigint_literal_arm(this, node: ref[AstNode]) returns ref[Type]?
+    {
+        let text AstNode.literal_text_of(node)
+        let n AstNode.literal_text_length_of(node)
+        let scratch String^host(((n + (n / 4)) + 4) as size_t)
+        let out scratch.get_buffer()
+        var start 0
+        let m Checker.pseudo_big_int_digits(text, n, out, &start)
+        if m < 0
+        {
+            ; The reference PANICS. Unreachable from here — the scanner accepted
+            ; the digits — so it reports rather than trapping, which is this file's
+            ; standing answer to a reference panic.
+            this.record_unported("parse-pseudo-big-int-invalid", 0)
+            return null
+        }
+        this.get_fresh_type_of_literal_type(this.get_bigint_literal_type(out + start, m, false))
+    }
 
     ; checkGrammarNumericLiteral, whole.
     ;

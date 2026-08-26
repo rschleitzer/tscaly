@@ -1,9 +1,11 @@
 // checkGrammarNumericLiteral, all three of its exits, and NONE of them can be
 // seen in a C section: its report is a SUGGESTION (TS80008, CategorySuggestion),
 // and GetDiagnostics does not read that list. The file is here because the arm
-// runs the check BEFORE the type — so the tag on every line below is
-// `get-number-literal-type` and never a grammar row — and because the two texts
-// the function reads are different texts:
+// runs the check BEFORE the type — and it never took a grammar row even while
+// the type was a stop (the tag was `get-number-literal-type` through slice 70;
+// since slice 71 the numeric arm ANSWERS and the file runs on to the type walk,
+// `type-of-node 245`) — and because the two texts the function reads are
+// different texts:
 //
 //   the third literal's `node.Text` is the scanner's cooked `1.1e21`, which
 //   CONTAINS a `.` the source does not, so asking the cooked text for the

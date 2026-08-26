@@ -4,8 +4,9 @@
 // the FIRST report, and an enum declaration's own stop (computeEnumMemberValues)
 // comes after its members walk — so the file's tag is the first thing any of its
 // enums says. With the initializer-bearing enum FIRST the tag is
-// `get-number-literal-type` (`check-expression` before slice 70 gave the dispatch
-// its arms), which is a MEMBER's report; put the plain one first and the
+// `check-binary-expression` (`check-expression` before slice 70 gave the dispatch
+// its arms, `get-number-literal-type` until slice 71 gave the numeric one a
+// type), which is a MEMBER's report; put the plain one first and the
 // tag becomes `compute-enum-member-values`, which is the DECLARATION's, and removing
 // the members walk then moves nothing. The first draft of this fixture had them the
 // other way round and gated nothing.
