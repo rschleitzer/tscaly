@@ -57,6 +57,18 @@
 # count equals the speaking-unit count exactly. **An instrument owes the list of
 # what its own gate cannot see, or the green is read as more than it is.**
 #
+# ★★★ AND THE THIRD THING IT COULD NOT SEE WAS NOT ON THAT LIST — SLICE 76 FOUND IT
+# BY MOVING FOUR UNITS INTO A BUCKET NOBODY HAD PRINTED. The stop mode returned
+# straight after `get_diagnostics()`, so a unit whose CHECK completes and whose DUMP
+# stops logged nothing at all; checkloop.py filed the combination under `other` and
+# explained it as *"the checker never ran"*. All 32 read `UNPORTED 0 type-of-node
+# <kind>` — a tag only the dump walk raises — and not one was a parse or a bind
+# stop. `TypeDump.write_stops` runs the walk now: the gate went 1 264/1 296 to
+# 1 296/1 296 and `other` to 1. ★★What it BUYS is the more useful number, because
+# those 32 are the units whose CHECK IS COMPLETE and whose only remaining wall is
+# one arm of `getTypeOfNode` — the closest thing this port has to a frontier, and
+# invisible in every histogram until now.
+#
 # ★★ THE CHECKSUM THE LOG ITSELF OWES is that the five artifacts stay byte-identical
 # with it in place — it is collected unconditionally, so it must change nothing that
 # is measured. Asserted by run.sh going green, and verified once directly on the

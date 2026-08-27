@@ -233,10 +233,16 @@ def main():
                             break
             except OSError:
                 pass
-            # An UNPORTED line whose tag came from the PARSE or the BIND is not a
-            # check stop: the checker never ran, so the log is legitimately empty.
-            # Those units are counted as `other` rather than compared, the same way
-            # the two sibling instruments treat a unit the oracle could not answer.
+            # ★★★ SLICE 76 CORRECTED WHAT THIS BUCKET HOLDS, AND THE OLD SENTENCE
+            # WAS WRONG ON THE DAY IT WAS WRITTEN. It read *"an UNPORTED line whose
+            # tag came from the PARSE or the BIND is not a check stop: the checker
+            # never ran, so the log is legitimately empty"* — argued, never sampled.
+            # Printed, all 32 of them read `UNPORTED 0 type-of-node <kind>`, a tag
+            # only the DUMP WALK raises: their CHECK completed and the stop mode did
+            # not run the walk, so it logged nothing while `types.ours` carried a
+            # line. TypeDump.write_stops runs the walk now and the bucket is down to
+            # the one unit the sentence always meant. ★A bucket a gate does not
+            # enter needs its contents PRINTED, not a sentence about them.
             if not stops and recorded is None:
                 matched += 1
             elif stops and recorded is not None and stops[0] == recorded:
