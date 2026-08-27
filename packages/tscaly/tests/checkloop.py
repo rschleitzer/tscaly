@@ -118,13 +118,13 @@ def unified_diff_head(ref, ours, n):
 
 
 def main():
-    mode = sys.argv[1]              # "diags" | "walk"
+    mode = sys.argv[1]              # "diags" | "walk" | "stops"
     cases = sys.argv[2]
     binary = sys.argv[3]
     work = sys.argv[4]
     filt = sys.argv[5] if len(sys.argv) > 5 else ""
     tree_bin = sys.argv[6] if len(sys.argv) > 6 else ""
-    flag = "--diags" if mode == "diags" else "--walk"
+    flag = {"diags": "--diags", "walk": "--walk", "stops": "--stops"}[mode]
 
     jobs = []                       # (case_key, idx, unit_path, ref)
     other = 0
@@ -173,8 +173,14 @@ def main():
     # stays, and it stays the DEFAULT whenever `BIN` is not the tree's own dumper.
     # A cached answer from the wrong binary is the one failure this whole file
     # exists to make impossible.
-    sidecar_name = "types.diags" if mode == "diags" else "types.walk"
-    use_sidecar = os.path.realpath(binary) == os.path.realpath(tree_bin) if tree_bin else False
+    sidecar_name = {"diags": "types.diags", "walk": "types.walk", "stops": None}[mode]
+    # ★ THE STOP MODE HAS NO SIDECAR ON PURPOSE (slice 75). run.sh's `--sections`
+    # dump writes two, for the two instruments that run per slice; this one is asked
+    # once a chapter, so it pays a process per unit rather than making every run
+    # write a third file. The spawn path is therefore not a fallback here, it is the
+    # only path — which also means it can never read an answer from another binary.
+    use_sidecar = (sidecar_name is not None and tree_bin
+                   and os.path.realpath(binary) == os.path.realpath(tree_bin))
 
     def run(job):
         case_key, idx, unit_path, ref = job
@@ -195,6 +201,8 @@ def main():
     units = len(jobs)
     matched = failed = speaking = lines = 0
     report = []
+    event_rows = []
+    unit_rows = []
 
     for (case_key, idx, unit_path, ref), rc, out, err in results:
         if rc != 0:
@@ -204,6 +212,53 @@ def main():
             report += err.splitlines()[:5]
             continue
         ours = out.splitlines()
+        # ★★★ THE STOP LOG'S GATE, AND IT IS WHY THIS MODE NEEDS NO REFERENCE. The
+        # log and the work list are two views of ONE event stream, so they must
+        # agree where they overlap: the unit's FIRST `S` line has to be the tag
+        # `record_unported` kept, and a unit with no stops has to carry no UNPORTED
+        # line. That makes the instrument self-refuting — if the log were collected
+        # anywhere but in record_unported, or out of order, this disagrees — and it
+        # is the whole reason the log is not simply printed to stderr from a probe.
+        if mode == "stops":
+            stops = [l for l in ours if l.startswith("S ")]
+            recorded = None
+            try:
+                with open(os.path.join(os.path.dirname(ref), "types.ours"),
+                          "r", errors="replace") as fh:
+                    for line in fh:
+                        if line.startswith("UNPORTED "):
+                            f = line.split()
+                            if len(f) >= 4:
+                                recorded = "S %s %s" % (f[2], f[3])
+                            break
+            except OSError:
+                pass
+            # An UNPORTED line whose tag came from the PARSE or the BIND is not a
+            # check stop: the checker never ran, so the log is legitimately empty.
+            # Those units are counted as `other` rather than compared, the same way
+            # the two sibling instruments treat a unit the oracle could not answer.
+            if not stops and recorded is None:
+                matched += 1
+            elif stops and recorded is not None and stops[0] == recorded:
+                matched += 1
+                speaking += 1
+                lines += len(stops)
+                # The two aggregation inputs. `events` is one line per arrival and
+                # `units` one line per (unit, stop) pair — the shell does the
+                # counting, so the rule for each histogram lives in exactly one
+                # place and neither is a second copy of the other.
+                for l in stops:
+                    event_rows.append(l[2:])
+                for l in sorted(set(l[2:] for l in stops)):
+                    unit_rows.append("%s[%s] %s" % (case_key, idx, l))
+            elif not stops and recorded is not None:
+                other += 1
+            else:
+                failed += 1
+                report.append("=== %s[%s] — %s" % (case_key, idx, unit_path))
+                report.append("--- first logged stop: %s" % (stops[0] if stops else "(none)"))
+                report.append("--- recorded by the work list: %s" % (recorded or "(none)"))
+            continue
         theirs = ref_lines(ref, mode)
         if mode == "diags":
             ours_c = [l for l in ours if l.startswith("C ")]
@@ -231,6 +286,13 @@ def main():
     with open(os.path.join(work, "failures.txt"), "w", encoding="utf-8") as fh:
         for line in report:
             fh.write(line + "\n")
+    if mode == "stops":
+        with open(os.path.join(work, "events.txt"), "w", encoding="utf-8") as fh:
+            for line in event_rows:
+                fh.write(line + "\n")
+        with open(os.path.join(work, "units.txt"), "w", encoding="utf-8") as fh:
+            for line in unit_rows:
+                fh.write(line + "\n")
 
     # The counters the shell wrapper prints, one per line, so it stays the owner of
     # the prose.
