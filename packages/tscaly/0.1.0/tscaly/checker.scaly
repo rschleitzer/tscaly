@@ -669,6 +669,40 @@ define DeclarationSpacesExportValue:     int 1 << 0
 define DeclarationSpacesExportType:      int 1 << 1
 define DeclarationSpacesExportNamespace: int 1 << 2
 
+; ── slice 73: the duplicate-member map ──────────────────────────────────────
+;
+; One entry of checkObjectTypeForDuplicateDeclarations' three `map[string]int`s.
+;
+; ★★★ AN ASSOCIATION LIST RATHER THAN A MAP, for the reason TypeInstantiation's
+; note gives above and with a number behind it this time. All three maps are
+; GUARDED: `instanceNames` and `staticNames` take an entry only for a member whose
+; symbol has more than one declaration — i.e. only for a name that is already an
+; error — and `privateNames` only for a member named with a private identifier.
+; The widest input the corpus has is privateNameDuplicateField.ts with 64 private
+; members in one FILE, spread over several classes, so a linear scan is bounded by
+; sixty-four comparisons per member and no hash can pay for itself here.
+;
+; ★★ THE EMPTY LIST **IS** GO'S NIL MAP, exactly, which is what lets the port
+; create all three eagerly where the reference creates each on first write. A read
+; of a nil Go map answers the zero value and a read of an empty list answers 0;
+; every write goes through set_duplicate_name_state, which the reference guards
+; with its own `if names == nil` allocation. An `Array` whose init is empty
+; allocates nothing, so the eager creation is also free.
+define DuplicateNameEntry
+(
+    name_data: pointer[char]
+    name_len: int
+    state: int
+)
+{
+    init(d: pointer[char], n: int, s: int)
+    {
+        set name_data: d
+        set name_len: n
+        set state: s
+    }
+}
+
 define Checker
 (
     host: pointer[Page]
@@ -9851,6 +9885,390 @@ define Checker
         this.record_unported("check-decorators", AstNode.kind_of(node))
     }
 
+    ; ── slice 73: checkObjectTypeForDuplicateDeclarations ─────────────────────
+    ;
+    ; The statement slice 72's histogram named: `check-object-type-for-duplicate-
+    ; declarations` was the head of the work list on BOTH stages (128 units at
+    ; stage 1, 2 891 at stage 2), and it is one function plus the reporter under
+    ; it. What it buys is the class's own duplicate-member family — TS2300 on a
+    ; repeated property or on a property that collides with an accessor, TS2699 on
+    ; a static member named `prototype`, and TS2804 on a private name used once
+    ; statically and once on an instance.
+    ;
+    ; ★★★ THE THREE MAPS ARE THE FUNCTION, and each one is guarded differently,
+    ; which is what makes them three rather than one keyed by a discriminator.
+    ; `instanceNames` and `staticNames` hold a KIND (1 property, 2 accessor, 3
+    ; already reported) and take an entry only for a symbol with more than one
+    ; declaration; `privateNames` holds a BITSET (1 instance, 2 static, 3 both,
+    ; reported on arrival) and takes an entry for every private-named member. Two
+    ; different value alphabets over the same key type is exactly the same-layout
+    ; merge §3.5n rejects. See DuplicateNameEntry for why the storage is a list.
+    ;
+    ; ★★ THE TWO STATIC QUESTIONS ARE NOT ONE QUESTION, and the reference asks
+    ; both, three lines apart. `ast.HasStaticModifier` — the modifier alone — picks
+    ; which of the two kind maps a member goes into; `ast.IsStatic` — a class
+    ; ELEMENT with that modifier, OR a static block — decides the private name's
+    ; bit and the reporter's `isStatic == ast.IsStatic(member)` filter. They differ
+    ; on a `static` modifier the parser accepted somewhere that is not a class
+    ; element, and folding them would be invisible until it did.
+    ;
+    ; ★★★ THE WALK OPENS A SECOND WORK-LIST ROW AND ONLY STAGE 2 HAS INPUT FOR IT:
+    ; 109 units land on `get-late-bound-symbol`, zero at stage 1. A class member with
+    ; a COMPUTED name carries the binder's internal name `__computed`, and
+    ; symbol_of_declaration routes such a symbol through get_late_bound_symbol, which
+    ; is a deliberate stop of another slice. **A work-list row is not a property of
+    ; the function that reports it** — this walk is simply the first caller that ever
+    ; asks a computed member for its symbol.
+    ;
+    ; ★ `checkPrivateNames` is a parameter rather than a constant because the
+    ; reference's three call sites disagree: the class passes true, checkTypeLiteral
+    ; and checkInterfaceDeclaration pass false. Only the class reaches here in this
+    ; slice — the other two arms stop earlier, the interface at check-index-
+    ; constraints inside its `interfaceChecked` block — so the false side has no
+    ; input yet and the flag is written out rather than folded away.
+    procedure check_object_type_for_duplicate_declarations(this, node: ref[AstNode], check_private_names: bool)
+    {
+        let members AstNode.member_list_of(node)
+        if members = null
+            return
+        let ms members as ref[Array[ref[AstNode]?]]
+        let count ms.get_length() as int
+        if count = 0
+            return
+        let ia host.allocate(sizeof Array[DuplicateNameEntry], alignof Array[DuplicateNameEntry]) as pointer[Array[DuplicateNameEntry]]
+        set *ia: Array[DuplicateNameEntry]()
+        let sa host.allocate(sizeof Array[DuplicateNameEntry], alignof Array[DuplicateNameEntry]) as pointer[Array[DuplicateNameEntry]]
+        set *sa: Array[DuplicateNameEntry]()
+        let pa host.allocate(sizeof Array[DuplicateNameEntry], alignof Array[DuplicateNameEntry]) as pointer[Array[DuplicateNameEntry]]
+        set *pa: Array[DuplicateNameEntry]()
+        let node_in_ambient_context (AstNode.flags_of(node) & NodeFlagsAmbient) <> 0
+        var i 0
+        while i < count
+        {
+            let m *(ms.get_buffer() + i)
+            set i: i + 1
+            if m = null
+                continue
+            let member m as ref[AstNode]
+            if AstNode.kind_of(member) = KindConstructor
+            {
+                ; A parameter property declares a class member without appearing in
+                ; the member list, so the constructor's parameters are walked in
+                ; the member's place. `is_parameter_property_declaration` reads the
+                ; parameter's own PARENT where the reference is handed `member`
+                ; explicitly; they are the same node, since the parameter list
+                ; being walked is this constructor's.
+                let params AstNode.parameters_of(member)
+                if params = null
+                    continue
+                let ps params as ref[Array[ref[AstNode]?]]
+                let pn ps.get_length() as int
+                var j 0
+                while j < pn
+                {
+                    let p *(ps.get_buffer() + j)
+                    set j: j + 1
+                    if p = null
+                        continue
+                    let param p as ref[AstNode]
+                    if b.is_parameter_property_declaration(param) = false
+                        continue
+                    if AstNode.is_binding_pattern(AstNode.name_of(param))
+                        continue
+                    this.check_property_or_accessor(node, this.symbol_of_declaration(param), 1, false, ia, sa)
+                }
+                continue
+            }
+            let symbol this.symbol_of_declaration(member)
+            let is_static b.has_syntactic_modifier(member, ModifierFlagsStatic)
+            ; In non-ambient contexts, check that static members are not named
+            ; 'prototype'.
+            if node_in_ambient_context = false
+            {
+                if is_static
+                {
+                    if symbol <> null
+                    {
+                        if Checker.symbol_name_equals(symbol as ref[Symbol], "prototype", 9)
+                            this.error_on_node_or_null(AstNode.name_of(member), DiagStatic_property_0_conflicts_with_built_in_property_Function_0_of_constructor_function_1)
+                    }
+                }
+            }
+            ; Check that this object type declaration doesn't contain multiple
+            ; declarations of the same property, or accessor and property
+            ; declarations with the same name.
+            ;
+            ; ★ The reference's condition is `IsPropertyDeclaration(member) &&
+            ; !HasAccessorModifier(member) || IsPropertySignatureDeclaration(member)`
+            ; against `IsAccessor(member) || IsPropertyDeclaration(member) &&
+            ; HasAccessorModifier(member)`, i.e. an `accessor` field is an ACCESSOR
+            ; and a plain field is a property. Written as nested ifs for the
+            ; language guide's reason, and the else-branch is the reference's `else
+            ; if` and not a second independent test.
+            ;
+            ; ★★★ THE MODIFIER TEST IS UNOBSERVABLE AND THE BINDER IS WHY (control
+            ; g08, two wrong fixtures). Only ONE kind pair distinguishes the two
+            ; readings — accessor against accessor, where the switch falls through
+            ; and reports nothing — and the binder never merges that pair: two
+            ; `accessor` fields conflict, and so does an `accessor` field beside a
+            ; getter, so each keeps its own symbol with ONE declaration and the
+            ; guard in check_property_or_accessor stops it. Every shape that DOES
+            ; merge (a plain field beside an `accessor` field, either order) reports
+            ; under both readings. So this test is here for the reference's sake and
+            ; nothing in this suite can go red on it; the symbols yardstick matching
+            ; those units is what makes that a claim about the reference.
+            ;
+            ; ★ KindPropertySignature has no input either: the only caller that
+            ; passes a type literal or an interface is behind an earlier stop.
+            let mk AstNode.kind_of(member)
+            var is_property false
+            if mk = KindPropertyDeclaration
+            {
+                if b.has_syntactic_modifier(member, ModifierFlagsAccessor) = false
+                    set is_property: true
+            }
+            if mk = KindPropertySignature
+                set is_property: true
+            if is_property
+                this.check_property_or_accessor(node, symbol, 1, is_static, ia, sa)
+            else
+            {
+                var is_accessor false
+                if Checker.is_accessor_kind(mk)
+                    set is_accessor: true
+                if mk = KindPropertyDeclaration
+                {
+                    if b.has_syntactic_modifier(member, ModifierFlagsAccessor)
+                        set is_accessor: true
+                }
+                if is_accessor
+                    this.check_property_or_accessor(node, symbol, 2, is_static, ia, sa)
+            }
+            ; Check that each private identifier is used only for instance members
+            ; or only for static members. It is an error for an instance and a
+            ; static member to have the same private identifier.
+            if check_private_names = false
+                continue
+            let nm AstNode.name_of(member)
+            if nm = null
+                continue
+            if AstNode.is_private_identifier(nm) = false
+                continue
+            if symbol = null
+            {
+                ; The reference dereferences the symbol here and would PANIC; a
+                ; private-named class element is always declared, so this reports
+                ; rather than trapping (§3.5, the standing answer to a reference
+                ; panic) and the histogram says so if the claim is ever false.
+                this.record_unported("duplicate-declarations-private-no-symbol", mk)
+                continue
+            }
+            let psym symbol as ref[Symbol]
+            let pd Symbol.name_data_of(psym)
+            let pl Symbol.name_len_of(psym)
+            var flags Checker.duplicate_name_state(pa, pd, pl)
+            if flags = 3
+                continue
+            var bit 1
+            if b.is_static(member)
+                set bit: 2
+            set flags: flags | bit
+            Checker.set_duplicate_name_state(pa, pd, pl, flags)
+            if flags = 3
+                this.report_duplicate_member_errors(node, pd, pl, false, false, DiagDuplicate_identifier_0_Static_and_instance_elements_cannot_share_the_same_private_name)
+        }
+    }
+
+    ; checkPropertyOrAccessor, the closure — the two kind maps it captures are
+    ; parameters, and `node` with them because the reporter needs it.
+    ;
+    ; ★★ THE STATE MACHINE IS THREE-VALUED AND ITS THIRD VALUE IS "ALREADY SAID SO".
+    ; `state == 0` is the absent key, so the first sighting of a name only records
+    ; what KIND it was; the second reports if the pair is property/property or
+    ; property/accessor and then writes 3, which no later member can move — two
+    ; accessors of the same name are a getter and a setter and are NOT an error,
+    ; which is the whole content of `state == 2 && kind != 2`.
+    procedure check_property_or_accessor(this, node: ref[AstNode], symbol: ref[Symbol]?, kind: int, is_static: bool, instance_names: ref[Array[DuplicateNameEntry]], static_names: ref[Array[DuplicateNameEntry]])
+    {
+        if symbol = null
+        {
+            ; `len(symbol.Declarations)` on a nil symbol PANICS upstream. The
+            ; reference itself is of two minds about it — the `prototype` test three
+            ; lines above this call site guards with `symbol != nil` and this call
+            ; does not — so the assumption is made visible rather than assumed.
+            this.record_unported("duplicate-declarations-no-symbol", AstNode.kind_of(node))
+            return
+        }
+        let sym symbol as ref[Symbol]
+        if Symbol.declaration_count(sym) <= 1
+            return
+        var names: ref[Array[DuplicateNameEntry]] instance_names
+        if is_static
+            set names: static_names
+        let d Symbol.name_data_of(sym)
+        let n Symbol.name_len_of(sym)
+        let state Checker.duplicate_name_state(names, d, n)
+        if state = 0
+        {
+            ; On first occurrence just record the kind.
+            Checker.set_duplicate_name_state(names, d, n, kind)
+            return
+        }
+        var report false
+        if state = 1
+            set report: true
+        if state = 2
+        {
+            if kind <> 2
+                set report: true
+        }
+        if report = false
+            return
+        ; Error on second property or combination of property and accessor.
+        this.report_duplicate_member_errors(node, d, n, true, is_static, DiagDuplicate_identifier_0)
+        ; Record that errors have been reported.
+        Checker.set_duplicate_name_state(names, d, n, 3)
+    }
+
+    ; reportDuplicateMemberErrors, whole.
+    ;
+    ; ★★ IT WALKS THE WHOLE MEMBER LIST AGAIN PER REPORTED NAME, and that is the
+    ; reference's shape rather than an oversight: the report has to land on EVERY
+    ; declaration of the name, not on the second one, so the diagnostics come out in
+    ; member order and a name declared three times collects three. Keeping a list of
+    ; the nodes seen so far would answer the same set in the same order only for the
+    ; declarations BEFORE the one that tripped the state machine.
+    ;
+    ; ★ `checkStatic` is false only on the private-name call, where the point is
+    ; precisely that a static and an instance member share the name — so the filter
+    ; that the two kind maps get from being separate maps has to be switched off.
+    procedure report_duplicate_member_errors(this, node: ref[AstNode], name_data: pointer[char], name_len: int, check_static: bool, is_static: bool, code: int)
+    {
+        let members AstNode.member_list_of(node)
+        if members = null
+            return
+        let ms members as ref[Array[ref[AstNode]?]]
+        let count ms.get_length() as int
+        var i 0
+        while i < count
+        {
+            let m *(ms.get_buffer() + i)
+            set i: i + 1
+            if m = null
+                continue
+            let member m as ref[AstNode]
+            if AstNode.kind_of(member) = KindConstructor
+            {
+                let params AstNode.parameters_of(member)
+                if params = null
+                    continue
+                let ps params as ref[Array[ref[AstNode]?]]
+                let pn ps.get_length() as int
+                var j 0
+                while j < pn
+                {
+                    let p *(ps.get_buffer() + j)
+                    set j: j + 1
+                    if p = null
+                        continue
+                    let param p as ref[AstNode]
+                    if b.is_parameter_property_declaration(param) = false
+                        continue
+                    if AstNode.is_binding_pattern(AstNode.name_of(param))
+                        continue
+                    let psym this.symbol_of_declaration(param)
+                    if psym = null
+                    {
+                        ; The reference reads `symbol.Name` here without asking, and
+                        ; would PANIC — the same shape check_property_or_accessor
+                        ; reports rather than trapping, and the third site of it in
+                        ; this pair. It is NOT covered by that one: the reporter
+                        ; walks every member, including a constructor the outer walk
+                        ; has not reached yet.
+                        this.record_unported("duplicate-member-errors-no-symbol", AstNode.kind_of(member))
+                        continue
+                    }
+                    if Checker.symbol_name_matches(psym as ref[Symbol], name_data, name_len)
+                        this.error_on_node_or_null(AstNode.name_of(param), code)
+                }
+                continue
+            }
+            let msym this.symbol_of_declaration(member)
+            ; ★ THIS guard is the REFERENCE'S own — `symbol != nil && symbol.Name ==
+            ; name` — so it is a skip and not a report, unlike the parameter branch
+            ; three lines up. The asymmetry is upstream's and is transcribed.
+            if msym = null
+                continue
+            if Checker.symbol_name_matches(msym as ref[Symbol], name_data, name_len) = false
+                continue
+            if check_static
+            {
+                if is_static <> b.is_static(member)
+                    continue
+            }
+            this.error_on_node_or_null(AstNode.name_of(member), code)
+        }
+    }
+
+    ; The map read, `names[symbol.Name]`. A name the list does not carry answers 0,
+    ; which is what a Go map read of an absent key does.
+    function duplicate_name_state(t: ref[Array[DuplicateNameEntry]], d: pointer[char], n: int) returns int
+    {
+        let len t.get_length() as int
+        var i 0
+        while i < len
+        {
+            let e *(t.get_buffer() + i)
+            if SymbolTable.names_equal(e.name_data, e.name_len, d, n)
+                return e.state
+            set i: i + 1
+        }
+        0
+    }
+
+    ; The map write, `names[symbol.Name] = state`. An existing name is overwritten
+    ; in place; a new one is appended.
+    procedure set_duplicate_name_state(t: ref[Array[DuplicateNameEntry]], d: pointer[char], n: int, s: int)
+    {
+        let len t.get_length() as int
+        var i 0
+        while i < len
+        {
+            let e t.get_buffer() + i
+            if SymbolTable.names_equal(e.name_data, e.name_len, d, n)
+            {
+                set e.state: s
+                return
+            }
+            set i: i + 1
+        }
+        t.add(DuplicateNameEntry(d, n, s))
+    }
+
+    ; `symbol.Name == <literal>`, for the one name this slice compares against a
+    ; constant. The bytes are not text (§Symbol.name_data), so the comparison is
+    ; SymbolTable.names_equal's and not a String's.
+    function symbol_name_equals(s: ref[Symbol], lit: pointer[const_char], len: int) returns bool
+    {
+        if Symbol.name_len_of(s) <> len
+            return false
+        let d Symbol.name_data_of(s)
+        if d = null
+            return false
+        var i 0
+        while i < len
+        {
+            if (*(d + i) as int) <> ((*(lit + i) as char) as int)
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    ; `symbol.Name == name`, symbol against the reported name's bytes.
+    function symbol_name_matches(s: ref[Symbol], d: pointer[char], n: int) returns bool
+        SymbolTable.names_equal(Symbol.name_data_of(s), Symbol.name_len_of(s), d, n)
+
     ; checkClassLikeDeclaration's prefix — two calls and then the check that stops
     ; it. It is a function of its own rather than folded into the class arm because
     ; the reference has it that way and because checkClassExpression is its second
@@ -9911,7 +10329,21 @@ define Checker
         this.check_function_or_constructor_symbol(sym)
         if this.is_unported() <> unported_before
             return
-        this.record_unported("check-object-type-for-duplicate-declarations", AstNode.kind_of(node))
+        ; ★★★ SLICE 73 MOVES THE CLASS PAST ITS DUPLICATE-MEMBER CHECK — the head
+        ; of the work list on both stages (128 units at stage 1, 2 891 at stage 2).
+        ; The class is the only one of the reference's three call sites that passes
+        ; checkPrivateNames true, and the only one this port can reach yet.
+        this.check_object_type_for_duplicate_declarations(node, true)
+        if this.is_unported() <> unported_before
+            return
+        ; ★★ ONE ROW FOR TWO PATHS, and the note is owed because the row's NAME is
+        ; exact for only one of them. The reference guards the next call with
+        ; `!nodeInAmbientContext`, so a plain class stops at
+        ; checkClassForStaticPropertyNameConflicts while an AMBIENT one skips it and
+        ; would meet the extends heritage block behind it. Both stop here, and the
+        ; row stands for the remainder in the second case — the same accounting the
+        ; interface arm's slice-66 note makes.
+        this.record_unported("check-class-for-static-property-name-conflicts", AstNode.kind_of(node))
     }
 
     ; checkClassDeclaration's prefix.
