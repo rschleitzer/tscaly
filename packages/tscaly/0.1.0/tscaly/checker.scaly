@@ -795,12 +795,21 @@ define SignatureLink
 (
     node: ref[AstNode]?
     resolved_signature: ref[Signature]?
+
+    ; ★★★ THE STOP BIT (slice 89). getResolvedSignature memoises through the slot
+    ; above, and this port has a THIRD state upstream does not: the resolution
+    ; STOPPED. Caching the nil alone would let the second ask answer it without
+    ; moving `unported_mark`, and every incompleteness guard in checker.scaly is a
+    ; mark delta — slice 88 paid for that once already, in type_node_links, where
+    ; the same bit is called `expression_stopped`.
+    signature_stopped: bool
 )
 {
     init(n: ref[AstNode]?)
     {
         set node: n
         set resolved_signature: null
+        set signature_stopped: false
     }
 }
 
@@ -1801,6 +1810,16 @@ define Checker
     ; container, a type predicate's parent and an accessor.
     signature_links: ref[Array[ref[SignatureLink]?]]
 
+    ; ── c.resolvingSignature (slice 89) ─────────────────────────────────────
+    ;
+    ; ONE of NewChecker's four singleton signatures, and the only one with a reader
+    ; in this port: getResolvedSignature parks it in a links slot while the
+    ; resolution runs and checkCallExpression compares against it. The other three
+    ; — anySignature, unknownSignature, silentNeverSignature — are named at
+    ; check_call_expression with the function that reads each, and all three of
+    ; those functions sit behind checkNonNullType (§3.5be).
+    resolving_signature: ref[Signature]
+
     ; c.SignatureCount — nextSignatureId, in creation order. It is a COUNTER and
     ; not a length, for `type_count`'s reason: a signature is minted into the
     ; region and the table that holds it is keyed on the declaration, not on the
@@ -1979,6 +1998,10 @@ define Checker
         set *bl: Array[ref[Type]?]()
         set c.bigint_literal_types: bl
         c.initialize_intrinsic_types()
+        ; NewChecker mints its four singleton signatures right here, after the
+        ; intrinsic types and before the globals — one of them has a reader (slice
+        ; 89), so one of them is minted.
+        set c.resolving_signature: c.new_signature(SignatureFlagsNone, null, null, null, null, c.any_type, 0)
         c
     }
 
@@ -8911,14 +8934,10 @@ define Checker
                 this.record_unported("check-import-call-expression", k)
                 return null
             }
-            this.record_unported("check-call-expression", k)
-            return null
+            return this.check_call_expression(node, check_mode)
         }
         if k = KindNewExpression
-        {
-            this.record_unported("check-call-expression", k)
-            return null
-        }
+            return this.check_call_expression(node, check_mode)
         if k = KindTaggedTemplateExpression
         {
             this.record_unported("check-tagged-template-expression", k)
@@ -10289,6 +10308,360 @@ define Checker
         if k = KindYieldExpression
             return true
         k = KindThisKeyword
+    }
+
+    ; ── the call and the new expression (slice 89) ──────────────────────────
+    ;
+    ; checkCallExpression serves BOTH kinds — the dispatch sends it every
+    ; NewExpression and every CallExpression that is not an import call — and so
+    ; does the whole chain below it, down to resolveCall. THAT is where this slice
+    ; stops: overload resolution is a thousand lines in the reference and its first
+    ; step is the assignability relation, a dimension of its own.
+    ;
+    ; ★★★ WHAT THIS CHAPTER CAN ANSWER IS DECIDED BY THE CALLEE, NOT BY THE CALL.
+    ; resolveCallExpression's third line is `c.checkExpression(node.Expression())`
+    ; and resolveNewExpression's first is the same call one wrapper down, and in
+    ; this corpus a callee is an Identifier or a property access almost everywhere —
+    ; so the row this slice closes hands most of its units on to `check-identifier`
+    ; (the globals table, §3.11) and `check-property-access-expression`. That is row
+    ; TRUTH rather than a diagnostic, and slice 88's finding three is the precedent:
+    ; a stop that names the wall its units actually hit is worth the slice even
+    ; where the corpus total does not move.
+    ;
+    ; ★★★ ONE OF NewChecker's FOUR SINGLETON SIGNATURES IS MINTED AND THREE ARE NOT,
+    ; on §3.5be's rule that a field with no reader is DECLARED rather than ported —
+    ; and each of the three is named here with the function that reads it.
+    ; `resolvingSignature` is minted because it has both a live writer and a live
+    ; reader in this file: getResolvedSignature parks it in the links slot while the
+    ; resolution runs, and checkCallExpression compares against it. `anySignature`
+    ; is resolveUntypedCall's answer, `unknownSignature` resolveErrorCall's, and
+    ; `silentNeverSignature` the answer of the two silentNever short-circuits — all
+    ; four of those functions sit BEHIND checkNonNullType, which is this chapter's
+    ; near wall, so minting their values now would be three fields nothing reads.
+    ; ★Nothing compares a signature ID (Type's own note says the same for type ids),
+    ; so the counter running three lower than the reference's costs nothing.
+    function check_call_expression(this, node: ref[AstNode], check_mode: int) returns ref[Type]?
+    {
+        this.check_grammar_type_arguments(AstNode.type_arguments_of(node))
+        let mark this.unported_mark()
+        let sig this.get_resolved_signature(node, check_mode)
+        if this.unported_mark() <> mark
+            return null
+        if sig = null
+            return null
+        let signature sig as ref[Signature]
+        ; CheckMode.SkipGenericFunctions deferred the call. Nothing passes that mode
+        ; here — checkExpressionEx reports on it — so the arm is live code with no
+        ; input; it is transcribed because the value it compares against is the one
+        ; singleton this slice does mint.
+        if signature = resolving_signature
+            return silent_never_type
+        this.check_deprecated_signature(signature, node)
+        if Checker.kind_or_unknown(AstNode.expression_of(node)) = KindSuperKeyword
+            return void_type
+        if AstNode.kind_of(node) = KindNewExpression
+        {
+            let decl signature.declaration
+            if decl <> null
+            {
+                let dk AstNode.kind_of(decl as ref[AstNode])
+                var constructs false
+                if dk = KindConstructor
+                    set constructs: true
+                if dk = KindConstructSignature
+                    set constructs: true
+                if dk = KindConstructorType
+                    set constructs: true
+                if constructs = false
+                {
+                    ; ★ noImplicitAny is TRUE here — an unset strict-family option,
+                    ; see the option accessors — so this is a live report and the
+                    ; `if` around it is not a gate this port can fail.
+                    if Checker.no_implicit_any()
+                        this.error_on_node(node, DiagX_new_expression_whose_target_lacks_a_construct_signature_implicitly_has_an_any_type)
+                    return any_type
+                }
+            }
+        }
+        ; isCommonJSRequire's SECOND line is resolveName against c.requireSymbol,
+        ; which initialize_intrinsic_types deliberately does not mint (§3.5be) — the
+        ; globals table again. The FIRST line is syntactic and is asked here, so the
+        ; row is reached by a JavaScript `require("m")` and not by every call in a
+        ; JavaScript file.
+        if Parser.is_in_js_file(node)
+        {
+            if Parser.is_require_call(node, true)
+            {
+                this.record_unported("is-common-js-require", AstNode.kind_of(node))
+                return null
+            }
+        }
+        let rt this.get_return_type_of_signature(signature)
+        if this.unported_mark() <> mark
+            return null
+        if rt = null
+            return null
+        let return_type rt as ref[Type]
+        ; The fresh-unique-symbol arm. Its first conjunct is a flag test on the
+        ; RETURN type, so the globals term behind it is asked only where a signature
+        ; whose return type is symbol-like exists — which is behind resolveCall.
+        if (return_type.flags & TypeFlagsESSymbolLike) <> 0
+        {
+            if this.symbol_call_undecidable(node)
+            {
+                this.record_unported("get-global-es-symbol-constructor-symbol", AstNode.kind_of(node))
+                return null
+            }
+        }
+        ; The assertion-target pair, TS2776 and TS2775. Four syntactic conjuncts and
+        ; then getTypePredicateOfSignature — and the FOURTH conjunct is what decides
+        ; whether the row is reached at all, because a call answers a VOID return
+        ; type only from a signature resolveCall built.
+        var assertion_shape false
+        if AstNode.kind_of(node) = KindCallExpression
+        {
+            if AstNode.question_dot_token_of(node) = null
+            {
+                if Checker.kind_or_unknown(AstNode.parent_node_of(node)) = KindExpressionStatement
+                {
+                    if (return_type.flags & TypeFlagsVoid) <> 0
+                        set assertion_shape: true
+                }
+            }
+        }
+        if assertion_shape
+        {
+            this.record_unported("get-type-predicate-of-signature", AstNode.kind_of(node))
+            return null
+        }
+        return_type
+    }
+
+    ; checkDeprecatedSignature. Its product is a SUGGESTION and never a C line, so
+    ; what this port would owe it is the suggestion COUNT — the discipline
+    ; check_grammar_numeric_literal's report follows.
+    ;
+    ; ★★ THE SECOND CONJUNCT IS THE ROW AND THE FIRST IS PORTED, which is the split
+    ; worth writing: a signature's DECLARATION slot is filled only by
+    ; getSignatureFromDeclaration, and every signature that reaches here today comes
+    ; from resolveCall, so the row says which half of the function this corpus can
+    ; reach rather than standing at the top of it.
+    procedure check_deprecated_signature(this, sig: ref[Signature], node: ref[AstNode])
+    {
+        if (sig.flags & SignatureFlagsIsSignatureCandidateForOverloadFailure) <> 0
+            return
+        if sig.declaration = null
+            return
+        this.record_unported("is-deprecated-declaration", AstNode.kind_of(node))
+    }
+
+    ; getResolvedSignature — the MEMO, on the same signatureLinks table
+    ; get_signature_from_declaration writes, keyed here on the CALL node rather than
+    ; on a declaration. That is the reference's own arrangement and not a shortcut:
+    ; `c.signatureLinks.Get(node)` is the same map in both functions.
+    ;
+    ; ★★★ IT CACHES ITS OWN INCOMPLETENESS, which is slice 88's second correction
+    ; arriving in a second table. Upstream never answers nil, so the slot has two
+    ; states; here a stop is a third, and caching the nil WITHOUT recording that it
+    ; was a stop would let the second ask answer nil while `unported_mark` stands
+    ; still — and every incompleteness guard in this file is a mark delta. The bit
+    ; is `signature_stopped` and the replay moves the mark without touching the log,
+    ; exactly as check_expression_cached_ex does.
+    ;
+    ; ★★★ AND THE MARKER IS TAKEN BACK OUT OF THE SLOT ON A STOP. A slot still
+    ; holding resolvingSignature reads as *resolution in progress* to every other
+    ; reader of this table, which is a THIRD meaning nobody would test for — so the
+    ; stop restores what was there and records itself in the bit instead.
+    ;
+    ; ★★ `c.flowLoopStack` IS EMPTY AND WILL BE UNTIL `flow-graph 264` LANDS, so the
+    ; branch that restores the PREVIOUS value instead of storing the result is named
+    ; at the line it decides rather than folded away.
+    function get_resolved_signature(this, node: ref[AstNode], check_mode: int) returns ref[Signature]?
+    {
+        let links this.signature_link_of(node)
+        let cached links.resolved_signature
+        if cached <> null
+        {
+            if (cached as ref[Signature]) <> resolving_signature
+                return cached
+        }
+        if links.signature_stopped
+        {
+            this.replay_stop_mark()
+            return null
+        }
+        let save_resolution_start resolution_start
+        if cached = null
+            set resolution_start: type_resolution_count
+        set links.resolved_signature: resolving_signature
+        let mark this.unported_mark()
+        var result this.resolve_signature(node, check_mode)
+        set resolution_start: save_resolution_start
+        if this.unported_mark() <> mark
+        {
+            set links.resolved_signature: cached
+            set links.signature_stopped: true
+            return null
+        }
+        if result = null
+        {
+            set links.resolved_signature: cached
+            set links.signature_stopped: true
+            return null
+        }
+        if (result as ref[Signature]) <> resolving_signature
+        {
+            if links.resolved_signature <> null
+            {
+                if (links.resolved_signature as ref[Signature]) <> resolving_signature
+                    set result: links.resolved_signature
+            }
+            ; `len(c.flowLoopStack) == 0` — always true here; the else stores
+            ; `cached` back.
+            set links.resolved_signature: result
+        }
+        result
+    }
+
+    ; resolveSignature. Six arms, two of them ported and four of them rows — and the
+    ; four are rows rather than an omission because the reference's default PANICS,
+    ; so a kind arriving here that is none of the six is a defect in the caller
+    ; rather than an unported construct.
+    ;
+    ; ★★ ALL FOUR ARE UNREACHABLE TODAY and each names the caller that would reach
+    ; it: the tagged template through checkTaggedTemplateExpression, the decorator
+    ; through checkDecorator, the three JSX kinds through checkJsxOpeningLikeElement
+    ; and the BinaryExpression through checkInstanceOfExpression — every one of them
+    ; a stop of its own in the dispatch or in the binary chapter.
+    function resolve_signature(this, node: ref[AstNode], check_mode: int) returns ref[Signature]?
+    {
+        let k AstNode.kind_of(node)
+        if k = KindCallExpression
+            return this.resolve_call_expression(node, check_mode)
+        if k = KindNewExpression
+            return this.resolve_new_expression(node, check_mode)
+        if k = KindTaggedTemplateExpression
+        {
+            this.record_unported("resolve-tagged-template-expression", k)
+            return null
+        }
+        if k = KindDecorator
+        {
+            this.record_unported("resolve-decorator", k)
+            return null
+        }
+        var jsx false
+        if k = KindJsxOpeningFragment
+            set jsx: true
+        if k = KindJsxOpeningElement
+            set jsx: true
+        if k = KindJsxSelfClosingElement
+            set jsx: true
+        if jsx
+        {
+            this.record_unported("resolve-jsx-opening-like-element", k)
+            return null
+        }
+        if k = KindBinaryExpression
+        {
+            this.record_unported("resolve-instanceof-expression", k)
+            return null
+        }
+        ; `panic("Unhandled case in resolveSignature")`, held as a row on this
+        ; file's rule about the reference's own assertions.
+        this.record_unported("resolve-signature-unhandled", k)
+        null
+    }
+
+    ; resolveCallExpression, down to the first unportable step of each branch.
+    function resolve_call_expression(this, node: ref[AstNode], check_mode: int) returns ref[Signature]?
+    {
+        let callee AstNode.expression_of(node)
+        if callee = null
+        {
+            this.record_unported("call-expression-slot-missing", KindCallExpression)
+            return null
+        }
+        let expr callee as ref[AstNode]
+        if AstNode.kind_of(expr) = KindSuperKeyword
+        {
+            ; The super branch hangs off checkSuperExpression's answer — the base
+            ; constructors, resolveCall and resolveUntypedCall all wait behind it —
+            ; and that is the dispatch's own row for a bare `super`.
+            this.record_unported("check-super-expression", KindSuperKeyword)
+            return null
+        }
+        ; ★ ast.IsImportCall is asked AGAIN here, and this port cannot reach the
+        ; branch: the dispatch has already sent an import call to
+        ; `check-import-call-expression`, which is why the test stands above the
+        ; callee's own check in the reference and below it in the work list. The row
+        ; is what resolveUntypedCall would be, and resolveUntypedCall is also the
+        ; one function of this chapter that walks the ARGUMENTS.
+        if Parser.is_import_call(node)
+        {
+            this.record_unported("resolve-untyped-call", KindCallExpression)
+            return null
+        }
+        let mark this.unported_mark()
+        let ft this.check_expression(expr)
+        if this.unported_mark() <> mark
+            return null
+        if ft = null
+            return null
+        if Checker.is_call_chain(node)
+        {
+            ; getOptionalExpressionType — GetNonNullableType at an optional-chain
+            ; ROOT and removeOptionalTypeMarker inside one, and both filter a UNION's
+            ; constituents, which is machinery this port does not have.
+            this.record_unported("get-optional-expression-type", KindCallExpression)
+            return null
+        }
+        ; checkNonNullTypeWithReporter. Its first arm — the two `unknown` reports —
+        ; is portable and has no input, because nothing in this port answers
+        ; unknownType from an expression; everything after it is getTypeFacts. So the
+        ; whole function is one row, under the tag the binary chapter's arithmetic
+        ; arm already uses for the same call.
+        ;
+        ; ★ The REPORTER differs between the two call sites
+        ; (reportCannotInvokePossiblyNullOrUndefined here,
+        ; reportObjectPossiblyNullOrUndefined at checkNonNullType) and is NOT a
+        ; parameter yet: §3.5e maps a func-value parameter to a flag when the callees
+        ; are static, and both are — but the flag would have no reader (§3.5be),
+        ; because the reporter is called from inside the facts branch and the facts
+        ; are the line that stops. It arrives WITH getTypeFacts.
+        this.record_unported("check-non-null-type", AstNode.kind_of(expr))
+        null
+    }
+
+    ; resolveNewExpression, to the same depth. Its first line is
+    ; checkNonNullExpression, which is checkExpression and then the same facts wall
+    ; one wrapper down — so the two functions stop for one reason and the row is
+    ; shared, while the KIND in its detail column keeps them apart.
+    function resolve_new_expression(this, node: ref[AstNode], check_mode: int) returns ref[Signature]?
+    {
+        let callee AstNode.expression_of(node)
+        if callee = null
+        {
+            this.record_unported("new-expression-slot-missing", KindNewExpression)
+            return null
+        }
+        let expr callee as ref[AstNode]
+        let mark this.unported_mark()
+        let et this.check_expression(expr)
+        if this.unported_mark() <> mark
+            return null
+        if et = null
+            return null
+        this.record_unported("check-non-null-type", AstNode.kind_of(expr))
+        null
+    }
+
+    ; isCallChain, whole.
+    function is_call_chain(n: ref[AstNode]) returns bool
+    {
+        if AstNode.kind_of(n) <> KindCallExpression
+            return false
+        (AstNode.flags_of(n) & NodeFlagsOptionalChain) <> 0
     }
 
     ; checkExpressionStatement, whole:
