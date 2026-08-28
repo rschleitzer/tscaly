@@ -292,6 +292,36 @@ if submodule_dirty; then
   exit 2
 fi
 
+# ── the DUPLICATE-DEFINE gate (slice 86) ─────────────────────────────────────
+#
+# ★★★ TWO MODULES OF ONE PACKAGE MAY DECLARE THE SAME TOP-LEVEL CONCEPT AND
+# NOTHING IS REPORTED — not by the planner, not by the linker, not by any of the
+# eight instruments in this directory. A top-level `define` mangles WITHOUT its
+# module (`_Z17TypeParameterData`), so the emitter keeps ONE named struct for the
+# pair and every field access in the other module reads the WRONG LAYOUT.
+#
+# ★★★ IT COST FOUR SLICES OF A SILENTLY DEAD PREDICATE. `checker.scaly`'s
+# TypeParameterData (four slots, one of them a bool) collided with `ast.scaly`'s
+# (five reference slots); under the AST layout `mark_this_type`'s `store i1` went
+# into the low byte of a pointer and `is_this_type_of`'s `return tp.is_this_type`
+# was DROPPED — the arm computed the value, branched to the tail and returned the
+# literal `false`. `isThisTypeParameter` therefore answered false for every type in
+# the tree from slice 66 to slice 86. **A collision whose two records happen to
+# have the same LLVM shape is invisible too** — TypeReferenceData was the second
+# pair and it was harmless purely by luck.
+#
+# ★ The check is a text scan and it is honest about that: it reads top-level
+# `define` lines, which is exactly what mangles without a namespace. Nested
+# concepts and generics are out of its reach and out of the hazard.
+DUPES=$(grep -h '^define [A-Za-z_]' "$PKG"/0.1.0/tscaly/*.scaly \
+        | awk '{print $2}' | sed 's/\[.*//' | grep -v ':' | sort | uniq -d)
+if [ -n "$DUPES" ]; then
+  red "two top-level concepts in packages/tscaly share a name, and the emitter keeps ONE:"
+  echo "$DUPES" | sed 's/^/    /'
+  echo "  Rename one of each pair. Nothing else in this tree can see this."
+  exit 2
+fi
+
 # ── build our side ───────────────────────────────────────────────────────────
 #
 # Two objects per program, the way the opensp drop-in is built: the package
