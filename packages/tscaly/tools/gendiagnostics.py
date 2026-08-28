@@ -80,6 +80,15 @@ SOURCES = [
     # describes and the reason the defect cost nothing. The lookbehind is proven
     # neutral on the five older sources: the same 337 names, as a set.
     os.path.join(SUB, "internal/checker/checker.go"),
+    # Slice 91. nameresolver.go joins under the same per-FILE rule, and for the
+    # same reason checker.go did: an arm of it reports. `Resolve`'s four
+    # message-gated steps are ported with this slice — the enum member reached
+    # from another file, the class type parameter in a static member, the base
+    # class expression and the computed property name — and three of those four
+    # messages appear in NO other source, so the port would otherwise have to
+    # spell them as bare numbers. It costs 4 new entries: the scrape is by NAME
+    # and this file's other uses are already in the table.
+    os.path.join(SUB, "internal/binder/nameresolver.go"),
 ]
 DST = os.path.join(REPO, "packages/tscaly/0.1.0/tscaly/DiagnosticCodes.scaly")
 
