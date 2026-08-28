@@ -223,6 +223,23 @@ define CheckModeRestBindingElement: int 1 << 5    ; Checking a type used to dete
 define CheckModeTypeOnly: int 1 << 6              ; Called from getTypeOfExpression, diagnostics may be omitted
 define CheckModeForceTuple: int 1 << 7
 
+; ── PredicateSemantics, slice 88 ────────────────────────────────────────────
+;
+; The three-valued answer of the two SYNTACTIC walks the logical and coalescing
+; operators use — `getSyntacticTruthySemantics` and
+; `getSyntacticNullishnessSemantics`. It is a bit PAIR and not an enum, and that
+; is what makes the ConditionalExpression arm one line: a conditional is
+; `semantics(whenTrue) | semantics(whenFalse)`, so two branches that disagree
+; combine to Sometimes without a case for it.
+;
+; ★ `Sometimes` is the only value that reports NOTHING, at all four report sites.
+; A walk that cannot decide must therefore answer Sometimes — which is why the
+; two Identifier arms below answer it when this port cannot resolve the name.
+define PredicateSemanticsNone:      int 0
+define PredicateSemanticsAlways:    int 1 << 0
+define PredicateSemanticsNever:     int 1 << 1
+define PredicateSemanticsSometimes: int PredicateSemanticsAlways | PredicateSemanticsNever
+
 ; ── the type payloads ───────────────────────────────────────────────────────
 ;
 ; ★★★ SLICE 66 IS THE SECOND PAYLOAD, so the union the note below promised
@@ -617,14 +634,32 @@ define TypeNodeLink
 (
     node: ref[AstNode]?
     resolved_type: ref[Type]?
+    expression_resolved: bool
+    expression_stopped: bool
 )
 {
     init(n: ref[AstNode]?)
     {
         set node: n
         set resolved_type: null
+        set expression_resolved: false
+        set expression_stopped: false
     }
 }
+
+; ★★★ THE SECOND SLOT IS A PORT-LOCAL BIT AND SLICE 88 PAID FOR IT AT STAGE 2.
+; Upstream `resolvedType == nil` means exactly *not computed*, because
+; checkExpressionEx always answers a type. **Here nil has a SECOND meaning — a
+; stop — so a node whose check stopped stayed uncached, and every node asked twice
+; re-ran its check and RE-EMITTED every diagnostic it had raised before the stop.**
+; Two declarations of one variable are enough: `var co2 = (3, co2); var co2: any;`
+; answered TWO TS2695 where the reference answers one, on two units of the stage-2
+; corpus and none of stage 1. ★The bit says *this expression has been checked*,
+; which is the question the reference asks with its nil; the nil TEST is kept in
+; front of it so that where the reference's memo answers, this answers identically.
+; ★★A port that gives a memo's sentinel a second meaning owes it a second slot —
+; otherwise the memo silently stops being a memo for exactly the inputs that
+; needed it.
 
 ; One row of c.nodeLinks (slice 83) — the reference's OTHER per-node table, and it
 ; is a fourth table rather than a slot on TypeNodeLink because upstream keeps the
@@ -1978,6 +2013,18 @@ define Checker
     ; rather than *has this unit stopped*.
     function unported_mark(this) returns int
         unported_count
+
+    ; ★★★ THE MARK WITHOUT THE LOG, and it exists for exactly one caller — see
+    ; check_expression_cached_ex. A memoised nil must still MOVE the mark, because
+    ; every `unported_mark` guard in this file reads *did anything stop under this
+    ; call* and a cached incomplete answer is still incomplete; but it must NOT
+    ; append to the log, because the log is the WORK LIST and the stop it stands
+    ; for was logged the first time the node was checked. ★It is the one place
+    ; where the count and the log deliberately disagree, which is the field's own
+    ; note (*the count says how many and the log says which*) used rather than
+    ; broken.
+    procedure replay_stop_mark(this)
+        set unported_count: unported_count + 1
 
     function unported_at(c: ref[Checker]) returns int
         c.unported_pos
@@ -4530,14 +4577,74 @@ define Checker
         ((target as ref[Type]).object_flags & ObjectFlagsTuple) <> 0
     }
 
-    ; checkExpressionCachedEx. ★★ THE MEMO IS STILL NOT ONE and the reader that
-    ; would change that is still the one slice 70 named — the first arm that writes
-    ; an error into a C section twice for one node. What this slice adds is the
-    ; MODE ARGUMENT, which is the half of the function that is not the cache: with
-    ; anything other than Normal the reference does not consult the cache at all,
-    ; so forwarding the mode is the whole body under every value the port can pass.
+    ; checkExpressionCachedEx.
+    ;
+    ; ★★★ SLICE 88 IS THE READER SLICE 70 NAMED, AND IT ARRIVED AS A RED DIAGCHECK
+    ; RATHER THAN AS A DESIGN STEP. This function's own header carried the sentence
+    ; *"a memo's only OBSERVABLE effect on a C section is a diagnostic reported
+    ; twice when the same node is checked twice … the first arm that writes an
+    ; error into the C section is the arm that owes this function its links
+    ; table"* — and the comma operator is that arm. `const comma = (1, 2, 3)`
+    ; produced TWO TS2695 per comma against the reference's one, because
+    ; check_variable_declaration checks the initializer once through
+    ; getTypeOfSymbol and once in its own tail.
+    ;
+    ; ★★★ AND THE PREDICTION WAS RIGHT ABOUT THE MECHANISM AND WRONG ABOUT WHICH
+    ; ARM: it named checkIdentifier's TS2304 as the nearest candidate, and that arm
+    ; is still a stop. What made this the one is not that the arm REPORTS but that
+    ; it also ANSWERS — the `??` arm of the same slice reports TS5076 and then
+    ; stops, its nil makes check_variable_declaration return before the second
+    ; check, and it stays single all on its own. **A double needs a diagnostic AND
+    ; a non-nil answer on the same node**, which no earlier slice could produce.
+    ;
+    ; ★★★ A nil IS CACHED THROUGH A SECOND SLOT, AND THE FIRST DRAFT DID NOT DO
+    ; THAT — read TypeNodeLink's own note, which carries the measurement. The
+    ; reading *upstream nil means not-yet-computed, a stop's nil means no claim, so
+    ; recomputing is right under both* is WRONG in its second half: recomputing
+    ; re-runs the check, and a check that stopped may have REPORTED on its way to
+    ; the stop. It cost two stage-2 units and it is the reason to run stage 2.
+    ; ★The price is that the stop LOG counts such a node once where the reference's
+    ; walk arrives twice — a number, against a duplicated diagnostic, which is a
+    ; hard failure.
+    ;
+    ; ★ The flow-loop stack and the flow type cache are saved and cleared around
+    ; the call upstream. Neither field exists here — nothing in this port does flow
+    ; analysis — so the save/restore is two lines that cannot be wrong and cannot
+    ; be right (§3.5be), and the reader that changes that is the flow-graph
+    ; dimension, which arrives with both fields.
     function check_expression_cached_ex(this, node: ref[AstNode], check_mode: int) returns ref[Type]?
-        this.check_expression_ex(node, check_mode)
+    {
+        if check_mode <> CheckModeNormal
+            return this.check_expression_ex(node, check_mode)
+        let links this.type_node_link_of(node)
+        if links.resolved_type = null
+        {
+            if links.expression_resolved = false
+            {
+                let mark this.unported_mark()
+                set links.resolved_type: this.check_expression_ex(node, check_mode)
+                set links.expression_resolved: true
+                if this.unported_mark() <> mark
+                    set links.expression_stopped: true
+            }
+            else
+            {
+                ; ★★★ A CACHED STOP MUST STILL MOVE THE MARK. Slice 88's second
+                ; correction, and the first one caused it: with the nil merely
+                ; cached, the SECOND ask returned it without moving
+                ; `unported_mark`, so getWidenedTypeForVariableLikeDeclaration's
+                ; incompleteness guard read *nothing stopped* and ran on an
+                ; incomplete answer — `var co = (3, q); var co: any;` then INVENTED
+                ; a TS7005, because a nil that means *the check stopped* had been
+                ; handed to a caller that reads nil as *nothing to infer from*. The
+                ; replay moves the mark and does not touch the log; the stop it
+                ; stands for is already on the work list from the first ask.
+                if links.expression_stopped
+                    this.replay_stop_mark()
+            }
+        }
+        links.resolved_type
+    }
 
     ; getQuickTypeOfExpression — "optimize for the common case", five arms over a
     ; parenthesis-stripped expression.
@@ -8657,12 +8764,12 @@ define Checker
     ; the C section (checkIdentifier's TS2304 is the nearest) is the arm that owes
     ; this function its links table.
     ;
-    ; ★ The `checkMode != CheckModeNormal` short-circuit in front of the memo is
-    ; kept as the whole function, which is the same statement from the other side:
-    ; with Normal the reference consults the cache, and with anything else it does
-    ; not — and Normal is all this port passes.
+    ; ★ It is `checkExpressionCachedEx(node, CheckModeNormal)`, which is the
+    ; reference's own body — and since slice 88 that call reaches a real memo. The
+    ; account of why it had to, and of the one shape that forced it, is at
+    ; check_expression_cached_ex.
     function check_expression_cached(this, node: ref[AstNode]) returns ref[Type]?
-        this.check_expression_ex(node, CheckModeNormal)
+        this.check_expression_cached_ex(node, CheckModeNormal)
 
     ; ★★★ checkExpressionWorker. THREE OF THE FORTY-SIX `case` LABELS ARE PORTED
     ; and the fourth thing ported is the switch's DEFAULT, which is not a case at
@@ -8909,10 +9016,7 @@ define Checker
             return null
         }
         if k = KindBinaryExpression
-        {
-            this.record_unported("check-binary-expression", k)
-            return null
-        }
+            return this.check_binary_expression(node, check_mode)
         if k = KindConditionalExpression
         {
             this.record_unported("check-conditional-expression", k)
@@ -9122,6 +9226,1071 @@ define Checker
         false
     }
 
+    ; ── slice 88: THE BINARY EXPRESSION ─────────────────────────────────────
+    ;
+    ; checkBinaryExpression is three lines; checkBinaryLikeExpression is the
+    ; chapter — two operand checks, a pre-pass for the logical and coalescing
+    ; operators, and a switch over sixteen operator groups.
+    ;
+    ; ★★★ TWO GROUPS CAN ANSWER AND FOURTEEN CANNOT, AND ONE MISSING TYPE DRAWS
+    ; THE LINE. `booleanType` is the SEVENTH line of NewChecker that
+    ; initialize_intrinsic_types does not transcribe — it is
+    ; `getUnionType(trueType, falseType)`, and that note already said so — so every
+    ; comparison and equality arm has no value to return; and every arithmetic arm
+    ; reaches isTypeAssignableToKind, which is isTypeAssignableTo, which is the
+    ; assignability RELATION that slice 70 named as a dimension. What is left is
+    ; `=`, which answers rightType, and `,`, which answers rightType.
+    ;
+    ; ★★★ AND THE HISTOGRAM SAYS THOSE TWO ARE THE CHAPTER. The row was opened as
+    ; a histogram the way slice 70 opened its own — `record_unported` was pointed at
+    ; the OPERATOR kind for one run instead of at KindBinaryExpression — and the
+    ; forty-one operators the corpus holds behind this stop are not evenly spread:
+    ; **`=` alone is 245 of the 413 stop events and 98 of the 142 units**, `,` is
+    ; six more units, and the whole remaining thirty-nine operators together are
+    ; thirty-eight units. ★The two arms that can answer are the two that need no
+    ; type at all, which is not a coincidence to pass over: the row was never
+    ; waiting on the relation, it was waiting on the DISPATCH.
+    ;
+    ; ★★★ AN OPERAND'S STOP DOES NOT ABORT THE FUNCTION, and that is what the slice
+    ; is worth rather than a detail of style. `x = 1` checks an Identifier on the
+    ; left, which stops at check-identifier (the globals table, §3.11) — so
+    ; `leftType` is nil for most of the corpus — while the reference's sequence
+    ; reaches checkAssignmentOperator regardless, and TS2364 is decided by the
+    ; NODE. Bailing out at the first nil would have made this whole chapter
+    ; invisible behind a table it does not need. It is the discipline
+    ; check_variable_declaration's tail already carries, one level down.
+    ;
+    ; ★★ WHERE A nil TYPE *IS* LOAD-BEARING IT IS TESTED, at three places and each
+    ; for its own reason: the silentNever short-circuit compares an identity that a
+    ; nil cannot have, checkTruthinessOfType reads flags off the type, and
+    ; checkForDisallowedESSymbolOperand asks maybeTypeOfKind. Each skips rather
+    ; than guesses — skipping loses a report, and diagcheck's subsequence relation
+    ; is green on a LOSS and red on an INVENTION.
+
+    ; checkBinaryExpression, whole.
+    ;
+    ; ★ The three slots are non-optional in BinaryExpressionData; the accessors
+    ; answer nil only through their union DEFAULT arm, which the caller's own kind
+    ; test has already excluded. The report is that claim's holder rather than a
+    ; live path — a row that would appear if it were false.
+    function check_binary_expression(this, node: ref[AstNode], check_mode: int) returns ref[Type]?
+    {
+        let left AstNode.binary_left_of(node)
+        let operator_token AstNode.binary_operator_token_of(node)
+        let right AstNode.binary_right_of(node)
+        if left = null
+        {
+            this.record_unported("binary-expression-slot-missing", KindBinaryExpression)
+            return null
+        }
+        if operator_token = null
+        {
+            this.record_unported("binary-expression-slot-missing", KindBinaryExpression)
+            return null
+        }
+        if right = null
+        {
+            this.record_unported("binary-expression-slot-missing", KindBinaryExpression)
+            return null
+        }
+        this.check_binary_like_expression(left as ref[AstNode], operator_token as ref[AstNode], right as ref[AstNode], check_mode, node)
+    }
+
+    ; checkBinaryLikeExpression. The head, the pre-pass and the switch.
+    ;
+    ; ★★ `errorNode` IS OPTIONAL UPSTREAM AND IS OPTIONAL HERE: checkDestructuring
+    ; Assignment's shorthand arm passes nil. The one report in this slice's prefix
+    ; that lands ON it — the equality arm's TS2839 — therefore goes through
+    ; error_on_node_or_null, which DROPS a nil, and that is the faithful answer
+    ; rather than a leniency: `c.error(nil, …)` builds a diagnostic with no file,
+    ; which lands in the GLOBAL list and never appears among the reference's own C
+    ; lines. The reporter family's header states the same rule from its own side.
+    function check_binary_like_expression(this, left: ref[AstNode], operator_token: ref[AstNode], right: ref[AstNode], check_mode: int, error_node: ref[AstNode]?) returns ref[Type]?
+    {
+        let op_kind AstNode.kind_of(operator_token)
+
+        ; The destructuring fork. `[a, b] = xs` and `({a} = o)` are not binary
+        ; operators at all — the left side is a PATTERN — so the reference leaves
+        ; the function here, and so does this port.
+        if op_kind = KindEqualsToken
+        {
+            let lk AstNode.kind_of(left)
+            var pattern false
+            if lk = KindObjectLiteralExpression
+                set pattern: true
+            if lk = KindArrayLiteralExpression
+                set pattern: true
+            if pattern
+            {
+                ; The reference evaluates `c.checkExpressionEx(right, checkMode)`
+                ; as the ARGUMENT, so the right side is checked before the stop and
+                ; its own row is reached.
+                this.check_expression_ex(right, check_mode)
+                this.record_unported("check-destructuring-assignment", lk)
+                return null
+            }
+        }
+
+        let left_type this.check_expression_ex(left, check_mode)
+        let right_type this.check_expression_ex(right, check_mode)
+
+        ; ── the logical / coalescing pre-pass ────────────────────────────────
+        ;
+        ; ★ The walk starts at `left.Parent.Parent`, which for `a && b` is the
+        ; binary expression's own parent: the reference is looking for the
+        ; STATEMENT this chain hangs off, and it climbs through parentheses and
+        ; through further logical operators to find it.
+        if Binder.is_logical_or_coalescing_binary_operator(op_kind)
+        {
+            var parent AstNode.parent_node_of(AstNode.parent_node_of(left))
+            while Checker.is_parenthesis_or_logical_chain(parent)
+                set parent: AstNode.parent_node_of(parent)
+            var ask_known_truthy false
+            if op_kind = KindAmpersandAmpersandToken
+                set ask_known_truthy: true
+            if Checker.kind_or_unknown(parent) = KindIfStatement
+                set ask_known_truthy: true
+            if ask_known_truthy
+            {
+                ; checkTestingKnownTruthyCallableOrAwaitableOrEnumMemberType. Its
+                ; first step is getTypeFacts and its reports need the CONTROL-FLOW
+                ; graph (`flow-graph 264`, still blocked), so the whole function is
+                ; a row and not a step.
+                this.record_unported("check-testing-known-truthy-callable-or-awaitable-or-enum-member-type", op_kind)
+            }
+            if Binder.is_logical_binary_operator(op_kind)
+            {
+                ; ★ `??` is excluded here and included above, which is the whole
+                ; reason is_logical_binary_operator was split back out of its
+                ; caller in binder.scaly.
+                if left_type <> null
+                    this.check_truthiness_of_type(left_type as ref[Type], left)
+            }
+        }
+
+        ; ── the switch ───────────────────────────────────────────────────────
+
+        ; The arithmetic and bitwise group, twenty-two operators. Its first two
+        ; steps are the silentNever short-circuit — ported, because it is an
+        ; identity comparison — and checkNonNullType, which is getTypeFacts.
+        if Checker.is_arithmetic_or_bitwise_operator(op_kind)
+        {
+            if Checker.either_is(left_type, right_type, silent_never_type)
+                return silent_never_type
+            this.record_unported("check-non-null-type", op_kind)
+            return null
+        }
+
+        ; `+` and `+=`. The silentNever short-circuit again, then
+        ; isTypeAssignableToKind — the relation under another name.
+        if Checker.is_plus_operator(op_kind)
+        {
+            if Checker.either_is(left_type, right_type, silent_never_type)
+                return silent_never_type
+            this.record_unported("is-type-assignable-to-kind", op_kind)
+            return null
+        }
+
+        ; The four relational operators. checkForDisallowedESSymbolOperand runs
+        ; FIRST and is ported whole; everything behind it is the relation, and the
+        ; answer would be booleanType.
+        if Checker.is_relational_operator(op_kind)
+        {
+            if this.check_for_disallowed_es_symbol_operand(left, right, left_type, right_type, op_kind)
+                this.record_unported("check-non-null-type", op_kind)
+            else
+                ; ★ THE ERROR PATH OWES A ROW TOO, for the reason the equality arm
+                ; states in full: on a reported ES-symbol operand the reference
+                ; skips the rest and returns booleanType, which is exactly the one
+                ; thing this port cannot mint — so the tag names getUnionType and
+                ; not the step that is no longer reached. A nil with no stop is
+                ; read by the caller as an ANSWER.
+                this.record_unported("get-union-type", op_kind)
+            return null
+        }
+
+        ; The four equality operators. Two of the three steps inside the
+        ; CheckModeTypeOnly gate are node-driven and are ported; the third is the
+        ; relation, and the answer is booleanType.
+        if Checker.is_equality_operator(op_kind)
+        {
+            if (check_mode & CheckModeTypeOnly) = 0
+            {
+                var object_literal false
+                if Checker.is_literal_expression_of_object(left)
+                    set object_literal: true
+                if Checker.is_literal_expression_of_object(right)
+                    set object_literal: true
+                if object_literal
+                {
+                    ; "only report for === and !== in JS, not == or !="
+                    var report true
+                    if Parser.is_in_js_file(left)
+                    {
+                        set report: false
+                        if op_kind = KindEqualsEqualsEqualsToken
+                            set report: true
+                        if op_kind = KindExclamationEqualsEqualsToken
+                            set report: true
+                    }
+                    if report
+                        this.error_on_node_or_null(error_node, DiagThis_condition_will_always_return_0_since_JavaScript_compares_objects_by_reference_not_value)
+                }
+                this.check_na_n_equality(error_node, op_kind, left, right)
+            }
+            ; ★★★ THE ROW IS RECORDED ON BOTH PATHS, AND A CONTROL IS WHY. The
+            ; answer is booleanType whichever way the gate goes, and this port
+            ; cannot mint it — so both paths owe a stop. Recorded INSIDE the gate,
+            ; g16 (the gate forced closed) made this arm answer nil with no stop at
+            ; all, and one unit then INVENTED a TS7005 the reference does not have.
+            ; **A nil is how this port says *no claim*; a nil without a stop says
+            ; nothing, and the callers above read it as an answer.**
+            this.record_unported("is-type-equality-comparable-to", op_kind)
+            return null
+        }
+
+        if op_kind = KindInstanceOfKeyword
+        {
+            this.record_unported("check-instance-of-expression", op_kind)
+            return null
+        }
+        if op_kind = KindInKeyword
+        {
+            this.record_unported("check-in-expression", op_kind)
+            return null
+        }
+
+        ; `&&`, `||`, `??` and their three compound spellings. The resultType each
+        ; of them computes is a UNION, so all six stop at the same place — and the
+        ; three compound ones still run checkAssignmentOperator afterwards, which
+        ; is the reference's own order and is where their TS2364 comes from.
+        if Checker.is_logical_or_coalescing_operator(op_kind)
+        {
+            if op_kind = KindQuestionQuestionToken
+                this.check_nullish_coalesce_operands(left, right)
+            ; hasTypeFacts, then getUnionType. The first is the row.
+            this.record_unported("has-type-facts", op_kind)
+            if Binder.is_logical_or_coalescing_assignment_operator(op_kind)
+                this.check_assignment_operator(left, op_kind, right, left_type, right_type)
+            return null
+        }
+
+        ; ★★★ THE ASSIGNMENT, WHICH IS TWO THIRDS OF THE ROW. It answers the RIGHT
+        ; operand's type — the reference's `return rightType` — so a unit whose
+        ; right side this port can type walks on past the assignment even when its
+        ; left side stopped.
+        if op_kind = KindEqualsToken
+        {
+            this.check_assignment_operator(left, op_kind, right, left_type, right_type)
+            return right_type
+        }
+
+        ; The comma operator, whole. Its report is the last thing in this chapter
+        ; that needs neither a type nor a table.
+        if op_kind = KindCommaToken
+        {
+            this.check_comma_operand(left)
+            return right_type
+        }
+
+        ; The reference PANICS here ("Unhandled case in checkBinaryLikeExpression").
+        ; A report rather than a trap, for the reason the JsxOpeningElement arm
+        ; above gives: this port holds an unreachability claim as a row.
+        this.record_unported("check-binary-like-expression-unhandled", op_kind)
+        null
+    }
+
+    ; `ast.IsParenthesizedExpression(parent) || ast.IsLogicalOrCoalescingBinary
+    ; Expression(parent)`, the pre-pass walk's loop condition.
+    function is_parenthesis_or_logical_chain(n: ref[AstNode]?) returns bool
+    {
+        let k Checker.kind_or_unknown(n)
+        if k = KindParenthesizedExpression
+            return true
+        if k <> KindBinaryExpression
+            return false
+        Binder.is_logical_or_coalescing_binary_operator(AstNode.binary_operator_kind(n))
+    }
+
+    ; `leftType == c.silentNeverType || rightType == c.silentNeverType`.
+    ;
+    ; ★ A nil operand type cannot BE silentNeverType — nothing answers that type
+    ; but the arms that return it — so a nil answers false here, which is the
+    ; conservative direction: it lets the arm fall through to its own stop instead
+    ; of claiming an answer.
+    function either_is(a: ref[Type]?, b: ref[Type]?, t: ref[Type]) returns bool
+    {
+        if a <> null
+        {
+            if (a as ref[Type]) = t
+                return true
+        }
+        if b <> null
+        {
+            if (b as ref[Type]) = t
+                return true
+        }
+        false
+    }
+
+    ; The switch's four operator GROUPS, as four predicates. They are written out
+    ; rather than derived from the Kind ranges because the reference's `case`
+    ; labels are not contiguous runs: the arithmetic group interleaves each
+    ; operator with its compound assignment, and `+`/`+=` sit in a group of their
+    ; own between them.
+    function is_arithmetic_or_bitwise_operator(k: int) returns bool
+    {
+        if k = KindAsteriskToken
+            return true
+        if k = KindAsteriskAsteriskToken
+            return true
+        if k = KindAsteriskEqualsToken
+            return true
+        if k = KindAsteriskAsteriskEqualsToken
+            return true
+        if k = KindSlashToken
+            return true
+        if k = KindSlashEqualsToken
+            return true
+        if k = KindPercentToken
+            return true
+        if k = KindPercentEqualsToken
+            return true
+        if k = KindMinusToken
+            return true
+        if k = KindMinusEqualsToken
+            return true
+        if k = KindLessThanLessThanToken
+            return true
+        if k = KindLessThanLessThanEqualsToken
+            return true
+        if k = KindGreaterThanGreaterThanToken
+            return true
+        if k = KindGreaterThanGreaterThanEqualsToken
+            return true
+        if k = KindGreaterThanGreaterThanGreaterThanToken
+            return true
+        if k = KindGreaterThanGreaterThanGreaterThanEqualsToken
+            return true
+        if k = KindBarToken
+            return true
+        if k = KindBarEqualsToken
+            return true
+        if k = KindCaretToken
+            return true
+        if k = KindCaretEqualsToken
+            return true
+        if k = KindAmpersandToken
+            return true
+        k = KindAmpersandEqualsToken
+    }
+
+    function is_plus_operator(k: int) returns bool
+    {
+        if k = KindPlusToken
+            return true
+        k = KindPlusEqualsToken
+    }
+
+    function is_relational_operator(k: int) returns bool
+    {
+        if k = KindLessThanToken
+            return true
+        if k = KindGreaterThanToken
+            return true
+        if k = KindLessThanEqualsToken
+            return true
+        k = KindGreaterThanEqualsToken
+    }
+
+    function is_equality_operator(k: int) returns bool
+    {
+        if k = KindEqualsEqualsToken
+            return true
+        if k = KindExclamationEqualsToken
+            return true
+        if k = KindEqualsEqualsEqualsToken
+            return true
+        k = KindExclamationEqualsEqualsToken
+    }
+
+    ; The six that produce a UNION: the three operators and their three compound
+    ; assignments. It is not ast.IsLogicalOrCoalescingBinaryOperator — that one is
+    ; the pre-pass's question and excludes the compound spellings.
+    function is_logical_or_coalescing_operator(k: int) returns bool
+    {
+        if Binder.is_logical_or_coalescing_binary_operator(k)
+            return true
+        Binder.is_logical_or_coalescing_assignment_operator(k)
+    }
+
+    ; isLiteralExpressionOfObject, whole — five kinds and no type.
+    function is_literal_expression_of_object(n: ref[AstNode]) returns bool
+    {
+        let k AstNode.kind_of(n)
+        if k = KindObjectLiteralExpression
+            return true
+        if k = KindArrayLiteralExpression
+            return true
+        if k = KindRegularExpressionLiteral
+            return true
+        if k = KindFunctionExpression
+            return true
+        k = KindClassExpression
+    }
+
+    ; checkForDisallowedESSymbolOperand, whole, and it answers TRUE when there was
+    ; NO error — the reference's own comment says so, and reading the bool the
+    ; other way round inverts three arms at once.
+    ;
+    ; ★★ A nil OPERAND TYPE IS NOT AN OPERAND OF SYMBOL TYPE, so a nil is skipped
+    ; and the function answers *no error* — the losing direction. The alternative
+    ; would be reporting TS2469 for an operand this port has not typed, which is
+    ; the one thing diagcheck's subsequence relation fails on.
+    function check_for_disallowed_es_symbol_operand(this, left: ref[AstNode], right: ref[AstNode], left_type: ref[Type]?, right_type: ref[Type]?, op_kind: int) returns bool
+    {
+        var offending: ref[AstNode]? null
+        if this.maybe_type_of_kind_considering_base_constraint(left_type, TypeFlagsESSymbolLike)
+            set offending: left
+        if offending = null
+        {
+            if this.maybe_type_of_kind_considering_base_constraint(right_type, TypeFlagsESSymbolLike)
+                set offending: right
+        }
+        if offending = null
+            return true
+        this.error_on_node(offending as ref[AstNode], DiagThe_0_operator_cannot_be_applied_to_type_symbol)
+        false
+    }
+
+    ; maybeTypeOfKindConsideringBaseConstraint, with getBaseConstraintOrType
+    ; inlined (`core.OrElse(getBaseConstraintOfType(t), t)`).
+    ;
+    ; ★★ A STOP UNDERNEATH getBaseConstraintOfType IS NOT "no constraint", and the
+    ; mark is what tells them apart: OrElse would read a stop's nil as the type
+    ; itself and then answer a question it has no answer to. On a stop this
+    ; answers FALSE — the same losing direction the nil operand takes.
+    function maybe_type_of_kind_considering_base_constraint(this, t: ref[Type]?, kind: int) returns bool
+    {
+        if t = null
+            return false
+        let ty t as ref[Type]
+        if Checker.maybe_type_of_kind(ty, kind)
+            return true
+        let mark this.unported_mark()
+        let base this.get_base_constraint_of_type(ty)
+        if this.unported_mark() <> mark
+            return false
+        if base = null
+            return Checker.maybe_type_of_kind(ty, kind)
+        Checker.maybe_type_of_kind(base as ref[Type], kind)
+    }
+
+    ; checkNaNEquality — ported whole in shape and INERT in this port, which is
+    ; why it is written rather than left as a row.
+    ;
+    ; ★★★ isGlobalNaN IS `getGlobalNaNSymbolOrNil() != nil && == getResolvedSymbol
+    ; (expr)`, i.e. a lookup in the GLOBALS TABLE (§3.11) that this port does not
+    ; have — so the left half is nil and the conjunction is false for every input.
+    ; The function therefore reports nothing here, and it reports nothing for a
+    ; reason that is a missing TABLE and not a missing function: the row it would
+    ; otherwise carry is `check-identifier`'s, already the corpus's second largest
+    ; and already blocked. ★A stop here would add an event to a chapter that has
+    ; one; the honest form is the reference's own shape with the one lookup it
+    ; cannot make named at its site.
+    procedure check_na_n_equality(this, error_node: ref[AstNode]?, op_kind: int, left: ref[AstNode], right: ref[AstNode])
+    {
+        if this.is_global_na_n(left)
+            return
+        if this.is_global_na_n(right)
+            return
+    }
+
+    ; isGlobalNaN. The identifier test is the reference's and is kept, so that the
+    ; slice which brings the globals table finds the shape of the question already
+    ; here; the LOOKUP is what is missing, and it makes the answer false.
+    function is_global_na_n(this, expr: ref[AstNode]) returns bool
+    {
+        let e Parser.skip_parentheses(expr)
+        if Checker.kind_or_unknown(e) <> KindIdentifier
+            return false
+        ; `c.getGlobalNaNSymbolOrNil()` — nil without a globals table, so the
+        ; conjunction below it is false whatever getResolvedSymbol would answer.
+        false
+    }
+
+    ; checkAssignmentOperator, and it is reached from FOUR of the switch's arms
+    ; (the arithmetic group's tail, `+=`, the three logical compounds and `=`) of
+    ; which this slice's prefix reaches two.
+    ;
+    ; ★★★ THE CommonJS GUARD IS A STOP AND NOT A SKIPPED STEP, because it decides
+    ; whether TS2364 is reported at all. Its third conjunct is
+    ; `c.symbolNodeLinks.Get(left).resolvedSymbol` — a links table this port does
+    ; not have — so on a `module.exports`-shaped left side the port cannot tell the
+    ; guard's two answers apart and reports the row instead of guessing. It is
+    ; confined to the two conditions it CAN ask, so an ordinary assignment never
+    ; reaches it.
+    procedure check_assignment_operator(this, left: ref[AstNode], op_kind: int, right: ref[AstNode], left_type: ref[Type]?, right_type: ref[Type]?)
+    {
+        if Parser.is_assignment_operator(op_kind) = false
+            return
+        let parent AstNode.parent_node_of(left)
+        if parent <> null
+        {
+            if AstNode.is_declaration_node(parent)
+            {
+                if Parser.get_assignment_declaration_kind(parent as ref[AstNode]) = JSDeclarationKindExportsProperty
+                {
+                    ; ★★★ THE FOURTH CONJUNCT IS ASKED BEFORE THE THIRD, AND THAT IS
+                    ; WHAT KEEPS THIS ROW SMALL. The reference's guard is
+                    ; `resolvedSymbol != nil && len(Declarations) > 1 &&
+                    ; rightType&Undefined != 0`; the links table the first two need
+                    ; does not exist here, but the LAST one is a flag on a type this
+                    ; port often has — and where the right side is not undefined the
+                    ; guard cannot fire whatever the symbol says. Both tests are pure,
+                    ; so the reordering is free. ★Asked in the reference's order the
+                    ; row was 25 events over 15 units of `exports.x = …`, every one of
+                    ; them a report LOST for a condition that was already false.
+                    var may_skip false
+                    if right_type = null
+                        set may_skip: true
+                    else
+                    {
+                        if ((right_type as ref[Type]).flags & TypeFlagsUndefined) <> 0
+                            set may_skip: true
+                    }
+                    if may_skip
+                    {
+                        this.record_unported("get-assignment-declaration-exports-property", op_kind)
+                        return
+                    }
+                }
+            }
+        }
+        ; "getters can be a subtype of setters, so to check for assignability we
+        ; use the setter's type instead". The rewritten leftType is read only by
+        ; the relation below, which reports — so the stop is recorded and the walk
+        ; CONTINUES, which is what keeps TS2364 on a `a.b += 1`.
+        if Parser.is_compound_assignment(op_kind)
+        {
+            if AstNode.kind_of(left) = KindPropertyAccessExpression
+                this.record_unported("check-property-access-expression", KindPropertyAccessExpression)
+        }
+        if this.check_reference_expression(left, DiagThe_left_hand_side_of_an_assignment_expression_must_be_a_variable_or_a_property_access, DiagThe_left_hand_side_of_an_assignment_expression_may_not_be_an_optional_property_access) = false
+            return
+        ; The exactOptionalPropertyTypes head-message branch is dead under this
+        ; harness — the option is a plain equality against TSTrue and answers false
+        ; (see exact_optional_property_types) — and headMessage is a message
+        ; ARGUMENT of the relation's own report, which the C section does not carry
+        ; anyway. Both readings agree, which is why the branch is stated here and
+        ; not transcribed.
+        this.record_unported("check-type-assignable-to", AstNode.kind_of(left))
+    }
+
+    ; checkReferenceExpression, whole. Both of its reports are node-driven, which
+    ; is what makes the assignment arm produce diagnostics on a corpus whose
+    ; operand types this port cannot yet answer.
+    ;
+    ; ★ The optional-chain test is the reference's — the RAW flag, with no kind
+    ; test in front of it. NodeFlagsOptionalChain shares its bit (binder.scaly's
+    ; is_optional_chain says so), but by this line the node is an Identifier or an
+    ; access expression, and neither carries ContainsThis or NestedNamespace.
+    function check_reference_expression(this, expr: ref[AstNode], invalid_reference_code: int, invalid_optional_chain_code: int) returns bool
+    {
+        let node Parser.skip_outer_expressions(expr, OEKAssertions | OEKParentheses)
+        if node = null
+        {
+            ; Unreachable: every kind is_outer_expression walks through has a
+            ; non-optional expression slot. The report holds the claim.
+            this.record_unported("skip-outer-expressions-nil", AstNode.kind_of(expr))
+            return false
+        }
+        let n node as ref[AstNode]
+        var reference_like false
+        if AstNode.kind_of(n) = KindIdentifier
+            set reference_like: true
+        if Parser.is_access_expression(n)
+            set reference_like: true
+        if reference_like = false
+        {
+            this.error_on_node(expr, invalid_reference_code)
+            return false
+        }
+        if (AstNode.flags_of(n) & NodeFlagsOptionalChain) <> 0
+        {
+            this.error_on_node(expr, invalid_optional_chain_code)
+            return false
+        }
+        true
+    }
+
+    ; The comma operator's arm, whole — `isSideEffectFree(left) &&
+    ; !isIndirectCall(left.Parent)` and then the TS2657 overlap test.
+    ;
+    ; ★★ THE OVERLAP TEST IS NOT DECORATION AND IT IS WHY THIS IS A FUNCTION. In a
+    ; JSX file `<a/> <b/>` parses as a comma expression whose left side is
+    ; side-effect free, and the reference suppresses TS2695 exactly where it has
+    ; already said *JSX expressions must have one parent element* at the same
+    ; position. Without it this port would INVENT a line on those units, which is
+    ; the one direction diagcheck fails on.
+    ;
+    ; ★ `AllowUnreachableCode.IsTrue()` is a plain equality against TSTrue, so an
+    ; unset option answers false and the check RUNS — the second reading of an
+    ; unset option in this file, not the strict-family one.
+    procedure check_comma_operand(this, left: ref[AstNode])
+    {
+        if this.is_side_effect_free(left) = false
+            return
+        if Checker.is_indirect_call(AstNode.parent_node_of(left))
+            return
+        let start b.skip_trivia_at(AstNode.pos_of(left))
+        if this.position_is_in_jsx_parent_diagnostic(start)
+            return
+        this.error_on_node(left, DiagLeft_side_of_comma_operator_is_unused_and_has_no_side_effects)
+    }
+
+    ; `core.Some(sf.Diagnostics(), …)` — the file's PARSE diagnostics, which is
+    ; the list AstNode.diagnostic_at reads, filtered by code 2657 and by
+    ; `d.Loc().Contains(start)` (pos <= start < end).
+    function position_is_in_jsx_parent_diagnostic(this, start: int) returns bool
+    {
+        let n AstNode.diagnostic_count(file)
+        var i 0
+        while i < n
+        {
+            var pos 0
+            var stop 0
+            var code 0
+            if AstNode.diagnostic_at(file, i, &pos, &stop, &code)
+            {
+                if code = DiagJSX_expressions_must_have_one_parent_element
+                {
+                    if start >= pos
+                    {
+                        if start < stop
+                            return true
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        false
+    }
+
+    ; isSideEffectFree, whole. A *shallow* smell test, in the reference's words,
+    ; and it needs no type.
+    function is_side_effect_free(this, node: ref[AstNode]) returns bool
+    {
+        let n Parser.skip_parentheses(node)
+        if n = null
+            return false
+        let x n as ref[AstNode]
+        let k AstNode.kind_of(x)
+        if Checker.is_side_effect_free_kind(k)
+            return true
+        if k = KindConditionalExpression
+        {
+            let wt AstNode.conditional_when_true_of(x)
+            let wf AstNode.conditional_when_false_of(x)
+            if wt = null
+                return false
+            if wf = null
+                return false
+            if this.is_side_effect_free(wt as ref[AstNode]) = false
+                return false
+            return this.is_side_effect_free(wf as ref[AstNode])
+        }
+        if k = KindBinaryExpression
+        {
+            if Parser.is_assignment_operator(AstNode.binary_operator_kind(x))
+                return false
+            let l AstNode.binary_left_of(x)
+            let r AstNode.binary_right_of(x)
+            if l = null
+                return false
+            if r = null
+                return false
+            if this.is_side_effect_free(l as ref[AstNode]) = false
+                return false
+            return this.is_side_effect_free(r as ref[AstNode])
+        }
+        if k = KindPrefixUnaryExpression
+        {
+            ; "Unary operators ~, !, + and - have no side effects. The rest do."
+            let op AstNode.prefix_unary_operator_kind(x)
+            if op = KindExclamationToken
+                return true
+            if op = KindPlusToken
+                return true
+            if op = KindMinusToken
+                return true
+            if op = KindTildeToken
+                return true
+            return false
+        }
+        false
+    }
+
+    ; The eighteen kinds of isSideEffectFree's first `case` label.
+    function is_side_effect_free_kind(k: int) returns bool
+    {
+        if k = KindIdentifier
+            return true
+        if k = KindStringLiteral
+            return true
+        if k = KindRegularExpressionLiteral
+            return true
+        if k = KindTaggedTemplateExpression
+            return true
+        if k = KindTemplateExpression
+            return true
+        if k = KindNoSubstitutionTemplateLiteral
+            return true
+        if k = KindNumericLiteral
+            return true
+        if k = KindBigIntLiteral
+            return true
+        if k = KindTrueKeyword
+            return true
+        if k = KindFalseKeyword
+            return true
+        if k = KindNullKeyword
+            return true
+        if k = KindUndefinedKeyword
+            return true
+        if k = KindFunctionExpression
+            return true
+        if k = KindClassExpression
+            return true
+        if k = KindArrowFunction
+            return true
+        if k = KindArrayLiteralExpression
+            return true
+        if k = KindObjectLiteralExpression
+            return true
+        if k = KindTypeOfExpression
+            return true
+        if k = KindNonNullExpression
+            return true
+        if k = KindJsxSelfClosingElement
+            return true
+        k = KindJsxElement
+    }
+
+    ; isIndirectCall — `(0, x.f)(...)` and `(0, eval)(...)`, which the reference
+    ; exempts because the comma is load-bearing there: it is what keeps `this`
+    ; from being passed.
+    function is_indirect_call(n: ref[AstNode]?) returns bool
+    {
+        if n = null
+            return false
+        if AstNode.kind_of(n as ref[AstNode]) <> KindBinaryExpression
+            return false
+        let node n as ref[AstNode]
+        let left AstNode.binary_left_of(node)
+        let right AstNode.binary_right_of(node)
+        let parent AstNode.parent_node_of(node)
+        if Checker.kind_or_unknown(parent) <> KindParenthesizedExpression
+            return false
+        if Checker.kind_or_unknown(left) <> KindNumericLiteral
+            return false
+        if Checker.node_text_is(AstNode.literal_text_of(left), AstNode.literal_text_length_of(left), "0", 1) = false
+            return false
+        let grandparent AstNode.parent_node_of(parent)
+        var call_shaped false
+        if Checker.kind_or_unknown(grandparent) = KindCallExpression
+        {
+            if AstNode.expression_of(grandparent) = parent
+                set call_shaped: true
+        }
+        if Checker.kind_or_unknown(grandparent) = KindTaggedTemplateExpression
+            set call_shaped: true
+        if call_shaped = false
+            return false
+        if Parser.is_access_expression(right)
+            return true
+        if Checker.kind_or_unknown(right) <> KindIdentifier
+            return false
+        Checker.node_text_is(AstNode.identifier_text_of(right), AstNode.identifier_text_length_of(right), "eval", 4)
+    }
+
+    ; A node's own text against a literal. symbol_name_equals' shape, over the
+    ; AstNode payload accessors rather than over a Symbol's name bytes.
+    function node_text_is(data: pointer[char], len: int, lit: pointer[const_char], lit_len: int) returns bool
+    {
+        if len <> lit_len
+            return false
+        if data = null
+            return false
+        var i 0
+        while i < lit_len
+        {
+            if (*(data + i) as int) <> ((*(lit + i) as char) as int)
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    ; checkTruthinessOfType, whole. Slice 63 left `check-truthiness-of-type` on
+    ; the work list from checkTruthinessExpression and this closes it — the arm
+    ; the binary expression needs and the arm the `if`, `do` and `while`
+    ; conditions need are the same arm.
+    function check_truthiness_of_type(this, t: ref[Type], node: ref[AstNode]) returns ref[Type]?
+    {
+        if (t.flags & TypeFlagsVoid) <> 0
+        {
+            this.error_on_node(node, DiagAn_expression_of_type_void_cannot_be_tested_for_truthiness)
+            return t
+        }
+        let semantics this.get_syntactic_truthy_semantics(node)
+        if semantics <> PredicateSemanticsSometimes
+        {
+            if semantics = PredicateSemanticsAlways
+                this.error_on_node(node, DiagThis_kind_of_expression_is_always_truthy)
+            else
+                this.error_on_node(node, DiagThis_kind_of_expression_is_always_falsy)
+        }
+        t
+    }
+
+    ; getSyntacticTruthySemantics, whole but for the one lookup its Identifier arm
+    ; makes.
+    ;
+    ; ★★★ THE IDENTIFIER ARM IS CONFINED TO THE ONE SPELLING THAT CAN ANSWER
+    ; DIFFERENTLY, and that is what keeps the row from swallowing the chapter.
+    ; The reference asks `getResolvedSymbol(node) == c.undefinedSymbol`, and only
+    ; an identifier whose text is `undefined` can resolve to that symbol — so
+    ; every other identifier answers Sometimes here for the reference's own
+    ; reason, and only `undefined` is a question this port cannot answer. It
+    ; reports and answers Sometimes, which loses the report rather than inventing
+    ; one; the reader that closes it is the globals table.
+    function get_syntactic_truthy_semantics(this, node: ref[AstNode]) returns int
+    {
+        let t Parser.skip_outer_expressions(node, OEKAll)
+        if t = null
+            return PredicateSemanticsSometimes
+        let n t as ref[AstNode]
+        let k AstNode.kind_of(n)
+        if k = KindNumericLiteral
+        {
+            ; "Allow `while(0)` or `while(1)`"
+            let d AstNode.literal_text_of(n)
+            let len AstNode.literal_text_length_of(n)
+            if Checker.node_text_is(d, len, "0", 1)
+                return PredicateSemanticsSometimes
+            if Checker.node_text_is(d, len, "1", 1)
+                return PredicateSemanticsSometimes
+            return PredicateSemanticsAlways
+        }
+        if Checker.is_always_truthy_kind(k)
+            return PredicateSemanticsAlways
+        if k = KindVoidExpression
+            return PredicateSemanticsNever
+        if k = KindNullKeyword
+            return PredicateSemanticsNever
+        if Checker.is_plain_string_literal_kind(k)
+        {
+            if AstNode.literal_text_length_of(n) <> 0
+                return PredicateSemanticsAlways
+            return PredicateSemanticsNever
+        }
+        if k = KindConditionalExpression
+        {
+            let wt AstNode.conditional_when_true_of(n)
+            let wf AstNode.conditional_when_false_of(n)
+            if wt = null
+                return PredicateSemanticsSometimes
+            if wf = null
+                return PredicateSemanticsSometimes
+            return this.get_syntactic_truthy_semantics(wt as ref[AstNode]) | this.get_syntactic_truthy_semantics(wf as ref[AstNode])
+        }
+        if k = KindIdentifier
+        {
+            if Checker.node_text_is(AstNode.identifier_text_of(n), AstNode.identifier_text_length_of(n), "undefined", 9)
+                this.record_unported("get-resolved-symbol-undefined", k)
+        }
+        PredicateSemanticsSometimes
+    }
+
+    ; The nine kinds that are always truthy without asking their text.
+    function is_always_truthy_kind(k: int) returns bool
+    {
+        if k = KindArrayLiteralExpression
+            return true
+        if k = KindArrowFunction
+            return true
+        if k = KindBigIntLiteral
+            return true
+        if k = KindClassExpression
+            return true
+        if k = KindFunctionExpression
+            return true
+        if k = KindJsxElement
+            return true
+        if k = KindJsxSelfClosingElement
+            return true
+        if k = KindObjectLiteralExpression
+            return true
+        k = KindRegularExpressionLiteral
+    }
+
+    ; The two kinds whose EMPTINESS decides — a template with substitutions is a
+    ; TemplateExpression and is not one of them.
+    function is_plain_string_literal_kind(k: int) returns bool
+    {
+        if k = KindNoSubstitutionTemplateLiteral
+            return true
+        k = KindStringLiteral
+    }
+
+    ; checkNullishCoalesceOperands, whole: the mixing report over three shapes,
+    ; then the left operand's own nullishness.
+    procedure check_nullish_coalesce_operands(this, left: ref[AstNode], right: ref[AstNode])
+    {
+        let grandparent AstNode.parent_node_of(AstNode.parent_node_of(left))
+        if Checker.kind_or_unknown(grandparent) = KindBinaryExpression
+        {
+            let gl AstNode.binary_left_of(grandparent)
+            if Checker.kind_or_unknown(gl) = KindBinaryExpression
+            {
+                if AstNode.binary_operator_kind(grandparent) = KindBarBarToken
+                    this.grammar_error_on_node_or_null(gl, DiagX_0_and_1_operations_cannot_be_mixed_without_parentheses)
+            }
+        }
+        else
+        {
+            if AstNode.kind_of(left) = KindBinaryExpression
+            {
+                let op AstNode.binary_operator_kind(left)
+                var mixed false
+                if op = KindBarBarToken
+                    set mixed: true
+                if op = KindAmpersandAmpersandToken
+                    set mixed: true
+                if mixed
+                    this.grammar_error_on_node(left, DiagX_0_and_1_operations_cannot_be_mixed_without_parentheses)
+            }
+            else
+            {
+                if AstNode.kind_of(right) = KindBinaryExpression
+                {
+                    if AstNode.binary_operator_kind(right) = KindAmpersandAmpersandToken
+                        this.grammar_error_on_node(right, DiagX_0_and_1_operations_cannot_be_mixed_without_parentheses)
+                }
+            }
+        }
+        this.check_nullish_coalesce_operand_left(left)
+    }
+
+    procedure check_nullish_coalesce_operand_left(this, left: ref[AstNode])
+    {
+        let target Parser.skip_outer_expressions(left, OEKAll)
+        if target = null
+            return
+        let t target as ref[AstNode]
+        let semantics this.get_syntactic_nullishness_semantics(t)
+        if semantics = PredicateSemanticsSometimes
+            return
+        if semantics = PredicateSemanticsAlways
+            this.error_on_node(t, DiagThis_expression_is_always_nullish)
+        else
+            this.error_on_node(t, DiagRight_operand_of_is_unreachable_because_the_left_operand_is_never_nullish)
+    }
+
+    ; getSyntacticNullishnessSemantics, whole but for the same one lookup, and
+    ; confined the same way — see get_syntactic_truthy_semantics' note.
+    ;
+    ; ★ Its DEFAULT is Never where the truthiness walk's is Sometimes, so an
+    ; unlisted kind here REPORTS (TS2869, *right operand is unreachable*) rather
+    ; than falling silent. That asymmetry is the reference's and it is why the
+    ; nine-kind first label is transcribed rather than folded into the default.
+    function get_syntactic_nullishness_semantics(this, node: ref[AstNode]) returns int
+    {
+        let t Parser.skip_outer_expressions(node, OEKAll)
+        if t = null
+            return PredicateSemanticsNever
+        let n t as ref[AstNode]
+        let k AstNode.kind_of(n)
+        if Checker.is_sometimes_nullish_kind(k)
+            return PredicateSemanticsSometimes
+        if k = KindBinaryExpression
+        {
+            let op AstNode.binary_operator_kind(n)
+            ; "List of operators that can produce null/undefined: || ||= && &&="
+            if Binder.is_logical_binary_operator(op)
+                return PredicateSemanticsSometimes
+            if op = KindBarBarEqualsToken
+                return PredicateSemanticsSometimes
+            if op = KindAmpersandAmpersandEqualsToken
+                return PredicateSemanticsSometimes
+            ; "For these operator kinds, the right operand is effectively
+            ; controlling"
+            var right_controls false
+            if op = KindCommaToken
+                set right_controls: true
+            if op = KindEqualsToken
+                set right_controls: true
+            if op = KindQuestionQuestionToken
+                set right_controls: true
+            if op = KindQuestionQuestionEqualsToken
+                set right_controls: true
+            if right_controls
+            {
+                let r AstNode.binary_right_of(n)
+                if r = null
+                    return PredicateSemanticsNever
+                return this.get_syntactic_nullishness_semantics(r as ref[AstNode])
+            }
+            return PredicateSemanticsNever
+        }
+        if k = KindConditionalExpression
+        {
+            let wt AstNode.conditional_when_true_of(n)
+            let wf AstNode.conditional_when_false_of(n)
+            if wt = null
+                return PredicateSemanticsNever
+            if wf = null
+                return PredicateSemanticsNever
+            return this.get_syntactic_nullishness_semantics(wt as ref[AstNode]) | this.get_syntactic_nullishness_semantics(wf as ref[AstNode])
+        }
+        if k = KindNullKeyword
+            return PredicateSemanticsAlways
+        if k = KindIdentifier
+        {
+            if Checker.node_text_is(AstNode.identifier_text_of(n), AstNode.identifier_text_length_of(n), "undefined", 9)
+            {
+                this.record_unported("get-resolved-symbol-undefined", k)
+                return PredicateSemanticsSometimes
+            }
+            return PredicateSemanticsSometimes
+        }
+        PredicateSemanticsNever
+    }
+
+    ; The nine kinds of the first `case` label — the ones that may or may not be
+    ; nullish and therefore report nothing.
+    function is_sometimes_nullish_kind(k: int) returns bool
+    {
+        if k = KindAwaitExpression
+            return true
+        if k = KindCallExpression
+            return true
+        if k = KindTaggedTemplateExpression
+            return true
+        if k = KindElementAccessExpression
+            return true
+        if k = KindMetaProperty
+            return true
+        if k = KindNewExpression
+            return true
+        if k = KindPropertyAccessExpression
+            return true
+        if k = KindYieldExpression
+            return true
+        k = KindThisKeyword
+    }
+
     ; checkExpressionStatement, whole:
     ;
     ;   c.checkGrammarStatementInAmbientContext(node)
@@ -9204,14 +10373,16 @@ define Checker
     {
         if node = null
             return
-        ; checkTruthinessOfType is the outer half and it is still the type
-        ; dimension (*this condition will always return true*, TS2801 and the
-        ; always-truthy family), so a condition whose expression NOW has a type
-        ; moves from `check-expression` to the row naming the half that is left.
+        ; ★★★ SLICE 88 CLOSES THE OUTER HALF. checkTruthinessOfType was a row here
+        ; from slice 63 until the binary expression needed the same function for
+        ; its `&&` and `||` arms — the `if`, `do` and `while` conditions and the
+        ; left operand of a logical operator are the SAME question, and the arm
+        ; arrives for both at once. What is left in this line is the INNER half,
+        ; checkExpression, whose stop is the expression dispatch's own.
         let t this.check_expression(node as ref[AstNode])
         if t = null
             return
-        this.record_unported("check-truthiness-of-type", AstNode.kind_of(node as ref[AstNode]))
+        this.check_truthiness_of_type(t as ref[Type], node as ref[AstNode])
     }
 
     ; checkIfStatement, whole.
