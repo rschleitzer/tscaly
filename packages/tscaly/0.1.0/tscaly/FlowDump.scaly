@@ -1,0 +1,432 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; FlowDump — our half of the FLOW yardstick's dump (slice 92).
+;
+; ★★★ THIS IS NOT A PORT OF ANYTHING. The format is OURS, invented with
+; tests/oracle/flow.go, and this file is its second producer. It lives inside the
+; package rather than in the dumper PROGRAM for SymbolDump's reason: the
+; numbering needs containers (an ordered flow-node list and a pointer-keyed
+; index), and a generic instance handed across a package boundary reads back as
+; garbage (root CLAUDE.md).
+;
+; ── Why the yardstick exists at all ─────────────────────────────────────────
+;
+; binder.scaly's header said of the control flow graph, for sixty slices, that
+; *"NONE of it is reachable through an exported accessor, so the symbols dump
+; cannot see it and neither can any dump this suite has."* The first half is
+; false — `Node.FlowNodeData()`, `BodyBase.EndFlowNode`, `SourceFile.EndFlowNode`,
+; the four `ReturnFlowNode` slots and `CaseOrDefaultClause.FallthroughFlowNode`
+; are all exported, and an oracle in tests/oracle is BUILT INSIDE the reference's
+; own module — and the second half followed from the first. What was missing was
+; not an accessor. It was a dump.
+;
+; ── The four sections ───────────────────────────────────────────────────────
+;
+;   f <kind> <pos> <end> <flow> <endFlow> <returnFlow> <fallthroughFlow>
+;   r <kind> <pos> <end> <flags>          the post-bind reachability bits
+;   N <id> <flags> <nodeKind> <nodePos> <nodeEnd> <antecedent> <n> <a…>
+;   w <id> <kind> <pos> <end> <clauseStart> <clauseEnd>   a switch-clause payload
+;   l <id> <target> <n> <a…>                              a reduce-label payload
+;
+; A node is named by KIND, POS and END and not by a walk index, exactly as the
+; symbols dump names one: an index is a claim about the whole walk, and the walk
+; is what the AST yardstick already compares.
+;
+; ★★★ THE IDS ARE INTERNED IN ENCOUNTER ORDER AND THE ORDER IS THE MEASUREMENT.
+; Section `f` walks the tree pre-order and mints an id the first time a flow node
+; is mentioned; section `N` then processes the id list in INCREASING order,
+; minting ids for antecedents as it meets them. Neither side needs to agree on a
+; hash, a pointer or a map iteration order — and a port that builds the right
+; graph in the wrong ORDER prints different ids and says so, which is exactly
+; what a set comparison would hide.
+;
+; ★★ THE LIST GROWS WHILE IT IS WALKED, which is the symbols oracle's own
+; arrangement and cost it a real defect once: an antecedent may be a flow node no
+; node in the tree points at, so assigning ids on demand and continuing to the
+; end of the growing list is what makes the numbering total.
+;
+; ★ A flow node nothing references is unreachable from both sections and is
+; invisible on both sides. That is sound rather than a gap: unreferenced is
+; exactly what the reference's own consumer never sees either.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.Vector
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use scaly.io.Console
+use tscaly.ast.AstNode
+use tscaly.ast.FlowNode
+use tscaly.ast.FlowList
+
+; One deferred payload line: the id it belongs to, and which of the two shapes.
+define FlowPayload (id: int  is_switch: bool)
+{
+    init(i: int, sw: bool)
+    {
+        set id: i
+        set is_switch: sw
+    }
+}
+
+define FlowDump
+(
+    host: ref[Page]
+    out: ref[StringBuilder]
+
+    ; The flow registry: the ORDER is the answer, and the buckets are only there
+    ; to find a node's index without walking the order for every question. The
+    ; shape is SymbolDump's, open-addressed on the pointer's own bits.
+    flow_order: ref[Array[ref[FlowNode]?]]
+    buckets: ref[Vector[int]]?     ; index + 1 into flow_order; 0 = empty
+    mask: int
+
+    payloads: ref[Array[FlowPayload]]
+)
+{
+    function write(host: ref[Page], file: ref[AstNode])
+    {
+        let d host.allocate(sizeof FlowDump, alignof FlowDump) as pointer[FlowDump]
+        set d.host: host
+        ; StringBuilder^host() and not allocate-then-assign — SymbolDump's header
+        ; has the measurement (a page-header corruption that surfaces as a memmove
+        ; with an absurd length, three allocations later).
+        let sb StringBuilder^host()
+        set d.out: sb
+        let fo host.allocate(sizeof Array[ref[FlowNode]?], alignof Array[ref[FlowNode]?]) as pointer[Array[ref[FlowNode]?]]
+        set *fo: Array[ref[FlowNode]?]()
+        set d.flow_order: fo
+        set d.buckets: null
+        set d.mask: 0
+        let pl host.allocate(sizeof Array[FlowPayload], alignof Array[FlowPayload]) as pointer[Array[FlowPayload]]
+        set *pl: Array[FlowPayload]()
+        set d.payloads: pl
+
+        d.walk(file)
+        d.emit_reachability(file)
+        d.emit_flow_nodes()
+        d.emit_payloads()
+
+        let s d.out.to_string()
+        Console.print(s.to_c_string())
+    }
+
+    ; ── the registry ────────────────────────────────────────────────────────
+    procedure index_of(this, f: ref[FlowNode]?) returns int
+    {
+        if f = null
+            return 0 - 1
+        if buckets <> null
+        {
+            var slot FlowDump.pointer_hash(f) & mask
+            while true
+            {
+                let e buckets.get(slot as size_t)
+                let idx *e
+                if idx = 0
+                    break
+                if flow_order[(idx - 1)] = f
+                    return idx - 1
+                set slot: (slot + 1) & mask
+            }
+        }
+
+        flow_order.add(f)
+        let count flow_order.get_length() as int
+        var cap 0
+        if buckets <> null
+            set cap: mask + 1
+        if (count * 2) > cap
+        {
+            var new_cap 16
+            while (count * 2) > new_cap
+                set new_cap: new_cap * 2
+            let v Vector[int]^host(new_cap as size_t)
+            set buckets: v
+            set mask: new_cap - 1
+            var j 0
+            while j < count
+            {
+                let fj flow_order[j]
+                var slot FlowDump.pointer_hash(fj) & mask
+                while true
+                {
+                    let e buckets.get(slot as size_t)
+                    if *e = 0
+                        break
+                    set slot: (slot + 1) & mask
+                }
+                buckets.put(slot as size_t, j + 1)
+                set j: j + 1
+            }
+            return count - 1
+        }
+
+        var slot FlowDump.pointer_hash(f) & mask
+        while true
+        {
+            let e buckets.get(slot as size_t)
+            if *e = 0
+                break
+            set slot: (slot + 1) & mask
+        }
+        buckets.put(slot as size_t, count)
+        count - 1
+    }
+
+    function pointer_hash(f: ref[FlowNode]?) returns int
+    {
+        let bits (f as size_t) as u64
+        let h ((bits >> 4) * 2654435761) as u64
+        ((h >> 1) as int)
+    }
+
+    ; ── section f: the walk ─────────────────────────────────────────────────
+    procedure walk(this, n: ref[AstNode]?)
+    {
+        if n = null
+            return
+        let flow AstNode.flow_node_of(n)
+        let end_flow AstNode.end_flow_node_of(n)
+        let return_flow AstNode.return_flow_node_of(n)
+        let fallthrough_flow AstNode.fallthrough_flow_node_of(n)
+        var interesting false
+        if flow <> null
+            set interesting: true
+        if end_flow <> null
+            set interesting: true
+        if return_flow <> null
+            set interesting: true
+        if fallthrough_flow <> null
+            set interesting: true
+        if interesting
+        {
+            out.append("f ")
+            out.append(AstNode.kind_of(n))
+            out.append(" " as char)
+            out.append(AstNode.pos_of(n))
+            out.append(" " as char)
+            out.append(AstNode.end_of(n))
+            out.append(" " as char)
+            out.append(this.index_of(flow))
+            out.append(" " as char)
+            out.append(this.index_of(end_flow))
+            out.append(" " as char)
+            out.append(this.index_of(return_flow))
+            out.append(" " as char)
+            out.append(this.index_of(fallthrough_flow))
+            out.append("\n" as char)
+        }
+
+        var i 0
+        while true
+        {
+            let c AstNode.child_at(n, i)
+            if c = null
+                return
+            this.walk(c)
+            set i: i + 1
+        }
+    }
+
+    ; ── section r: the post-bind reachability bits ──────────────────────────
+    ;
+    ; ★★★ THIS IS THE HALF A CHECKER CAN READ TODAY, and it is why the binder's
+    ; construction slice has a diagnostic product rather than only a graph.
+    ; NodeFlagsUnreachable, HasImplicitReturn and HasExplicitReturn are written by
+    ; the BINDER and read by the CHECKER without ever touching the flow analyzer:
+    ; TS7027, TS7028 and TS2378 are decided by those three bits alone.
+    ;
+    ; ★ It is a SECOND WALK rather than two more columns on the `f` line, because
+    ; the two sets of nodes barely overlap — a node with a flow node usually has
+    ; no reachability bit, and the function-likes that carry HasImplicitReturn are
+    ; not statements.
+    procedure emit_reachability(this, n: ref[AstNode]?)
+    {
+        if n = null
+            return
+        let bits AstNode.flags_of(n) & (NodeFlagsUnreachable | NodeFlagsReachabilityCheckFlags)
+        if bits <> 0
+        {
+            out.append("r ")
+            out.append(AstNode.kind_of(n))
+            out.append(" " as char)
+            out.append(AstNode.pos_of(n))
+            out.append(" " as char)
+            out.append(AstNode.end_of(n))
+            out.append(" " as char)
+            out.append(bits)
+            out.append("\n" as char)
+        }
+        var i 0
+        while true
+        {
+            let c AstNode.child_at(n, i)
+            if c = null
+                return
+            this.emit_reachability(c)
+            set i: i + 1
+        }
+    }
+
+    ; ── section N: the flow nodes ───────────────────────────────────────────
+    procedure emit_flow_nodes(this)
+    {
+        var i 0
+        while i < (flow_order.get_length() as int)
+        {
+            let f flow_order[i] as ref[FlowNode]
+            var node_kind 0 - 1
+            var node_pos 0 - 1
+            var node_end 0 - 1
+            let payload f.node
+            if payload <> null
+            {
+                ; ★★ The two SYNTHETIC nodes are told apart by the FLOW FLAGS and
+                ; not by the node's kind: both are KindUnknown, and the flags are
+                ; the reference's own discriminator (createFlowSwitchClause is the
+                ; only maker of one and createReduceLabel of the other).
+                if (f.flags & FlowFlagsSwitchClause) <> 0
+                {
+                    set node_kind: 0 - 2
+                    payloads.add(FlowPayload(i, true))
+                }
+                else
+                {
+                    if (f.flags & FlowFlagsReduceLabel) <> 0
+                    {
+                        set node_kind: 0 - 3
+                        payloads.add(FlowPayload(i, false))
+                        ; The reduce label's target and antecedent list are
+                        ; numbered HERE so that the `l` line can name ids the `N`
+                        ; section has already defined.
+                        let p payload as ref[AstNode]
+                        this.index_of(AstNode.flow_reduce_target_of(p))
+                        this.number_list(AstNode.flow_reduce_antecedents_of(p))
+                    }
+                    else
+                    {
+                        let p payload as ref[AstNode]
+                        set node_kind: AstNode.kind_of(p)
+                        set node_pos: AstNode.pos_of(p)
+                        set node_end: AstNode.end_of(p)
+                    }
+                }
+            }
+            ; ★★★ THE MINTING ORDER IS PART OF THE FORMAT: the oracle numbers a
+            ; reduce label's target and list first, then the node's own
+            ; ANTECEDENTS LIST, and only then the single `antecedent` slot — Go's
+            ; statement order, and the `ants` loop stands before the Fprintf whose
+            ; arguments include `r.get(f.Antecedent)`. Get it the other way round
+            ; and every id after the first label is off by one.
+            this.number_list(f.antecedents)
+            out.append("N ")
+            out.append(i)
+            out.append(" " as char)
+            out.append(f.flags)
+            out.append(" " as char)
+            out.append(node_kind)
+            out.append(" " as char)
+            out.append(node_pos)
+            out.append(" " as char)
+            out.append(node_end)
+            out.append(" " as char)
+            out.append(this.index_of(f.antecedent))
+            out.append(" " as char)
+            out.append(FlowDump.list_length(f.antecedents))
+            this.append_list(f.antecedents)
+            out.append("\n" as char)
+            set i: i + 1
+        }
+    }
+
+    function list_length(l: ref[FlowList]?) returns int
+    {
+        var n 0
+        var cur l
+        while cur <> null
+        {
+            let c cur as ref[FlowList]
+            set n: n + 1
+            set cur: c.next
+        }
+        n
+    }
+
+    procedure append_list(this, l: ref[FlowList]?)
+    {
+        var cur l
+        while cur <> null
+        {
+            let c cur as ref[FlowList]
+            out.append(" " as char)
+            out.append(this.index_of(c.flow))
+            set cur: c.next
+        }
+    }
+
+    procedure number_list(this, l: ref[FlowList]?)
+    {
+        var cur l
+        while cur <> null
+        {
+            let c cur as ref[FlowList]
+            this.index_of(c.flow)
+            set cur: c.next
+        }
+    }
+
+    ; ── the two payload sections ────────────────────────────────────────────
+    ;
+    ; They come LAST because their ids are the `N` section's, and a reader (or a
+    ; diff) should meet a definition before a reference to it.
+    procedure emit_payloads(this)
+    {
+        var i 0
+        let count payloads.get_length() as int
+        while i < count
+        {
+            let pl payloads[i]
+            if pl.is_switch
+            {
+                let f flow_order[pl.id] as ref[FlowNode]
+                let p f.node as ref[AstNode]
+                let sw AstNode.flow_switch_statement_of(p) as ref[AstNode]
+                out.append("w ")
+                out.append(pl.id)
+                out.append(" " as char)
+                out.append(AstNode.kind_of(sw))
+                out.append(" " as char)
+                out.append(AstNode.pos_of(sw))
+                out.append(" " as char)
+                out.append(AstNode.end_of(sw))
+                out.append(" " as char)
+                out.append(AstNode.flow_clause_start_of(p))
+                out.append(" " as char)
+                out.append(AstNode.flow_clause_end_of(p))
+                out.append("\n" as char)
+            }
+            set i: i + 1
+        }
+        var j 0
+        while j < count
+        {
+            let pl payloads[j]
+            if pl.is_switch = false
+            {
+                let f flow_order[pl.id] as ref[FlowNode]
+                let p f.node as ref[AstNode]
+                let ants AstNode.flow_reduce_antecedents_of(p)
+                out.append("l ")
+                out.append(pl.id)
+                out.append(" " as char)
+                out.append(this.index_of(AstNode.flow_reduce_target_of(p)))
+                out.append(" " as char)
+                out.append(FlowDump.list_length(ants))
+                this.append_list(ants)
+                out.append("\n" as char)
+            }
+            set j: j + 1
+        }
+    }
+}

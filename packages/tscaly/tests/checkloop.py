@@ -38,6 +38,8 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
+UNIT_TIMEOUT = float(os.environ.get("TSCALY_UNIT_TIMEOUT", "10"))
+
 SUFFIXES = (".ts", ".mts", ".cts", ".tsx", ".jsx", ".js", ".cjs", ".mjs", ".json")
 
 
@@ -191,7 +193,24 @@ def main():
                     return job, 0, fh.read(), ""
             except OSError:
                 pass
-        p = subprocess.run([binary, flag, unit_path], capture_output=True, text=True)
+        # ★★★ A TIME LIMIT, ADDED IN SLICE 94 AND FORCED BY A CONTROL. §3.5ec
+        # recorded the gap and did not close it: *"run.sh runs both dumpers with
+        # no time limit, so a control that loops is bounded by RAM rather than by
+        # the harness"*. Slice 94's h06 is a patch that removes the BASE CASE of
+        # the type printer's recursion, and the process then grows until the
+        # machine does. A killed call answers nothing, which is the honest verdict
+        # for a port that does not terminate; without the limit the whole battery
+        # stalls on one row and the machine is what notices.
+        #
+        # ★ TSCALY_UNIT_TIMEOUT overrides it, and the default is MEASURED rather
+        # than guessed: over a 250-unit sample of the stage-1 corpus the slowest
+        # call is 44 ms, so ten seconds is 227x the worst legitimate case. A limit
+        # that trips on a slow unit would turn a measurement into a flake.
+        try:
+            p = subprocess.run([binary, flag, unit_path], capture_output=True,
+                               text=True, timeout=UNIT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return job, 124, "", "TIMEOUT after %gs" % UNIT_TIMEOUT
         return job, p.returncode, p.stdout, p.stderr
 
     workers = min(32, (os.cpu_count() or 4))

@@ -95,6 +95,14 @@ use scaly.containers.String
 use scaly.containers.StringBuilder
 use tscaly.ast.AstNode
 use tscaly.ast.Symbol
+use tscaly.ast.FlowNode
+use tscaly.ast.FlowList
+; ★ Slice 94 is the first slice in which the CHECKER mints an AST node — the
+; synthetic `this.p` of isPropertyInitializedInConstructor — so the payload union
+; and the one arm it builds have to be visible here as well as the node itself.
+use tscaly.ast.NodeData
+use tscaly.ast.TokenData
+use tscaly.ast.PropertyAccessData
 use tscaly.parser.Parser
 use tscaly.binder.Binder
 use tscaly.Diagnostics.DiagnosticList
@@ -154,6 +162,44 @@ define ObjectFlagsMembersResolved: int 1 << 21        ; Members have been resolv
 define ObjectFlagsUnresolvedMembers: int 1 << 29
 
 define ObjectFlagsClassOrInterface: int ObjectFlagsClass | ObjectFlagsInterface
+
+; ── the two REUSED positions slice 94 reads, each under its own TypeFlags ────
+;
+; ★★ THE TABLE ABOVE STOPS AT BIT 21 BECAUSE THE POSITIONS ABOVE IT MEAN
+; DIFFERENT THINGS ON DIFFERENT TYPES, and its own rule is that *a slice that
+; needs one declares it beside the reader that establishes which TypeFlags it is
+; reading it under*. These are the first two to arrive under that rule, and the
+; name carries the condition:
+;
+;   1 << 25 is ObjectFlagsContainsIntersections on a type with TypeFlagsUnion,
+;           and ObjectFlagsIsNeverIntersection on one with TypeFlagsIntersection.
+;   1 << 27 is ObjectFlagsIsConstrainedTypeVariable on a type with
+;           TypeFlagsIntersection, and IsGenericTypeComputed elsewhere.
+;
+; ★★★ THE SECOND IS READ ONLY WHERE IT CANNOT FIRE, AND THAT IS WHY IT IS
+; DECLARED RATHER THAN LEFT OUT. add_type_to_union's constrained-type-variable
+; term is `flags & Intersection <> 0 and t.object_flags & this <> 0`, and NOTHING
+; IN THIS PORT MINTS AN INTERSECTION TYPE — new_object_type has no arm for one and
+; there is no new_intersection_type — so the guard's first term settles it. The
+; term is written with the real bit anyway: a version that dropped the second half
+; would be a different function the day an intersection arrives, and the deletion
+; would be invisible.
+define ObjectFlagsContainsIntersections: int 1 << 25
+define ObjectFlagsIsConstrainedTypeVariable: int 1 << 27
+
+; ── UnionReduction ──────────────────────────────────────────────────────────
+;
+; checker.UnionReduction, slice 94. Three values and the reference's own numbers,
+; because `unionReduction & UnionReductionSubtype` is a BIT test on them rather
+; than an equality — Literal is 1 and Subtype is 2, so Literal does not reduce
+; subtypes and None does neither.
+;
+; ★ getUnionType passes Literal, which is the only value any caller in this port
+; passes today; Subtype's callers upstream are inference and the array-literal
+; chapter, and the arm that meets one carries `remove-subtypes`.
+define UnionReductionNone: int 0
+define UnionReductionLiteral: int 1
+define UnionReductionSubtype: int 2
 
 ; ★ ObjectFlagsPropagatingFlags, whose only reader is getPropagatingFlagsOfTypes.
 ; ObjectFlagsObjectTypeKindMask is still NOT declared: it NAMES two of the reused
@@ -1356,6 +1402,39 @@ define MemberEvent
     }
 }
 
+
+; UnionType, slice 94. Two slots, and the second of them has no writer in this
+; port — which is a statement about what a union can BE here rather than an
+; omission.
+;
+; ★★★ `origin` IS THE DENORMALIZED UNION AND IT CANNOT BE WRITTEN, WHICH MAKES
+; THREE BLOCKS OF getUnionTypeWorker DEAD BY CONTAINMENT RATHER THAN BY CHOICE.
+; The reference sets it in exactly one place: the `origin == nil && includes &
+; TypeFlagsUnion != 0` block, and `includes` gets TypeFlagsUnion only from
+; addTypesToUnion's `t.alias != nil || u.origin != nil`. `Type.alias` is not
+; carried at all (see Type's own note — its reader is typeToString's alias arm,
+; which reports), and `origin` is nil for every union this port mints, so the
+; disjunction is FALSE for every constituent and the bit is never set. The slot
+; is carried anyway because it has READERS: CompareTypes' union arm orders by it,
+; and the nodebuilder substitutes it in front of the union arm of the printer.
+;
+; ★ NOT CARRIED, with its reader: `regularType` — getRegularTypeOfLiteralType's
+; union memo, which is `mapType` over the constituents and therefore a chapter
+; away (the tag `map-type` already names it in get_widened_literal_type).
+; `resolvedProperties`, `resolvedIndexType` and the rest of the reference's
+; UnionType are the members dimension.
+define UnionTypeData
+(
+    types: ref[Array[ref[Type]?]]?
+    origin: ref[Type]?
+)
+{
+    init(ts: ref[Array[ref[Type]?]]?, org: ref[Type]?)
+    {
+        set types: ts
+        set origin: org
+    }
+}
 define TypeData union
 (
     None: NoTypeData
@@ -1364,6 +1443,7 @@ define TypeData union
     TypeParameter: TypeParameterTypeData
     Anonymous: AnonymousTypeData
     Literal: LiteralTypeData
+    Union: UnionTypeData
 )
 
 ; ── Type ────────────────────────────────────────────────────────────────────
@@ -1539,6 +1619,162 @@ define DuplicateNameEntry
         set name_data: d
         set name_len: n
         set state: s
+    }
+}
+
+; ── slice 93: the flow walk's records ───────────────────────────────────────
+;
+; ★★★ THERE IS NO `FlowType` RECORD HERE, AND THAT IS THIS PACKAGE'S OWN
+; CONVENTION RATHER THAN A SIMPLIFICATION. Upstream every arm of the walk answers
+; a two-field VALUE `FlowType{t, incomplete}`. No function in this port returns a
+; record by value — the grep is `returns [A-Z]` and it finds nothing in 76 000
+; lines — and the reason is in the root CLAUDE.md: a constructed struct return
+; takes the CALLER's page, so in a walk that recurses once per flow EDGE it is a
+; page per edge. The pair is a `ref[Type]?` result and a `ref[bool]` out-cell,
+; which is the spelling this tree uses for every other out-parameter.
+;
+; ★★★ AND THE NIL HALF SURVIVES INTACT, WHICH IS WHAT MADE THE CHOICE SAFE — it
+; is the one thing a lowering here could have lost. A nil `t` is a REAL ANSWER at
+; three arms: assignment, call and array mutation answer it to mean *this node
+; does not affect the reference, keep walking*, and the dispatch reads exactly
+; that. It is NOT this port's stop signal. The stop signal is the unported MARK,
+; as everywhere else in this file, and every recursion point in the walk compares
+; one BEFORE it looks at the answer — because the two are otherwise the same
+; null.
+
+; checker.SharedFlow — one row of the per-invocation memo of getTypeAtFlowNode.
+; A flow node is SHARED when it is the antecedent of more than one node (slice
+; 92's h15 measured the two bits a saturating counter), and the whole point of
+; the memo is that such a node is reached more than once per invocation.
+define SharedFlow
+(
+    flow: ref[FlowNode]?
+    t: ref[Type]?
+    incomplete: bool
+)
+{
+    init(fl: ref[FlowNode]?, ty: ref[Type]?, inc: bool)
+    {
+        set flow: fl
+        set t: ty
+        set incomplete: inc
+    }
+}
+
+; The reduce-label stack, `f.reduceLabels` upstream.
+;
+; ★★★ IT IS A CONS LIST AND NOT AN ARRAY, AND THE REASON IS THE POP. Upstream the
+; stack is pushed before a recursion and truncated after it (`f.reduceLabels =
+; f.reduceLabels[:len-1]`), and `Array` in this stdlib has `add` and `clear` and
+; nothing between them — reaching into its `length` field to truncate would be
+; this package writing through a container's internals. A cons list pushes by
+; minting a head and pops by USING THE OLD HEAD in the continuation, which is the
+; same stack with the truncation deleted rather than worked around.
+;
+; ★ And it reads in the right direction for free: getBranchLabelAntecedents walks
+; the reference's array BACKWARD (`i := len; for i != 0 { i-- }`), because a
+; `try` nested in a `try` pushes twice for one target and the INNER push must
+; win. The head of this list is the last push.
+define ReduceLabelStack
+(
+    data: ref[AstNode]?
+    next: ref[ReduceLabelStack]?
+)
+{
+    init(d: ref[AstNode]?, n: ref[ReduceLabelStack]?)
+    {
+        set data: d
+        set next: n
+    }
+}
+
+; checker.FlowState. Upstream it is recycled through a free list
+; (getFlowState/putFlowState) because one is allocated per
+; getFlowTypeOfReference; here it is minted on the checker's page and the region
+; frees it, so the free list has nothing to buy and is not ported.
+;
+; ★ `sharedFlows` is a CHECKER-level stack upstream, sliced per invocation
+; through `f.sharedFlowStart` and truncated on the way out. A per-invocation
+; Array is the same window with no cursor, so the start index is gone and the
+; truncation with it. `antecedentTypes` is the same shape one level down and
+; lives in getTypeAtFlowBranchLabel for the same reason.
+;
+; ★ `refKey` is NOT here, and its absence is a claim: its only reader is
+; getTypeAtFlowLoopLabel's cache key, and the loop label is this slice's wall.
+define FlowState
+(
+    reference: ref[AstNode]?
+    declared_type: ref[Type]?
+    initial_type: ref[Type]?
+    flow_container: ref[AstNode]?
+    depth: int
+    reduce_labels: ref[ReduceLabelStack]?
+    shared_flows: ref[Array[ref[SharedFlow]?]]
+)
+{
+    init(r: ref[AstNode]?, dt: ref[Type]?, it: ref[Type]?, fc: ref[AstNode]?, d: int, rl: ref[ReduceLabelStack]?, sf: ref[Array[ref[SharedFlow]?]])
+    {
+        set reference: r
+        set declared_type: dt
+        set initial_type: it
+        set flow_container: fc
+        set depth: d
+        set reduce_labels: rl
+        set shared_flows: sf
+    }
+}
+
+; checker.FlowTraceEvent — the row of the FLOWPIN (slice 93).
+;
+; ★★★ THE BATTERY IS WHY THIS EXISTS, AND SLICE 92'S OWN FINDING IS WHY IT COULD
+; BE BUILT. This chapter's product is a flow TYPE, and no instrument in this
+; directory can see one: the T section is emitted only for a unit whose check
+; COMPLETES, and not one unit that reaches the flow does. So a control that breaks
+; the walk and still ANSWERS — the wrong type, silently — moves nothing. Measured:
+; the first draft of controls-slice93.sh put 31 rows against five instruments and
+; NINETEEN came back ungated, including the Start arm's hop, the reduce-label
+; stack and the branch label's collapse.
+;
+; ★★★ IT IS A PIN AND NOT A YARDSTICK, AND SAYING SO IS THE HONEST PART. There is
+; no reference side: what it compares is this port against ITSELF one patch ago,
+; the way the STOPPIN and the MEMBERPIN do. It cannot say an answer is RIGHT —
+; diagcheck and the DIAGPIN are what say that, and between them they cover the
+; three diagnostics this chapter produces. What it says is that the WALK took the
+; edges it took, which is the claim every row of the battery is about.
+;
+;   kind 0  an invocation      a = the reference's pos, b = its end
+;   kind 1  a visited node     a = the flow node's FLAGS, b = 0
+;   kind 2  the answer         a = the type's id, b = 1 if a stop ended the walk
+define FlowTraceEvent
+(
+    kind: int
+    a: int
+    b: int
+)
+{
+    init(k: int, x: int, y: int)
+    {
+        set kind: k
+        set a: x
+        set b: y
+    }
+}
+
+; c.flowNodeReachable's row — the Shared-node memo of isReachableFlowNodeWorker,
+; keyed on the FLOW NODE and living for the whole check rather than for one
+; invocation. It is a SEPARATE table from SharedFlow above and not a second use
+; of it: reachability is a property of the graph alone, so it survives across
+; references, where a flow TYPE is a property of the reference and cannot.
+define FlowReachableLink
+(
+    flow: ref[FlowNode]?
+    reachable: bool
+)
+{
+    init(fl: ref[FlowNode]?, r: bool)
+    {
+        set flow: fl
+        set reachable: r
     }
 }
 
@@ -1859,16 +2095,49 @@ define Checker
     ; through getFreshTypeOfLiteralType. `c.falseType` is what `case
     ; ast.KindFalseKeyword` answers, and it is the FRESH one.
     ;
-    ; ★★★ `booleanType` IS STILL MISSING AND STILL NAMED, which is what keeps
-    ; type_to_string's Boolean arm reporting: it is `getUnionType([regularFalse,
-    ; regularTrue])`, and a union is a dimension away. So this slice makes the two
-    ; boolean LITERAL types without making the type they union into — the same cut
-    ; slice 69 drew when it ported getTypeFromTypeNode's keyword arms and left
-    ; `boolean` out.
+    ; ★★★ `booleanType` ARRIVES IN SLICE 94 AND THE LINE THAT USED TO STAND HERE —
+    ; *"still missing and still named ... a union is a dimension away"* — IS THE
+    ; DEFERRAL NAMING ITS OWN EXPIRY DATE, exactly as slice 66's base-type one did.
+    ; It is `getUnionType([regularFalse, regularTrue])`, it is the FIRST union this
+    ; port mints, and it is the type that makes three arms live at once:
+    ; type_to_string's Boolean keyword, getTypeFromTypeNode's KindBooleanKeyword and
+    ; getWidenedLiteralType's boolean arm.
+    ;
+    ; ★★ IT IS AN OPTION WHERE ITS FOUR NEIGHBOURS ARE NOT, and that is
+    ; get_union_type's signature rather than a claim about the value: every union
+    ; answer is `ref[Type]?` because the worker can STOP (see the union chapter's
+    ; walls), so a non-optional field here would need an `x as ref[Type]` unwrap at
+    ; the one place where the value is produced — an exit-21 lie for a call that has
+    ; no reachable stop today and might grow one. The three readers all answer
+    ; `ref[Type]?` themselves, so the Option costs nothing.
     regular_false_type: ref[Type]
     false_type: ref[Type]
     regular_true_type: ref[Type]
     true_type: ref[Type]
+    boolean_type: ref[Type]?
+
+    ; ── the union intern table, slice 94 ────────────────────────────────────
+    ;
+    ; c.unionTypes. The reference keys a Go map on a HASH of the constituent type
+    ; ids (getUnionKey); this is an association list scanned linearly and compared
+    ; on the LIST — same length, same types in the same order — which is what the
+    ; hash stands in for and is exact where a hash is a bet.
+    ;
+    ; ★★★ WHAT THE TABLE BUYS IS IDENTITY, AND HERE — UNLIKE THE THREE LITERAL
+    ; TABLES — IT IS OBSERVABLE ON THE DAY IT LANDS. `getOptionalType` answers `t`
+    ; unchanged when `t.Types()[0]` is already the undefined type, `formatUnionTypes`
+    ; asks whether a constituent pair IS booleanType, and `containsType` and
+    ; CompareTypes compare types by POINTER throughout. A union minted twice would
+    ; make each of those answer no, silently.
+    ;
+    ; ★ The reference's second cache, `unionOfUnionTypes`, is NOT carried, and the
+    ; argument is that its absence is unobservable rather than cheap: it memoises
+    ; getUnionTypeWorker for the two-constituent case, the worker is a pure function
+    ; of (constituents, reduction) once alias and origin are out of the picture — and
+    ; they are, permanently, see UnionTypeData's header — and its answer is interned
+    ; by the table above. So a miss costs a re-walk and cannot cost a second type:
+    ; the only `new_type` inside the worker is behind this table's own guard.
+    union_types: ref[Array[ref[Type]?]]
 
     ; ── the three intern tables, slice 71 ───────────────────────────────────
     ;
@@ -1988,6 +2257,36 @@ define Checker
     ; signature is asked for, which in this port is a `return` statement's
     ; container, a type predicate's parent and an accessor.
     signature_links: ref[Array[ref[SignatureLink]?]]
+
+    ; ── the flow walk's checker-level state (slice 93) ──────────────────────
+    ;
+    ; c.flowAnalysisDisabled — set by the depth guard and read at
+    ; getFlowTypeOfReferenceEx's first line. It is a LATCH: once the walk has
+    ; overflowed inside one container the reference stops analysing for the rest
+    ; of the check, which is why the flag is on the checker and not on a state.
+    flow_analysis_disabled: bool
+
+    ; ★ c.flowInvocationCount is NOT a field here. Upstream it feeds the tracer
+    ; and getFlowCacheKey's staleness test; this port has neither, and a counter
+    ; nothing prints is a number nobody can be wrong about (§3.5be). What says how
+    ; often this chapter runs is the stop log, which is an instrument.
+
+    ; c.flowNodeReachable, c.lastFlowNode, c.lastFlowNodeReachable — the two
+    ; memos of isReachableFlowNodeWorker, transcribed rather than dropped.
+    ;
+    ; ★★ A MEMO OF A PURE FUNCTION LOOKS DROPPABLE AND THIS ONE IS NOT. Without
+    ; the Shared-node table the branch-label arm re-walks every antecedent of
+    ; every junction it meets, which is exponential in the nesting depth — the
+    ; reference's own reason for the table. The one-entry `lastFlowNode` cache in
+    ; front of it is an optimisation and is transcribed with its invalidation
+    ; (the reduce-label arm clears it, because a label whose antecedents have
+    ; been swapped is a different question under the same identity).
+    ; c.flowTrace — the FLOWPIN's log; see FlowTraceEvent for why it exists.
+    flow_trace: ref[Array[ref[FlowTraceEvent]?]]
+
+    flow_node_reachable: ref[Array[ref[FlowReachableLink]?]]
+    last_flow_node: ref[FlowNode]?
+    last_flow_node_reachable: bool
 
     ; c.symbolNodeLinks (slice 91) — the same idiom a SIXTH time, keyed on the
     ; identifier NODE. One row per identifier the checker resolves, which is why
@@ -2162,6 +2461,15 @@ define Checker
         let snl host.allocate(sizeof Array[ref[SymbolNodeLink]?], alignof Array[ref[SymbolNodeLink]?]) as pointer[Array[ref[SymbolNodeLink]?]]
         set *snl: Array[ref[SymbolNodeLink]?]()
         set c.symbol_node_links: snl
+        set c.flow_analysis_disabled: false
+        let fnr host.allocate(sizeof Array[ref[FlowReachableLink]?], alignof Array[ref[FlowReachableLink]?]) as pointer[Array[ref[FlowReachableLink]?]]
+        set *fnr: Array[ref[FlowReachableLink]?]()
+        set c.flow_node_reachable: fnr
+        let ftr host.allocate(sizeof Array[ref[FlowTraceEvent]?], alignof Array[ref[FlowTraceEvent]?]) as pointer[Array[ref[FlowTraceEvent]?]]
+        set *ftr: Array[ref[FlowTraceEvent]?]()
+        set c.flow_trace: ftr
+        set c.last_flow_node: null
+        set c.last_flow_node_reachable: false
         set c.signature_count: 0
         let tr host.allocate(sizeof Array[ref[TypeResolution]?], alignof Array[ref[TypeResolution]?]) as pointer[Array[ref[TypeResolution]?]]
         set *tr: Array[ref[TypeResolution]?]()
@@ -2199,6 +2507,10 @@ define Checker
         let bl host.allocate(sizeof Array[ref[Type]?], alignof Array[ref[Type]?]) as pointer[Array[ref[Type]?]]
         set *bl: Array[ref[Type]?]()
         set c.bigint_literal_types: bl
+        let ut host.allocate(sizeof Array[ref[Type]?], alignof Array[ref[Type]?]) as pointer[Array[ref[Type]?]]
+        set *ut: Array[ref[Type]?]()
+        set c.union_types: ut
+        set c.boolean_type: null
         c.initialize_intrinsic_types()
         ; NewChecker mints its four singleton signatures right here, after the
         ; intrinsic types and before the globals — one of them has a reader (slice
@@ -2267,6 +2579,43 @@ define Checker
     ; these rather than touching the Array.
     function stop_count(c: ref[Checker]) returns int
         c.stop_log.get_length() as int
+
+    ; ── the flow trace's readers (slice 93), statics for the same reason ──
+
+    ; ── the UNION PIN's two accessors (slice 94) ────────────────────────────
+    ;
+    ; ★★★ THE SEVENTH INSTRUMENT'S ARGUMENT, ONE PRODUCT ON FROM SLICE 93's. That
+    ; slice built `--flow` because *this chapter's product is a type no artifact in
+    ; this directory prints*; the union chapter's product is a type too, and the
+    ; FLOWPIN sees only its ID. What it cannot see is the two halves this slice
+    ; spends eighty lines on — the constituent ORDER that CompareTypes decides, and
+    ; the NAME that formatUnionTypes and type_to_string's union arm compose out of
+    ; it. A control that reverses the sort or drops the boolean collapse moves
+    ; neither a diagnostic nor a stop; it moves this.
+    ;
+    ; ★ The table is the intern table itself, in creation order, so the pin also
+    ; counts: a broken interning mints the same union twice and the count says so.
+    function union_type_count(c: ref[Checker]) returns int
+        c.union_types.get_length() as int
+
+    function union_type_at(c: ref[Checker], i: int) returns ref[Type]?
+        c.union_types[i]
+
+    function flow_trace_count(c: ref[Checker]) returns int
+        c.flow_trace.get_length() as int
+
+    function flow_trace_field_at(c: ref[Checker], i: int, which: int) returns int
+    {
+        let row c.flow_trace[i]
+        if row = null
+            return 0
+        let ev row as ref[FlowTraceEvent]
+        if which = 0
+            return ev.kind
+        if which = 1
+            return ev.a
+        return ev.b
+    }
 
     ; ── the member log's readers (slice 86), statics for stop_count's reason ──
 
@@ -4045,16 +4394,15 @@ define Checker
             }
             return t
         }
-        ; strictNullChecks is true under this harness, so the guard's SECOND term
-        ; is the one that decides — and an optional function or module symbol is
-        ; not something this slice can be handed.
+        ; strictNullChecks is true under this harness, so the guard's SECOND term is
+        ; the one that decides — and an optional function or module symbol is not
+        ; something this slice can be handed. ★The `get-optional-type` stop that
+        ; stood here is a call since slice 94, which is what makes that sentence a
+        ; claim about the INPUT rather than about the port.
         if Checker.strict_null_checks()
         {
             if (f & SymbolFlagsOptional) <> 0
-            {
-                this.record_unported("get-optional-type", 0)
-                return null
-            }
+                return this.get_optional_type(t, true)
         }
         t
     }
@@ -5164,12 +5512,11 @@ define Checker
     ; DECLARATION and not only on the expression, which is the whole content of the
     ; caller above.
     ;
-    ; ★★★ THE BOOLEAN ARM IS THE ONE STOP THAT IS REACHABLE, and it is reachable
-    ; often: `let b = true` gets the fresh true type from the dispatch and needs
-    ; `booleanType` to widen to. That type is `getUnionType([regularFalse,
-    ; regularTrue])` and is still the same missing union slice 71 left named at the
-    ; field and at type_to_string's Boolean arm. So this slice makes a THIRD reader
-    ; for it, and all three report.
+    ; ★★★ THE BOOLEAN ARM WAS THE ONE REACHABLE STOP AND SLICE 94 CLOSES IT. The
+    ; sentence that stood here — *"`let b = true` gets the fresh true type from the
+    ; dispatch and needs `booleanType` to widen to ... so this slice makes a THIRD
+    ; reader for it, and all three report"* — named its own expiry date, and the
+    ; union chapter is it. All three readers answer now.
     ;
     ; ★★ THE ENUM-LIKE AND UNION ARMS ARE INERT FOR THE SAME REASON THEIR FLAGS
     ; ARE: nothing here sets TypeFlagsEnum, TypeFlagsEnumLiteral or TypeFlagsUnion
@@ -5199,11 +5546,7 @@ define Checker
             if (t.flags & TypeFlagsBigIntLiteral) <> 0
                 return bigint_type
             if (t.flags & TypeFlagsBooleanLiteral) <> 0
-            {
-                ; c.booleanType — see the header.
-                this.record_unported("boolean-type", t.flags)
-                return null
-            }
+                return boolean_type
         }
         if (t.flags & TypeFlagsUnion) <> 0
         {
@@ -5350,22 +5693,20 @@ define Checker
         t
     }
 
-    ; addOptionalityEx. getOptionalType is a UNION and this port has none, so the
-    ; optional half is one report — and it stands behind strictNullChecks, which is
-    ; TRUE here, so `x?: string` reaches it and `x: string` does not.
+    ; addOptionalityEx, whole since slice 94. It stands behind strictNullChecks,
+    ; which is TRUE here, so `x?: string` reaches getOptionalType and `x: string`
+    ; does not.
+    ;
+    ; ★ The line that stood here said *"getOptionalType is a UNION and this port has
+    ; none, so the optional half is one report"* — the union chapter is what retires
+    ; it, and this is the site where the difference is visible in the T section: an
+    ; optional parameter or property now prints `T | undefined` instead of stopping.
     function add_optionality_ex(this, t: ref[Type], is_property: bool, is_optional: bool) returns ref[Type]?
     {
         if Checker.strict_null_checks()
         {
             if is_optional
-            {
-                ; getOptionalType's own first test is against undefinedOrMissingType
-                ; or undefinedType, which is a plain identity — but its answer is
-                ; getUnionType in every other case, and is_property is what selects
-                ; between the two sentinels. Reported whole rather than half.
-                this.record_unported("get-optional-type", t.flags)
-                return null
-            }
+                return this.get_optional_type(t, is_property)
         }
         t
     }
@@ -5428,12 +5769,16 @@ define Checker
             return non_primitive_type
         if k = KindIntrinsicKeyword
             return intrinsic_marker_type
-        ; ★ KindBooleanKeyword IS NOT HERE, and its absence is a measurement rather
-        ; than an omission: booleanType is a UNION of the two boolean literal types,
-        ; and initialize_intrinsic_types' header already names it among the types
-        ; this port cannot make. So the keyword reports with its neighbours, and the
-        ; same sentence retires the TypePredicate arm — two lines answering voidType
-        ; or booleanType, of which the second is that missing union.
+        ; ★★★ KindBooleanKeyword ARRIVES IN SLICE 94 AND ITS OLD NOTE NAMED THE
+        ; EXPIRY DATE: *"booleanType is a UNION of the two boolean literal types ...
+        ; so the keyword reports with its neighbours"*. It is the one keyword arm in
+        ; this table whose answer is not an intrinsic, and it prints as a bare
+        ; keyword anyway — see type_to_string's Boolean arm for the one line that
+        ; makes that true. ★The TypePredicate arm the same sentence deferred is
+        ; STILL not here: its other half is voidType and its guard is a type
+        ; predicate NODE, which this table has no arm for at all.
+        if k = KindBooleanKeyword
+            return boolean_type
         ;
         ; ★ ParenthesizedType and the three JSDoc wrappers RECURSE into
         ; getTypeFromTypeNode and would work; they are left out deliberately,
@@ -5451,6 +5796,14 @@ define Checker
         ; the line on false without writing it into the real sink. So the unit
         ; stays UNPORTED and only the TAG moves — from this table to the printer,
         ; which is where the missing dimension actually is.
+        ; ★★★ KindUnionType, SLICE 94, AND IT IS THE ARM THAT MAKES THE UNION
+        ; CHAPTER VISIBLE IN THE T SECTION. Every other consumer of a union in this
+        ; slice reaches it through an inference (getOptionalType, getWidenedLiteral
+        ; Type); this is the one where the SOURCE says `string | undefined` and the
+        ; dump prints what we answer. It is the second-largest row of this table at
+        ; stage 1.
+        if k = KindUnionType
+            return this.get_type_from_union_type_node(node)
         if k = KindTypeLiteral
             return this.get_type_from_type_literal_or_function_or_constructor_type_node(node)
         if k = KindFunctionType
@@ -5488,6 +5841,54 @@ define Checker
     ; question it needs. What the value is FOR is `t.alias`, a slot on Type whose
     ; only readers (type_to_string's alias arm, getTypeAliasInstantiation) report
     ; today; §3.5be says that slot arrives with them.
+    ; getTypeFromUnionTypeNode. Six lines upstream and the memo is the reference's
+    ; own — two `string | undefined` annotations in one file are two NODES and one
+    ; type, and the interning in the union chapter is what makes them one; this
+    ; table is what makes the second one free.
+    ;
+    ; ★★★ THE ALIAS IS A STOP HERE AND NOT AN OMISSION, WHICH IS THE OPPOSITE OF
+    ; WHAT ITS SIBLING BELOW DOES, AND THE DIFFERENCE IS THE PRINTER. That function
+    ; ignores the alias because the type it answers is an ANONYMOUS OBJECT, which
+    ; type_to_string reports for either way. A union PRINTS — so `type X = string |
+    ; number` would come out as `string | number` where the reference prints `X`,
+    ; and that is a well-formed WRONG answer rather than an honest UNPORTED. The
+    ; alias slot on Type and its two readers arrive together (§3.5be); until then
+    ; the presence of one is a row.
+    function get_type_from_union_type_node(this, node: ref[AstNode]) returns ref[Type]?
+    {
+        let links this.type_node_link_of(node)
+        if links.resolved_type <> null
+            return links.resolved_type
+        if this.get_alias_symbol_for_type_node(node) <> null
+        {
+            this.record_unported("type-alias-union", KindUnionType)
+            return null
+        }
+        let nodes AstNode.type_list_of(node)
+        if nodes = null
+            return null
+        let list nodes as ref[Array[ref[AstNode]?]]
+        let n list.get_length() as int
+        let types this.new_type_list(null)
+        var i 0
+        while i < n
+        {
+            let e list[i]
+            set i: i + 1
+            if e = null
+                return null
+            let t this.get_type_from_type_node(e as ref[AstNode])
+            if t = null
+                return null
+            types.add(t)
+        }
+        let u this.get_union_type_ex(types, UnionReductionLiteral)
+        if u = null
+            return null
+        set links.resolved_type: u
+        links.resolved_type
+    }
+
     function get_type_from_type_literal_or_function_or_constructor_type_node(this, node: ref[AstNode]) returns ref[Type]?
     {
         let links this.type_node_link_of(node)
@@ -6982,6 +7383,1129 @@ define Checker
     function no_implicit_this() returns bool
         true
 
+    ; strictPropertyInitialization — the FIFTH, and slice 94's reader is
+    ; checkPropertyInitialization. Same derivation as the four above: an unset
+    ; strict-family option falls through to `Strict != TSFalse` and answers TRUE, so
+    ; the function's whole guard turns on the node's Ambient flag alone.
+    ;
+    ; ★ It is why the row it gates was worth 296 units at stage 1 rather than none —
+    ; the check that stood behind the union wall was LIVE the whole time, which is
+    ; what the stop at its call site has said since slice 77.
+    function strict_property_initialization() returns bool
+        true
+
+    ; ── slice 94: checkPropertyInitialization ────────────────────────────────
+    ;
+    ; ★★★ THE HEAD OF THE WORK LIST ON BOTH STAGES SINCE SLICE 77, AND WHAT HELD IT
+    ; WAS ONE CALL. Slice 92 built the flow GRAPH and the row stayed; slice 93 built
+    ; the WALK and the row stayed; the sentence that stood at the stop named the
+    ; reason both times — *"what holds it is `getOptionalType(propType, false)`, the
+    ; INITIAL type this caller passes"*. The union chapter above is that call, so
+    ; the row is this slice's to close.
+    ;
+    ; ★★★ AND IT IS THE FIRST PLACE IN THIS PORT WHERE THE CHECKER MINTS AN AST
+    ; NODE. isPropertyInitializedInConstructor does not FIND a reference to ask the
+    ; flow walk about — there is none in the source — it BUILDS one: `this.p`,
+    ; parented to the constructor and carrying the constructor's return flow node,
+    ; and then asks what type that reference has where the constructor ends. Slice
+    ; 93 predicted the consequence at its own line: *"a property access, an element
+    ; access, a qualified name and a meta property cannot arrive [at
+    ; isMatchingReference] until that row lands, and §3.5be says the day it lands is
+    ; the day they are written"*. This is the day, and the property-access arm is
+    ; written; the other three still have no producer.
+    ;
+    ; ★★ WHAT THE SYNTHETIC NODE OWES, and every slot is read by something: `kind`
+    ; and the payload (isMatchingReference's arm and getAccessedPropertyName),
+    ; `parent` on BOTH nodes (getControlFlowContainer walks up from the reference,
+    ; and getFlowTypeOfReferenceEx's NonNullExpression test reads the parent), and
+    ; `flow_node`. ★The NAME node is REUSED rather than copied — the reference
+    ; passes `propName` straight into the factory and does not re-parent it either,
+    ; so the name's parent stays the property declaration in both.
+    ;
+    ; ★ The reference's `pos` and `end` are the factory's synthetic -1/-1; here they
+    ; are 0/0, because AstNode.alloc hands back raw region memory and every slot is
+    ; written explicitly (parser.new_node's note). Nothing reads them: the only
+    ; consumer is trace_flow, which is the FLOWPIN instrument, and it prints the
+    ; reference's extent rather than comparing it.
+    function new_synthetic_node(this, kind: int, data: NodeData) returns ref[AstNode]
+    {
+        let n AstNode.alloc(host)
+        set n.kind: kind
+        set n.flags: NodeFlagsNone
+        set n.pos: 0
+        set n.end: 0
+        set n.data: data
+        set n.parent: null
+        set n.symbol: null
+        set n.local_symbol: null
+        set n.locals: null
+        set n.flow_node: null
+        set n.end_flow_node: null
+        set n.return_flow_node: null
+        set n.fallthrough_flow_node: null
+        n
+    }
+
+    ; ast.FindConstructorDeclaration. ★`NodeIsPresent(member.Body())` is the whole
+    ; content of the test beside the kind: an OVERLOAD signature declares a
+    ; constructor and initializes nothing, so a class whose only `constructor` has
+    ; no body is a class with no constructor for this question.
+    function find_constructor_declaration(node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let members AstNode.member_list_of(node)
+        if members = null
+            return null
+        let ms members as ref[Array[ref[AstNode]?]]
+        let n ms.get_length() as int
+        var i 0
+        while i < n
+        {
+            let m ms[i]
+            set i: i + 1
+            if m = null
+                continue
+            let member m as ref[AstNode]
+            if AstNode.kind_of(member) = KindConstructor
+            {
+                if Binder.node_is_present(AstNode.body_of(member))
+                    return member
+            }
+        }
+        null
+    }
+
+    ; isPropertyWithoutInitializer.
+    function is_property_without_initializer(this, node: ref[AstNode]) returns bool
+    {
+        if AstNode.kind_of(node) <> KindPropertyDeclaration
+            return false
+        if b.has_syntactic_modifier(node, ModifierFlagsAbstract)
+            return false
+        let postfix AstNode.postfix_token_of(node)
+        if postfix <> null
+        {
+            if AstNode.kind_of(postfix as ref[AstNode]) = KindExclamationToken
+                return false
+        }
+        AstNode.initializer_of(node) = null
+    }
+
+    ; checkPropertyInitialization.
+    ;
+    ; ★★ ITS GUARD IS `!strictNullChecks || !strictPropertyInitialization ||
+    ; Ambient`, and BOTH options answer TRUE under this harness — they are
+    ; strict-FAMILY options read through GetStrictOptionValue, so the function is
+    ; LIVE. See strict_null_checks' header for the derivation, which is the one that
+    ; surprises.
+    ;
+    ; ★ isPropertyInitializedInStaticBlocks is the sibling this does NOT need: the
+    ; loop below skips every STATIC member, and that function's only caller is
+    ; getTypeOfVariableOrParameterOrPropertyWorker's static branch.
+    procedure check_property_initialization(this, node: ref[AstNode])
+    {
+        if Checker.strict_null_checks() = false
+            return
+        if Checker.strict_property_initialization() = false
+            return
+        if (AstNode.flags_of(node) & NodeFlagsAmbient) <> 0
+            return
+        let constructor Checker.find_constructor_declaration(node)
+        let members AstNode.member_list_of(node)
+        if members = null
+            return
+        let ms members as ref[Array[ref[AstNode]?]]
+        let count ms.get_length() as int
+        var i 0
+        while i < count
+        {
+            let m ms[i]
+            set i: i + 1
+            if m = null
+                continue
+            let member m as ref[AstNode]
+            if b.has_syntactic_modifier(member, ModifierFlagsAmbient)
+                continue
+            if b.is_static(member)
+                continue
+            if this.is_property_without_initializer(member) = false
+                continue
+            let pn AstNode.name_of(member)
+            if pn = null
+                continue
+            let prop_name pn as ref[AstNode]
+            let nk AstNode.kind_of(prop_name)
+            var named false
+            if nk = KindIdentifier
+                set named: true
+            if nk = KindPrivateIdentifier
+                set named: true
+            if nk = KindComputedPropertyName
+                set named: true
+            if named = false
+                continue
+            let sym this.symbol_of_declaration(member)
+            if sym = null
+                continue
+            ; ★★★ THE MARK IS TAKEN PER MEMBER AND A STOP IS A `continue`, NOT A
+            ; `return`, AND THE DIFFERENCE IS TWO DIAGNOSTICS ON THIS SLICE'S OWN
+            ; FIXTURE. The reference's loop asks an independent question about every
+            ; member, so a walk that stops on member A says nothing about member B —
+            ; abandoning the class would silently trade an honest diagnostic for
+            ; another member's unanswerable one. ★What must NOT be traded is the
+            ; other direction: where the walk stops, `is_property_initialized_in_
+            ; constructor` answers `false`, which is *not initialized* and would
+            ; INVENT a TS2564. The mark is what separates the two, and it is the
+            ; reason both calls below are bracketed by one rather than tested for
+            ; null.
+            let mark this.unported_mark()
+            let t this.get_type_of_symbol(sym as ref[Symbol])
+            if this.unported_mark() <> mark
+                continue
+            if t = null
+                continue
+            let ty t as ref[Type]
+            if (ty.flags & TypeFlagsAnyOrUnknown) <> 0
+                continue
+            if Checker.contains_undefined_type(ty)
+                continue
+            var initialized false
+            if constructor <> null
+            {
+                let ok this.is_property_initialized_in_constructor(prop_name, ty, constructor as ref[AstNode])
+                if this.unported_mark() <> mark
+                    continue
+                set initialized: ok
+            }
+            if initialized = false
+                this.error_on_node(prop_name, DiagProperty_0_has_no_initializer_and_is_not_definitely_assigned_in_the_constructor)
+        }
+    }
+
+    ; isPropertyInitializedInConstructor.
+    ;
+    ; ★★★ THE COMPUTED-NAME ARM BUILDS AN **ELEMENT** ACCESS AND IS A STOP RATHER
+    ; THAN A SECOND SYNTHESIS, and the reason is isMatchingReference and not the
+    ; factory: matching an element access needs
+    ; tryGetElementAccessExpressionName, which is the literal/entity-name fork over
+    ; the argument expression, and a wrong `false` there would make a real
+    ; assignment invisible to the walk — the same argument slice 93 wrote for the
+    ; five source arms it left as stops.
+    function is_property_initialized_in_constructor(this, prop_name: ref[AstNode], prop_type: ref[Type], constructor: ref[AstNode]) returns bool
+    {
+        if AstNode.kind_of(prop_name) = KindComputedPropertyName
+        {
+            this.record_unported("property-initialized-element-access", KindComputedPropertyName)
+            return false
+        }
+        let this_node this.new_synthetic_node(KindThisKeyword, NodeData.Token(TokenData()))
+        let reference this.new_synthetic_node(KindPropertyAccessExpression, NodeData.PropertyAccessExpression(PropertyAccessData(this_node, null, prop_name)))
+        set this_node.parent: reference
+        set reference.parent: constructor
+        set reference.flow_node: AstNode.return_flow_node_of(constructor)
+        let initial this.get_optional_type(prop_type, false)
+        if initial = null
+            return false
+        let flow_type this.get_flow_type_of_reference_ex(reference, prop_type, initial, null, null)
+        if flow_type = null
+            return false
+        Checker.contains_undefined_type(flow_type as ref[Type]) = false
+    }
+
+    ; ── the union type (slice 94) ───────────────────────────────────────────
+    ;
+    ; getUnionType / getUnionTypeEx / getUnionTypeWorker and everything they stand
+    ; on: the ORDER a constituent list is kept in, the reduction, the interning, and
+    ; getOptionalType on top. Slice 93 named this row and named it by a
+    ; MEASUREMENT rather than by a histogram — *"nine of this slice's stops are
+    ; doors into it"* — and the nine are one room: a branch label unions its
+    ; antecedents, a loop label unions them again, getOptionalType unions with
+    ; undefined, and so on.
+    ;
+    ; ★★★ THE ORDER IS THE PRODUCT, NOT THE SET. A union type here is a SORTED,
+    ; DEDUPLICATED constituent list, sorted by CompareTypes, and TypeFlags' own
+    ; generated header already said why that matters: *the numeric values of
+    ; TypeFlags determine the order computed by the CompareTypes function and
+    ; therefore the order of constituent types in union types* — so the table this
+    ; port generates decides how `string | undefined` PRINTS. The sort is what
+    ; makes the interning below a list comparison rather than a set comparison, and
+    ; it is what makes `getOptionalType`'s `Types()[0] == undefinedType` test mean
+    ; anything.
+    ;
+    ; ★★★ FOUR REDUCTION STEPS ARE UNREACHABLE HERE AND EACH IS A CONTAINMENT
+    ; PROOF WITH A DIFFERENT WITNESS, which is worth more than four stops that
+    ; never fire:
+    ;   removeStringLiteralsMatchedByTemplateLiterals  — its guard needs
+    ;       TemplateLiteral or StringMapping in `includes`, and no type of either
+    ;       kind can be MADE here (getTypeFromTypeNode reports for both).
+    ;   removeConstrainedTypeVariables — its guard needs
+    ;       IncludesConstrainedTypeVariable, which add_type_to_union sets only for
+    ;       an INTERSECTION type, and nothing mints one.
+    ;   the namedUnions / origin block — see UnionTypeData's header: `includes`
+    ;       never carries TypeFlagsUnion, because that bit comes from a
+    ;       constituent's `alias` or `origin` and this port has neither.
+    ;   the `!strictNullChecks` arm of add_type_to_union — the option is TRUE under
+    ;       this harness (strict_null_checks' header has the derivation).
+    ; Three of the four are written as GATES WITH REPORTS anyway, on this file's
+    ; standing rule for an inert arm; the fourth is written as the reference's
+    ; conditional with the option spelled as a constant, which is what
+    ; create_widening_type does one chapter up.
+
+    ; newUnionType. Four lines upstream and four here.
+    function new_union_type(this, object_flags: int, types: ref[Array[ref[Type]?]]) returns ref[Type]
+        this.new_type(TypeFlagsUnion, object_flags, null, TypeData.Union(UnionTypeData(types, null)))
+
+    ; UnionType.types and UnionType.origin, as questions about the union TAG —
+    ; this file's payload-accessor idiom, and each answers null for an arm that is
+    ; not Union where the reference's `AsUnionType()` would panic.
+    function union_types_of(t: ref[Type]) returns ref[Array[ref[Type]?]]?
+    {
+        choose t.data
+            when d: Union
+                return d.types
+        null
+    }
+
+    function union_origin_of(t: ref[Type]) returns ref[Type]?
+    {
+        choose t.data
+            when d: Union
+                return d.origin
+        null
+    }
+
+    ; ── the order ───────────────────────────────────────────────────────────
+
+    ; getSortOrderFlags. The comment upstream is the whole content: an enum-like
+    ; UNIT type sorts as if it were plain `enum`, so all of one enum's members land
+    ; together and are then ordered by their symbols.
+    function get_sort_order_flags(t: ref[Type]) returns int
+    {
+        if (t.flags & TypeFlagsEnumLike) <> 0
+        {
+            if (t.flags & TypeFlagsUnion) = 0
+                return TypeFlagsEnum
+        }
+        t.flags
+    }
+
+    ; getTypeNameSymbol. The alias arm is the first line upstream and cannot be
+    ; written: `Type.alias` is not carried (see Type's note), so a type NAMED by an
+    ; alias is indistinguishable here from one that is not — which is exactly the
+    ; divergence typeToString's alias arm already reports.
+    function get_type_name_symbol(t: ref[Type]) returns ref[Symbol]?
+    {
+        if (t.flags & (TypeFlagsTypeParameter | TypeFlagsStringMapping)) <> 0
+            return t.symbol
+        if (t.object_flags & (ObjectFlagsClassOrInterface | ObjectFlagsReference)) <> 0
+            return t.symbol
+        null
+    }
+
+    ; compareTypeNames. ★It compares the NAMES with strings.Compare and does NOT go
+    ; through compareSymbols — two different orders over the same pair, and the
+    ; distinction is the reference's: a NAMED type is ordered by its name so that
+    ; the printed union reads in name order, while an unnamed one falls through to
+    ; the symbol's DECLARATION position below.
+    function compare_type_names(t1: ref[Type], t2: ref[Type]) returns int
+    {
+        let s1 Checker.get_type_name_symbol(t1)
+        let s2 Checker.get_type_name_symbol(t2)
+        if s1 = s2
+            ; The alias arm behind this equality is the one above; with no alias
+            ; carried, equal name symbols are the reference's `return 0`.
+            return 0
+        if s1 = null
+            return 1
+        if s2 = null
+            return 0 - 1
+        let a s1 as ref[Symbol]
+        let b s2 as ref[Symbol]
+        Checker.compare_names(Symbol.name_data_of(a), Symbol.name_len_of(a), Symbol.name_data_of(b), Symbol.name_len_of(b))
+    }
+
+    ; compareTypeLists.
+    function compare_type_lists(this, l1: ref[Array[ref[Type]?]]?, l2: ref[Array[ref[Type]?]]?) returns int
+    {
+        var n1 0
+        if l1 <> null
+            set n1: (l1 as ref[Array[ref[Type]?]]).get_length() as int
+        var n2 0
+        if l2 <> null
+            set n2: (l2 as ref[Array[ref[Type]?]]).get_length() as int
+        if n1 <> n2
+            return n1 - n2
+        if n1 = 0
+            return 0
+        let a l1 as ref[Array[ref[Type]?]]
+        let b l2 as ref[Array[ref[Type]?]]
+        var i 0
+        while i < n1
+        {
+            let x a[i]
+            let y b[i]
+            let c this.compare_types(x, y)
+            if c <> 0
+                return c
+            set i: i + 1
+        }
+        0
+    }
+
+    ; ★★★ CompareTypes, AND WHAT IS **NOT** IN IT IS THE SLICE'S MOST LOAD-BEARING
+    ; LIST. The reference's switch has fourteen arms; this port can MAKE a type for
+    ; six of them, and the other eight are containment rather than omission —
+    ; nothing here mints an Intersection, an Index, an IndexedAccess, a Conditional,
+    ; a Substitution, a TemplateLiteral, a StringMapping or a UniqueESSymbol type,
+    ; so an arm for one could not be reached by a test. ★They are left out rather
+    ; than stopped for the reason this file gives elsewhere: a comparator that
+    ; REPORTS would turn an ordering question into an unported unit, and the fall
+    ; through to the type id below answers the same thing the reference's own tail
+    ; answers for every pair that reaches it.
+    ;
+    ; ★★★ THE OBJECT ARM IS THE ONE WITH REAL DEAD SUB-ARMS AND THEY ARE PROVEN
+    ; DEAD, not assumed: a TUPLE type is refused by new_object_type (it reports),
+    ; and a DEFERRED type reference cannot exist because create_type_reference
+    ; always writes resolvedTypeArguments — which is the same fact
+    ; get_type_arguments' `get-type-arguments-deferred` stop records from the other
+    ; side. `mapper` is not carried at all. So the reference's four-way sub-switch
+    ; collapses to: both references, order by the type ARGUMENT lists; one
+    ; reference, it comes first; neither, they are two anonymous types with the same
+    ; symbol and the same object-type KIND, and the id decides.
+    ;
+    ; ★ `t1.checker != t2.checker` is a panic upstream and is not written: a
+    ; Checker here is built per file and there is one.
+    function compare_types(this, a: ref[Type]?, b: ref[Type]?) returns int
+    {
+        if a = b
+            return 0
+        if a = null
+            return 0 - 1
+        if b = null
+            return 1
+        let t1 a as ref[Type]
+        let t2 b as ref[Type]
+        if t1 = t2
+            return 0
+        let cf Checker.get_sort_order_flags(t1) - Checker.get_sort_order_flags(t2)
+        if cf <> 0
+            return cf
+        let cn Checker.compare_type_names(t1, t2)
+        if cn <> 0
+            return cn
+        ; The intrinsic arm is the reference's empty case: only the id tells two
+        ; `undefined`s apart, and the id is the tail below.
+        if (t1.flags & TypeFlagsObject) <> 0
+        {
+            let cs this.compare_symbols(t1.symbol, t2.symbol)
+            if cs <> 0
+                return cs
+            let r1 (t1.object_flags & ObjectFlagsReference) <> 0
+            let r2 (t2.object_flags & ObjectFlagsReference) <> 0
+            if r1
+            {
+                if r2
+                {
+                    let ca this.compare_type_lists(Checker.resolved_type_arguments_of(t1), Checker.resolved_type_arguments_of(t2))
+                    if ca <> 0
+                        return ca
+                }
+                if r2 = false
+                    return 0 - 1
+            }
+            if r1 = false
+            {
+                if r2
+                    return 1
+            }
+        }
+        if (t1.flags & TypeFlagsUnion) <> 0
+        {
+            ; Both origins are null here for the reason UnionTypeData's header
+            ; gives, so the reference's three-way fork on them collapses to its
+            ; first arm.
+            let cl this.compare_type_lists(Checker.union_types_of(t1), Checker.union_types_of(t2))
+            if cl <> 0
+                return cl
+        }
+        if (t1.flags & TypeFlagsStringLiteral) <> 0
+        {
+            let cv Checker.compare_names(Checker.literal_text_of(t1), Checker.literal_text_length_of(t1), Checker.literal_text_of(t2), Checker.literal_text_length_of(t2))
+            if cv <> 0
+                return cv
+        }
+        if (t1.flags & TypeFlagsNumberLiteral) <> 0
+        {
+            let cv Checker.compare_number_literal_bits(Checker.literal_bits_of(t1), Checker.literal_bits_of(t2))
+            if cv <> 0
+                return cv
+        }
+        if (t1.flags & TypeFlagsBooleanLiteral) <> 0
+        {
+            let b1 Checker.literal_bool_of(t1)
+            let b2 Checker.literal_bool_of(t2)
+            if b1 <> b2
+            {
+                if b1
+                    return 1
+                return 0 - 1
+            }
+        }
+        if (t1.flags & TypeFlagsTypeParameter) <> 0
+        {
+            let cs this.compare_symbols(t1.symbol, t2.symbol)
+            if cs <> 0
+                return cs
+        }
+        ; Fall back to type ids, which is creation order for the built-in types.
+        t1.id - t2.id
+    }
+
+    ; ★★★ cmp.Compare OVER TWO jsnum.Numbers, DONE ON THE BITS, AND THE TWO INPUTS
+    ; THE TWO SPELLINGS DISAGREE ABOUT ARE THE TWO A NUMERIC LITERAL CANNOT BE.
+    ; A total order on the IEEE-754 bit pattern puts NaN at one end and orders -0
+    ; BELOW +0, where cmp.Compare puts NaN FIRST and calls -0 and +0 equal. The
+    ; number-literal table's own note has the argument for why neither can arrive:
+    ; a NumericLiteral's text is a number the scanner accepted, so jsnum_from_string
+    ; of it is neither NaN nor negative zero. For every input this port can reach
+    ; the two answers are the same one.
+    function compare_number_literal_bits(b1: u64, b2: u64) returns int
+    {
+        if b1 = b2
+            return 0
+        let n1 (b1 & 0x8000000000000000) <> (0 as u64)
+        let n2 (b2 & 0x8000000000000000) <> (0 as u64)
+        if n1
+        {
+            if n2 = false
+                return 0 - 1
+            ; Both negative: the larger bit pattern is the smaller value.
+            if b1 > b2
+                return 0 - 1
+            return 1
+        }
+        if n2
+            return 1
+        if b1 < b2
+            return 0 - 1
+        1
+    }
+
+    ; slices.BinarySearchFunc over a SORTED constituent list. Answers the index at
+    ; which `t` belongs and writes whether it is already there.
+    ;
+    ; ★ Go's contract is the one that matters here and it is not "the index of t":
+    ; it is the position of the FIRST element that does not compare less than `t`,
+    ; which is where an insert keeps the list sorted whether or not the search hit.
+    function binary_search_type(this, list: ref[Array[ref[Type]?]], t: ref[Type]?, found: ref[bool]) returns int
+    {
+        set found: false
+        let n list.get_length() as int
+        var lo 0
+        var hi n
+        while lo < hi
+        {
+            let mid lo + (hi - lo) / 2
+            let e list[mid]
+            if this.compare_types(e, t) < 0
+                set lo: mid + 1
+            else
+                set hi: mid
+        }
+        if lo < n
+        {
+            let e list[lo]
+            if this.compare_types(e, t) = 0
+                set found: true
+        }
+        lo
+    }
+
+    ; containsType.
+    function contains_type(this, list: ref[Array[ref[Type]?]], t: ref[Type]?) returns bool
+    {
+        var found false
+        this.binary_search_type(list, t, &found)
+        found
+    }
+
+    ; ★★ slices.Insert AT AN INDEX, AND SCALY'S Array HAS NO SUCH THING — it grows
+    ; at the end and clears, and nothing in between (slice 93 met the same wall from
+    ; the other side and answered it with a cons list). The shift is written out:
+    ; one `add` to make room and a right-to-left run of `put`. It is O(n) per insert
+    ; over a list whose length is the number of constituents of one union.
+    procedure insert_type_at(list: ref[Array[ref[Type]?]], index: int, t: ref[Type]?)
+    {
+        list.add(null)
+        var i (list.get_length() as int) - 1
+        while i > index
+        {
+            list.put(i as size_t, list[i - 1])
+            set i: i - 1
+        }
+        list.put(index as size_t, t)
+    }
+
+    ; slices.Delete of ONE element, as a rebuild — the same wall as the insert
+    ; above, met where the reference shrinks a slice. The survivors are copied into
+    ; a fresh list, which is the same answer and the only spelling available.
+    function type_list_without(this, list: ref[Array[ref[Type]?]], index: int) returns ref[Array[ref[Type]?]]
+    {
+        let out this.new_type_list(null)
+        let n list.get_length() as int
+        var i 0
+        while i < n
+        {
+            if i <> index
+                out.add(list[i])
+            set i: i + 1
+        }
+        out
+    }
+
+    ; ── building the constituent set ────────────────────────────────────────
+
+    ; addTypeToUnion. The reference returns the slice and the flags; here the SET is
+    ; a mutable Array the caller owns, so only `includes` is an answer.
+    function add_type_to_union(this, type_set: ref[Array[ref[Type]?]], includes_in: int, t: ref[Type]) returns int
+    {
+        var includes includes_in
+        let flags t.flags
+        ; 'never' is ignored in unions.
+        if (flags & TypeFlagsNever) <> 0
+            return includes
+        set includes: includes | (flags & TypeFlagsIncludesMask)
+        if (flags & TypeFlagsInstantiable) <> 0
+            set includes: includes | TypeFlagsIncludesInstantiable
+        ; See ObjectFlagsIsConstrainedTypeVariable's own note: the first term
+        ; settles this for every type this port can mint.
+        if (flags & TypeFlagsIntersection) <> 0
+        {
+            if (t.object_flags & ObjectFlagsIsConstrainedTypeVariable) <> 0
+                set includes: includes | TypeFlagsIncludesConstrainedTypeVariable
+        }
+        if t = wildcard_type
+            set includes: includes | TypeFlagsIncludesWildcard
+        if this.is_error_type(t)
+            set includes: includes | TypeFlagsIncludesError
+        ; `!c.strictNullChecks && flags&Nullable != 0` — the option is TRUE under
+        ; this harness, so the ELSE is the branch that runs and the widening bit the
+        ; other one records is never set. Written as the reference's conditional
+        ; with the option spelled as a constant, exactly as create_widening_type is.
+        var non_widening false
+        if Checker.strict_null_checks() = false
+        {
+            if (flags & TypeFlagsNullable) <> 0
+                set non_widening: true
+        }
+        if non_widening
+        {
+            if (t.object_flags & ObjectFlagsContainsWideningType) = 0
+                set includes: includes | TypeFlagsIncludesNonWideningType
+            return includes
+        }
+        var found false
+        let index this.binary_search_type(type_set, t, &found)
+        if found = false
+            Checker.insert_type_at(type_set, index, t)
+        includes
+    }
+
+    ; addTypesToUnion. The `lastType` guard is the reference's own cheap
+    ; deduplication of an already-sorted input and is kept: it is what makes
+    ; `getUnionType([t, t])` walk the set once.
+    function add_types_to_union(this, type_set: ref[Array[ref[Type]?]], includes_in: int, types: ref[Array[ref[Type]?]]) returns int
+    {
+        var includes includes_in
+        var last: ref[Type]? null
+        let n types.get_length() as int
+        var i 0
+        while i < n
+        {
+            let e types[i]
+            if e <> null
+            {
+                let t e as ref[Type]
+                var same false
+                if last <> null
+                {
+                    if (last as ref[Type]) = t
+                        set same: true
+                }
+                if same = false
+                {
+                    if (t.flags & TypeFlagsUnion) <> 0
+                    {
+                        ; `t.alias != nil || u.origin != nil` sets TypeFlagsUnion in
+                        ; `includes` upstream; neither can be true here, so the bit
+                        ; is never set and the whole namedUnions block in the worker
+                        ; is unreachable. See UnionTypeData's header.
+                        let sub Checker.union_types_of(t)
+                        if sub <> null
+                            set includes: this.add_types_to_union(type_set, includes, sub as ref[Array[ref[Type]?]])
+                    }
+                    else
+                        set includes: this.add_type_to_union(type_set, includes, t)
+                    set last: t
+                }
+            }
+            set i: i + 1
+        }
+        includes
+    }
+
+    ; ★★★ removeRedundantLiteralTypes, AND THE ONE DIVERGENCE IS THE SHAPE OF THE
+    ; LOOP RATHER THAN OF THE ANSWER. Upstream walks BACKWARD and deletes in place,
+    ; so a later test sees a list that has already shrunk; here the survivors are
+    ; collected in one forward pass. The two agree, and the proof is the ordering
+    ; this chapter is built on:
+    ;   — every condition but the last reads `includes`, which is FIXED before the
+    ;     loop starts, so no deletion can change one;
+    ;   — the last one is `isFreshLiteralType(t) && containsType(types, regularType
+    ;     of t)`, and a fresh literal type is minted FROM its regular one
+    ;     (get_fresh_type_of_literal_type), so its id is larger; the two are equal
+    ;     in flags and in value, so CompareTypes separates them by id alone and the
+    ;     REGULAR one is always at the lower index. A backward pass therefore never
+    ;     deletes a regular type before testing the fresh one that looks for it.
+    ;
+    ; ★ This is where `literal_regular_type_of` gets its FIRST reader — the slot
+    ; slice 71 minted and slice 72 corrected the reader list of, saying in the
+    ; record's own header that it had none.
+    function remove_redundant_literal_types(this, types: ref[Array[ref[Type]?]], includes: int, reduce_void_undefined: bool) returns ref[Array[ref[Type]?]]
+    {
+        let out this.new_type_list(null)
+        let n types.get_length() as int
+        var i 0
+        while i < n
+        {
+            let e types[i]
+            var remove false
+            if e <> null
+            {
+                let t e as ref[Type]
+                let flags t.flags
+                if (flags & (TypeFlagsStringLiteral | TypeFlagsTemplateLiteral | TypeFlagsStringMapping)) <> 0
+                {
+                    if (includes & TypeFlagsString) <> 0
+                        set remove: true
+                }
+                if (flags & TypeFlagsNumberLiteral) <> 0
+                {
+                    if (includes & TypeFlagsNumber) <> 0
+                        set remove: true
+                }
+                if (flags & TypeFlagsBigIntLiteral) <> 0
+                {
+                    if (includes & TypeFlagsBigInt) <> 0
+                        set remove: true
+                }
+                if (flags & TypeFlagsUniqueESSymbol) <> 0
+                {
+                    if (includes & TypeFlagsESSymbol) <> 0
+                        set remove: true
+                }
+                if reduce_void_undefined
+                {
+                    if (flags & TypeFlagsUndefined) <> 0
+                    {
+                        if (includes & TypeFlagsVoid) <> 0
+                            set remove: true
+                    }
+                }
+                if Checker.is_fresh_literal_type(t)
+                {
+                    if this.contains_type(types, Checker.literal_regular_type_of(t))
+                        set remove: true
+                }
+            }
+            if remove = false
+                out.add(e)
+            set i: i + 1
+        }
+        out
+    }
+
+    ; getUnionTypeFromSortedList. The list is assumed sorted and deduplicated,
+    ; which is what add_types_to_union guarantees.
+    function get_union_type_from_sorted_list(this, types: ref[Array[ref[Type]?]], precomputed_object_flags: int) returns ref[Type]?
+    {
+        let n types.get_length() as int
+        if n = 0
+            return never_type
+        if n = 1
+            return types[0]
+        let existing this.find_union_type(types)
+        if existing <> null
+            return existing
+        let t this.new_union_type(precomputed_object_flags | Checker.get_propagating_flags_of_types(types, TypeFlagsNullable), types)
+        ; ★★★ THE ONE LINE THAT MAKES `boolean` A KEYWORD AGAIN. A two-constituent
+        ; union of the two boolean literal types carries TypeFlagsBoolean as well as
+        ; TypeFlagsUnion, which is why type_to_string's Boolean arm — a keyword arm
+        ; standing far above the union arm — catches booleanType before the union
+        ; machinery ever sees it. Without it `boolean` would print as
+        ; `false | true`, on every declaration in the corpus.
+        if n = 2
+        {
+            let e0 types[0]
+            let e1 types[1]
+            if e0 <> null
+            {
+                if e1 <> null
+                {
+                    if ((e0 as ref[Type]).flags & TypeFlagsBooleanLiteral) <> 0
+                    {
+                        if ((e1 as ref[Type]).flags & TypeFlagsBooleanLiteral) <> 0
+                            set t.flags: t.flags | TypeFlagsBoolean
+                    }
+                }
+            }
+        }
+        union_types.add(t)
+        t
+    }
+
+    ; The intern table's lookup — `c.unionTypes[getUnionKey(types, origin, alias)]`
+    ; with the hash replaced by the comparison it stands for. Origin and alias are
+    ; out of the key for the reason UnionTypeData's header gives, so the key is the
+    ; constituent LIST: same length, same types, same order.
+    function find_union_type(this, types: ref[Array[ref[Type]?]]) returns ref[Type]?
+    {
+        let n types.get_length() as int
+        let count union_types.get_length() as int
+        var i 0
+        while i < count
+        {
+            let row union_types[i]
+            if row <> null
+            {
+                let u row as ref[Type]
+                let ts Checker.union_types_of(u)
+                if ts <> null
+                {
+                    let list ts as ref[Array[ref[Type]?]]
+                    if (list.get_length() as int) = n
+                    {
+                        var same true
+                        var j 0
+                        while j < n
+                        {
+                            if list[j] <> types[j]
+                                set same: false
+                            set j: j + 1
+                        }
+                        if same
+                            return u
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        null
+    }
+
+    ; getUnionTypeWorker.
+    function get_union_type_worker(this, types: ref[Array[ref[Type]?]], union_reduction: int) returns ref[Type]?
+    {
+        var type_set this.new_type_list(null)
+        var includes this.add_types_to_union(type_set, 0, types)
+        if union_reduction <> UnionReductionNone
+        {
+            if (includes & TypeFlagsAnyOrUnknown) <> 0
+            {
+                if (includes & TypeFlagsAny) <> 0
+                {
+                    if (includes & TypeFlagsIncludesWildcard) <> 0
+                        return wildcard_type
+                    if (includes & TypeFlagsIncludesError) <> 0
+                        return error_type
+                    return any_type
+                }
+                return unknown_type
+            }
+            if (includes & TypeFlagsUndefined) <> 0
+            {
+                ; If the set holds both undefinedType and missingType, missingType
+                ; goes. The two sort adjacently and in that order because they are
+                ; two intrinsics with identical flags separated by their ids.
+                if (type_set.get_length() as int) >= 2
+                {
+                    let e0 type_set[0]
+                    let e1 type_set[1]
+                    var pair false
+                    if e0 <> null
+                    {
+                        if e1 <> null
+                        {
+                            if (e0 as ref[Type]) = undefined_type
+                            {
+                                if (e1 as ref[Type]) = missing_type
+                                    set pair: true
+                            }
+                        }
+                    }
+                    if pair
+                        set type_set: this.type_list_without(type_set, 1)
+                }
+            }
+            var reduce false
+            if (includes & (TypeFlagsEnum | TypeFlagsLiteral | TypeFlagsUniqueESSymbol | TypeFlagsTemplateLiteral | TypeFlagsStringMapping)) <> 0
+                set reduce: true
+            if (includes & TypeFlagsVoid) <> 0
+            {
+                if (includes & TypeFlagsUndefined) <> 0
+                    set reduce: true
+            }
+            if reduce
+            {
+                var reduce_void_undefined false
+                if (union_reduction & UnionReductionSubtype) <> 0
+                    set reduce_void_undefined: true
+                set type_set: this.remove_redundant_literal_types(type_set, includes, reduce_void_undefined)
+            }
+            ; removeStringLiteralsMatchedByTemplateLiterals. A gate with a report
+            ; rather than a comment, on the same rule get_widened_literal_type's
+            ; inert arms follow: the guard needs a template-literal or
+            ; string-mapping type in the set and neither can be minted here, so the
+            ; report is what will say the argument has broken.
+            if (includes & TypeFlagsStringLiteral) <> 0
+            {
+                if (includes & (TypeFlagsTemplateLiteral | TypeFlagsStringMapping)) <> 0
+                {
+                    this.record_unported("remove-string-literals-matched-by-template-literals", includes)
+                    return null
+                }
+            }
+            ; removeConstrainedTypeVariables, likewise — it needs an intersection.
+            if (includes & TypeFlagsIncludesConstrainedTypeVariable) <> 0
+            {
+                this.record_unported("remove-constrained-type-variables", includes)
+                return null
+            }
+            ; removeSubtypes, whose own body is isTypeSubtypeOf — the assignability
+            ; relation, a dimension of its own. No caller in this port passes
+            ; Subtype today; the ones upstream that do are inference and the array
+            ; literal.
+            if (union_reduction & UnionReductionSubtype) <> 0
+            {
+                this.record_unported("remove-subtypes", includes)
+                return null
+            }
+            if (type_set.get_length() as int) = 0
+            {
+                if (includes & TypeFlagsNull) <> 0
+                {
+                    if (includes & TypeFlagsIncludesNonWideningType) <> 0
+                        return null_type
+                    return null_widening_type
+                }
+                if (includes & TypeFlagsUndefined) <> 0
+                {
+                    if (includes & TypeFlagsIncludesNonWideningType) <> 0
+                        return undefined_type
+                    return undefined_widening_type
+                }
+                return never_type
+            }
+        }
+        ; The namedUnions / origin block stands here upstream and is unreachable —
+        ; `includes` never carries TypeFlagsUnion (UnionTypeData's header). It is
+        ; NOT a gate with a report, because the condition is a property of the
+        ; representation rather than of the input: there is no source text that
+        ; could make it true while `alias` and `origin` have no writer, so a report
+        ; there would be a row that can never appear.
+        var object_flags ObjectFlagsNone
+        if (includes & TypeFlagsNotPrimitiveUnion) = 0
+            set object_flags: ObjectFlagsPrimitiveUnion
+        if (includes & TypeFlagsIntersection) <> 0
+            set object_flags: object_flags | ObjectFlagsContainsIntersections
+        this.get_union_type_from_sorted_list(type_set, object_flags)
+    }
+
+    ; getUnionTypeEx. ★The two-constituent memo the reference keeps in front of the
+    ; worker is not carried and its absence is unobservable — see the union table's
+    ; own note for the proof, which is that the worker is a pure function once alias
+    ; and origin are out of the picture.
+    function get_union_type_ex(this, types: ref[Array[ref[Type]?]], union_reduction: int) returns ref[Type]?
+    {
+        let n types.get_length() as int
+        if n = 0
+            return never_type
+        if n = 1
+            return types[0]
+        this.get_union_type_worker(types, union_reduction)
+    }
+
+    function get_union_type(this, types: ref[Array[ref[Type]?]]) returns ref[Type]?
+        this.get_union_type_ex(types, UnionReductionLiteral)
+
+    ; `c.getUnionType([]*Type{a, b})` — the shape almost every caller in this port
+    ; has, written once so a caller is one line rather than four.
+    function get_union_type_pair(this, a: ref[Type], b: ref[Type]) returns ref[Type]?
+    {
+        let list this.new_type_list(null)
+        list.add(a)
+        list.add(b)
+        this.get_union_type(list)
+    }
+
+    ; getOptionalType. ★Its `debug.Assert(c.strictNullChecks)` holds under this
+    ; harness, so the assertion is a comment rather than a branch.
+    ;
+    ; ★★ THE FIRST TEST IS WHAT MAKES THE INTERN TABLE LOAD-BEARING: `t.Types()[0]
+    ; == missingOrUndefined` is a POINTER comparison against the first constituent,
+    ; and it can only answer yes because the sort puts `undefined` (flags 1 << 2)
+    ; in front of everything but `any` and `unknown`, and because a union minted
+    ; twice would be a different object.
+    function get_optional_type(this, t: ref[Type], is_property: bool) returns ref[Type]?
+    {
+        var missing_or_undefined undefined_type
+        if is_property
+            set missing_or_undefined: undefined_or_missing_type
+        if t = missing_or_undefined
+            return t
+        if (t.flags & TypeFlagsUnion) <> 0
+        {
+            let ts Checker.union_types_of(t)
+            if ts <> null
+            {
+                let list ts as ref[Array[ref[Type]?]]
+                if (list.get_length() as int) > 0
+                {
+                    let f list[0]
+                    if f <> null
+                    {
+                        if (f as ref[Type]) = missing_or_undefined
+                            return t
+                    }
+                }
+            }
+        }
+        this.get_union_type_pair(t, missing_or_undefined)
+    }
+
+    ; ★★★ formatUnionTypes — THE PRINTER'S HALF, AND IT IS WHY THIS SLICE CAN SHOW
+    ; ANYTHING AT ALL. Minting a union without it moves a unit's stop from
+    ; `get-union-type` to `type-to-string` and buys nothing: the T section is
+    ; emitted only for a unit whose check COMPLETES, so a type nobody can name is a
+    ; type nobody can measure. This is the transformation the nodebuilder applies
+    ; before it builds a UnionTypeNode — it collapses a boolean-literal pair back
+    ; into `boolean`, collapses an enum's members back into the enum, and moves
+    ; `null` and `undefined` to the END of the printed list wherever they occur.
+    ;
+    ; ★ `expandingEnum` is FALSE at the one call site this port has: it is set only
+    ; in the nodebuilder's enum-expansion branch, which is behind shouldExpandType
+    ; and a symbol-named type, and the enum arm below reports before that can
+    ; matter.
+    function format_union_types(this, types: ref[Array[ref[Type]?]]) returns ref[Array[ref[Type]?]]?
+    {
+        let out this.new_type_list(null)
+        var flags 0
+        let n types.get_length() as int
+        var i 0
+        while i < n
+        {
+            let e types[i]
+            if e = null
+                return null
+            let t e as ref[Type]
+            set flags: flags | t.flags
+            ; The reference's `i += count - 1; continue` inside a `for` with its own
+            ; `i++`; here the step is carried out of the arm instead, because a
+            ; `continue` in this loop would skip the increment rather than perform
+            ; the reference's TWO.
+            var step 1
+            if (t.flags & TypeFlagsNullable) = 0
+            {
+                var collapse false
+                if (t.flags & TypeFlagsBooleanLiteral) <> 0
+                    set collapse: true
+                if (t.flags & TypeFlagsEnumLike) <> 0
+                {
+                    ; getBaseTypeOfEnumLikeType — getDeclaredTypeOfSymbol of the
+                    ; member's parent, which is the enum chapter. The same tag
+                    ; get_widened_literal_type's enum arm already carries.
+                    this.record_unported("get-base-type-of-enum-like-type", t.flags)
+                    return null
+                }
+                if collapse
+                {
+                    ; ★★ A DEAD GUARD, AND IT IS SAID SO RATHER THAN LEFT TO BE
+                    ; RE-DERIVED. `boolean_type` is minted by
+                    ; initialize_intrinsic_types out of two boolean LITERAL types,
+                    ; and no arm of get_union_type_worker can stop on that input —
+                    ; the reduction it takes is removeRedundantLiteralTypes, which
+                    ; removes neither of them, and every gate below it needs a flag
+                    ; a boolean literal does not carry. So this cannot answer null,
+                    ; which is why it is a `return null` and not a stop: a nil with
+                    ; no stop would be a claim, and control h04 (booleanType forced
+                    ; null) is what shows the shape of that claim — **diagcheck RED
+                    ; 18 by INVENTION**.
+                    if boolean_type = null
+                        return null
+                    let base boolean_type as ref[Type]
+                    if (base.flags & TypeFlagsUnion) <> 0
+                    {
+                        let bl Checker.union_types_of(base)
+                        if bl <> null
+                        {
+                            let blist bl as ref[Array[ref[Type]?]]
+                            let count blist.get_length() as int
+                            if (i + count) <= n
+                            {
+                                let last_here types[i + count - 1]
+                                let last_there blist[count - 1]
+                                ; `match` is a reserved word here (see CLAUDE.md's
+                                ; list beside init/label/loop/shared).
+                                var matched false
+                                if last_here <> null
+                                {
+                                    if last_there <> null
+                                    {
+                                        let ra this.get_regular_type_of_literal_type(last_here as ref[Type])
+                                        let rb this.get_regular_type_of_literal_type(last_there as ref[Type])
+                                        if ra <> null
+                                        {
+                                            if ra = rb
+                                                set matched: true
+                                        }
+                                    }
+                                }
+                                if matched
+                                {
+                                    out.add(base)
+                                    set step: count
+                                }
+                            }
+                        }
+                    }
+                }
+                if step = 1
+                    out.add(t)
+            }
+            set i: i + step
+        }
+        if (flags & TypeFlagsNull) <> 0
+            out.add(null_type)
+        if (flags & TypeFlagsUndefined) <> 0
+            out.add(undefined_type)
+        out
+    }
+
+    ; getRegularTypeOfLiteralType, for the two arms this port can answer. Its UNION
+    ; arm is `mapType` over the constituents memoised on the union, and both halves
+    ; of that are a chapter away — the memo slot is named in UnionTypeData's header
+    ; and the walk carries the `map-type` tag get_widened_literal_type already uses.
+    function get_regular_type_of_literal_type(this, t: ref[Type]) returns ref[Type]?
+    {
+        if (t.flags & TypeFlagsFreshable) <> 0
+            return Checker.literal_regular_type_of(t)
+        if (t.flags & TypeFlagsUnion) <> 0
+        {
+            this.record_unported("map-type", t.flags)
+            return null
+        }
+        t
+    }
+
     ; NewChecker's intrinsic block. The order is the reference's, because the type
     ; ids are assigned along it.
     ;
@@ -7027,15 +8551,6 @@ define Checker
         set string_type: this.new_intrinsic_type(TypeFlagsString, "string")
         set number_type: this.new_intrinsic_type(TypeFlagsNumber, "number")
         set bigint_type: this.new_intrinsic_type(TypeFlagsBigInt, "bigint")
-        set es_symbol_type: this.new_intrinsic_type(TypeFlagsESSymbol, "symbol")
-        set void_type: this.new_intrinsic_type(TypeFlagsVoid, "void")
-        set never_type: this.new_intrinsic_type(TypeFlagsNever, "never")
-        set silent_never_type: this.new_intrinsic_type_ex(TypeFlagsNever, "never", ObjectFlagsNonInferrableType)
-        set implicit_never_type: this.new_intrinsic_type(TypeFlagsNever, "never")
-        set unreachable_never_type: this.new_intrinsic_type(TypeFlagsNever, "never")
-        set non_primitive_type: this.new_intrinsic_type(TypeFlagsNonPrimitive, "object")
-        ; Special `never` flagged by union reduction to behave as a literal.
-        set unique_literal_type: this.new_intrinsic_type(TypeFlagsNever, "never")
 
         ; ★★★ THE BOOLEAN PAIR IS BUILT HERE AND IN THE REFERENCE'S OWN ORDER,
         ; which is REGULAR then FRESH and then two writes that close the cycle —
@@ -7043,8 +8558,15 @@ define Checker
         ; `falseType.freshType = falseType`. It is the one literal type
         ; getFreshTypeOfLiteralType never mints, so the eight lines below are the
         ; only place in this port where that function's postcondition is
-        ; established by hand. ★Six lines of NewChecker are transcribed and the
-        ; SEVENTH is not: `c.booleanType = c.getUnionType(...)` needs a union.
+        ; established by hand.
+        ;
+        ; ★★★ SLICE 94 MOVES THE BLOCK AND ADDS THE SEVENTH LINE. Slice 71 wrote
+        ; the six after uniqueLiteralType, at the END of this procedure, because
+        ; `c.booleanType = c.getUnionType(...)` could not follow them and a block
+        ; whose last line is missing has no natural place. Both halves are here
+        ; now, in NewChecker's own position — which is what keeps the type IDS in
+        ; the reference's order through the whole intrinsic run, the one property
+        ; this procedure's header says the order is for.
         set regular_false_type: this.new_literal_type(TypeFlagsBooleanLiteral, null, 0, 0 as u64, false, false, null)
         set false_type: this.new_literal_type(TypeFlagsBooleanLiteral, null, 0, 0 as u64, false, false, regular_false_type)
         Checker.set_literal_fresh_type(regular_false_type, false_type)
@@ -7053,6 +8575,32 @@ define Checker
         set true_type: this.new_literal_type(TypeFlagsBooleanLiteral, null, 0, 0 as u64, false, true, regular_true_type)
         Checker.set_literal_fresh_type(regular_true_type, true_type)
         Checker.set_literal_fresh_type(true_type, true_type)
+        ; c.booleanType. The FIRST union this port mints, and the first type here
+        ; whose creation runs code rather than a constructor.
+        set boolean_type: this.get_union_type_pair(regular_false_type, regular_true_type)
+
+        set es_symbol_type: this.new_intrinsic_type(TypeFlagsESSymbol, "symbol")
+        set void_type: this.new_intrinsic_type(TypeFlagsVoid, "void")
+        set never_type: this.new_intrinsic_type(TypeFlagsNever, "never")
+        set silent_never_type: this.new_intrinsic_type_ex(TypeFlagsNever, "never", ObjectFlagsNonInferrableType)
+        set implicit_never_type: this.new_intrinsic_type(TypeFlagsNever, "never")
+        set unreachable_never_type: this.new_intrinsic_type(TypeFlagsNever, "never")
+        set non_primitive_type: this.new_intrinsic_type(TypeFlagsNonPrimitive, "object")
+        ; ★★ THE FOUR OTHER INTRINSIC UNIONS STAND HERE UPSTREAM AND ARE NOT MINTED
+        ; — stringOrNumberType, stringNumberSymbolType, numberOrBigIntType and
+        ; templateConstraintType — and slice 94 could mint every one of them in a
+        ; line. §3.5be is why it does not: each is read by a checkTypeAssignableTo
+        ; call site, i.e. by the assignability relation, which reports; a field with
+        ; no reader is a claim about the future. ★numericStringType between them
+        ; needs getTemplateLiteralType and is a second reason the same line is not
+        ; written.
+        ;
+        ; ★ Their absence shifts the type IDS of everything below by five against
+        ; the reference's numbering and nothing observes that — the dump prints a
+        ; type's STRING (see Type's note) and CompareTypes' id fallback only ever
+        ; compares types this port made, whose RELATIVE order is the reference's.
+        ; Special `never` flagged by union reduction to behave as a literal.
+        set unique_literal_type: this.new_intrinsic_type(TypeFlagsNever, "never")
 
         ; ★★ c.emptyTypeLiteralType, slice 80, and it stands where the reference
         ; puts it — between the marker types it is the only one of, so the ids of
@@ -7174,16 +8722,16 @@ define Checker
             return Checker.write_keyword(out, "number")
         if (t.flags & TypeFlagsBigInt) <> 0
             return Checker.write_keyword(out, "bigint")
-        ; `t.flags&Boolean != 0 && t.alias == nil` — booleanType is a UNION of the
-        ; two boolean literals, so this arm needs getUnionType before it can ever
-        ; be entered, and no boolean type exists here to enter it with. ★Slice 71
-        ; makes the two boolean LITERAL types and still not this one, which is why
-        ; the arm four below it is live and this one is not.
+        ; `t.flags&Boolean != 0 && t.alias == nil`. ★★★ THE ARM IS LIVE SINCE
+        ; SLICE 94 AND IT IS THE REASON THE UNION CHAPTER SETS TypeFlagsBoolean ON
+        ; A TWO-BOOLEAN-LITERAL UNION AT ALL: booleanType IS a union, and it
+        ; reaches this keyword long before the union arm at the tail — which is
+        ; what keeps `boolean` from printing as `false | true`. ★The second
+        ; conjunct is `t.alias == nil`, which is not carried and is always true
+        ; here (see Type's note); a type ALIASED to a boolean would print its alias
+        ; upstream, and that divergence is typeToString's alias arm, not this one.
         if (t.flags & TypeFlagsBoolean) <> 0
-        {
-            this.record_unported("type-to-string-boolean", 0)
-            return false
-        }
+            return Checker.write_keyword(out, "boolean")
         if (t.flags & TypeFlagsEnumLike) <> 0
         {
             this.record_unported("type-to-string-enum", 0)
@@ -7244,9 +8792,63 @@ define Checker
             return Checker.write_keyword(out, "symbol")
         if (t.flags & TypeFlagsNonPrimitive) <> 0
             return Checker.write_keyword(out, "object")
+        ; ★★★ THE UNION ARM, SLICE 94 — the first arm of this printer that composes
+        ; a name out of OTHER NAMES, and the point at which the two halves of the
+        ; checker dimension stop being cut at the same place. This table's own
+        ; header draws the boundary at *"an arm here whose result the T section
+        ; cannot print would move a unit from an honest UNPORTED to a FAIL"*, and
+        ; the union chapter is the first one that had to bring the printer with it:
+        ; minting `string | undefined` without being able to NAME it moves a unit's
+        ; stop from `get-union-type` to `type-to-string` and buys nothing at all.
+        ;
+        ; ★★ IT IS THREE STEPS OF nodebuilderimpl AND NOT ONE. The origin
+        ; substitution in front of the arm is the identity here (origin has no
+        ; writer — UnionTypeData's header); formatUnionTypes is the real
+        ; transformation and is written; and `len(types) == 1` after it recurses on
+        ; the single constituent rather than printing a one-member union, which is
+        ; how `boolean | undefined` comes out in the reference's order.
+        ;
+        ; ★★ THE PRINTER'S PARENTHESIZATION IS THE IDENTITY FOR EVERY TYPE THIS
+        ; PORT CAN NAME, and that is a containment proof rather than an omission:
+        ; parenthesizeConstituentTypeOfUnionType wraps a function, constructor,
+        ; conditional, infer or nested union type node, and the only constituents
+        ; reachable here are the keyword and literal arms above. The separator is
+        ; the emitter's ` | `.
+        if (t.flags & TypeFlagsUnion) <> 0
+        {
+            let ts Checker.union_types_of(t)
+            if ts = null
+            {
+                this.record_unported("type-to-string", t.flags)
+                return false
+            }
+            let formatted this.format_union_types(ts as ref[Array[ref[Type]?]])
+            if formatted = null
+                return false
+            let list formatted as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            if n = 1
+                return this.type_to_string(list[0], out)
+            if n = 0
+            {
+                ; `typeNodes` empty — upstream this sets encounteredError and
+                ; answers nil, i.e. no name at all.
+                this.record_unported("type-to-string-empty-union", t.flags)
+                return false
+            }
+            var i 0
+            while i < n
+            {
+                if i > 0
+                    out.append(" | ")
+                if this.type_to_string(list[i], out) = false
+                    return false
+                set i: i + 1
+            }
+            return true
+        }
         ; Everything past this point is the this-type, the alias, and the object /
-        ; union / intersection / instantiable machinery — the rest of
-        ; nodebuilderimpl.
+        ; intersection / instantiable machinery — the rest of nodebuilderimpl.
         this.record_unported("type-to-string", t.flags)
         false
     }
@@ -9092,93 +10694,13 @@ define Checker
     ; is worth more than eight saved zeroes.
     ; ── slice 91: the IDENTIFIER ─────────────────────────────────────────────
     ;
-    ; ast.GetAssignmentTarget, whole. Its `for` is a CLIMB and not a search: the
-    ; four kinds in the middle arm hand the question to the parent, the rest answer.
-    function get_assignment_target(node: ref[AstNode]) returns ref[AstNode]?
-    {
-        var n: ref[AstNode]? node
-        while n <> null
-        {
-            let parent AstNode.parent_node_of(n as ref[AstNode])
-            if parent = null
-                return null
-            let pn parent as ref[AstNode]
-            let pk AstNode.kind_of(pn)
-            if pk = KindBinaryExpression
-            {
-                if Parser.is_assignment_operator(AstNode.binary_operator_kind(pn))
-                {
-                    if AstNode.binary_left_of(pn) = n
-                        return pn
-                }
-                return null
-            }
-            if pk = KindPrefixUnaryExpression
-            {
-                let op AstNode.prefix_unary_operator_kind(pn)
-                if op = KindPlusPlusToken
-                    return pn
-                if op = KindMinusMinusToken
-                    return pn
-                return null
-            }
-            ; ★★ THE POSTFIX ARM'S TEST IS CONSTANT AND THE PORT SAYS SO RATHER
-            ; THAN ASKING. `PostfixUnaryExpression` shares WrappedTypeData with a
-            ; dozen one-child nodes (§3.5bb) and stores no operator kind — and it
-            ; needs none: the grammar admits exactly `++` and `--` after an
-            ; operand, so the reference's `op == ++ || op == --` is true for every
-            ; node that can reach this line. ★If a third postfix operator is ever
-            ; added, the record grows a slot and this is the line that has to ask.
-            if pk = KindPostfixUnaryExpression
-                return pn
-            var for_in_or_of false
-            if pk = KindForInStatement
-                set for_in_or_of: true
-            if pk = KindForOfStatement
-                set for_in_or_of: true
-            if for_in_or_of
-            {
-                if AstNode.initializer_of(pn) = n
-                    return pn
-                return null
-            }
-            var climbs false
-            if pk = KindParenthesizedExpression
-                set climbs: true
-            if pk = KindArrayLiteralExpression
-                set climbs: true
-            if pk = KindSpreadElement
-                set climbs: true
-            if pk = KindNonNullExpression
-                set climbs: true
-            if climbs
-            {
-                set n: pn
-                continue
-            }
-            if pk = KindSpreadAssignment
-            {
-                set n: AstNode.parent_node_of(pn)
-                continue
-            }
-            if pk = KindShorthandPropertyAssignment
-            {
-                if AstNode.name_of(pn) <> n
-                    return null
-                set n: AstNode.parent_node_of(pn)
-                continue
-            }
-            if pk = KindPropertyAssignment
-            {
-                if AstNode.name_of(pn) = n
-                    return null
-                set n: AstNode.parent_node_of(pn)
-                continue
-            }
-            return null
-        }
-        null
-    }
+    ; ★ ast.GetAssignmentTarget MOVED TO binder.scaly IN SLICE 92. Its second
+    ; reader is bindBinaryExpressionFlow (`IsAssignmentOperator(op) &&
+    ; !IsAssignmentTarget(node)`), and the binder is declared before the checker.
+    ; It does not go to ast.scaly with its neighbour above, because it asks
+    ; `Parser.is_assignment_operator` and `ast` is declared before `parser` — the
+    ; one place where this port's module order and the reference's file layout
+    ; disagree, and the binder is where they meet.
 
     ; getAssignmentTargetKind. ★The reference's default arm PANICS ("Unhandled
     ; case"); it is unreachable by construction — the target can only be one of the
@@ -9186,7 +10708,7 @@ define Checker
     ; rather than reporting, the way try_get_declared_type_of_symbol's tail does.
     function get_assignment_target_kind(node: ref[AstNode]) returns int
     {
-        let target Checker.get_assignment_target(node)
+        let target Binder.get_assignment_target(node)
         if target = null
             return AssignmentKindNone
         let t target as ref[AstNode]
@@ -9222,7 +10744,7 @@ define Checker
 
     function is_in_compound_like_assignment(node: ref[AstNode]) returns bool
     {
-        let target Checker.get_assignment_target(node)
+        let target Binder.get_assignment_target(node)
         if target = null
             return false
         let t target as ref[AstNode]
@@ -9483,6 +11005,1367 @@ define Checker
         this.get_type_of_symbol(symbol)
     }
 
+    ; The FLOWPIN's one writer.
+    procedure trace_flow(this, kind: int, a: int, b: int)
+    {
+        let ev host.allocate(sizeof FlowTraceEvent, alignof FlowTraceEvent) as pointer[FlowTraceEvent]
+        set *ev: FlowTraceEvent(kind, a, b)
+        flow_trace.add(ev as ref[FlowTraceEvent])
+    }
+
+    ; ══ slice 93 — THE FLOW WALK ═══════════════════════════════════════════
+    ;
+    ; getFlowTypeOfReference and the graph walk under it: the checker's walk
+    ; BACKWARD through the graph slice 92 built, and the row slice 92 named as its
+    ; successor. Its two callers are `flow-graph 79` (checkIdentifier's tail) and
+    ; `flow-graph 264` (checkPropertyInitialization); only the first is wired
+    ; here, and the reason is at the caller.
+    ;
+    ; ★★★ WHAT THIS SLICE DOES **NOT** PORT IS ONE THING WEARING SEVEN NAMES, AND
+    ; NAMING IT ONCE IS WORTH MORE THAN SEVEN STOPS: `getUnionType`. A branch
+    ; label unions its antecedents, a loop label unions them again through a
+    ; cache keyed on a reference HASH, `getOptionalType` unions with undefined,
+    ; `getAssignmentReducedType` reduces one, the evolving-array family builds one
+    ; per element, and narrowType's whole job is to produce one. The seven stops
+    ; below are seven doors into that room. ★It is why the class caller cannot be
+    ; wired: isPropertyInitializedInConstructor's initial type is
+    ; `getOptionalType(propType, false)`.
+    ;
+    ; ★★ WHAT DOES ANSWER, THEN, AND IT IS NOT A REMNANT: the reference of a
+    ; variable whose declared type is not a union, reached over straight-line
+    ; flow, over an assignment to itself, over a junction whose antecedents agree,
+    ; or from the top of its own container. That is the shape most code has.
+
+    ; ast.IsAssignmentExpression(node, excludeCompoundAssignment: FALSE) — the
+    ; second polarity, and the one isMatchingReference's target arm asks for. The
+    ; first is already in this file under its own name; the two differ by exactly
+    ; the compound operators, so they are two functions rather than one with a
+    ; flag, which is §3.9e's treatment of the same shape.
+    function is_assignment_expression_including_compound(node: ref[AstNode]) returns bool
+    {
+        if AstNode.kind_of(node) <> KindBinaryExpression
+            return false
+        if Parser.is_assignment_operator(AstNode.binary_operator_kind(node)) = false
+            return false
+        Parser.is_left_hand_side_expression_kind(Checker.kind_or_unknown(AstNode.binary_left_of(node)))
+    }
+
+    ; ast.IsFunctionExpressionOrArrowFunction.
+    function is_function_expression_or_arrow_function(node: ref[AstNode]) returns bool
+    {
+        let k AstNode.kind_of(node)
+        if k = KindFunctionExpression
+            return true
+        k = KindArrowFunction
+    }
+
+    ; getFlowNodeOfNode. Slice 92's finding five measured the `FlowNodeData() !=
+    ; nil` guard VACUOUS in this port — every node carries the slot — so what is
+    ; left of the function is the slot read, and the guard is not written.
+    function get_flow_node_of_node(node: ref[AstNode]?) returns ref[FlowNode]?
+        AstNode.flow_node_of(node)
+
+    ; convertAutoToAny. The autoArrayType arm CANNOT BE ASKED here and that is a
+    ; containment proof rather than an omission: `c.autoArrayType` is
+    ; `createArrayType(c.autoType)`, which needs the global `Array` symbol, which
+    ; is the globals table (§3.11). Nothing in this port mints it, so no type in
+    ; the run is equal to it, so the arm is written as the sentence you are
+    ; reading.
+    function convert_auto_to_any(this, t: ref[Type]?) returns ref[Type]?
+    {
+        if t = null
+            return null
+        if (t as ref[Type]) = auto_type
+            return any_type
+        t
+    }
+
+    ; c.flowNodeReachable[flow] — the LOOKUP, and it is deliberately not the
+    ; mint-on-miss reader the other six tables in this file use. Those answer a
+    ; row whose fields start empty and mean *not yet computed*; this one's payload
+    ; is a BOOL, where an absent row and a row holding false are different facts
+    ; and a mint-on-miss reader could not tell them apart.
+    function flow_reachable_lookup(this, flow: ref[FlowNode]) returns ref[FlowReachableLink]?
+    {
+        let len flow_node_reachable.get_length() as int
+        var i 0
+        while i < len
+        {
+            let row flow_node_reachable[i]
+            if row <> null
+            {
+                let r row as ref[FlowReachableLink]
+                if r.flow = flow
+                    return r
+            }
+            set i: i + 1
+        }
+        null
+    }
+
+    ; getBranchLabelAntecedents — the reduce-label stack read from the HEAD, which
+    ; is the reference's backward walk over its array; see ReduceLabelStack's own
+    ; note for why the head is the last push.
+    function get_branch_label_antecedents(flow: ref[FlowNode], reduce_labels: ref[ReduceLabelStack]?) returns ref[FlowList]?
+    {
+        var cur reduce_labels
+        while cur <> null
+        {
+            let c cur as ref[ReduceLabelStack]
+            if AstNode.flow_reduce_target_of(c.data) = flow
+                return AstNode.flow_reduce_antecedents_of(c.data)
+            set cur: c.next
+        }
+        flow.antecedents
+    }
+
+    ; isReachableFlowNode. The one-entry cache is written here rather than in the
+    ; worker, exactly as upstream: the worker recurses and would otherwise
+    ; overwrite the entry with an inner question's answer.
+    function is_reachable_flow_node(this, flow: ref[FlowNode]) returns bool
+    {
+        let result this.is_reachable_flow_node_worker(null, flow, false)
+        set last_flow_node: flow
+        set last_flow_node_reachable: result
+        result
+    }
+
+    ; isReachableFlowNodeWorker. A pure walk over the GRAPH — no type is asked for
+    ; anywhere in it except through getEffectsSignature, which is a stop — so this
+    ; is the half of the flow chapter that needs nothing the checker cannot
+    ; already answer.
+    ;
+    ; ★ The reference takes a `*FlowState` and reads exactly one field of it; the
+    ; stack itself is the parameter here.
+    function is_reachable_flow_node_worker(this, reduce_labels: ref[ReduceLabelStack]?, flow_in: ref[FlowNode], no_cache_check_in: bool) returns bool
+    {
+        var flow flow_in
+        var no_cache_check no_cache_check_in
+        repeat
+        {
+            if last_flow_node <> null
+            {
+                if (last_flow_node as ref[FlowNode]) = flow
+                    return last_flow_node_reachable
+            }
+            let flags flow.flags
+            if (flags & FlowFlagsShared) <> 0
+            {
+                if no_cache_check = false
+                {
+                    let hit this.flow_reachable_lookup(flow)
+                    if hit <> null
+                        return (hit as ref[FlowReachableLink]).reachable
+                    let reachable this.is_reachable_flow_node_worker(reduce_labels, flow, true)
+                    let made host.allocate(sizeof FlowReachableLink, alignof FlowReachableLink) as pointer[FlowReachableLink]
+                    set *made: FlowReachableLink(flow, reachable)
+                    flow_node_reachable.add(made)
+                    return reachable
+                }
+                set no_cache_check: false
+            }
+            var advance false
+            if (flags & (FlowFlagsAssignment | FlowFlagsCondition | FlowFlagsArrayMutation)) <> 0
+                set advance: true
+            if advance = false
+            {
+                if (flags & FlowFlagsCall) <> 0
+                {
+                    ; getEffectsSignature — the assertion half of the graph, and
+                    ; the first of this slice's seven doors. Two of its three
+                    ; branches END the walk (an `asserts x` whose argument is
+                    ; provably false, and a callee returning never), so guessing
+                    ; *no effects* here would answer REACHABLE where the reference
+                    ; answers unreachable, which is the direction that invents.
+                    this.record_unported("get-effects-signature", Checker.kind_or_unknown(flow.node))
+                    return true
+                }
+            }
+            if advance = false
+            {
+                if (flags & FlowFlagsBranchLabel) <> 0
+                {
+                    ; "A branching point is reachable if any branch is reachable."
+                    var list Checker.get_branch_label_antecedents(flow, reduce_labels)
+                    while list <> null
+                    {
+                        let l list as ref[FlowList]
+                        if l.flow <> null
+                        {
+                            if this.is_reachable_flow_node_worker(reduce_labels, l.flow as ref[FlowNode], false)
+                                return true
+                        }
+                        set list: l.next
+                    }
+                    return false
+                }
+            }
+            if advance = false
+            {
+                if (flags & FlowFlagsLoopLabel) <> 0
+                {
+                    let ants flow.antecedents
+                    if ants = null
+                        return false
+                    ; "A loop is reachable if the control flow path that leads to
+                    ; the top is reachable" — the FIRST antecedent, which slice
+                    ; 92's h12 measured to be the non-looping one by construction.
+                    set flow: (ants as ref[FlowList]).flow as ref[FlowNode]
+                    continue
+                }
+            }
+            if advance = false
+            {
+                if (flags & FlowFlagsSwitchClause) <> 0
+                {
+                    if AstNode.flow_clause_start_of(flow.node) = AstNode.flow_clause_end_of(flow.node)
+                    {
+                        ; isExhaustiveSwitchStatement — the second door. It asks
+                        ; getTypeOfExpression of the switch subject and compares
+                        ; against every clause's literal type, i.e. the union
+                        ; machinery again.
+                        this.record_unported("is-exhaustive-switch-statement", KindSwitchStatement)
+                        return true
+                    }
+                    set advance: true
+                }
+            }
+            if advance = false
+            {
+                if (flags & FlowFlagsReduceLabel) <> 0
+                {
+                    ; "Cache is unreliable once we start adjusting labels."
+                    set last_flow_node: null
+                    let cell host.allocate(sizeof ReduceLabelStack, alignof ReduceLabelStack) as pointer[ReduceLabelStack]
+                    set *cell: ReduceLabelStack(flow.node, reduce_labels)
+                    return this.is_reachable_flow_node_worker(cell, flow.antecedent as ref[FlowNode], false)
+                }
+            }
+            if advance = false
+                return (flags & FlowFlagsUnreachable) = 0
+            set flow: flow.antecedent as ref[FlowNode]
+        }
+    }
+
+    ; ── the reference-matching family ───────────────────────────────────────
+
+    ; isMatchingReference, taken to the ONE source kind this port can hand it.
+    ;
+    ; ★★★ THE FIVE SOURCE ARMS BELOW THE IDENTIFIER HAVE ZERO INPUT AND THAT IS A
+    ; CONTAINMENT PROOF, NOT A GAP. The reference is whatever the CALLER passes,
+    ; and this slice wires one caller: checkIdentifier, which passes the
+    ; identifier. The other producer of a reference is
+    ; isPropertyInitializedInConstructor, which synthesizes `this.p` — and it is
+    ; behind getOptionalType, i.e. behind the union wall. So a property access, an
+    ; element access, a qualified name and a meta property cannot arrive here
+    ; until that row lands, and §3.5be says the day it lands is the day they are
+    ; written. ★They are a STOP rather than a `false`, because answering false
+    ; would make a real assignment invisible to the walk, silently.
+    function is_matching_reference(this, source: ref[AstNode], target: ref[AstNode]) returns bool
+    {
+        let tk AstNode.kind_of(target)
+        if tk = KindParenthesizedExpression
+        {
+            let e AstNode.expression_of(target)
+            if e = null
+                return false
+            return this.is_matching_reference(source, e as ref[AstNode])
+        }
+        if tk = KindNonNullExpression
+        {
+            let e AstNode.expression_of(target)
+            if e = null
+                return false
+            return this.is_matching_reference(source, e as ref[AstNode])
+        }
+        if tk = KindBinaryExpression
+        {
+            if Checker.is_assignment_expression_including_compound(target)
+            {
+                let l AstNode.binary_left_of(target)
+                if l <> null
+                {
+                    if this.is_matching_reference(source, l as ref[AstNode])
+                        return true
+                }
+            }
+            if AstNode.binary_operator_kind(target) = KindCommaToken
+            {
+                let r AstNode.binary_right_of(target)
+                if r <> null
+                    return this.is_matching_reference(source, r as ref[AstNode])
+            }
+            return false
+        }
+        let sk AstNode.kind_of(source)
+        if sk = KindThisKeyword
+            return tk = KindThisKeyword
+        if sk = KindSuperKeyword
+            return tk = KindSuperKeyword
+        if sk = KindNonNullExpression
+        {
+            let e AstNode.expression_of(source)
+            if e = null
+                return false
+            return this.is_matching_reference(e as ref[AstNode], target)
+        }
+        if sk = KindParenthesizedExpression
+        {
+            let e AstNode.expression_of(source)
+            if e = null
+                return false
+            return this.is_matching_reference(e as ref[AstNode], target)
+        }
+        if sk = KindSatisfiesExpression
+        {
+            let e AstNode.expression_of(source)
+            if e = null
+                return false
+            return this.is_matching_reference(e as ref[AstNode], target)
+        }
+        if sk = KindMetaProperty
+        {
+            this.record_unported("is-matching-reference-source", sk)
+            return false
+        }
+        ; ★★★ THE PROPERTY-ACCESS ARM, SLICE 94, AND IT IS THE ONE SLICE 93
+        ; PREDICTED. Its note said the five arms below the identifier *"have ZERO
+        ; input and that is a containment proof, not a gap ... a property access, an
+        ; element access, a qualified name and a meta property cannot arrive here
+        ; until that row lands, and §3.5be says the day it lands is the day they are
+        ; written"*. checkPropertyInitialization is that row and it synthesizes
+        ; exactly one shape — `this.p` — so exactly one of the four is written and
+        ; the other three still have no producer.
+        ;
+        ; ★★ THE SHARED HALF IS `IsAccessExpression(target)` AND NOT
+        ; `IsPropertyAccessExpression`: `this.p = x` and `this["p"] = x` initialize
+        ; the same property, and the reference compares the accessed NAMES rather
+        ; than the syntax. The element-access side of getAccessedPropertyName is
+        ; where this port stops, so an element-access TARGET is a stop rather than a
+        ; false — a wrong `false` would make a real assignment invisible to the
+        ; walk, silently, which is the hazard slice 93 named for these arms.
+        if sk = KindPropertyAccessExpression
+        {
+            if Parser.is_access_expression(target)
+            {
+                var source_name: pointer[char] null
+                var source_len 0
+                if this.get_accessed_property_name(source, &source_name, &source_len) = false
+                    return false
+                var target_name: pointer[char] null
+                var target_len 0
+                if this.get_accessed_property_name(target, &target_name, &target_len) = false
+                    return false
+                if source_len <> target_len
+                    return false
+                if Checker.text_equals(source_name, target_name, source_len) = false
+                    return false
+                let se AstNode.expression_of(source)
+                let te AstNode.expression_of(target)
+                if se = null
+                    return false
+                if te = null
+                    return false
+                return this.is_matching_reference(se as ref[AstNode], te as ref[AstNode])
+            }
+            return false
+        }
+        if sk = KindElementAccessExpression
+        {
+            this.record_unported("is-matching-reference-source", sk)
+            return false
+        }
+        if sk = KindQualifiedName
+        {
+            this.record_unported("is-matching-reference-source", sk)
+            return false
+        }
+        var is_name false
+        if sk = KindIdentifier
+            set is_name: true
+        if sk = KindPrivateIdentifier
+            set is_name: true
+        if is_name = false
+            return false
+        if Checker.is_this_in_type_query(source)
+            return tk = KindThisKeyword
+        if tk = KindIdentifier
+        {
+            if this.get_resolved_symbol(source) = this.get_resolved_symbol(target)
+                return true
+        }
+        var target_declares false
+        if tk = KindVariableDeclaration
+            set target_declares: true
+        if tk = KindBindingElement
+            set target_declares: true
+        if target_declares = false
+            return false
+        let exported this.get_export_symbol_of_value_symbol_if_exported(this.get_resolved_symbol(source))
+        if exported = null
+            return false
+        let td this.symbol_of_declaration(target)
+        if td = null
+            return false
+        (exported as ref[Symbol]) = (td as ref[Symbol])
+    }
+
+    ; ★★ getAccessedPropertyName, FOR THE ONE ARM THIS PORT CAN ANSWER. Upstream it
+    ; answers a `(string, bool)` pair over four access shapes; here the name is a
+    ; BORROWED run of source bytes and a length written through two out-cells, and
+    ; the bool is the answer — the same shape type_to_string's caller-owns-the-
+    ; buffer rule produces, and for the same reason: every name that reaches here is
+    ; an identifier's text on the page the parse owns.
+    ;
+    ; ★ The three arms that report are the three with no producer in this slice.
+    ; The element-access one is the sharp one: it is not a syntax question but
+    ; tryGetElementAccessExpressionName, a literal/entity-name fork over the
+    ; argument expression, and answering `false` for it would be a claim rather than
+    ; a stop (see is_matching_reference's arm).
+    function get_accessed_property_name(this, access: ref[AstNode], out_data: ref[pointer[char]], out_len: ref[int]) returns bool
+    {
+        let k AstNode.kind_of(access)
+        if k = KindPropertyAccessExpression
+        {
+            let n AstNode.name_of(access)
+            if n = null
+                return false
+            let name n as ref[AstNode]
+            set out_data: AstNode.identifier_text_of(name)
+            set out_len: AstNode.identifier_text_length_of(name)
+            return true
+        }
+        if k = KindElementAccessExpression
+        {
+            this.record_unported("try-get-element-access-expression-name", k)
+            return false
+        }
+        if k = KindBindingElement
+        {
+            this.record_unported("get-destructuring-property-name", k)
+            return false
+        }
+        if k = KindParameter
+        {
+            this.record_unported("accessed-property-name-parameter", k)
+            return false
+        }
+        false
+    }
+
+    ; containsMatchingReference — the dotted prefix walk.
+    function contains_matching_reference(this, source: ref[AstNode], target: ref[AstNode]) returns bool
+    {
+        var s source
+        while Parser.is_access_expression(s)
+        {
+            let e AstNode.expression_of(s)
+            if e = null
+                return false
+            set s: e as ref[AstNode]
+            if this.is_matching_reference(s, target)
+                return true
+        }
+        false
+    }
+
+    ; optionalChainContainsReference — the same walk over the OPTIONAL chain.
+    function optional_chain_contains_reference(this, source: ref[AstNode], target: ref[AstNode]) returns bool
+    {
+        var s source
+        while Binder.is_optional_chain(s)
+        {
+            let e AstNode.expression_of(s)
+            if e = null
+                return false
+            set s: e as ref[AstNode]
+            if this.is_matching_reference(s, target)
+                return true
+        }
+        false
+    }
+
+    ; ── the arms of getTypeAtFlowNode ───────────────────────────────────────
+
+    ; getTypeAtFlowAssignment.
+    ;
+    ; ★★ THE ARM THAT ANSWERS, AND IT ANSWERS `f.declaredType`. An assignment
+    ; narrows only where the declared type is a UNION — the reference says so in
+    ; its own first comment — so the whole cost of the arm for a plain variable is
+    ; the reachability test and the identity of the target.
+    function get_type_at_flow_assignment(this, f: ref[FlowState], flow: ref[FlowNode], out_incomplete: ref[bool]) returns ref[Type]?
+    {
+        set out_incomplete: false
+        let node_opt flow.node
+        if node_opt = null
+            return null
+        let node node_opt as ref[AstNode]
+        let reference f.reference as ref[AstNode]
+        let declared f.declared_type as ref[Type]
+        if this.is_matching_reference(reference, node)
+        {
+            if this.is_reachable_flow_node(flow) = false
+                return unreachable_never_type
+            if Checker.get_assignment_target_kind(node) = AssignmentKindCompound
+            {
+                ; getBaseTypeOfLiteralType — the row the equality operators and
+                ; checkIdentifier's own compound arm already stand at.
+                this.record_unported("get-base-type-of-literal-type", AstNode.kind_of(node))
+                return null
+            }
+            if declared = auto_type
+            {
+                ; The evolving-array family: an `auto` declared type means `var x;`
+                ; with no annotation, and every branch below it mints an evolving
+                ; array or widens a literal. Third door.
+                this.record_unported("get-evolving-array-type", AstNode.kind_of(node))
+                return null
+            }
+            if Checker.is_in_compound_like_assignment(node)
+            {
+                this.record_unported("get-base-type-of-literal-type", AstNode.kind_of(node))
+                return null
+            }
+            if (declared.flags & TypeFlagsUnion) <> 0
+            {
+                ; getAssignmentReducedType — the fourth door, and the one the
+                ; reference's own comment points at: an assignment narrows a union
+                ; and nothing else.
+                this.record_unported("get-assignment-reduced-type", AstNode.kind_of(node))
+                return null
+            }
+            return declared
+        }
+        if this.contains_matching_reference(reference, node)
+        {
+            if this.is_reachable_flow_node(flow) = false
+                return unreachable_never_type
+            ; "A matching dotted name might also be an expando property on a
+            ; function *expression*, in which case we continue control flow
+            ; analysis back to the function's declaration."
+            if AstNode.kind_of(node) = KindVariableDeclaration
+            {
+                var expando false
+                if Parser.is_in_js_file(node)
+                    set expando: true
+                if this.is_var_const_like(node)
+                    set expando: true
+                if expando
+                {
+                    let ini AstNode.initializer_of(node)
+                    if ini <> null
+                    {
+                        if Checker.is_function_expression_or_arrow_function(ini as ref[AstNode])
+                            return this.get_type_at_flow_node(f, flow.antecedent as ref[FlowNode], out_incomplete)
+                    }
+                }
+            }
+            return declared
+        }
+        ; "for (const _ in ref) acts as a nonnull on ref"
+        if AstNode.kind_of(node) = KindVariableDeclaration
+        {
+            let list AstNode.parent_node_of(node)
+            if list <> null
+            {
+                let stmt AstNode.parent_node_of(list as ref[AstNode])
+                if stmt <> null
+                {
+                    if AstNode.kind_of(stmt as ref[AstNode]) = KindForInStatement
+                    {
+                        let expr AstNode.expression_of(stmt as ref[AstNode])
+                        if expr <> null
+                        {
+                            var hit false
+                            if this.is_matching_reference(reference, expr as ref[AstNode])
+                                set hit: true
+                            if hit = false
+                            {
+                                if this.optional_chain_contains_reference(expr as ref[AstNode], reference)
+                                    set hit: true
+                            }
+                            if hit
+                            {
+                                ; getNonNullableTypeIfNeeded — getTypeWithFacts
+                                ; under strictNullChecks, i.e. a FILTER over a
+                                ; union. Fifth door.
+                                this.record_unported("get-non-nullable-type", KindForInStatement)
+                                return null
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ; "Assignment doesn't affect reference" — the nil answer, which the
+        ; dispatch reads as *walk on*.
+        null
+    }
+
+    ; getTypeAtFlowCall — the sixth door, and the whole arm is behind it.
+    function get_type_at_flow_call(this, f: ref[FlowState], flow: ref[FlowNode], out_incomplete: ref[bool]) returns ref[Type]?
+    {
+        set out_incomplete: false
+        this.record_unported("get-effects-signature", Checker.kind_or_unknown(flow.node))
+        null
+    }
+
+    ; getTypeAtFlowCondition. The never early-out is REAL work and is written: it
+    ; is what makes a reference after `if (false) { … }` answer at all.
+    function get_type_at_flow_condition(this, f: ref[FlowState], flow: ref[FlowNode], out_incomplete: ref[bool]) returns ref[Type]?
+    {
+        var inc false
+        let t this.get_type_at_flow_node(f, flow.antecedent as ref[FlowNode], &inc)
+        if t = null
+            return null
+        let ty t as ref[Type]
+        if (ty.flags & TypeFlagsNever) <> 0
+        {
+            set out_incomplete: inc
+            return ty
+        }
+        ; narrowType — the seventh door, and the largest room behind any of them:
+        ; thirty functions in flow.go, every one of which ends in getUnionType,
+        ; getTypeWithFacts or filterType. It is the next slice.
+        set out_incomplete: false
+        this.record_unported("narrow-type", Checker.kind_or_unknown(flow.node))
+        null
+    }
+
+    ; getTypeAtSwitchClause — narrowTypeBySwitchOnDiscriminant and its four
+    ; siblings, all of which build a union of the clause literals.
+    function get_type_at_switch_clause(this, f: ref[FlowState], flow: ref[FlowNode], out_incomplete: ref[bool]) returns ref[Type]?
+    {
+        set out_incomplete: false
+        this.record_unported("get-type-at-switch-clause", KindSwitchStatement)
+        null
+    }
+
+    ; getTypeAtFlowBranchLabel, taken to the point where the antecedent types
+    ; DISAGREE.
+    ;
+    ; ★★★ THE EARLY-OUT IS THE SLICE'S WHOLE PRODUCT AT A JUNCTION AND IT IS THE
+    ; REFERENCE'S OWN: *"if the type at a particular antecedent path is the
+    ; declared type and the reference is known to always be assigned … there is no
+    ; reason to process more antecedents"*. Where it fires, the union never comes
+    ; up. Where it does not, the antecedent list is collected and a list with ONE
+    ; member is answered directly — `getUnionType` of one type is that type — and
+    ; anything longer is the stop.
+    ;
+    ; ★ subtypeReduction is not computed and cannot be: its only reader is the
+    ; union call. seenIncomplete IS computed, because the single-type answer
+    ; carries it.
+    function get_type_at_flow_branch_label(this, f: ref[FlowState], flow: ref[FlowNode], antecedents: ref[FlowList], out_incomplete: ref[bool]) returns ref[Type]?
+    {
+        set out_incomplete: false
+        ; ★ The Array is bound as a `ref` and not left as the `pointer` the
+        ; allocation answers, and the difference is not style: a subscript on a
+        ; `pointer[Array[X]]` is POINTER ARITHMETIC with an Array-sized stride,
+        ; so `types[0]` on the raw allocation answers the whole Array. The
+        ; compiler caught it here; it does not always.
+        let types_p host.allocate(sizeof Array[ref[Type]?], alignof Array[ref[Type]?]) as pointer[Array[ref[Type]?]]
+        set *types_p: Array[ref[Type]?]()
+        let types types_p as ref[Array[ref[Type]?]]
+        var seen_incomplete false
+        var list: ref[FlowList]? antecedents
+        var bypass: ref[FlowNode]? null
+        while list <> null
+        {
+            let l list as ref[FlowList]
+            set list: l.next
+            let antecedent l.flow as ref[FlowNode]
+            if bypass = null
+            {
+                if (antecedent.flags & FlowFlagsSwitchClause) <> 0
+                {
+                    if AstNode.flow_clause_start_of(antecedent.node) = AstNode.flow_clause_end_of(antecedent.node)
+                    {
+                        ; "The antecedent is the bypass branch of a potentially
+                        ; exhaustive switch statement."
+                        set bypass: antecedent
+                        continue
+                    }
+                }
+            }
+            var inc false
+            let ft this.get_type_at_flow_node(f, antecedent, &inc)
+            if ft = null
+                return null
+            let fty ft as ref[Type]
+            if fty = (f.declared_type as ref[Type])
+            {
+                if (f.declared_type as ref[Type]) = (f.initial_type as ref[Type])
+                    return fty
+            }
+            var present false
+            let len types.get_length() as int
+            var i 0
+            while i < len
+            {
+                let row types[i]
+                if row <> null
+                {
+                    if (row as ref[Type]) = fty
+                        set present: true
+                }
+                set i: i + 1
+            }
+            if present = false
+                types.add(fty)
+            if inc
+                set seen_incomplete: true
+        }
+        if bypass <> null
+        {
+            ; The bypass branch needs isExhaustiveSwitchStatement before it can be
+            ; either taken or dropped, and the second door is where it goes.
+            this.record_unported("is-exhaustive-switch-statement", KindSwitchStatement)
+            return null
+        }
+        let n types.get_length() as int
+        if n = 1
+        {
+            let only types[0]
+            set out_incomplete: seen_incomplete
+            return only
+        }
+        ; getUnionOrEvolvingArrayType over two or more distinct antecedent types.
+        ; ★The tag is the reference's own function name rather than
+        ; `get-union-type`, which two operator arms in this file already use with
+        ; an operator KIND as detail: here the detail is the antecedent COUNT, and
+        ; two details meaning different things under one tag is a histogram that
+        ; lies.
+        this.record_unported("get-union-or-evolving-array-type", n)
+        null
+    }
+
+    ; getTypeAtFlowLoopLabel — the cache, the reference HASH that keys it, and the
+    ; in-process stack that makes a back edge terminate. Nothing of it is here:
+    ; the cache key is `getFlowReferenceKey`, a structural hash of the reference,
+    ; and every exit from the function goes through getUnionOrEvolvingArrayType.
+    ;
+    ; ★ The SINGLE-antecedent loop label never reaches this function — the
+    ; dispatch collapses it, exactly as upstream — so what stops here is a loop
+    ; with a real back edge.
+    function get_type_at_flow_loop_label(this, f: ref[FlowState], flow: ref[FlowNode], out_incomplete: ref[bool]) returns ref[Type]?
+    {
+        set out_incomplete: false
+        this.record_unported("get-type-at-flow-loop-label", Checker.kind_or_unknown(flow.node))
+        null
+    }
+
+    ; getTypeAtFlowArrayMutation. The GUARD is ported and the body is not, and the
+    ; guard is what matters: it answers nil — *walk on* — for every declared type
+    ; that is not `auto`, which is every annotated variable in the corpus.
+    function get_type_at_flow_array_mutation(this, f: ref[FlowState], flow: ref[FlowNode], out_incomplete: ref[bool]) returns ref[Type]?
+    {
+        set out_incomplete: false
+        if (f.declared_type as ref[Type]) <> auto_type
+            return null
+        this.record_unported("get-evolving-array-type", Checker.kind_or_unknown(flow.node))
+        null
+    }
+
+    ; The arm switch of getTypeAtFlowNode, lifted out of its loop.
+    ;
+    ; ★★★ UPSTREAM THIS IS A GO `switch` WITH `continue` IN FIVE ARMS, AND A
+    ; `continue` THERE DOES NOT ALWAYS MEAN `flow.Antecedent`. The two label arms
+    ; collapse to their single antecedent and the Start arm hops to the CONTAINING
+    ; function's flow node — three different next nodes wearing one keyword. So
+    ; the lifted form answers through a `next` cell, and a non-null `next` IS the
+    ; continue. Reading it as *the antecedent* would have made a nested function's
+    ; reference walk its own container's graph instead of the outer one's.
+    function get_type_at_flow_node_arm(this, f: ref[FlowState], flow: ref[FlowNode], out_incomplete: ref[bool], out_next: ref[ref[FlowNode]?]) returns ref[Type]?
+    {
+        let flags flow.flags
+        if (flags & FlowFlagsAssignment) <> 0
+        {
+            let t this.get_type_at_flow_assignment(f, flow, out_incomplete)
+            if t = null
+                set out_next: flow.antecedent
+            return t
+        }
+        if (flags & FlowFlagsCall) <> 0
+        {
+            let t this.get_type_at_flow_call(f, flow, out_incomplete)
+            if t = null
+                set out_next: flow.antecedent
+            return t
+        }
+        if (flags & FlowFlagsCondition) <> 0
+            return this.get_type_at_flow_condition(f, flow, out_incomplete)
+        if (flags & FlowFlagsSwitchClause) <> 0
+            return this.get_type_at_switch_clause(f, flow, out_incomplete)
+        if (flags & FlowFlagsBranchLabel) <> 0
+        {
+            ; ★★ THE UNWRAP IS THE ASSERTION AND IT IS MEASURED, NOT ASSUMED. A
+            ; label with no antecedents cannot be reached: finishFlowLabel answers
+            ; the unreachable SENTINEL for one instead of the label, so nothing
+            ; ever records it as an antecedent. Upstream `antecedents.Next` would
+            ; panic; here the null-unwrap trap is the same statement in this
+            ; language, and a `return null` in its place would be a silent
+            ; no-answer with nothing in the work list. **Probed over 17 375
+            ; stage-2 units: zero arrivals, both labels.**
+            let al Checker.get_branch_label_antecedents(flow, f.reduce_labels) as ref[FlowList]
+            if al.next = null
+            {
+                set out_next: al.flow
+                return null
+            }
+            return this.get_type_at_flow_branch_label(f, flow, al, out_incomplete)
+        }
+        if (flags & FlowFlagsLoopLabel) <> 0
+        {
+            let al flow.antecedents as ref[FlowList]
+            if al.next = null
+            {
+                set out_next: al.flow
+                return null
+            }
+            return this.get_type_at_flow_loop_label(f, flow, out_incomplete)
+        }
+        if (flags & FlowFlagsArrayMutation) <> 0
+        {
+            let t this.get_type_at_flow_array_mutation(f, flow, out_incomplete)
+            if t = null
+                set out_next: flow.antecedent
+            return t
+        }
+        if (flags & FlowFlagsReduceLabel) <> 0
+        {
+            let saved f.reduce_labels
+            let cell host.allocate(sizeof ReduceLabelStack, alignof ReduceLabelStack) as pointer[ReduceLabelStack]
+            set *cell: ReduceLabelStack(flow.node, saved)
+            set f.reduce_labels: cell
+            let t this.get_type_at_flow_node(f, flow.antecedent as ref[FlowNode], out_incomplete)
+            set f.reduce_labels: saved
+            return t
+        }
+        if (flags & FlowFlagsStart) <> 0
+        {
+            ; "Check if we should continue with the control flow of the containing
+            ; function." Four terms, and the last of them is a negated
+            ; conjunction — written as the two tests it is (§3.5u).
+            let container flow.node
+            if container <> null
+            {
+                let cn container as ref[AstNode]
+                var hop true
+                if f.flow_container <> null
+                {
+                    if (f.flow_container as ref[AstNode]) = cn
+                        set hop: false
+                }
+                let rk AstNode.kind_of(f.reference as ref[AstNode])
+                if rk = KindPropertyAccessExpression
+                    set hop: false
+                if rk = KindElementAccessExpression
+                    set hop: false
+                if rk = KindThisKeyword
+                {
+                    if AstNode.kind_of(cn) <> KindArrowFunction
+                        set hop: false
+                }
+                if hop
+                {
+                    let next AstNode.flow_node_of(cn)
+                    if next <> null
+                    {
+                        set out_next: next
+                        return null
+                    }
+                }
+            }
+            ; "At the top of the flow we have the initial type."
+            return f.initial_type
+        }
+        ; "Unreachable code errors are reported in the binding phase. Here we
+        ; simply return the non-auto declared type to reduce follow-on errors."
+        this.convert_auto_to_any(f.declared_type)
+    }
+
+    ; getTypeAtFlowNode — the loop, the shared-node memo and the depth guard.
+    function get_type_at_flow_node(this, f: ref[FlowState], flow_in: ref[FlowNode], out_incomplete: ref[bool]) returns ref[Type]?
+    {
+        set out_incomplete: false
+        if f.depth = 2000
+        {
+            ; reportFlowControlError. The report needs FindAncestor over
+            ; IsFunctionOrModuleBlock and the statement list's own token range —
+            ; and its CODE, "The containing function or module body is too large
+            ; for control flow analysis", is not in DiagnosticCodes at all. So the
+            ; arm is a stop rather than an invented line. ★It has zero arrivals in
+            ; this corpus: 2000 is a guard against the stack, not a limit anything
+            ; here meets, and the LATCH beside it is what the guard is for.
+            set flow_analysis_disabled: true
+            this.record_unported("report-flow-control-error", 0)
+            return error_type
+        }
+        set f.depth: f.depth + 1
+        var flow flow_in
+        var shared_flow: ref[FlowNode]? null
+        repeat
+        {
+            let flags flow.flags
+            this.trace_flow(1, flags, 0)
+            if (flags & FlowFlagsShared) <> 0
+            {
+                ; "We cache results of flow type resolution for shared nodes that
+                ; were previously visited in the same getFlowTypeOfReference
+                ; invocation."
+                let len f.shared_flows.get_length() as int
+                var i 0
+                while i < len
+                {
+                    let row f.shared_flows[i]
+                    if row <> null
+                    {
+                        let sfr row as ref[SharedFlow]
+                        if sfr.flow = flow
+                        {
+                            set f.depth: f.depth - 1
+                            set out_incomplete: sfr.incomplete
+                            return sfr.t
+                        }
+                    }
+                    set i: i + 1
+                }
+                set shared_flow: flow
+            }
+            let mark this.unported_mark()
+            var next: ref[FlowNode]? null
+            var inc false
+            let t this.get_type_at_flow_node_arm(f, flow, &inc, &next)
+            if this.unported_mark() <> mark
+            {
+                set f.depth: f.depth - 1
+                return null
+            }
+            if next <> null
+            {
+                set flow: next as ref[FlowNode]
+                continue
+            }
+            if shared_flow <> null
+            {
+                let made host.allocate(sizeof SharedFlow, alignof SharedFlow) as pointer[SharedFlow]
+                set *made: SharedFlow(shared_flow, t, inc)
+                f.shared_flows.add(made)
+            }
+            set f.depth: f.depth - 1
+            set out_incomplete: inc
+            return t
+        }
+    }
+
+    ; ★ getFlowTypeOfReference — the two-argument entry — is NOT written. It is
+    ; `getFlowTypeOfReferenceEx(reference, t, t, nil, nil)` and every caller of it
+    ; in the reference is behind a wall this slice does not reach (the property
+    ; access, the `this` expression, getFlowTypeOfProperty). A forwarder with no
+    ; caller is machinery no instrument can see (§3.5be); it lands with its first
+    ; caller. The one caller this slice HAS passes four of the five arguments.
+
+    ; getFlowTypeOfReferenceEx — the entry, and the two-line tail under the walk.
+    ;
+    ; ★ The evolving-array half of that tail is an identity here for the reason
+    ; convert_auto_to_any's second arm is unaskable: no type in this run carries
+    ; ObjectFlagsEvolvingArray, because nothing mints one. finalizeEvolvingArrayType
+    ; is therefore not written, and isEvolvingArrayOperationTarget with it.
+    ;
+    ; ★★ THE NonNullExpression TERM IS A STOP AND ITS GUARD ORDER IS LOAD-BEARING.
+    ; Go's `||` short-circuits, so the unreachableNeverType test answers first and
+    ; the getTypeWithFacts term is only asked where the parent is a `!`. Asking it
+    ; first would have put a stop on every reference in the corpus.
+    function get_flow_type_of_reference_ex(this, reference: ref[AstNode], declared_type: ref[Type], initial_type: ref[Type]?, flow_container: ref[AstNode]?, flow_node_in: ref[FlowNode]?) returns ref[Type]?
+    {
+        if flow_analysis_disabled
+            return error_type
+        var flow_node flow_node_in
+        if flow_node = null
+        {
+            set flow_node: Checker.get_flow_node_of_node(reference)
+            if flow_node = null
+                return declared_type
+        }
+        var initial initial_type
+        if initial = null
+            set initial: declared_type
+        let sf host.allocate(sizeof Array[ref[SharedFlow]?], alignof Array[ref[SharedFlow]?]) as pointer[Array[ref[SharedFlow]?]]
+        set *sf: Array[ref[SharedFlow]?]()
+        let fp host.allocate(sizeof FlowState, alignof FlowState) as pointer[FlowState]
+        set *fp: FlowState(reference, declared_type, initial, flow_container, 0, null, sf)
+        let f fp as ref[FlowState]
+        this.trace_flow(0, AstNode.pos_of(reference), AstNode.end_of(reference))
+        var inc false
+        let evolved this.get_type_at_flow_node(f, flow_node as ref[FlowNode], &inc)
+        if evolved = null
+        {
+            this.trace_flow(2, 0, 1)
+            return null
+        }
+        this.trace_flow(2, (evolved as ref[Type]).id, 0)
+        let result evolved as ref[Type]
+        if result = unreachable_never_type
+            return declared_type
+        let parent AstNode.parent_node_of(reference)
+        if parent <> null
+        {
+            if AstNode.kind_of(parent as ref[AstNode]) = KindNonNullExpression
+            {
+                if (result.flags & TypeFlagsNever) = 0
+                {
+                    ; getTypeWithFacts(result, NEUndefinedOrNull) — a FILTER over a
+                    ; union, which is the same room the seven doors open on.
+                    this.record_unported("get-type-with-facts", KindNonNullExpression)
+                    return null
+                }
+            }
+        }
+        result
+    }
+
+    ; ── the caller's own half (slice 93) ────────────────────────────────────
+
+    ; getControlFlowContainer — FindAncestor from the PARENT over a four-term
+    ; predicate, written as the walk it is (§3.9d).
+    ;
+    ; ★ The IIFE exclusion is the same one slice 92's h03 measured on the binder's
+    ; side: an immediately invoked function expression is part of the containing
+    ; control flow, so it is not a container here either. The two sites have to
+    ; agree — the binder decides which Start node exists and this decides which
+    ; one the walk stops at.
+    function get_control_flow_container(node: ref[AstNode]) returns ref[AstNode]?
+    {
+        var cur AstNode.parent_node_of(node)
+        while cur <> null
+        {
+            let n cur as ref[AstNode]
+            let k AstNode.kind_of(n)
+            var hit false
+            if AstNode.is_function_like(n)
+            {
+                if AstNode.get_immediately_invoked_function_expression(n) = null
+                    set hit: true
+            }
+            if k = KindModuleBlock
+                set hit: true
+            if k = KindSourceFile
+                set hit: true
+            if k = KindPropertyDeclaration
+                set hit: true
+            if hit
+                return n
+            set cur: AstNode.parent_node_of(n)
+        }
+        null
+    }
+
+    ; getReferenceRoot — the parenthesis/assignment/comma climb, upward.
+    function get_reference_root(node: ref[AstNode]) returns ref[AstNode]
+    {
+        var n node
+        repeat
+        {
+            let p AstNode.parent_node_of(n)
+            if p = null
+                return n
+            let parent p as ref[AstNode]
+            let pk AstNode.kind_of(parent)
+            var climb false
+            if pk = KindParenthesizedExpression
+                set climb: true
+            if pk = KindBinaryExpression
+            {
+                let op AstNode.binary_operator_kind(parent)
+                if op = KindEqualsToken
+                {
+                    if AstNode.binary_left_of(parent) = n
+                        set climb: true
+                }
+                if op = KindCommaToken
+                {
+                    if AstNode.binary_right_of(parent) = n
+                        set climb: true
+                }
+            }
+            if climb = false
+                return n
+            set n: parent
+        }
+    }
+
+    ; ast.IsPushOrUnshiftIdentifier.
+    function is_push_or_unshift_identifier(n: ref[AstNode]) returns bool
+    {
+        if Checker.node_text_is(AstNode.identifier_text_of(n), AstNode.identifier_text_length_of(n), "push", 4)
+            return true
+        Checker.node_text_is(AstNode.identifier_text_of(n), AstNode.identifier_text_length_of(n), "unshift", 7)
+    }
+
+    ; isEvolvingArrayOperationTarget. The FIRST disjunct is purely syntactic and is
+    ; written; the second ends in getTypeOfExpression and is a stop behind its own
+    ; five syntactic terms.
+    function is_evolving_array_operation_target(this, node: ref[AstNode]) returns bool
+    {
+        let root Checker.get_reference_root(node)
+        let p AstNode.parent_node_of(root)
+        if p = null
+            return false
+        let parent p as ref[AstNode]
+        let pk AstNode.kind_of(parent)
+        if pk = KindPropertyAccessExpression
+        {
+            let nm AstNode.property_access_name_of(parent)
+            if nm <> null
+            {
+                let name nm as ref[AstNode]
+                if Checker.node_text_is(AstNode.identifier_text_of(name), AstNode.identifier_text_length_of(name), "length", 6)
+                    return true
+                let gp AstNode.parent_node_of(parent)
+                if gp <> null
+                {
+                    if AstNode.kind_of(gp as ref[AstNode]) = KindCallExpression
+                    {
+                        if AstNode.kind_of(name) = KindIdentifier
+                        {
+                            if Checker.is_push_or_unshift_identifier(name)
+                                return true
+                        }
+                    }
+                }
+            }
+            return false
+        }
+        if pk <> KindElementAccessExpression
+            return false
+        if AstNode.expression_of(parent) <> root
+            return false
+        let gp AstNode.parent_node_of(parent)
+        if gp = null
+            return false
+        let grand gp as ref[AstNode]
+        if AstNode.kind_of(grand) <> KindBinaryExpression
+            return false
+        if AstNode.binary_operator_kind(grand) <> KindEqualsToken
+            return false
+        if AstNode.binary_left_of(grand) <> parent
+            return false
+        if Binder.is_assignment_target(grand)
+            return false
+        ; isTypeAssignableToKind(getTypeOfExpression(argumentExpression), NumberLike)
+        ; — the expression chapter, one term below five syntactic ones.
+        this.record_unported("get-type-of-expression", KindElementAccessExpression)
+        false
+    }
+
+    ; containsUndefinedType. The union arm reads the FIRST constituent and nothing
+    ; else, which is exact rather than an approximation: a union's constituents are
+    ; sorted by CompareTypes, whose first key is the type FLAGS, and only Any
+    ; (1 << 0) and Unknown (1 << 1) sort ahead of Undefined (1 << 2) — a union
+    ; containing either of those is not a union at all, because getUnionTypeWorker
+    ; answers `any` or `unknown` for it. So an undefined-carrying union carries it
+    ; first.
+    ;
+    ; ★★★ THE ARM IS WRITTEN IN SLICE 94 AND THE LINE IT REPLACES NAMED ITS OWN
+    ; EXPIRY DATE: *"No union is minted here, so the arm has no input either way"*.
+    ; It has input now, and it is the input that decides the whole property-
+    ; initialization row — `p: string` and `p: string | undefined` differ here and
+    ; nowhere else.
+    function contains_undefined_type(t: ref[Type]) returns bool
+    {
+        var ty t
+        if (t.flags & TypeFlagsUnion) <> 0
+        {
+            let ts Checker.union_types_of(t)
+            if ts <> null
+            {
+                let list ts as ref[Array[ref[Type]?]]
+                if (list.get_length() as int) > 0
+                {
+                    let f list[0]
+                    if f <> null
+                        set ty: f as ref[Type]
+                }
+            }
+        }
+        (ty.flags & TypeFlagsUndefined) <> 0
+    }
+
+    ; isDestructuringAssignmentTarget.
+    function is_destructuring_assignment_target(parent: ref[AstNode]) returns bool
+    {
+        let g AstNode.parent_node_of(parent)
+        if g = null
+            return false
+        let grand g as ref[AstNode]
+        let gk AstNode.kind_of(grand)
+        if gk = KindBinaryExpression
+        {
+            if AstNode.binary_left_of(grand) = parent
+                return true
+        }
+        if gk = KindForOfStatement
+        {
+            if AstNode.initializer_of(grand) = parent
+                return true
+        }
+        false
+    }
+
+    ; ast.IsInTypeQuery — FindAncestorOrQuit, and the QUIT is the mechanism: the
+    ; walk climbs only through the entity-name spine and stops at anything else,
+    ; so `typeof (x)` and `typeof f()` answer differently from `typeof a.b`.
+    function is_in_type_query(node: ref[AstNode]) returns bool
+    {
+        var p: ref[AstNode]? node
+        while p <> null
+        {
+            let n p as ref[AstNode]
+            let k AstNode.kind_of(n)
+            if k = KindTypeQuery
+                return true
+            if k <> KindIdentifier
+            {
+                if k <> KindQualifiedName
+                    return false
+            }
+            set p: AstNode.parent_node_of(n)
+        }
+        false
+    }
+
+    ; isMutableLocalVariableDeclaration — "a non-exported and non-global `let`".
+    function is_mutable_local_variable_declaration(this, declaration: ref[AstNode]) returns bool
+    {
+        let lp AstNode.parent_node_of(declaration)
+        if lp = null
+            return false
+        let list lp as ref[AstNode]
+        if (AstNode.flags_of(list) & NodeFlagsLet) = 0
+            return false
+        if (b.combined_modifier_flags(declaration) & ModifierFlagsExport) <> 0
+            return false
+        let sp AstNode.parent_node_of(list)
+        if sp = null
+            return true
+        let stmt sp as ref[AstNode]
+        if AstNode.kind_of(stmt) <> KindVariableStatement
+            return true
+        Checker.is_global_source_file(b, AstNode.parent_node_of(stmt)) = false
+    }
+
+    ; isConstantVariable.
+    function is_constant_variable(this, symbol: ref[Symbol]) returns bool
+    {
+        if (Symbol.flags_of(symbol) & SymbolFlagsVariable) = 0
+            return false
+        (Checker.get_declaration_node_flags_from_symbol(symbol) & NodeFlagsConstant) <> 0
+    }
+
+    ; isParameterOrMutableLocalVariable — "a parameter, a catch clause variable,
+    ; or a mutable local variable".
+    function is_parameter_or_mutable_local_variable(this, symbol: ref[Symbol]) returns bool
+    {
+        let vd Symbol.value_declaration_of(symbol)
+        if vd = null
+            return false
+        let rd Binder.get_root_declaration(vd as ref[AstNode])
+        if rd = null
+            return false
+        let declaration rd as ref[AstNode]
+        let k AstNode.kind_of(declaration)
+        if k = KindParameter
+            return true
+        if k <> KindVariableDeclaration
+            return false
+        let p AstNode.parent_node_of(declaration)
+        if p <> null
+        {
+            if AstNode.kind_of(p as ref[AstNode]) = KindCatchClause
+                return true
+        }
+        this.is_mutable_local_variable_declaration(declaration)
+    }
+
+    ; isSameScopedBindingElement.
+    function is_same_scoped_binding_element(this, node: ref[AstNode], declaration: ref[AstNode]) returns bool
+    {
+        if AstNode.kind_of(declaration) <> KindBindingElement
+            return false
+        let be Checker.find_ancestor_kind(node, KindBindingElement)
+        if be = null
+            return false
+        let a Binder.get_root_declaration(be as ref[AstNode])
+        let d Binder.get_root_declaration(declaration)
+        if a = null
+            return false
+        if d = null
+            return false
+        (a as ref[AstNode]) = (d as ref[AstNode])
+    }
+
+    ; someType(t, isGenericTypeWithUnionConstraint), with both composite walks
+    ; named rather than written — neither a union nor an intersection type is
+    ; minted anywhere in this port, so neither list can be reached, and a walk
+    ; over a list nothing builds is §3.5be's forbidden shape.
+    function some_type_is_generic_with_union_constraint(this, t: ref[Type]) returns bool
+    {
+        if (t.flags & TypeFlagsUnionOrIntersection) <> 0
+        {
+            this.record_unported("some-type", 0)
+            return true
+        }
+        if (t.flags & TypeFlagsInstantiable) = 0
+            return false
+        let mark this.unported_mark()
+        var base this.get_base_constraint_of_type(t)
+        if this.unported_mark() <> mark
+            return true
+        if base = null
+            set base: t
+        ((base as ref[Type]).flags & (TypeFlagsNullable | TypeFlagsUnion)) <> 0
+    }
+
+    ; getNarrowableTypeForReference.
+    ;
+    ; ★ isNoInferType's peel is not written: it tests for a SubstitutionType, and
+    ; nothing in this port mints one. ★mapType over a non-union is `f(t)`, so the
+    ; substituting arm would be answerable — what is not is the DISJUNCTION that
+    ; guards it, whose second half is the contextual type chapter.
+    function get_narrowable_type_for_reference(this, t: ref[Type], reference: ref[AstNode], check_mode: int) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let some this.some_type_is_generic_with_union_constraint(t)
+        if this.unported_mark() <> mark
+            return null
+        if some = false
+            return t
+        this.record_unported("get-narrowable-type-for-reference", AstNode.kind_of(reference))
+        null
+    }
+
+    ; removeOptionalityFromDeclaredType — the FOUR terms in the reference's own
+    ; order, which is what keeps the fourth from being asked.
+    function remove_optionality_from_declared_type(this, declared_type: ref[Type], declaration: ref[AstNode]) returns ref[Type]?
+    {
+        if Checker.strict_null_checks() = false
+            return declared_type
+        if AstNode.kind_of(declaration) <> KindParameter
+            return declared_type
+        if AstNode.initializer_of(declaration) = null
+            return declared_type
+        let mark this.unported_mark()
+        let is_undef this.has_type_facts(declared_type, TypeFactsIsUndefined)
+        if this.unported_mark() <> mark
+            return null
+        if is_undef = false
+            return declared_type
+        ; parameterInitializerContainsUndefined -> checkDeclarationInitializer, and
+        ; then getTypeWithFacts over the answer. Both are the union room.
+        this.record_unported("parameter-initializer-contains-undefined", KindParameter)
+        null
+    }
+
     ; checkIdentifier — the work list's largest row, taken to its three walls.
     ;
     ; ★★★ THE STOP THAT STOOD AT THE DISPATCH WAS ONE ARGUMENT AND THE ARGUMENT WAS
@@ -9648,8 +12531,299 @@ define Checker
         }
         if declaration = null
             return t
-        this.record_unported("flow-graph", KindIdentifier)
-        null
+        let decl declaration as ref[AstNode]
+        if t = null
+            return null
+        var ty t as ref[Type]
+        ; ── the flow tail (slice 93) ────────────────────────────────────────
+        ;
+        ; ★★★ SLICE 91 WROTE THAT THE `assumeInitialized` DISJUNCTION IS "ELEVEN
+        ; TERMS OF WHICH EVERY ONE IS ANSWERABLE AND NONE IS WORTH ASKING,
+        ; BECAUSE THE VALUE IT COMPUTES HAS EXACTLY ONE READER AND THAT READER IS
+        ; THE FLOW CALL." That was true while the flow call was a stop and it is
+        ; false now — and the way it is false is the point. The value picks the
+        ; INITIAL TYPE, and the two things it picks between are `t`, which is
+        ; free, and `getOptionalType(t, false)`, which is the union wall. So the
+        ; disjunction is not an input to the flow call: it decides whether the
+        ; call can happen at all, and every term of it is written.
+        ;
+        ; ★★★ TWO TERMS ARE COMPUTED LAZILY, AND THAT IS FAITHFULNESS RATHER THAN
+        ; CLEVERNESS. `isNeverInitialized` is read in exactly one place —
+        ; `isOuterVariable && !isNeverInitialized` — and the container-extending
+        ; loop runs only where the two containers differ; both therefore stand
+        ; behind the SAME test, and both need markNodeAssignments, a walk of its
+        ; own. Computing them eagerly would put that stop on every identifier in
+        ; the corpus to decide a term that cannot change the answer.
+        let outer_mark this.unported_mark()
+        let narrowed this.get_narrowable_type_for_reference(ty, node, check_mode)
+        if narrowed = null
+            return null
+        set ty: narrowed as ref[Type]
+        var is_parameter false
+        let root_decl Binder.get_root_declaration(decl)
+        if root_decl <> null
+        {
+            if AstNode.kind_of(root_decl as ref[AstNode]) = KindParameter
+                set is_parameter: true
+        }
+        let declaration_container Checker.get_control_flow_container(decl)
+        var flow_container Checker.get_control_flow_container(node)
+        var is_outer_variable true
+        if flow_container = null
+        {
+            if declaration_container = null
+                set is_outer_variable: false
+        }
+        if flow_container <> null
+        {
+            if declaration_container <> null
+            {
+                if (flow_container as ref[AstNode]) = (declaration_container as ref[AstNode])
+                    set is_outer_variable: false
+            }
+        }
+        var is_spread_destructuring_assignment_target false
+        let np AstNode.parent_node_of(node)
+        if np <> null
+        {
+            let parent np as ref[AstNode]
+            if AstNode.parent_node_of(parent) <> null
+            {
+                if AstNode.kind_of(parent) = KindSpreadAssignment
+                {
+                    if Checker.is_destructuring_assignment_target(parent)
+                        set is_spread_destructuring_assignment_target: true
+                }
+            }
+        }
+        var is_module_exports false
+        if (Symbol.flags_of(symbol) & SymbolFlagsModuleExports) <> 0
+            set is_module_exports: true
+        var type_is_automatic false
+        if ty = auto_type
+            set type_is_automatic: true
+        var is_automatic_type_in_non_null false
+        if type_is_automatic
+        {
+            if Checker.kind_or_unknown(np) = KindNonNullExpression
+                set is_automatic_type_in_non_null: true
+        }
+        ; "When the control flow originates in a function expression, arrow
+        ; function, method, or accessor, and we are referencing a closed-over
+        ; const variable or parameter or mutable local variable past its last
+        ; assignment, we extend the origin of the control flow analysis to include
+        ; the immediately enclosing control flow container."
+        ;
+        ; ★ The third conjunct is an OR whose FIRST half is decidable here
+        ; (isConstantVariable is a flag test on the symbol's declaration) and
+        ; whose second ends in isPastLastAssignment. So a closed-over `const`
+        ; extends the container with no stop at all, and only a closed-over
+        ; parameter or `let` reaches the eighth door.
+        var extending true
+        while extending
+        {
+            set extending: false
+            if flow_container = null
+                break
+            let fc flow_container as ref[AstNode]
+            var same false
+            if declaration_container <> null
+            {
+                if (declaration_container as ref[AstNode]) = fc
+                    set same: true
+            }
+            if same
+                break
+            var container_is_closure false
+            if Checker.is_function_expression_or_arrow_function(fc)
+                set container_is_closure: true
+            if Binder.is_object_literal_or_class_expression_method_or_accessor(fc)
+                set container_is_closure: true
+            if container_is_closure = false
+                break
+            var referencing false
+            if this.is_constant_variable(les)
+                set referencing: true
+            if referencing = false
+            {
+                if this.is_parameter_or_mutable_local_variable(les)
+                {
+                    ; isPastLastAssignment -> ensureAssignmentsMarked ->
+                    ; markNodeAssignments, an AST walk that records the last
+                    ; assignment position of every parameter and mutable local.
+                    ; It needs no type, so it is a slice of its own rather than a
+                    ; door into the union room — the eighth wall and the only one
+                    ; here that is not getUnionType.
+                    this.record_unported("mark-node-assignments", KindIdentifier)
+                    return null
+                }
+            }
+            if referencing = false
+                break
+            set flow_container: Checker.get_control_flow_container(fc)
+            set extending: true
+        }
+        ; isNeverInitialized, behind its one reader.
+        var is_never_initialized false
+        if is_outer_variable
+        {
+            if AstNode.kind_of(decl) = KindVariableDeclaration
+            {
+                var in_for_in_or_of false
+                let dl AstNode.parent_node_of(decl)
+                if dl <> null
+                {
+                    let ds AstNode.parent_node_of(dl as ref[AstNode])
+                    if ds <> null
+                    {
+                        let dsk AstNode.kind_of(ds as ref[AstNode])
+                        if dsk = KindForInStatement
+                            set in_for_in_or_of: true
+                        if dsk = KindForOfStatement
+                            set in_for_in_or_of: true
+                    }
+                }
+                if in_for_in_or_of = false
+                {
+                    if AstNode.initializer_of(decl) = null
+                    {
+                        if AstNode.exclamation_token_of(decl) = null
+                        {
+                            if this.is_mutable_local_variable_declaration(decl)
+                            {
+                                ; isSymbolAssignedDefinitely, the same walk the
+                                ; loop above waits on.
+                                this.record_unported("mark-node-assignments", KindVariableDeclaration)
+                                return null
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        var assume_initialized false
+        if is_parameter
+            set assume_initialized: true
+        if is_alias
+            set assume_initialized: true
+        if is_outer_variable
+        {
+            if is_never_initialized = false
+                set assume_initialized: true
+        }
+        if is_spread_destructuring_assignment_target
+            set assume_initialized: true
+        if is_module_exports
+            set assume_initialized: true
+        if this.is_same_scoped_binding_element(node, decl)
+            set assume_initialized: true
+        if assume_initialized = false
+        {
+            if type_is_automatic = false
+            {
+                if Checker.strict_null_checks() = false
+                    set assume_initialized: true
+                if (ty.flags & (TypeFlagsAnyOrUnknown | TypeFlagsVoid)) <> 0
+                    set assume_initialized: true
+                if Checker.is_in_type_query(node)
+                    set assume_initialized: true
+                if this.is_in_ambient_or_type_node(node)
+                    set assume_initialized: true
+                if Checker.kind_or_unknown(np) = KindExportSpecifier
+                    set assume_initialized: true
+            }
+        }
+        if Checker.kind_or_unknown(np) = KindNonNullExpression
+            set assume_initialized: true
+        if AstNode.kind_of(decl) = KindVariableDeclaration
+        {
+            if AstNode.exclamation_token_of(decl) <> null
+                set assume_initialized: true
+        }
+        if (AstNode.flags_of(decl) & NodeFlagsAmbient) <> 0
+            set assume_initialized: true
+        var initial: ref[Type]? null
+        if is_automatic_type_in_non_null
+            set initial: undefined_type
+        if initial = null
+        {
+            if assume_initialized
+            {
+                if is_parameter
+                {
+                    set initial: this.remove_optionality_from_declared_type(ty, decl)
+                    if initial = null
+                        return null
+                }
+                if initial = null
+                    set initial: ty
+            }
+        }
+        if initial = null
+        {
+            if type_is_automatic
+                set initial: undefined_type
+        }
+        if initial = null
+        {
+            ; getOptionalType(t, false) — `getUnionType([t, undefinedType])`.
+            ;
+            ; ★★★ THIS WAS THE NINTH DOOR AND SLICE 94 OPENS IT. Slice 93 called it
+            ; *"the one that decides how much of the corpus this slice reaches"*,
+            ; and it is: an uninitialized `let` whose declared type does not already
+            ; admit undefined is exactly the shape TS2454 is about, and it is the
+            ; shape the flow walk is asked about most.
+            set initial: this.get_optional_type(ty, false)
+            if initial = null
+                return null
+        }
+        if this.unported_mark() <> outer_mark
+            return null
+        let flow_type this.get_flow_type_of_reference_ex(node, ty, initial, flow_container, null)
+        if flow_type = null
+            return null
+        let ft flow_type as ref[Type]
+        if type_is_automatic
+        {
+            ; The two implicit-any reports and convertAutoToAny, behind
+            ; isEvolvingArrayOperationTarget. ★The conjunction is asked in the
+            ; opposite order from the reference's, and that is a decision rather
+            ; than an accident: `!isEvolvingArrayOperationTarget(node) && t ==
+            ; autoType` evaluates the CALL first upstream, and the call can stop
+            ; here, where the second term is a pointer comparison that decides the
+            ; answer on its own. Reordering two side-effect-free terms of an AND
+            ; cannot change what it answers; asking the stopping one first would
+            ; have put a stop on every identifier in the corpus.
+            if this.is_evolving_array_operation_target(node) = false
+            {
+                this.record_unported("get-evolving-array-type", KindIdentifier)
+                return null
+            }
+        }
+        if assume_initialized = false
+        {
+            if Checker.contains_undefined_type(ty) = false
+            {
+                if Checker.contains_undefined_type(ft)
+                {
+                    ; TS2454, and it is WRITTEN rather than left for the union
+                    ; slice even though nothing can reach it today: the only way
+                    ; here is an initial type from getOptionalType, which is the
+                    ; ninth door above. It is written because the day that door
+                    ; opens, this report is what the corpus sees — and a report
+                    ; landing in a slice whose subject is a type CONSTRUCTOR
+                    ; would be a diagnostic with no chapter of its own.
+                    this.error_on_node(node, DiagVariable_0_is_used_before_being_assigned)
+                    return ty
+                }
+            }
+        }
+        if assignment_kind <> AssignmentKindNone
+        {
+            this.record_unported("get-base-type-of-literal-type", KindIdentifier)
+            return null
+        }
+        ft
     }
 
     function check_expression_worker(this, node: ref[AstNode], check_mode: int) returns ref[Type]?
@@ -10298,13 +13472,15 @@ define Checker
                 this.record_unported("get-base-type-of-literal-type-for-comparison", op_kind)
             }
             else
-                ; ★ THE ERROR PATH OWES A ROW TOO, for the reason the equality arm
-                ; states in full: on a reported ES-symbol operand the reference
-                ; skips the rest and returns booleanType, which is exactly the one
-                ; thing this port cannot mint — so the tag names getUnionType and
-                ; not the step that is no longer reached. A nil with no stop is
-                ; read by the caller as an ANSWER.
-                this.record_unported("get-union-type", op_kind)
+                ; ★★★ THE ERROR PATH ANSWERS SINCE SLICE 94, AND THE LINE IT
+                ; REPLACES IS THE CLEAREST STATEMENT OF WHAT THE UNION WALL COST:
+                ; *"on a reported ES-symbol operand the reference skips the rest and
+                ; returns booleanType, which is exactly the one thing this port
+                ; cannot mint — so the tag names getUnionType and not the step that
+                ; is no longer reached"*. It can mint it now, so the arm is a real
+                ; answer rather than a row, and the diagnostic
+                ; check_for_disallowed_es_symbol_operand already reported stands.
+                return boolean_type
             return null
         }
 
@@ -10337,15 +13513,27 @@ define Checker
                 }
                 this.check_na_n_equality(error_node, op_kind, left, right)
             }
-            ; ★★★ THE ROW IS RECORDED ON BOTH PATHS, AND A CONTROL IS WHY. The
-            ; answer is booleanType whichever way the gate goes, and this port
-            ; cannot mint it — so both paths owe a stop. Recorded INSIDE the gate,
-            ; g16 (the gate forced closed) made this arm answer nil with no stop at
-            ; all, and one unit then INVENTED a TS7005 the reference does not have.
-            ; **A nil is how this port says *no claim*; a nil without a stop says
-            ; nothing, and the callers above read it as an answer.**
-            this.record_unported("is-type-equality-comparable-to", op_kind)
-            return null
+            ; ★★★ SLICE 90 RECORDED THE ROW ON BOTH PATHS AND SLICE 94 SPLITS THEM,
+            ; WHICH IS THE SAME ARGUMENT ARRIVING AT ITS OTHER END. That slice's
+            ; note reads *"the answer is booleanType whichever way the gate goes,
+            ; and this port cannot mint it — so both paths owe a stop"*, and its
+            ; control g16 proved the shape of the hazard: with the gate forced
+            ; closed and no stop recorded, one unit INVENTED a TS7005. Both halves
+            ; still hold. What changed is that the CLOSED path now has a real
+            ; answer — booleanType — so it owes no row at all, while the OPEN path
+            ; still stops, because reportOperatorErrorUnless is the relation and
+            ; produces diagnostics this port cannot.
+            ;
+            ; ★ The stop moved INSIDE the gate, which is exactly the placement g16
+            ; refuted while the answer was nil. It is safe for the reason g16
+            ; names and not despite it: a nil is how this port says *no claim*, and
+            ; the closed path no longer answers nil.
+            if (check_mode & CheckModeTypeOnly) = 0
+            {
+                this.record_unported("is-type-equality-comparable-to", op_kind)
+                return null
+            }
+            return boolean_type
         }
 
         if op_kind = KindInstanceOfKeyword
@@ -10394,11 +13582,16 @@ define Checker
                 {
                     if asked
                     {
-                        ; The three union answers — extractDefinitelyFalsyTypes for
-                        ; `&&`, removeDefinitelyFalsyTypes behind GetNonNullableType
-                        ; for `||`, GetNonNullableType alone for `??` — are one row,
-                        ; because getUnionType is one wall.
-                        this.record_unported("get-union-type", op_kind)
+                        ; ★★ THE TAG MOVES IN SLICE 94 AND THE MOVE IS THE POINT.
+                        ; The three answers — extractDefinitelyFalsyTypes for `&&`,
+                        ; removeDefinitelyFalsyTypes behind GetNonNullableType for
+                        ; `||`, GetNonNullableType alone for `??` — were one row
+                        ; *because getUnionType is one wall*. It is not one any
+                        ; more; what all three are behind is `filterType`, which is
+                        ; mapType over the constituents with getUnionType at its
+                        ; tail. A tag that keeps naming a wall that has fallen sends
+                        ; the next reader to the wrong chapter.
+                        this.record_unported("filter-type", op_kind)
                         set result: null
                     }
                 }
@@ -14811,7 +18004,7 @@ define Checker
             return true
         if b.has_syntactic_modifier(location, ModifierFlagsAsync)
             return true
-        Checker.get_immediately_invoked_function_expression(location) = null
+        AstNode.get_immediately_invoked_function_expression(location) = null
     }
 
     ; compilerOptions.GetIsolatedModules() — `IsolatedModules.IsTrue() ||
@@ -15416,10 +18609,28 @@ define Checker
         if symbol = null
             return
         let sym symbol as ref[Symbol]
-        let unported_before this.is_unported()
         this.check_type_parameter_lists_identical(sym)
-        if this.is_unported() <> unported_before
-            return
+        ; ★★★ AND THERE IS NO EARLY EXIT AFTER IT, WHICH SLICE 94 HAD TO REMOVE AND
+        ; WHICH IS WORTH MORE THAN THE TWO LINES IT COST. checkTypeParameterLists
+        ; Identical is a `procedure`: it reports TS2428 or it stops, and NOTHING
+        ; downstream reads a value from it — the reference has no exit between it and
+        ; the tail either. The guard that stood here was
+        ; `if this.is_unported() <> unported_before  return`, and **`is_unported()` is
+        ; a BOOL — *has this unit stopped at all* — so the guard fired only when this
+        ; call was the unit's FIRST stop.** That made the members walk of a merged
+        ; interface depend on whether some EARLIER declaration in the same file had
+        ; already stopped: it ran while `checkPropertyInitialization` still stopped on
+        ; every class, and stopped running the day slice 94 closed that row. Measured:
+        ; two TS7010 lost at stage 2, in the two `classWithMultipleBaseClasses` units,
+        ; where a class stands before a merged interface.
+        ;
+        ; ★★★ THE CLASS THIS BELONGS TO IS SLICE 85's — *a marker is about its own
+        ; object* — arriving from the far side: a guard built on the sticky FLAG is a
+        ; no-op for every unit that has already spoken, so it is dormant until
+        ; something removes the earlier stop, and then it wakes up as a LOSS. **A
+        ; diagnostic loss is the direction diagcheck's subsequence cannot see**, and
+        ; the only instrument that caught this was the old-against-new comparison over
+        ; the same corpus. Any slice that CLOSES a row owes that comparison.
         ; ★★★ THE ONCE-BLOCK IS ITS OWN PROCEDURE, AND THAT IS THE WHOLE STRUCTURAL
         ; CONTENT OF THE SLICE ON THIS ARM. Its body returns at five places — every
         ; one a value it cannot compute — and while the block was inline each of
@@ -17207,9 +20418,11 @@ define Checker
         let static_type this.get_type_of_symbol(sym)
         if this.is_unported() <> unported_before
             return
+        ; ★ No early exit after it, for the reason checkInterfaceDeclaration's own
+        ; call site states in full: the procedure answers nothing and the reference
+        ; has no exit there either. The guards around this one are different — each
+        ; of them stands in front of a statement that READS the value above it.
         this.check_type_parameter_lists_identical(sym)
-        if this.is_unported() <> unported_before
-            return
         ; ★★★ SLICE 68 MOVES THE CLASS PAST ITS OVERLOAD CHECK. A class symbol
         ; carries SymbolFlagsClass and its declaration list is what
         ; checkFunctionOrConstructorSymbol walks — a class merged with a function
@@ -17293,17 +20506,16 @@ define Checker
         this.check_index_constraints(class_type as ref[Type], sym, false)
         this.check_index_constraints(static_type as ref[Type], sym, true)
         this.check_class_or_interface_for_duplicate_index_signatures(node)
-        ; checkPropertyInitialization. Its guard is `!strictNullChecks ||
-        ; !strictPropertyInitialization || Ambient`, and BOTH options answer TRUE
-        ; under this harness (they are strict-FAMILY options read through
-        ; GetStrictOptionValue — strict_null_checks' header has the reading), so the
-        ; function is LIVE and not inert. What it needs is
-        ; isPropertyInitializedInConstructor, which synthesizes a `this.p` reference
-        ; and asks getFlowTypeOfReferenceEx: the flow graph, which this port's binder
-        ; does not build. ★It is the same wall checkAllCodePathsInNonVoidFunction
-        ; ReturnOrThrow stands behind, so the tag is shared rather than named after
-        ; either caller.
-        this.record_unported("flow-graph", AstNode.kind_of(node))
+        ; ★★★ checkPropertyInitialization, AND THE ROW THAT STOOD HERE WAS THE HEAD
+        ; OF THE WORK LIST FROM SLICE 77 TO SLICE 94. Three slices named the wall
+        ; and the first two named it wrong: the sentence at this line said *"the
+        ; flow graph, which this port's binder does not build"* until slice 92 built
+        ; it and the row did not move, and slice 93 built the WALK and it did not
+        ; move either. What actually held it was `getOptionalType(propType, false)`
+        ; — one call, in the union chapter — which is why the tag `flow-graph` was
+        ; two walls wearing one name. **A shared tag is a claim that two callers
+        ; wait on the same thing; check it before believing it.**
+        this.check_property_initialization(node)
     }
 
     ; ── slice 74a: checkClassForStaticPropertyNameConflicts ──────────────────
@@ -18312,11 +21524,14 @@ define Checker
     procedure check_array_type(this, node: ref[AstNode])
         this.check_source_element(AstNode.array_element_type_of(node))
 
-    ; checkUnionOrIntersectionType, whole but for its last line.
+    ; checkUnionOrIntersectionType, WHOLE since slice 94 — two lines, and the second
+    ; of them is `getTypeFromTypeNode(node)`, which for a UNION node is now a call.
+    ; ★The INTERSECTION half still stops, inside getTypeFromTypeNode's tail and
+    ; under its own kind, which is the split the tag was already able to express.
     procedure check_union_or_intersection_type(this, node: ref[AstNode])
     {
         this.check_each_child_source_element(node)
-        this.record_unported("get-type-from-type-node", AstNode.kind_of(node))
+        this.get_type_from_type_node(node)
     }
 
     ; checkThisType, whole: one call, and the whole of it is the stop.
@@ -19253,8 +22468,9 @@ define Checker
     ; ★★★ SLICE 77 MEASURED THIS ROW AS CFG-BLOCKED AND THAT IS TRUE OF HALF OF IT.
     ; Its sentence — *the return-annotation chapter is CFG-blocked and not
     ; type-node-blocked, which the row's name suggests and is not true* — was read
-    ; off `functionHasImplicitReturn`, which is `EndFlowNode` + `isReachableFlowNode`
-    ; and is a graph this binder does not build. What it did not ask is what that
+    ; off `functionHasImplicitReturn`, which is `EndFlowNode` + `isReachableFlowNode`.
+    ; ★That half is ANSWERED since slice 93 and the row is closed; what follows is
+    ; the reasoning that was already true of the other half. What it did not ask is what that
     ; answer is FOR: every one of the switch's first three cases is guarded by
     ; `t != nil`, and the fourth by `NoImplicitReturns == TSTrue`. **So for a
     ; function with NO return annotation the CFG question is asked for a value that
@@ -19292,18 +22508,59 @@ define Checker
     function no_implicit_returns() returns bool
         false
 
-    ; maybeTypeOfKind, ported as its first line and nothing else.
+    ; maybeTypeOfKind, WHOLE since slice 94.
     ;
-    ; ★★★ THE UNION/INTERSECTION RECURSION CANNOT BE ENTERED AND IS LEFT OUT RATHER
-    ; THAN STOPPED — slice 81's measurement of the type factory used a second time.
-    ; Every type this port holds comes out of one of four functions, and the only
-    ; flags those four ever set are the eleven intrinsic ones, Object, TypeParameter
-    ; and the four literal ones; `TypeFlagsUnionOrIntersection` is not among them, so
-    ; `t.Types()` cannot be asked here. **A record_unported in a branch nothing can
-    ; enter is a work-list row that can never appear**, and the work list is this
-    ; port's product.
+    ; ★★★ THIS IS THE ONE PLACE WHERE THE UNION CHAPTER BROKE A CONTAINMENT PROOF
+    ; WRITTEN IN A DIFFERENT CHAPTER, AND ONLY STAGE 2 CAUGHT IT. The note that
+    ; stood here said the recursion *"CANNOT BE ENTERED AND IS LEFT OUT RATHER THAN
+    ; STOPPED ... the only flags [the four factories] ever set are the eleven
+    ; intrinsic ones, Object, TypeParameter and the four literal ones;
+    ; `TypeFlagsUnionOrIntersection` is not among them"*. Every word of that was
+    ; true when it was written, and slice 94 adds a fifth factory. What it cost:
+    ; `function f(): number | void {}` — checkAllCodePathsInNonVoidFunctionReturn
+    ; OrThrow's guard is `maybeTypeOfKind(t, Void)`, so with the recursion missing
+    ; the union answered NO and the function INVENTED a TS2355 the reference does
+    ; not have. **Three units of 18 249, none of the 1 479 at stage 1** — slice 64's
+    ; *iterate at stage 1 and confirm at stage 2 once* earning its rule again, and
+    ; the reduction is `union_maybe_void.ts`, so stage 1 covers it from here.
+    ;
+    ; ★★★ THE LESSON IS NOT ABOUT UNIONS. A containment proof is a claim about what
+    ; the port can BUILD, and it is invalidated by a slice that builds something new
+    ; — in a file the new slice never opens. **A left-out arm and a stopped arm are
+    ; the same code until the day the input arrives, and then one of them reports
+    ; and the other one answers.** The `record_unported`-in-an-unenterable-branch
+    ; argument the old note made is still right; what it needed beside it was a
+    ; GREP for its own premise, which is what this slice ran (five sites, four of
+    ; them gates with reports and this one).
+    ;
+    ; ★ The Intersection half of the recursion still has no input — nothing mints an
+    ; intersection type — and is written with the union half rather than split,
+    ; because `TypeFlagsUnionOrIntersection` is the reference's own test and a
+    ; version narrowed to Union would be the same claim again.
     function maybe_type_of_kind(t: ref[Type], kind: int) returns bool
-        (t.flags & kind) <> 0
+    {
+        if (t.flags & kind) <> 0
+            return true
+        if (t.flags & TypeFlagsUnionOrIntersection) <> 0
+        {
+            let ts Checker.union_types_of(t)
+            if ts = null
+                return false
+            let list ts as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            var i 0
+            while i < n
+            {
+                let e list[i]
+                set i: i + 1
+                if e = null
+                    continue
+                if Checker.maybe_type_of_kind(e as ref[Type], kind)
+                    return true
+            }
+        }
+        false
+    }
 
     ; unwrapReturnType. The reference takes no node; `fn` is carried here for the
     ; stop's DETAIL column and is read for nothing else.
@@ -19498,34 +22755,12 @@ define Checker
     ; the parenthesis walk is the reference's own loop, and the last test compares
     ; the call's EXPRESSION against the node the walk came up through, so
     ; `(function(){})()` answers the call and `f(function(){})` answers nil.
-    function get_immediately_invoked_function_expression(fn: ref[AstNode]) returns ref[AstNode]?
-    {
-        let k AstNode.kind_of(fn)
-        var eligible false
-        if k = KindFunctionExpression
-            set eligible: true
-        if k = KindArrowFunction
-            set eligible: true
-        if eligible = false
-            return null
-        var prev fn
-        var parent AstNode.parent_node_of(fn)
-        while parent <> null
-        {
-            if AstNode.kind_of(parent as ref[AstNode]) <> KindParenthesizedExpression
-                break
-            set prev: parent as ref[AstNode]
-            set parent: AstNode.parent_node_of(parent)
-        }
-        if parent = null
-            return null
-        let p parent as ref[AstNode]
-        if AstNode.kind_of(p) <> KindCallExpression
-            return null
-        if AstNode.expression_of(p) <> prev
-            return null
-        p
-    }
+    ; ★ ast.GetImmediatelyInvokedFunctionExpression MOVED TO ast.scaly IN SLICE 92,
+    ; where the reference keeps it (internal/ast/utilities.go). bindContainer asks
+    ; it to decide whether a function expression is an IIFE — which decides whether
+    ; the container gets a flow graph of its OWN or joins the containing one — and
+    ; the binder is declared before the checker, so a copy here would have been the
+    ; §3.5br class: an accessor narrowed to its first caller, paid for twice.
 
     ; getAccessorThisParameter / getAnnotatedAccessorThisParameter. The arity test
     ; is the reference's — ONE higher than the accessor's plain arity — and
@@ -19653,7 +22888,7 @@ define Checker
         var this_parameter: ref[Symbol]? null
         var min_argument_count 0
         var has_this_parameter false
-        let iife Checker.get_immediately_invoked_function_expression(declaration)
+        let iife AstNode.get_immediately_invoked_function_expression(declaration)
         let parameters host.allocate(sizeof Array[ref[Symbol]?], alignof Array[ref[Symbol]?]) as pointer[Array[ref[Symbol]?]]
         set *parameters: Array[ref[Symbol]?]()
 
@@ -20011,9 +23246,76 @@ define Checker
         if AstNode.kind_of(body as ref[AstNode]) <> KindBlock
             return
         ; functionHasImplicitReturn — `fn.BodyData().EndFlowNode != nil &&
-        ; c.isReachableFlowNode(endFlowNode)`. THE control-flow graph, and the row
-        ; slice 77 named `flow-graph` precisely because two chapters share it.
-        this.record_unported("flow-graph", AstNode.kind_of(fn))
+        ; c.isReachableFlowNode(endFlowNode)`, and it is ANSWERED since slice 93.
+        ;
+        ; ★★★ IT IS THE HALF OF THE FLOW CHAPTER THAT NEEDS NO TYPE, AND THAT IS
+        ; WHY THIS CALLER LANDS WHERE checkPropertyInitialization DOES NOT. Both
+        ; stood behind the tag `flow-graph`; one of them wants a reachability walk
+        ; over the graph and the other wants a flow TYPE for a synthesized `this.p`
+        ; whose initial type is getOptionalType. Sharing a tag made them look like
+        ; one wall (slice 77 named it precisely because two chapters share it), and
+        ; they are two.
+        ; ★★★ THE MARK IS CHECKED HERE AND STAGE 2 IS WHY. isReachableFlowNode
+        ; answers a BOOL, so the getEffectsSignature stop inside its Call arm
+        ; cannot travel out through the answer — and that arm's honest answer is
+        ; *reachable*, which is the direction that INVENTS. Measured: without this
+        ; guard, `class C { err(): never { super.throw() } }` reports TS2534 twice
+        ; where the reference reports nothing, because a callee returning never
+        ; makes the end point unreachable and only getEffectsSignature knows that.
+        ; ★It is ONE unit of 18 242 and NOT ONE of the 1 473 at stage 1 — slice
+        ; 64's *confirm at stage 2 once* earning its rule in a single run.
+        let fhir_mark this.unported_mark()
+        let fhir this.function_has_implicit_return(fn)
+        if this.unported_mark() <> fhir_mark
+            return
+        if fhir = false
+            return
+        var has_explicit_return false
+        if (AstNode.flags_of(fn) & NodeFlagsHasExplicitReturn) <> 0
+            set has_explicit_return: true
+        ; The errorNode walk: the return type annotation, else the JSDoc full
+        ; signature, else the function itself.
+        var error_node: ref[AstNode]? AstNode.type_of(fn)
+        if error_node = null
+            set error_node: AstNode.full_signature_of(fn)
+        if error_node = null
+            set error_node: fn
+        ; The four-arm switch, in the reference's order — a `switch` with no
+        ; subject is an ORDERED chain (§3.5u).
+        if (ty.flags & TypeFlagsNever) <> 0
+        {
+            this.error_on_node(error_node, DiagA_function_returning_never_cannot_have_a_reachable_end_point)
+            return
+        }
+        if has_explicit_return = false
+        {
+            this.error_on_node(error_node, DiagA_function_whose_declared_type_is_neither_undefined_void_nor_any_must_return_a_value)
+            return
+        }
+        ; isTypeAssignableTo(undefinedType, t) — the assignability chapter, and the
+        ; only term of the four this port cannot ask. ★The arm below it is the
+        ; noImplicitReturns one, dead under this harness by the option, which is
+        ; why the stop is the LAST thing here rather than a fall-through.
+        if Checker.strict_null_checks()
+        {
+            this.record_unported("is-type-assignable-to", AstNode.kind_of(fn))
+            return
+        }
+        if Checker.no_implicit_returns()
+            this.record_unported("no-implicit-returns", AstNode.kind_of(fn))
+    }
+
+    ; functionHasImplicitReturn — two reads and the reachability walk.
+    ;
+    ; ★ The slot is on the FUNCTION node and not on its body: upstream it is
+    ; `fn.BodyData().EndFlowNode`, i.e. a field of the function-like data, and the
+    ; binder writes it through `n.end_flow_node` at the container's close.
+    function function_has_implicit_return(this, fn: ref[AstNode]) returns bool
+    {
+        let end AstNode.end_flow_node_of(fn)
+        if end = null
+            return false
+        this.is_reachable_flow_node(end as ref[FlowNode])
     }
 
     ; isPrivateWithinAmbient. ★`ast.HasModifier` and `ast.HasSyntacticModifier` are
@@ -23757,30 +27059,39 @@ define Checker
         }
         this.check_decorators(node)
         this.check_signature_declaration(node)
-        ; ★★★ TS2378 IS CFG-BLOCKED AND THE FIRST DRAFT OF THIS ARM ANSWERED IT
-        ; SILENTLY. Its test is `Ambient == 0 && NodeIsPresent(body) &&
-        ; HasImplicitReturn && !HasExplicitReturn`, and the header of this section
-        ; called that *a BINDER FLAG read, not a control-flow question* — which is
-        ; true of where the flag is READ and false of where it is WRITTEN. Upstream
-        ; both bits are set in bindContainer, under `b.currentFlow.Flags &
-        ; FlowFlagsUnreachable == 0`; this port's binder builds no flow graph, so
-        ; NodeFlagsHasImplicitReturn and NodeFlagsHasExplicitReturn are DECLARED in
-        ; NodeFlags.scaly (*set by the binder*) and written NOWHERE — a grep over
-        ; the package finds their definition and no other line.
+        ; ★★★ TS2378 WAS CFG-BLOCKED AND SLICE 92 UNBLOCKS IT — THIS IS THE
+        ; DIAGNOSTIC PRODUCT OF THE BINDER'S FLOW HALF. Its test is `Ambient == 0
+        ; && NodeIsPresent(body) && HasImplicitReturn && !HasExplicitReturn`, and
+        ; slice 83's note here called that *a BINDER FLAG read, not a control-flow
+        ; question* — true of where the flags are READ and false of where they are
+        ; WRITTEN. Upstream both bits are set in bindContainer under
+        ; `b.currentFlow.Flags & FlowFlagsUnreachable == 0`, so until the binder
+        ; built a flow graph they were DECLARED in NodeFlags.scaly and written
+        ; nowhere. They are written now, and the flow yardstick's `r` section is
+        ; what says so on every unit rather than on this one.
         ;
-        ; ★★★ SO THE THIRD TERM CANNOT BE ASKED AND THE REPORT IS A STOP. Writing
-        ; the four-term test would answer FALSE on every input and lose TS2378
+        ; ★★★ THE WARNING THAT STOOD HERE IS THE REASON THIS SLICE MEASURED THE
+        ; SWAP FROM BOTH ENDS, and it is worth keeping: writing the four-term test
+        ; against flags nobody sets answers FALSE on every input and loses TS2378
         ; corpus-wide — and **diagcheck compares a SUBSEQUENCE, so a line this port
-        ; never emits is invisible to it**: the draft was green on all 1 371 units
-        ; with the report dead. What caught it was one fixture read against the
-        ; reference by hand (§3.5v's second row). The two answerable terms are
-        ; asked, so the stop names only the units where the flag would decide.
+        ; never emits is invisible to it**. The draft slice 83 caught was green on
+        ; all 1 371 units with the report dead. So the arm's control is a LOSS
+        ; control (h-, in the battery) and not an invention one.
         if AstNode.kind_of(node) = KindGetAccessor
         {
             if (AstNode.flags_of(node) & NodeFlagsAmbient) = 0
             {
                 if Binder.node_is_missing(AstNode.body_of(node)) = false
-                    this.record_unported("flow-graph", AstNode.kind_of(node))
+                {
+                    if (AstNode.flags_of(node) & NodeFlagsHasImplicitReturn) <> 0
+                    {
+                        if (AstNode.flags_of(node) & NodeFlagsHasExplicitReturn) = 0
+                        {
+                            if name <> null
+                                this.error_on_node(name as ref[AstNode], DiagA_get_accessor_must_return_a_value)
+                        }
+                    }
+                }
             }
         }
         ; The reference's own comment is the argument for asking the KIND rather
