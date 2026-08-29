@@ -3,7 +3,7 @@
 #
 # run.sh — the tscaly yardsticks.
 #
-# FOUR yardsticks over one corpus, all built from the pinned submodule, so
+# FIVE yardsticks over one corpus, all built from the pinned submodule, so
 # "green" means our port agrees with the TypeScript compiler's own output and
 # not with an expectation someone typed:
 #
@@ -218,7 +218,8 @@ submodule_dirty() {
 oracle_stamp() {
   shasum -a 256 "$PKG/tests/oracle/tokens.go"  "$PKG/tests/oracle/ast.go" \
                 "$PKG/tests/oracle/jsdoc.go"   "$PKG/tests/oracle/split.go" \
-                "$PKG/tests/oracle/symbols.go" "$PKG/tests/oracle/types.go" \
+                "$PKG/tests/oracle/symbols.go" "$PKG/tests/oracle/flow.go" \
+                "$PKG/tests/oracle/types.go" \
     | awk '{print $1}'
   git -C "$SUB" rev-parse HEAD 2>/dev/null
   go version 2>/dev/null
@@ -250,28 +251,31 @@ HAVE=
 [ -f "$STAMP" ] && HAVE=$(cat "$STAMP")
 
 oracles_present() {
-  for o in oracle_tokens oracle_ast oracle_jsdoc oracle_split oracle_symbols oracle_types; do
+  for o in oracle_tokens oracle_ast oracle_jsdoc oracle_split oracle_symbols oracle_flow oracle_types; do
     [ -x "$OUT/$o" ] || return 1
   done
 }
 
 if [ -z "${TSCALY_FORCE_ORACLE:-}" ] && [ "$WANT" = "$HAVE" ] && oracles_present; then
-  : # the six binaries already answer to this stamp
+  : # the seven binaries already answer to this stamp
 else
   rm -f "$STAMP"
   mkdir -p "$SUB/oracle/tokens" "$SUB/oracle/ast" "$SUB/oracle/jsdoc" \
-           "$SUB/oracle/split" "$SUB/oracle/symbols" "$SUB/oracle/types"
+           "$SUB/oracle/split" "$SUB/oracle/symbols" "$SUB/oracle/flow" \
+           "$SUB/oracle/types"
   cp "$PKG/tests/oracle/tokens.go"  "$SUB/oracle/tokens/main.go"
   cp "$PKG/tests/oracle/ast.go"     "$SUB/oracle/ast/main.go"
   cp "$PKG/tests/oracle/jsdoc.go"   "$SUB/oracle/jsdoc/main.go"
   cp "$PKG/tests/oracle/split.go"   "$SUB/oracle/split/main.go"
   cp "$PKG/tests/oracle/symbols.go" "$SUB/oracle/symbols/main.go"
+  cp "$PKG/tests/oracle/flow.go"    "$SUB/oracle/flow/main.go"
   cp "$PKG/tests/oracle/types.go"   "$SUB/oracle/types/main.go"
   ( cd "$SUB" && go build -o "$REPO/$OUT/oracle_tokens"  ./oracle/tokens \
               && go build -o "$REPO/$OUT/oracle_ast"     ./oracle/ast \
               && go build -o "$REPO/$OUT/oracle_jsdoc"   ./oracle/jsdoc \
               && go build -o "$REPO/$OUT/oracle_split"   ./oracle/split \
               && go build -o "$REPO/$OUT/oracle_symbols" ./oracle/symbols \
+              && go build -o "$REPO/$OUT/oracle_flow"    ./oracle/flow \
               && go build -o "$REPO/$OUT/oracle_types"   ./oracle/types ) \
     > "$OUT/oracle-build.log" 2>&1
   orc=$?
@@ -333,7 +337,7 @@ if [ $? -ne 0 ]; then
   red "the tscaly package failed to compile:"; sed 's/^/    /' "$OUT/pkg-build.log"; exit 2
 fi
 
-for prog in tscaly_tokens tscaly_ast tscaly_jsdoc tscaly_symbols tscaly_types tscaly_dump; do
+for prog in tscaly_tokens tscaly_ast tscaly_jsdoc tscaly_symbols tscaly_flow tscaly_types tscaly_dump; do
   "$SCALYC" -c -o "$OUT/$prog.o" "$PKG/0.1.0/$prog.scaly" > "$OUT/$prog-build.log" 2>&1
   if [ $? -ne 0 ]; then
     red "$prog failed to compile:"; sed 's/^/    /' "$OUT/$prog-build.log"; exit 2
@@ -504,6 +508,7 @@ report "scanner yardstick" $matched_tokens $unported_tokens $accepted_tokens $fa
 report "parser yardstick"  $matched_ast    $unported_ast    $accepted_ast    $failed_ast    $refcrash_ast
 report "jsdoc yardstick"   $matched_jsdoc  $unported_jsdoc  $accepted_jsdoc  $failed_jsdoc  $refcrash_jsdoc
 report "binder yardstick"  $matched_symbols $unported_symbols $accepted_symbols $failed_symbols $refcrash_symbols
+report "flow yardstick"    $matched_flow   $unported_flow   $accepted_flow   $failed_flow   $refcrash_flow
 report "checker yardstick" $matched_types  $unported_types  $accepted_types  $failed_types  $refcrash_types
 
 echo
@@ -525,6 +530,18 @@ echo "  the reference keeps in a third list that neither Diagnostics() nor"
 echo "  JSDiagnostics() includes. None of it is in the tree the parser yardstick"
 echo "  walks, so without this artifact a port producing no symbols and a port"
 echo "  producing wrong ones compare exactly equal. See tests/oracle/symbols.go."
+
+echo
+echo "  The FIFTH yardstick (slice 92) compares the CONTROL FLOW GRAPH the bind"
+echo "  built: the flow node reaching every statement, the four per-node slots"
+echo "  (flow, end-of-body, return, fallthrough), every flow node's flags, its"
+echo "  associated AST node and its antecedent list, and the three REACHABILITY"
+echo "  bits the binder writes on a node. ★★★It is the only EQUALITY in this"
+echo "  directory: diagcheck compares a subsequence and cannot see a line we fail"
+echo "  to emit, where a missing EDGE and an invented one are both red here."
+echo "  ★★★And the sentence it refutes had stood for sixty slices — the graph was"
+echo "  said to be unreachable through any exported accessor, which is a claim"
+echo "  about an INSTRUMENT and was simply false. See tests/oracle/flow.go."
 
 echo
 echo "  of those, $jsdoc_bearing units actually CARRY JSDoc — the rest match by both"
@@ -583,16 +600,17 @@ echo
 echo "  Each count is printed rather than folded away: a yardstick that shrinks in"
 echo "  silence is the failure mode this suite exists to prevent."
 
-# ★★★ THE FOURTH YARDSTICK'S COUNTERS BELONG IN THESE THREE SUMS, and leaving them
+# ★★★ EVERY YARDSTICK'S COUNTERS BELONG IN THESE THREE SUMS, and leaving one
 # out is exactly the defect slice 26's control c4 found: with the binder oracle
 # patched to exit 3, the report printed **865 UNEXPLAINED** in its own column and
 # the run still said OK and listed no failures, because these sums named three
 # yardsticks and there were four. A column that cannot fail the run is a column
 # that is not measured — the same sentence this suite keeps writing about the
-# `unported` column, one level up.
-total_stale=$(( stale_tokens + stale_ast + stale_jsdoc + stale_symbols + stale_types ))
-total_failed=$(( failed_tokens + failed_ast + failed_jsdoc + failed_symbols + failed_types ))
-total_timeout=$(( timeout_tokens + timeout_ast + timeout_jsdoc + timeout_symbols + timeout_types ))
+# `unported` column, one level up. ★Slice 92 added the FIFTH and these are the
+# three lines it had to touch; the control that proves it is s01.
+total_stale=$(( stale_tokens + stale_ast + stale_jsdoc + stale_symbols + stale_flow + stale_types ))
+total_failed=$(( failed_tokens + failed_ast + failed_jsdoc + failed_symbols + failed_flow + failed_types ))
+total_timeout=$(( timeout_tokens + timeout_ast + timeout_jsdoc + timeout_symbols + timeout_flow + timeout_types ))
 
 # A timed-out dump is counted in UNEXPLAINED like any other failure — it IS one —
 # but it is also named separately, because "our dumper did not finish" and "our
@@ -607,7 +625,7 @@ if [ $total_timeout -ne 0 ]; then
   echo "  $OUT/failures.txt for the list."
 fi
 
-total_refcrash=$(( refcrash_tokens + refcrash_ast + refcrash_jsdoc + refcrash_symbols + refcrash_types ))
+total_refcrash=$(( refcrash_tokens + refcrash_ast + refcrash_jsdoc + refcrash_symbols + refcrash_flow + refcrash_types ))
 
 # ★ NAMED, ALWAYS, AND NEVER SUMMARISED AWAY. A unit the reference cannot answer
 # is a hole in the measurement, so the list IS the point: it has to be possible to

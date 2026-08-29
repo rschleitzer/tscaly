@@ -500,7 +500,8 @@ def _first_line(path):
 # the name" for all of them, and a per-line rule would be a normalisation inside
 # the comparison. Numeric kinds are looked up in tscaly/Kind.scaly when a diff
 # has to be read.
-ARTIFACTS = (("tokens", 4), ("ast", 5), ("jsdoc", 5), ("symbols", 0), ("types", 0))
+ARTIFACTS = (("tokens", 4), ("ast", 5), ("jsdoc", 5), ("symbols", 0), ("flow", 0),
+             ("types", 0))
 
 
 def main():
@@ -747,7 +748,8 @@ def main():
     # rather than to a wrong verdict. `TSCALY_NO_COMBINED=1` takes the slow path
     # for everything, and that is the A/B the whole-corpus proof was run through.
     _COMBINED_SEPS = [b"==== TSCALY-DUMP ast\n", b"==== TSCALY-DUMP jsdoc\n",
-                      b"==== TSCALY-DUMP symbols\n", b"==== TSCALY-DUMP types\n"]
+                      b"==== TSCALY-DUMP symbols\n", b"==== TSCALY-DUMP flow\n",
+                      b"==== TSCALY-DUMP types\n"]
 
     def combined_sections(case_file, work):
         rc, blob = run_capture([f"{out}/tscaly_dump", case_file],
