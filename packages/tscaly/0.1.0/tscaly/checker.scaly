@@ -95,6 +95,8 @@ use scaly.containers.String
 use scaly.containers.StringBuilder
 use tscaly.ast.AstNode
 use tscaly.ast.Symbol
+use tscaly.ast.FlowNode
+use tscaly.ast.FlowList
 use tscaly.parser.Parser
 use tscaly.binder.Binder
 use tscaly.Diagnostics.DiagnosticList
@@ -1542,6 +1544,162 @@ define DuplicateNameEntry
     }
 }
 
+; ── slice 93: the flow walk's records ───────────────────────────────────────
+;
+; ★★★ THERE IS NO `FlowType` RECORD HERE, AND THAT IS THIS PACKAGE'S OWN
+; CONVENTION RATHER THAN A SIMPLIFICATION. Upstream every arm of the walk answers
+; a two-field VALUE `FlowType{t, incomplete}`. No function in this port returns a
+; record by value — the grep is `returns [A-Z]` and it finds nothing in 76 000
+; lines — and the reason is in the root CLAUDE.md: a constructed struct return
+; takes the CALLER's page, so in a walk that recurses once per flow EDGE it is a
+; page per edge. The pair is a `ref[Type]?` result and a `ref[bool]` out-cell,
+; which is the spelling this tree uses for every other out-parameter.
+;
+; ★★★ AND THE NIL HALF SURVIVES INTACT, WHICH IS WHAT MADE THE CHOICE SAFE — it
+; is the one thing a lowering here could have lost. A nil `t` is a REAL ANSWER at
+; three arms: assignment, call and array mutation answer it to mean *this node
+; does not affect the reference, keep walking*, and the dispatch reads exactly
+; that. It is NOT this port's stop signal. The stop signal is the unported MARK,
+; as everywhere else in this file, and every recursion point in the walk compares
+; one BEFORE it looks at the answer — because the two are otherwise the same
+; null.
+
+; checker.SharedFlow — one row of the per-invocation memo of getTypeAtFlowNode.
+; A flow node is SHARED when it is the antecedent of more than one node (slice
+; 92's h15 measured the two bits a saturating counter), and the whole point of
+; the memo is that such a node is reached more than once per invocation.
+define SharedFlow
+(
+    flow: ref[FlowNode]?
+    t: ref[Type]?
+    incomplete: bool
+)
+{
+    init(fl: ref[FlowNode]?, ty: ref[Type]?, inc: bool)
+    {
+        set flow: fl
+        set t: ty
+        set incomplete: inc
+    }
+}
+
+; The reduce-label stack, `f.reduceLabels` upstream.
+;
+; ★★★ IT IS A CONS LIST AND NOT AN ARRAY, AND THE REASON IS THE POP. Upstream the
+; stack is pushed before a recursion and truncated after it (`f.reduceLabels =
+; f.reduceLabels[:len-1]`), and `Array` in this stdlib has `add` and `clear` and
+; nothing between them — reaching into its `length` field to truncate would be
+; this package writing through a container's internals. A cons list pushes by
+; minting a head and pops by USING THE OLD HEAD in the continuation, which is the
+; same stack with the truncation deleted rather than worked around.
+;
+; ★ And it reads in the right direction for free: getBranchLabelAntecedents walks
+; the reference's array BACKWARD (`i := len; for i != 0 { i-- }`), because a
+; `try` nested in a `try` pushes twice for one target and the INNER push must
+; win. The head of this list is the last push.
+define ReduceLabelStack
+(
+    data: ref[AstNode]?
+    next: ref[ReduceLabelStack]?
+)
+{
+    init(d: ref[AstNode]?, n: ref[ReduceLabelStack]?)
+    {
+        set data: d
+        set next: n
+    }
+}
+
+; checker.FlowState. Upstream it is recycled through a free list
+; (getFlowState/putFlowState) because one is allocated per
+; getFlowTypeOfReference; here it is minted on the checker's page and the region
+; frees it, so the free list has nothing to buy and is not ported.
+;
+; ★ `sharedFlows` is a CHECKER-level stack upstream, sliced per invocation
+; through `f.sharedFlowStart` and truncated on the way out. A per-invocation
+; Array is the same window with no cursor, so the start index is gone and the
+; truncation with it. `antecedentTypes` is the same shape one level down and
+; lives in getTypeAtFlowBranchLabel for the same reason.
+;
+; ★ `refKey` is NOT here, and its absence is a claim: its only reader is
+; getTypeAtFlowLoopLabel's cache key, and the loop label is this slice's wall.
+define FlowState
+(
+    reference: ref[AstNode]?
+    declared_type: ref[Type]?
+    initial_type: ref[Type]?
+    flow_container: ref[AstNode]?
+    depth: int
+    reduce_labels: ref[ReduceLabelStack]?
+    shared_flows: ref[Array[ref[SharedFlow]?]]
+)
+{
+    init(r: ref[AstNode]?, dt: ref[Type]?, it: ref[Type]?, fc: ref[AstNode]?, d: int, rl: ref[ReduceLabelStack]?, sf: ref[Array[ref[SharedFlow]?]])
+    {
+        set reference: r
+        set declared_type: dt
+        set initial_type: it
+        set flow_container: fc
+        set depth: d
+        set reduce_labels: rl
+        set shared_flows: sf
+    }
+}
+
+; checker.FlowTraceEvent — the row of the FLOWPIN (slice 93).
+;
+; ★★★ THE BATTERY IS WHY THIS EXISTS, AND SLICE 92'S OWN FINDING IS WHY IT COULD
+; BE BUILT. This chapter's product is a flow TYPE, and no instrument in this
+; directory can see one: the T section is emitted only for a unit whose check
+; COMPLETES, and not one unit that reaches the flow does. So a control that breaks
+; the walk and still ANSWERS — the wrong type, silently — moves nothing. Measured:
+; the first draft of controls-slice93.sh put 31 rows against five instruments and
+; NINETEEN came back ungated, including the Start arm's hop, the reduce-label
+; stack and the branch label's collapse.
+;
+; ★★★ IT IS A PIN AND NOT A YARDSTICK, AND SAYING SO IS THE HONEST PART. There is
+; no reference side: what it compares is this port against ITSELF one patch ago,
+; the way the STOPPIN and the MEMBERPIN do. It cannot say an answer is RIGHT —
+; diagcheck and the DIAGPIN are what say that, and between them they cover the
+; three diagnostics this chapter produces. What it says is that the WALK took the
+; edges it took, which is the claim every row of the battery is about.
+;
+;   kind 0  an invocation      a = the reference's pos, b = its end
+;   kind 1  a visited node     a = the flow node's FLAGS, b = 0
+;   kind 2  the answer         a = the type's id, b = 1 if a stop ended the walk
+define FlowTraceEvent
+(
+    kind: int
+    a: int
+    b: int
+)
+{
+    init(k: int, x: int, y: int)
+    {
+        set kind: k
+        set a: x
+        set b: y
+    }
+}
+
+; c.flowNodeReachable's row — the Shared-node memo of isReachableFlowNodeWorker,
+; keyed on the FLOW NODE and living for the whole check rather than for one
+; invocation. It is a SEPARATE table from SharedFlow above and not a second use
+; of it: reachability is a property of the graph alone, so it survives across
+; references, where a flow TYPE is a property of the reference and cannot.
+define FlowReachableLink
+(
+    flow: ref[FlowNode]?
+    reachable: bool
+)
+{
+    init(fl: ref[FlowNode]?, r: bool)
+    {
+        set flow: fl
+        set reachable: r
+    }
+}
+
 define Checker
 (
     host: ref[Page]
@@ -1989,6 +2147,36 @@ define Checker
     ; container, a type predicate's parent and an accessor.
     signature_links: ref[Array[ref[SignatureLink]?]]
 
+    ; ── the flow walk's checker-level state (slice 93) ──────────────────────
+    ;
+    ; c.flowAnalysisDisabled — set by the depth guard and read at
+    ; getFlowTypeOfReferenceEx's first line. It is a LATCH: once the walk has
+    ; overflowed inside one container the reference stops analysing for the rest
+    ; of the check, which is why the flag is on the checker and not on a state.
+    flow_analysis_disabled: bool
+
+    ; ★ c.flowInvocationCount is NOT a field here. Upstream it feeds the tracer
+    ; and getFlowCacheKey's staleness test; this port has neither, and a counter
+    ; nothing prints is a number nobody can be wrong about (§3.5be). What says how
+    ; often this chapter runs is the stop log, which is an instrument.
+
+    ; c.flowNodeReachable, c.lastFlowNode, c.lastFlowNodeReachable — the two
+    ; memos of isReachableFlowNodeWorker, transcribed rather than dropped.
+    ;
+    ; ★★ A MEMO OF A PURE FUNCTION LOOKS DROPPABLE AND THIS ONE IS NOT. Without
+    ; the Shared-node table the branch-label arm re-walks every antecedent of
+    ; every junction it meets, which is exponential in the nesting depth — the
+    ; reference's own reason for the table. The one-entry `lastFlowNode` cache in
+    ; front of it is an optimisation and is transcribed with its invalidation
+    ; (the reduce-label arm clears it, because a label whose antecedents have
+    ; been swapped is a different question under the same identity).
+    ; c.flowTrace — the FLOWPIN's log; see FlowTraceEvent for why it exists.
+    flow_trace: ref[Array[ref[FlowTraceEvent]?]]
+
+    flow_node_reachable: ref[Array[ref[FlowReachableLink]?]]
+    last_flow_node: ref[FlowNode]?
+    last_flow_node_reachable: bool
+
     ; c.symbolNodeLinks (slice 91) — the same idiom a SIXTH time, keyed on the
     ; identifier NODE. One row per identifier the checker resolves, which is why
     ; the scan is the longest of the six and still linear: see the record's own
@@ -2162,6 +2350,15 @@ define Checker
         let snl host.allocate(sizeof Array[ref[SymbolNodeLink]?], alignof Array[ref[SymbolNodeLink]?]) as pointer[Array[ref[SymbolNodeLink]?]]
         set *snl: Array[ref[SymbolNodeLink]?]()
         set c.symbol_node_links: snl
+        set c.flow_analysis_disabled: false
+        let fnr host.allocate(sizeof Array[ref[FlowReachableLink]?], alignof Array[ref[FlowReachableLink]?]) as pointer[Array[ref[FlowReachableLink]?]]
+        set *fnr: Array[ref[FlowReachableLink]?]()
+        set c.flow_node_reachable: fnr
+        let ftr host.allocate(sizeof Array[ref[FlowTraceEvent]?], alignof Array[ref[FlowTraceEvent]?]) as pointer[Array[ref[FlowTraceEvent]?]]
+        set *ftr: Array[ref[FlowTraceEvent]?]()
+        set c.flow_trace: ftr
+        set c.last_flow_node: null
+        set c.last_flow_node_reachable: false
         set c.signature_count: 0
         let tr host.allocate(sizeof Array[ref[TypeResolution]?], alignof Array[ref[TypeResolution]?]) as pointer[Array[ref[TypeResolution]?]]
         set *tr: Array[ref[TypeResolution]?]()
@@ -2267,6 +2464,24 @@ define Checker
     ; these rather than touching the Array.
     function stop_count(c: ref[Checker]) returns int
         c.stop_log.get_length() as int
+
+    ; ── the flow trace's readers (slice 93), statics for the same reason ──
+
+    function flow_trace_count(c: ref[Checker]) returns int
+        c.flow_trace.get_length() as int
+
+    function flow_trace_field_at(c: ref[Checker], i: int, which: int) returns int
+    {
+        let row c.flow_trace[i]
+        if row = null
+            return 0
+        let ev row as ref[FlowTraceEvent]
+        if which = 0
+            return ev.kind
+        if which = 1
+            return ev.a
+        return ev.b
+    }
 
     ; ── the member log's readers (slice 86), statics for stop_count's reason ──
 
@@ -9403,6 +9618,1262 @@ define Checker
         this.get_type_of_symbol(symbol)
     }
 
+    ; The FLOWPIN's one writer.
+    procedure trace_flow(this, kind: int, a: int, b: int)
+    {
+        let ev host.allocate(sizeof FlowTraceEvent, alignof FlowTraceEvent) as pointer[FlowTraceEvent]
+        set *ev: FlowTraceEvent(kind, a, b)
+        flow_trace.add(ev as ref[FlowTraceEvent])
+    }
+
+    ; ══ slice 93 — THE FLOW WALK ═══════════════════════════════════════════
+    ;
+    ; getFlowTypeOfReference and the graph walk under it: the checker's walk
+    ; BACKWARD through the graph slice 92 built, and the row slice 92 named as its
+    ; successor. Its two callers are `flow-graph 79` (checkIdentifier's tail) and
+    ; `flow-graph 264` (checkPropertyInitialization); only the first is wired
+    ; here, and the reason is at the caller.
+    ;
+    ; ★★★ WHAT THIS SLICE DOES **NOT** PORT IS ONE THING WEARING SEVEN NAMES, AND
+    ; NAMING IT ONCE IS WORTH MORE THAN SEVEN STOPS: `getUnionType`. A branch
+    ; label unions its antecedents, a loop label unions them again through a
+    ; cache keyed on a reference HASH, `getOptionalType` unions with undefined,
+    ; `getAssignmentReducedType` reduces one, the evolving-array family builds one
+    ; per element, and narrowType's whole job is to produce one. The seven stops
+    ; below are seven doors into that room. ★It is why the class caller cannot be
+    ; wired: isPropertyInitializedInConstructor's initial type is
+    ; `getOptionalType(propType, false)`.
+    ;
+    ; ★★ WHAT DOES ANSWER, THEN, AND IT IS NOT A REMNANT: the reference of a
+    ; variable whose declared type is not a union, reached over straight-line
+    ; flow, over an assignment to itself, over a junction whose antecedents agree,
+    ; or from the top of its own container. That is the shape most code has.
+
+    ; ast.IsAssignmentExpression(node, excludeCompoundAssignment: FALSE) — the
+    ; second polarity, and the one isMatchingReference's target arm asks for. The
+    ; first is already in this file under its own name; the two differ by exactly
+    ; the compound operators, so they are two functions rather than one with a
+    ; flag, which is §3.9e's treatment of the same shape.
+    function is_assignment_expression_including_compound(node: ref[AstNode]) returns bool
+    {
+        if AstNode.kind_of(node) <> KindBinaryExpression
+            return false
+        if Parser.is_assignment_operator(AstNode.binary_operator_kind(node)) = false
+            return false
+        Parser.is_left_hand_side_expression_kind(Checker.kind_or_unknown(AstNode.binary_left_of(node)))
+    }
+
+    ; ast.IsFunctionExpressionOrArrowFunction.
+    function is_function_expression_or_arrow_function(node: ref[AstNode]) returns bool
+    {
+        let k AstNode.kind_of(node)
+        if k = KindFunctionExpression
+            return true
+        k = KindArrowFunction
+    }
+
+    ; getFlowNodeOfNode. Slice 92's finding five measured the `FlowNodeData() !=
+    ; nil` guard VACUOUS in this port — every node carries the slot — so what is
+    ; left of the function is the slot read, and the guard is not written.
+    function get_flow_node_of_node(node: ref[AstNode]?) returns ref[FlowNode]?
+        AstNode.flow_node_of(node)
+
+    ; convertAutoToAny. The autoArrayType arm CANNOT BE ASKED here and that is a
+    ; containment proof rather than an omission: `c.autoArrayType` is
+    ; `createArrayType(c.autoType)`, which needs the global `Array` symbol, which
+    ; is the globals table (§3.11). Nothing in this port mints it, so no type in
+    ; the run is equal to it, so the arm is written as the sentence you are
+    ; reading.
+    function convert_auto_to_any(this, t: ref[Type]?) returns ref[Type]?
+    {
+        if t = null
+            return null
+        if (t as ref[Type]) = auto_type
+            return any_type
+        t
+    }
+
+    ; c.flowNodeReachable[flow] — the LOOKUP, and it is deliberately not the
+    ; mint-on-miss reader the other six tables in this file use. Those answer a
+    ; row whose fields start empty and mean *not yet computed*; this one's payload
+    ; is a BOOL, where an absent row and a row holding false are different facts
+    ; and a mint-on-miss reader could not tell them apart.
+    function flow_reachable_lookup(this, flow: ref[FlowNode]) returns ref[FlowReachableLink]?
+    {
+        let len flow_node_reachable.get_length() as int
+        var i 0
+        while i < len
+        {
+            let row flow_node_reachable[i]
+            if row <> null
+            {
+                let r row as ref[FlowReachableLink]
+                if r.flow = flow
+                    return r
+            }
+            set i: i + 1
+        }
+        null
+    }
+
+    ; getBranchLabelAntecedents — the reduce-label stack read from the HEAD, which
+    ; is the reference's backward walk over its array; see ReduceLabelStack's own
+    ; note for why the head is the last push.
+    function get_branch_label_antecedents(flow: ref[FlowNode], reduce_labels: ref[ReduceLabelStack]?) returns ref[FlowList]?
+    {
+        var cur reduce_labels
+        while cur <> null
+        {
+            let c cur as ref[ReduceLabelStack]
+            if AstNode.flow_reduce_target_of(c.data) = flow
+                return AstNode.flow_reduce_antecedents_of(c.data)
+            set cur: c.next
+        }
+        flow.antecedents
+    }
+
+    ; isReachableFlowNode. The one-entry cache is written here rather than in the
+    ; worker, exactly as upstream: the worker recurses and would otherwise
+    ; overwrite the entry with an inner question's answer.
+    function is_reachable_flow_node(this, flow: ref[FlowNode]) returns bool
+    {
+        let result this.is_reachable_flow_node_worker(null, flow, false)
+        set last_flow_node: flow
+        set last_flow_node_reachable: result
+        result
+    }
+
+    ; isReachableFlowNodeWorker. A pure walk over the GRAPH — no type is asked for
+    ; anywhere in it except through getEffectsSignature, which is a stop — so this
+    ; is the half of the flow chapter that needs nothing the checker cannot
+    ; already answer.
+    ;
+    ; ★ The reference takes a `*FlowState` and reads exactly one field of it; the
+    ; stack itself is the parameter here.
+    function is_reachable_flow_node_worker(this, reduce_labels: ref[ReduceLabelStack]?, flow_in: ref[FlowNode], no_cache_check_in: bool) returns bool
+    {
+        var flow flow_in
+        var no_cache_check no_cache_check_in
+        repeat
+        {
+            if last_flow_node <> null
+            {
+                if (last_flow_node as ref[FlowNode]) = flow
+                    return last_flow_node_reachable
+            }
+            let flags flow.flags
+            if (flags & FlowFlagsShared) <> 0
+            {
+                if no_cache_check = false
+                {
+                    let hit this.flow_reachable_lookup(flow)
+                    if hit <> null
+                        return (hit as ref[FlowReachableLink]).reachable
+                    let reachable this.is_reachable_flow_node_worker(reduce_labels, flow, true)
+                    let made host.allocate(sizeof FlowReachableLink, alignof FlowReachableLink) as pointer[FlowReachableLink]
+                    set *made: FlowReachableLink(flow, reachable)
+                    flow_node_reachable.add(made)
+                    return reachable
+                }
+                set no_cache_check: false
+            }
+            var advance false
+            if (flags & (FlowFlagsAssignment | FlowFlagsCondition | FlowFlagsArrayMutation)) <> 0
+                set advance: true
+            if advance = false
+            {
+                if (flags & FlowFlagsCall) <> 0
+                {
+                    ; getEffectsSignature — the assertion half of the graph, and
+                    ; the first of this slice's seven doors. Two of its three
+                    ; branches END the walk (an `asserts x` whose argument is
+                    ; provably false, and a callee returning never), so guessing
+                    ; *no effects* here would answer REACHABLE where the reference
+                    ; answers unreachable, which is the direction that invents.
+                    this.record_unported("get-effects-signature", Checker.kind_or_unknown(flow.node))
+                    return true
+                }
+            }
+            if advance = false
+            {
+                if (flags & FlowFlagsBranchLabel) <> 0
+                {
+                    ; "A branching point is reachable if any branch is reachable."
+                    var list Checker.get_branch_label_antecedents(flow, reduce_labels)
+                    while list <> null
+                    {
+                        let l list as ref[FlowList]
+                        if l.flow <> null
+                        {
+                            if this.is_reachable_flow_node_worker(reduce_labels, l.flow as ref[FlowNode], false)
+                                return true
+                        }
+                        set list: l.next
+                    }
+                    return false
+                }
+            }
+            if advance = false
+            {
+                if (flags & FlowFlagsLoopLabel) <> 0
+                {
+                    let ants flow.antecedents
+                    if ants = null
+                        return false
+                    ; "A loop is reachable if the control flow path that leads to
+                    ; the top is reachable" — the FIRST antecedent, which slice
+                    ; 92's h12 measured to be the non-looping one by construction.
+                    set flow: (ants as ref[FlowList]).flow as ref[FlowNode]
+                    continue
+                }
+            }
+            if advance = false
+            {
+                if (flags & FlowFlagsSwitchClause) <> 0
+                {
+                    if AstNode.flow_clause_start_of(flow.node) = AstNode.flow_clause_end_of(flow.node)
+                    {
+                        ; isExhaustiveSwitchStatement — the second door. It asks
+                        ; getTypeOfExpression of the switch subject and compares
+                        ; against every clause's literal type, i.e. the union
+                        ; machinery again.
+                        this.record_unported("is-exhaustive-switch-statement", KindSwitchStatement)
+                        return true
+                    }
+                    set advance: true
+                }
+            }
+            if advance = false
+            {
+                if (flags & FlowFlagsReduceLabel) <> 0
+                {
+                    ; "Cache is unreliable once we start adjusting labels."
+                    set last_flow_node: null
+                    let cell host.allocate(sizeof ReduceLabelStack, alignof ReduceLabelStack) as pointer[ReduceLabelStack]
+                    set *cell: ReduceLabelStack(flow.node, reduce_labels)
+                    return this.is_reachable_flow_node_worker(cell, flow.antecedent as ref[FlowNode], false)
+                }
+            }
+            if advance = false
+                return (flags & FlowFlagsUnreachable) = 0
+            set flow: flow.antecedent as ref[FlowNode]
+        }
+    }
+
+    ; ── the reference-matching family ───────────────────────────────────────
+
+    ; isMatchingReference, taken to the ONE source kind this port can hand it.
+    ;
+    ; ★★★ THE FIVE SOURCE ARMS BELOW THE IDENTIFIER HAVE ZERO INPUT AND THAT IS A
+    ; CONTAINMENT PROOF, NOT A GAP. The reference is whatever the CALLER passes,
+    ; and this slice wires one caller: checkIdentifier, which passes the
+    ; identifier. The other producer of a reference is
+    ; isPropertyInitializedInConstructor, which synthesizes `this.p` — and it is
+    ; behind getOptionalType, i.e. behind the union wall. So a property access, an
+    ; element access, a qualified name and a meta property cannot arrive here
+    ; until that row lands, and §3.5be says the day it lands is the day they are
+    ; written. ★They are a STOP rather than a `false`, because answering false
+    ; would make a real assignment invisible to the walk, silently.
+    function is_matching_reference(this, source: ref[AstNode], target: ref[AstNode]) returns bool
+    {
+        let tk AstNode.kind_of(target)
+        if tk = KindParenthesizedExpression
+        {
+            let e AstNode.expression_of(target)
+            if e = null
+                return false
+            return this.is_matching_reference(source, e as ref[AstNode])
+        }
+        if tk = KindNonNullExpression
+        {
+            let e AstNode.expression_of(target)
+            if e = null
+                return false
+            return this.is_matching_reference(source, e as ref[AstNode])
+        }
+        if tk = KindBinaryExpression
+        {
+            if Checker.is_assignment_expression_including_compound(target)
+            {
+                let l AstNode.binary_left_of(target)
+                if l <> null
+                {
+                    if this.is_matching_reference(source, l as ref[AstNode])
+                        return true
+                }
+            }
+            if AstNode.binary_operator_kind(target) = KindCommaToken
+            {
+                let r AstNode.binary_right_of(target)
+                if r <> null
+                    return this.is_matching_reference(source, r as ref[AstNode])
+            }
+            return false
+        }
+        let sk AstNode.kind_of(source)
+        if sk = KindThisKeyword
+            return tk = KindThisKeyword
+        if sk = KindSuperKeyword
+            return tk = KindSuperKeyword
+        if sk = KindNonNullExpression
+        {
+            let e AstNode.expression_of(source)
+            if e = null
+                return false
+            return this.is_matching_reference(e as ref[AstNode], target)
+        }
+        if sk = KindParenthesizedExpression
+        {
+            let e AstNode.expression_of(source)
+            if e = null
+                return false
+            return this.is_matching_reference(e as ref[AstNode], target)
+        }
+        if sk = KindSatisfiesExpression
+        {
+            let e AstNode.expression_of(source)
+            if e = null
+                return false
+            return this.is_matching_reference(e as ref[AstNode], target)
+        }
+        if sk = KindMetaProperty
+        {
+            this.record_unported("is-matching-reference-source", sk)
+            return false
+        }
+        if sk = KindPropertyAccessExpression
+        {
+            this.record_unported("is-matching-reference-source", sk)
+            return false
+        }
+        if sk = KindElementAccessExpression
+        {
+            this.record_unported("is-matching-reference-source", sk)
+            return false
+        }
+        if sk = KindQualifiedName
+        {
+            this.record_unported("is-matching-reference-source", sk)
+            return false
+        }
+        var is_name false
+        if sk = KindIdentifier
+            set is_name: true
+        if sk = KindPrivateIdentifier
+            set is_name: true
+        if is_name = false
+            return false
+        if Checker.is_this_in_type_query(source)
+            return tk = KindThisKeyword
+        if tk = KindIdentifier
+        {
+            if this.get_resolved_symbol(source) = this.get_resolved_symbol(target)
+                return true
+        }
+        var target_declares false
+        if tk = KindVariableDeclaration
+            set target_declares: true
+        if tk = KindBindingElement
+            set target_declares: true
+        if target_declares = false
+            return false
+        let exported this.get_export_symbol_of_value_symbol_if_exported(this.get_resolved_symbol(source))
+        if exported = null
+            return false
+        let td this.symbol_of_declaration(target)
+        if td = null
+            return false
+        (exported as ref[Symbol]) = (td as ref[Symbol])
+    }
+
+    ; containsMatchingReference — the dotted prefix walk.
+    function contains_matching_reference(this, source: ref[AstNode], target: ref[AstNode]) returns bool
+    {
+        var s source
+        while Parser.is_access_expression(s)
+        {
+            let e AstNode.expression_of(s)
+            if e = null
+                return false
+            set s: e as ref[AstNode]
+            if this.is_matching_reference(s, target)
+                return true
+        }
+        false
+    }
+
+    ; optionalChainContainsReference — the same walk over the OPTIONAL chain.
+    function optional_chain_contains_reference(this, source: ref[AstNode], target: ref[AstNode]) returns bool
+    {
+        var s source
+        while Binder.is_optional_chain(s)
+        {
+            let e AstNode.expression_of(s)
+            if e = null
+                return false
+            set s: e as ref[AstNode]
+            if this.is_matching_reference(s, target)
+                return true
+        }
+        false
+    }
+
+    ; ── the arms of getTypeAtFlowNode ───────────────────────────────────────
+
+    ; getTypeAtFlowAssignment.
+    ;
+    ; ★★ THE ARM THAT ANSWERS, AND IT ANSWERS `f.declaredType`. An assignment
+    ; narrows only where the declared type is a UNION — the reference says so in
+    ; its own first comment — so the whole cost of the arm for a plain variable is
+    ; the reachability test and the identity of the target.
+    function get_type_at_flow_assignment(this, f: ref[FlowState], flow: ref[FlowNode], out_incomplete: ref[bool]) returns ref[Type]?
+    {
+        set out_incomplete: false
+        let node_opt flow.node
+        if node_opt = null
+            return null
+        let node node_opt as ref[AstNode]
+        let reference f.reference as ref[AstNode]
+        let declared f.declared_type as ref[Type]
+        if this.is_matching_reference(reference, node)
+        {
+            if this.is_reachable_flow_node(flow) = false
+                return unreachable_never_type
+            if Checker.get_assignment_target_kind(node) = AssignmentKindCompound
+            {
+                ; getBaseTypeOfLiteralType — the row the equality operators and
+                ; checkIdentifier's own compound arm already stand at.
+                this.record_unported("get-base-type-of-literal-type", AstNode.kind_of(node))
+                return null
+            }
+            if declared = auto_type
+            {
+                ; The evolving-array family: an `auto` declared type means `var x;`
+                ; with no annotation, and every branch below it mints an evolving
+                ; array or widens a literal. Third door.
+                this.record_unported("get-evolving-array-type", AstNode.kind_of(node))
+                return null
+            }
+            if Checker.is_in_compound_like_assignment(node)
+            {
+                this.record_unported("get-base-type-of-literal-type", AstNode.kind_of(node))
+                return null
+            }
+            if (declared.flags & TypeFlagsUnion) <> 0
+            {
+                ; getAssignmentReducedType — the fourth door, and the one the
+                ; reference's own comment points at: an assignment narrows a union
+                ; and nothing else.
+                this.record_unported("get-assignment-reduced-type", AstNode.kind_of(node))
+                return null
+            }
+            return declared
+        }
+        if this.contains_matching_reference(reference, node)
+        {
+            if this.is_reachable_flow_node(flow) = false
+                return unreachable_never_type
+            ; "A matching dotted name might also be an expando property on a
+            ; function *expression*, in which case we continue control flow
+            ; analysis back to the function's declaration."
+            if AstNode.kind_of(node) = KindVariableDeclaration
+            {
+                var expando false
+                if Parser.is_in_js_file(node)
+                    set expando: true
+                if this.is_var_const_like(node)
+                    set expando: true
+                if expando
+                {
+                    let ini AstNode.initializer_of(node)
+                    if ini <> null
+                    {
+                        if Checker.is_function_expression_or_arrow_function(ini as ref[AstNode])
+                            return this.get_type_at_flow_node(f, flow.antecedent as ref[FlowNode], out_incomplete)
+                    }
+                }
+            }
+            return declared
+        }
+        ; "for (const _ in ref) acts as a nonnull on ref"
+        if AstNode.kind_of(node) = KindVariableDeclaration
+        {
+            let list AstNode.parent_node_of(node)
+            if list <> null
+            {
+                let stmt AstNode.parent_node_of(list as ref[AstNode])
+                if stmt <> null
+                {
+                    if AstNode.kind_of(stmt as ref[AstNode]) = KindForInStatement
+                    {
+                        let expr AstNode.expression_of(stmt as ref[AstNode])
+                        if expr <> null
+                        {
+                            var hit false
+                            if this.is_matching_reference(reference, expr as ref[AstNode])
+                                set hit: true
+                            if hit = false
+                            {
+                                if this.optional_chain_contains_reference(expr as ref[AstNode], reference)
+                                    set hit: true
+                            }
+                            if hit
+                            {
+                                ; getNonNullableTypeIfNeeded — getTypeWithFacts
+                                ; under strictNullChecks, i.e. a FILTER over a
+                                ; union. Fifth door.
+                                this.record_unported("get-non-nullable-type", KindForInStatement)
+                                return null
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ; "Assignment doesn't affect reference" — the nil answer, which the
+        ; dispatch reads as *walk on*.
+        null
+    }
+
+    ; getTypeAtFlowCall — the sixth door, and the whole arm is behind it.
+    function get_type_at_flow_call(this, f: ref[FlowState], flow: ref[FlowNode], out_incomplete: ref[bool]) returns ref[Type]?
+    {
+        set out_incomplete: false
+        this.record_unported("get-effects-signature", Checker.kind_or_unknown(flow.node))
+        null
+    }
+
+    ; getTypeAtFlowCondition. The never early-out is REAL work and is written: it
+    ; is what makes a reference after `if (false) { … }` answer at all.
+    function get_type_at_flow_condition(this, f: ref[FlowState], flow: ref[FlowNode], out_incomplete: ref[bool]) returns ref[Type]?
+    {
+        var inc false
+        let t this.get_type_at_flow_node(f, flow.antecedent as ref[FlowNode], &inc)
+        if t = null
+            return null
+        let ty t as ref[Type]
+        if (ty.flags & TypeFlagsNever) <> 0
+        {
+            set out_incomplete: inc
+            return ty
+        }
+        ; narrowType — the seventh door, and the largest room behind any of them:
+        ; thirty functions in flow.go, every one of which ends in getUnionType,
+        ; getTypeWithFacts or filterType. It is the next slice.
+        set out_incomplete: false
+        this.record_unported("narrow-type", Checker.kind_or_unknown(flow.node))
+        null
+    }
+
+    ; getTypeAtSwitchClause — narrowTypeBySwitchOnDiscriminant and its four
+    ; siblings, all of which build a union of the clause literals.
+    function get_type_at_switch_clause(this, f: ref[FlowState], flow: ref[FlowNode], out_incomplete: ref[bool]) returns ref[Type]?
+    {
+        set out_incomplete: false
+        this.record_unported("get-type-at-switch-clause", KindSwitchStatement)
+        null
+    }
+
+    ; getTypeAtFlowBranchLabel, taken to the point where the antecedent types
+    ; DISAGREE.
+    ;
+    ; ★★★ THE EARLY-OUT IS THE SLICE'S WHOLE PRODUCT AT A JUNCTION AND IT IS THE
+    ; REFERENCE'S OWN: *"if the type at a particular antecedent path is the
+    ; declared type and the reference is known to always be assigned … there is no
+    ; reason to process more antecedents"*. Where it fires, the union never comes
+    ; up. Where it does not, the antecedent list is collected and a list with ONE
+    ; member is answered directly — `getUnionType` of one type is that type — and
+    ; anything longer is the stop.
+    ;
+    ; ★ subtypeReduction is not computed and cannot be: its only reader is the
+    ; union call. seenIncomplete IS computed, because the single-type answer
+    ; carries it.
+    function get_type_at_flow_branch_label(this, f: ref[FlowState], flow: ref[FlowNode], antecedents: ref[FlowList], out_incomplete: ref[bool]) returns ref[Type]?
+    {
+        set out_incomplete: false
+        ; ★ The Array is bound as a `ref` and not left as the `pointer` the
+        ; allocation answers, and the difference is not style: a subscript on a
+        ; `pointer[Array[X]]` is POINTER ARITHMETIC with an Array-sized stride,
+        ; so `types[0]` on the raw allocation answers the whole Array. The
+        ; compiler caught it here; it does not always.
+        let types_p host.allocate(sizeof Array[ref[Type]?], alignof Array[ref[Type]?]) as pointer[Array[ref[Type]?]]
+        set *types_p: Array[ref[Type]?]()
+        let types types_p as ref[Array[ref[Type]?]]
+        var seen_incomplete false
+        var list: ref[FlowList]? antecedents
+        var bypass: ref[FlowNode]? null
+        while list <> null
+        {
+            let l list as ref[FlowList]
+            set list: l.next
+            let antecedent l.flow as ref[FlowNode]
+            if bypass = null
+            {
+                if (antecedent.flags & FlowFlagsSwitchClause) <> 0
+                {
+                    if AstNode.flow_clause_start_of(antecedent.node) = AstNode.flow_clause_end_of(antecedent.node)
+                    {
+                        ; "The antecedent is the bypass branch of a potentially
+                        ; exhaustive switch statement."
+                        set bypass: antecedent
+                        continue
+                    }
+                }
+            }
+            var inc false
+            let ft this.get_type_at_flow_node(f, antecedent, &inc)
+            if ft = null
+                return null
+            let fty ft as ref[Type]
+            if fty = (f.declared_type as ref[Type])
+            {
+                if (f.declared_type as ref[Type]) = (f.initial_type as ref[Type])
+                    return fty
+            }
+            var present false
+            let len types.get_length() as int
+            var i 0
+            while i < len
+            {
+                let row types[i]
+                if row <> null
+                {
+                    if (row as ref[Type]) = fty
+                        set present: true
+                }
+                set i: i + 1
+            }
+            if present = false
+                types.add(fty)
+            if inc
+                set seen_incomplete: true
+        }
+        if bypass <> null
+        {
+            ; The bypass branch needs isExhaustiveSwitchStatement before it can be
+            ; either taken or dropped, and the second door is where it goes.
+            this.record_unported("is-exhaustive-switch-statement", KindSwitchStatement)
+            return null
+        }
+        let n types.get_length() as int
+        if n = 1
+        {
+            let only types[0]
+            set out_incomplete: seen_incomplete
+            return only
+        }
+        ; getUnionOrEvolvingArrayType over two or more distinct antecedent types.
+        ; ★The tag is the reference's own function name rather than
+        ; `get-union-type`, which two operator arms in this file already use with
+        ; an operator KIND as detail: here the detail is the antecedent COUNT, and
+        ; two details meaning different things under one tag is a histogram that
+        ; lies.
+        this.record_unported("get-union-or-evolving-array-type", n)
+        null
+    }
+
+    ; getTypeAtFlowLoopLabel — the cache, the reference HASH that keys it, and the
+    ; in-process stack that makes a back edge terminate. Nothing of it is here:
+    ; the cache key is `getFlowReferenceKey`, a structural hash of the reference,
+    ; and every exit from the function goes through getUnionOrEvolvingArrayType.
+    ;
+    ; ★ The SINGLE-antecedent loop label never reaches this function — the
+    ; dispatch collapses it, exactly as upstream — so what stops here is a loop
+    ; with a real back edge.
+    function get_type_at_flow_loop_label(this, f: ref[FlowState], flow: ref[FlowNode], out_incomplete: ref[bool]) returns ref[Type]?
+    {
+        set out_incomplete: false
+        this.record_unported("get-type-at-flow-loop-label", Checker.kind_or_unknown(flow.node))
+        null
+    }
+
+    ; getTypeAtFlowArrayMutation. The GUARD is ported and the body is not, and the
+    ; guard is what matters: it answers nil — *walk on* — for every declared type
+    ; that is not `auto`, which is every annotated variable in the corpus.
+    function get_type_at_flow_array_mutation(this, f: ref[FlowState], flow: ref[FlowNode], out_incomplete: ref[bool]) returns ref[Type]?
+    {
+        set out_incomplete: false
+        if (f.declared_type as ref[Type]) <> auto_type
+            return null
+        this.record_unported("get-evolving-array-type", Checker.kind_or_unknown(flow.node))
+        null
+    }
+
+    ; The arm switch of getTypeAtFlowNode, lifted out of its loop.
+    ;
+    ; ★★★ UPSTREAM THIS IS A GO `switch` WITH `continue` IN FIVE ARMS, AND A
+    ; `continue` THERE DOES NOT ALWAYS MEAN `flow.Antecedent`. The two label arms
+    ; collapse to their single antecedent and the Start arm hops to the CONTAINING
+    ; function's flow node — three different next nodes wearing one keyword. So
+    ; the lifted form answers through a `next` cell, and a non-null `next` IS the
+    ; continue. Reading it as *the antecedent* would have made a nested function's
+    ; reference walk its own container's graph instead of the outer one's.
+    function get_type_at_flow_node_arm(this, f: ref[FlowState], flow: ref[FlowNode], out_incomplete: ref[bool], out_next: ref[ref[FlowNode]?]) returns ref[Type]?
+    {
+        let flags flow.flags
+        if (flags & FlowFlagsAssignment) <> 0
+        {
+            let t this.get_type_at_flow_assignment(f, flow, out_incomplete)
+            if t = null
+                set out_next: flow.antecedent
+            return t
+        }
+        if (flags & FlowFlagsCall) <> 0
+        {
+            let t this.get_type_at_flow_call(f, flow, out_incomplete)
+            if t = null
+                set out_next: flow.antecedent
+            return t
+        }
+        if (flags & FlowFlagsCondition) <> 0
+            return this.get_type_at_flow_condition(f, flow, out_incomplete)
+        if (flags & FlowFlagsSwitchClause) <> 0
+            return this.get_type_at_switch_clause(f, flow, out_incomplete)
+        if (flags & FlowFlagsBranchLabel) <> 0
+        {
+            ; ★★ THE UNWRAP IS THE ASSERTION AND IT IS MEASURED, NOT ASSUMED. A
+            ; label with no antecedents cannot be reached: finishFlowLabel answers
+            ; the unreachable SENTINEL for one instead of the label, so nothing
+            ; ever records it as an antecedent. Upstream `antecedents.Next` would
+            ; panic; here the null-unwrap trap is the same statement in this
+            ; language, and a `return null` in its place would be a silent
+            ; no-answer with nothing in the work list. **Probed over 17 375
+            ; stage-2 units: zero arrivals, both labels.**
+            let al Checker.get_branch_label_antecedents(flow, f.reduce_labels) as ref[FlowList]
+            if al.next = null
+            {
+                set out_next: al.flow
+                return null
+            }
+            return this.get_type_at_flow_branch_label(f, flow, al, out_incomplete)
+        }
+        if (flags & FlowFlagsLoopLabel) <> 0
+        {
+            let al flow.antecedents as ref[FlowList]
+            if al.next = null
+            {
+                set out_next: al.flow
+                return null
+            }
+            return this.get_type_at_flow_loop_label(f, flow, out_incomplete)
+        }
+        if (flags & FlowFlagsArrayMutation) <> 0
+        {
+            let t this.get_type_at_flow_array_mutation(f, flow, out_incomplete)
+            if t = null
+                set out_next: flow.antecedent
+            return t
+        }
+        if (flags & FlowFlagsReduceLabel) <> 0
+        {
+            let saved f.reduce_labels
+            let cell host.allocate(sizeof ReduceLabelStack, alignof ReduceLabelStack) as pointer[ReduceLabelStack]
+            set *cell: ReduceLabelStack(flow.node, saved)
+            set f.reduce_labels: cell
+            let t this.get_type_at_flow_node(f, flow.antecedent as ref[FlowNode], out_incomplete)
+            set f.reduce_labels: saved
+            return t
+        }
+        if (flags & FlowFlagsStart) <> 0
+        {
+            ; "Check if we should continue with the control flow of the containing
+            ; function." Four terms, and the last of them is a negated
+            ; conjunction — written as the two tests it is (§3.5u).
+            let container flow.node
+            if container <> null
+            {
+                let cn container as ref[AstNode]
+                var hop true
+                if f.flow_container <> null
+                {
+                    if (f.flow_container as ref[AstNode]) = cn
+                        set hop: false
+                }
+                let rk AstNode.kind_of(f.reference as ref[AstNode])
+                if rk = KindPropertyAccessExpression
+                    set hop: false
+                if rk = KindElementAccessExpression
+                    set hop: false
+                if rk = KindThisKeyword
+                {
+                    if AstNode.kind_of(cn) <> KindArrowFunction
+                        set hop: false
+                }
+                if hop
+                {
+                    let next AstNode.flow_node_of(cn)
+                    if next <> null
+                    {
+                        set out_next: next
+                        return null
+                    }
+                }
+            }
+            ; "At the top of the flow we have the initial type."
+            return f.initial_type
+        }
+        ; "Unreachable code errors are reported in the binding phase. Here we
+        ; simply return the non-auto declared type to reduce follow-on errors."
+        this.convert_auto_to_any(f.declared_type)
+    }
+
+    ; getTypeAtFlowNode — the loop, the shared-node memo and the depth guard.
+    function get_type_at_flow_node(this, f: ref[FlowState], flow_in: ref[FlowNode], out_incomplete: ref[bool]) returns ref[Type]?
+    {
+        set out_incomplete: false
+        if f.depth = 2000
+        {
+            ; reportFlowControlError. The report needs FindAncestor over
+            ; IsFunctionOrModuleBlock and the statement list's own token range —
+            ; and its CODE, "The containing function or module body is too large
+            ; for control flow analysis", is not in DiagnosticCodes at all. So the
+            ; arm is a stop rather than an invented line. ★It has zero arrivals in
+            ; this corpus: 2000 is a guard against the stack, not a limit anything
+            ; here meets, and the LATCH beside it is what the guard is for.
+            set flow_analysis_disabled: true
+            this.record_unported("report-flow-control-error", 0)
+            return error_type
+        }
+        set f.depth: f.depth + 1
+        var flow flow_in
+        var shared_flow: ref[FlowNode]? null
+        repeat
+        {
+            let flags flow.flags
+            this.trace_flow(1, flags, 0)
+            if (flags & FlowFlagsShared) <> 0
+            {
+                ; "We cache results of flow type resolution for shared nodes that
+                ; were previously visited in the same getFlowTypeOfReference
+                ; invocation."
+                let len f.shared_flows.get_length() as int
+                var i 0
+                while i < len
+                {
+                    let row f.shared_flows[i]
+                    if row <> null
+                    {
+                        let sfr row as ref[SharedFlow]
+                        if sfr.flow = flow
+                        {
+                            set f.depth: f.depth - 1
+                            set out_incomplete: sfr.incomplete
+                            return sfr.t
+                        }
+                    }
+                    set i: i + 1
+                }
+                set shared_flow: flow
+            }
+            let mark this.unported_mark()
+            var next: ref[FlowNode]? null
+            var inc false
+            let t this.get_type_at_flow_node_arm(f, flow, &inc, &next)
+            if this.unported_mark() <> mark
+            {
+                set f.depth: f.depth - 1
+                return null
+            }
+            if next <> null
+            {
+                set flow: next as ref[FlowNode]
+                continue
+            }
+            if shared_flow <> null
+            {
+                let made host.allocate(sizeof SharedFlow, alignof SharedFlow) as pointer[SharedFlow]
+                set *made: SharedFlow(shared_flow, t, inc)
+                f.shared_flows.add(made)
+            }
+            set f.depth: f.depth - 1
+            set out_incomplete: inc
+            return t
+        }
+    }
+
+    ; ★ getFlowTypeOfReference — the two-argument entry — is NOT written. It is
+    ; `getFlowTypeOfReferenceEx(reference, t, t, nil, nil)` and every caller of it
+    ; in the reference is behind a wall this slice does not reach (the property
+    ; access, the `this` expression, getFlowTypeOfProperty). A forwarder with no
+    ; caller is machinery no instrument can see (§3.5be); it lands with its first
+    ; caller. The one caller this slice HAS passes four of the five arguments.
+
+    ; getFlowTypeOfReferenceEx — the entry, and the two-line tail under the walk.
+    ;
+    ; ★ The evolving-array half of that tail is an identity here for the reason
+    ; convert_auto_to_any's second arm is unaskable: no type in this run carries
+    ; ObjectFlagsEvolvingArray, because nothing mints one. finalizeEvolvingArrayType
+    ; is therefore not written, and isEvolvingArrayOperationTarget with it.
+    ;
+    ; ★★ THE NonNullExpression TERM IS A STOP AND ITS GUARD ORDER IS LOAD-BEARING.
+    ; Go's `||` short-circuits, so the unreachableNeverType test answers first and
+    ; the getTypeWithFacts term is only asked where the parent is a `!`. Asking it
+    ; first would have put a stop on every reference in the corpus.
+    function get_flow_type_of_reference_ex(this, reference: ref[AstNode], declared_type: ref[Type], initial_type: ref[Type]?, flow_container: ref[AstNode]?, flow_node_in: ref[FlowNode]?) returns ref[Type]?
+    {
+        if flow_analysis_disabled
+            return error_type
+        var flow_node flow_node_in
+        if flow_node = null
+        {
+            set flow_node: Checker.get_flow_node_of_node(reference)
+            if flow_node = null
+                return declared_type
+        }
+        var initial initial_type
+        if initial = null
+            set initial: declared_type
+        let sf host.allocate(sizeof Array[ref[SharedFlow]?], alignof Array[ref[SharedFlow]?]) as pointer[Array[ref[SharedFlow]?]]
+        set *sf: Array[ref[SharedFlow]?]()
+        let fp host.allocate(sizeof FlowState, alignof FlowState) as pointer[FlowState]
+        set *fp: FlowState(reference, declared_type, initial, flow_container, 0, null, sf)
+        let f fp as ref[FlowState]
+        this.trace_flow(0, AstNode.pos_of(reference), AstNode.end_of(reference))
+        var inc false
+        let evolved this.get_type_at_flow_node(f, flow_node as ref[FlowNode], &inc)
+        if evolved = null
+        {
+            this.trace_flow(2, 0, 1)
+            return null
+        }
+        this.trace_flow(2, (evolved as ref[Type]).id, 0)
+        let result evolved as ref[Type]
+        if result = unreachable_never_type
+            return declared_type
+        let parent AstNode.parent_node_of(reference)
+        if parent <> null
+        {
+            if AstNode.kind_of(parent as ref[AstNode]) = KindNonNullExpression
+            {
+                if (result.flags & TypeFlagsNever) = 0
+                {
+                    ; getTypeWithFacts(result, NEUndefinedOrNull) — a FILTER over a
+                    ; union, which is the same room the seven doors open on.
+                    this.record_unported("get-type-with-facts", KindNonNullExpression)
+                    return null
+                }
+            }
+        }
+        result
+    }
+
+    ; ── the caller's own half (slice 93) ────────────────────────────────────
+
+    ; getControlFlowContainer — FindAncestor from the PARENT over a four-term
+    ; predicate, written as the walk it is (§3.9d).
+    ;
+    ; ★ The IIFE exclusion is the same one slice 92's h03 measured on the binder's
+    ; side: an immediately invoked function expression is part of the containing
+    ; control flow, so it is not a container here either. The two sites have to
+    ; agree — the binder decides which Start node exists and this decides which
+    ; one the walk stops at.
+    function get_control_flow_container(node: ref[AstNode]) returns ref[AstNode]?
+    {
+        var cur AstNode.parent_node_of(node)
+        while cur <> null
+        {
+            let n cur as ref[AstNode]
+            let k AstNode.kind_of(n)
+            var hit false
+            if AstNode.is_function_like(n)
+            {
+                if AstNode.get_immediately_invoked_function_expression(n) = null
+                    set hit: true
+            }
+            if k = KindModuleBlock
+                set hit: true
+            if k = KindSourceFile
+                set hit: true
+            if k = KindPropertyDeclaration
+                set hit: true
+            if hit
+                return n
+            set cur: AstNode.parent_node_of(n)
+        }
+        null
+    }
+
+    ; getReferenceRoot — the parenthesis/assignment/comma climb, upward.
+    function get_reference_root(node: ref[AstNode]) returns ref[AstNode]
+    {
+        var n node
+        repeat
+        {
+            let p AstNode.parent_node_of(n)
+            if p = null
+                return n
+            let parent p as ref[AstNode]
+            let pk AstNode.kind_of(parent)
+            var climb false
+            if pk = KindParenthesizedExpression
+                set climb: true
+            if pk = KindBinaryExpression
+            {
+                let op AstNode.binary_operator_kind(parent)
+                if op = KindEqualsToken
+                {
+                    if AstNode.binary_left_of(parent) = n
+                        set climb: true
+                }
+                if op = KindCommaToken
+                {
+                    if AstNode.binary_right_of(parent) = n
+                        set climb: true
+                }
+            }
+            if climb = false
+                return n
+            set n: parent
+        }
+    }
+
+    ; ast.IsPushOrUnshiftIdentifier.
+    function is_push_or_unshift_identifier(n: ref[AstNode]) returns bool
+    {
+        if Checker.node_text_is(AstNode.identifier_text_of(n), AstNode.identifier_text_length_of(n), "push", 4)
+            return true
+        Checker.node_text_is(AstNode.identifier_text_of(n), AstNode.identifier_text_length_of(n), "unshift", 7)
+    }
+
+    ; isEvolvingArrayOperationTarget. The FIRST disjunct is purely syntactic and is
+    ; written; the second ends in getTypeOfExpression and is a stop behind its own
+    ; five syntactic terms.
+    function is_evolving_array_operation_target(this, node: ref[AstNode]) returns bool
+    {
+        let root Checker.get_reference_root(node)
+        let p AstNode.parent_node_of(root)
+        if p = null
+            return false
+        let parent p as ref[AstNode]
+        let pk AstNode.kind_of(parent)
+        if pk = KindPropertyAccessExpression
+        {
+            let nm AstNode.property_access_name_of(parent)
+            if nm <> null
+            {
+                let name nm as ref[AstNode]
+                if Checker.node_text_is(AstNode.identifier_text_of(name), AstNode.identifier_text_length_of(name), "length", 6)
+                    return true
+                let gp AstNode.parent_node_of(parent)
+                if gp <> null
+                {
+                    if AstNode.kind_of(gp as ref[AstNode]) = KindCallExpression
+                    {
+                        if AstNode.kind_of(name) = KindIdentifier
+                        {
+                            if Checker.is_push_or_unshift_identifier(name)
+                                return true
+                        }
+                    }
+                }
+            }
+            return false
+        }
+        if pk <> KindElementAccessExpression
+            return false
+        if AstNode.expression_of(parent) <> root
+            return false
+        let gp AstNode.parent_node_of(parent)
+        if gp = null
+            return false
+        let grand gp as ref[AstNode]
+        if AstNode.kind_of(grand) <> KindBinaryExpression
+            return false
+        if AstNode.binary_operator_kind(grand) <> KindEqualsToken
+            return false
+        if AstNode.binary_left_of(grand) <> parent
+            return false
+        if Binder.is_assignment_target(grand)
+            return false
+        ; isTypeAssignableToKind(getTypeOfExpression(argumentExpression), NumberLike)
+        ; — the expression chapter, one term below five syntactic ones.
+        this.record_unported("get-type-of-expression", KindElementAccessExpression)
+        false
+    }
+
+    ; containsUndefinedType. The union arm reads the FIRST constituent and nothing
+    ; else, which is exact rather than an approximation: getUnionType sorts its
+    ; constituents by type id and undefined's id is minted before any other
+    ; nullable in NewChecker's fixed order, so an undefined-carrying union carries
+    ; it first. No union is minted here, so the arm has no input either way.
+    function contains_undefined_type(t: ref[Type]) returns bool
+        (t.flags & TypeFlagsUndefined) <> 0
+
+    ; isDestructuringAssignmentTarget.
+    function is_destructuring_assignment_target(parent: ref[AstNode]) returns bool
+    {
+        let g AstNode.parent_node_of(parent)
+        if g = null
+            return false
+        let grand g as ref[AstNode]
+        let gk AstNode.kind_of(grand)
+        if gk = KindBinaryExpression
+        {
+            if AstNode.binary_left_of(grand) = parent
+                return true
+        }
+        if gk = KindForOfStatement
+        {
+            if AstNode.initializer_of(grand) = parent
+                return true
+        }
+        false
+    }
+
+    ; ast.IsInTypeQuery — FindAncestorOrQuit, and the QUIT is the mechanism: the
+    ; walk climbs only through the entity-name spine and stops at anything else,
+    ; so `typeof (x)` and `typeof f()` answer differently from `typeof a.b`.
+    function is_in_type_query(node: ref[AstNode]) returns bool
+    {
+        var p: ref[AstNode]? node
+        while p <> null
+        {
+            let n p as ref[AstNode]
+            let k AstNode.kind_of(n)
+            if k = KindTypeQuery
+                return true
+            if k <> KindIdentifier
+            {
+                if k <> KindQualifiedName
+                    return false
+            }
+            set p: AstNode.parent_node_of(n)
+        }
+        false
+    }
+
+    ; isMutableLocalVariableDeclaration — "a non-exported and non-global `let`".
+    function is_mutable_local_variable_declaration(this, declaration: ref[AstNode]) returns bool
+    {
+        let lp AstNode.parent_node_of(declaration)
+        if lp = null
+            return false
+        let list lp as ref[AstNode]
+        if (AstNode.flags_of(list) & NodeFlagsLet) = 0
+            return false
+        if (b.combined_modifier_flags(declaration) & ModifierFlagsExport) <> 0
+            return false
+        let sp AstNode.parent_node_of(list)
+        if sp = null
+            return true
+        let stmt sp as ref[AstNode]
+        if AstNode.kind_of(stmt) <> KindVariableStatement
+            return true
+        Checker.is_global_source_file(b, AstNode.parent_node_of(stmt)) = false
+    }
+
+    ; isConstantVariable.
+    function is_constant_variable(this, symbol: ref[Symbol]) returns bool
+    {
+        if (Symbol.flags_of(symbol) & SymbolFlagsVariable) = 0
+            return false
+        (Checker.get_declaration_node_flags_from_symbol(symbol) & NodeFlagsConstant) <> 0
+    }
+
+    ; isParameterOrMutableLocalVariable — "a parameter, a catch clause variable,
+    ; or a mutable local variable".
+    function is_parameter_or_mutable_local_variable(this, symbol: ref[Symbol]) returns bool
+    {
+        let vd Symbol.value_declaration_of(symbol)
+        if vd = null
+            return false
+        let rd Binder.get_root_declaration(vd as ref[AstNode])
+        if rd = null
+            return false
+        let declaration rd as ref[AstNode]
+        let k AstNode.kind_of(declaration)
+        if k = KindParameter
+            return true
+        if k <> KindVariableDeclaration
+            return false
+        let p AstNode.parent_node_of(declaration)
+        if p <> null
+        {
+            if AstNode.kind_of(p as ref[AstNode]) = KindCatchClause
+                return true
+        }
+        this.is_mutable_local_variable_declaration(declaration)
+    }
+
+    ; isSameScopedBindingElement.
+    function is_same_scoped_binding_element(this, node: ref[AstNode], declaration: ref[AstNode]) returns bool
+    {
+        if AstNode.kind_of(declaration) <> KindBindingElement
+            return false
+        let be Checker.find_ancestor_kind(node, KindBindingElement)
+        if be = null
+            return false
+        let a Binder.get_root_declaration(be as ref[AstNode])
+        let d Binder.get_root_declaration(declaration)
+        if a = null
+            return false
+        if d = null
+            return false
+        (a as ref[AstNode]) = (d as ref[AstNode])
+    }
+
+    ; someType(t, isGenericTypeWithUnionConstraint), with both composite walks
+    ; named rather than written — neither a union nor an intersection type is
+    ; minted anywhere in this port, so neither list can be reached, and a walk
+    ; over a list nothing builds is §3.5be's forbidden shape.
+    function some_type_is_generic_with_union_constraint(this, t: ref[Type]) returns bool
+    {
+        if (t.flags & TypeFlagsUnionOrIntersection) <> 0
+        {
+            this.record_unported("some-type", 0)
+            return true
+        }
+        if (t.flags & TypeFlagsInstantiable) = 0
+            return false
+        let mark this.unported_mark()
+        var base this.get_base_constraint_of_type(t)
+        if this.unported_mark() <> mark
+            return true
+        if base = null
+            set base: t
+        ((base as ref[Type]).flags & (TypeFlagsNullable | TypeFlagsUnion)) <> 0
+    }
+
+    ; getNarrowableTypeForReference.
+    ;
+    ; ★ isNoInferType's peel is not written: it tests for a SubstitutionType, and
+    ; nothing in this port mints one. ★mapType over a non-union is `f(t)`, so the
+    ; substituting arm would be answerable — what is not is the DISJUNCTION that
+    ; guards it, whose second half is the contextual type chapter.
+    function get_narrowable_type_for_reference(this, t: ref[Type], reference: ref[AstNode], check_mode: int) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let some this.some_type_is_generic_with_union_constraint(t)
+        if this.unported_mark() <> mark
+            return null
+        if some = false
+            return t
+        this.record_unported("get-narrowable-type-for-reference", AstNode.kind_of(reference))
+        null
+    }
+
+    ; removeOptionalityFromDeclaredType — the FOUR terms in the reference's own
+    ; order, which is what keeps the fourth from being asked.
+    function remove_optionality_from_declared_type(this, declared_type: ref[Type], declaration: ref[AstNode]) returns ref[Type]?
+    {
+        if Checker.strict_null_checks() = false
+            return declared_type
+        if AstNode.kind_of(declaration) <> KindParameter
+            return declared_type
+        if AstNode.initializer_of(declaration) = null
+            return declared_type
+        let mark this.unported_mark()
+        let is_undef this.has_type_facts(declared_type, TypeFactsIsUndefined)
+        if this.unported_mark() <> mark
+            return null
+        if is_undef = false
+            return declared_type
+        ; parameterInitializerContainsUndefined -> checkDeclarationInitializer, and
+        ; then getTypeWithFacts over the answer. Both are the union room.
+        this.record_unported("parameter-initializer-contains-undefined", KindParameter)
+        null
+    }
+
     ; checkIdentifier — the work list's largest row, taken to its three walls.
     ;
     ; ★★★ THE STOP THAT STOOD AT THE DISPATCH WAS ONE ARGUMENT AND THE ARGUMENT WAS
@@ -9568,8 +11039,296 @@ define Checker
         }
         if declaration = null
             return t
-        this.record_unported("flow-graph", KindIdentifier)
-        null
+        let decl declaration as ref[AstNode]
+        if t = null
+            return null
+        var ty t as ref[Type]
+        ; ── the flow tail (slice 93) ────────────────────────────────────────
+        ;
+        ; ★★★ SLICE 91 WROTE THAT THE `assumeInitialized` DISJUNCTION IS "ELEVEN
+        ; TERMS OF WHICH EVERY ONE IS ANSWERABLE AND NONE IS WORTH ASKING,
+        ; BECAUSE THE VALUE IT COMPUTES HAS EXACTLY ONE READER AND THAT READER IS
+        ; THE FLOW CALL." That was true while the flow call was a stop and it is
+        ; false now — and the way it is false is the point. The value picks the
+        ; INITIAL TYPE, and the two things it picks between are `t`, which is
+        ; free, and `getOptionalType(t, false)`, which is the union wall. So the
+        ; disjunction is not an input to the flow call: it decides whether the
+        ; call can happen at all, and every term of it is written.
+        ;
+        ; ★★★ TWO TERMS ARE COMPUTED LAZILY, AND THAT IS FAITHFULNESS RATHER THAN
+        ; CLEVERNESS. `isNeverInitialized` is read in exactly one place —
+        ; `isOuterVariable && !isNeverInitialized` — and the container-extending
+        ; loop runs only where the two containers differ; both therefore stand
+        ; behind the SAME test, and both need markNodeAssignments, a walk of its
+        ; own. Computing them eagerly would put that stop on every identifier in
+        ; the corpus to decide a term that cannot change the answer.
+        let outer_mark this.unported_mark()
+        let narrowed this.get_narrowable_type_for_reference(ty, node, check_mode)
+        if narrowed = null
+            return null
+        set ty: narrowed as ref[Type]
+        var is_parameter false
+        let root_decl Binder.get_root_declaration(decl)
+        if root_decl <> null
+        {
+            if AstNode.kind_of(root_decl as ref[AstNode]) = KindParameter
+                set is_parameter: true
+        }
+        let declaration_container Checker.get_control_flow_container(decl)
+        var flow_container Checker.get_control_flow_container(node)
+        var is_outer_variable true
+        if flow_container = null
+        {
+            if declaration_container = null
+                set is_outer_variable: false
+        }
+        if flow_container <> null
+        {
+            if declaration_container <> null
+            {
+                if (flow_container as ref[AstNode]) = (declaration_container as ref[AstNode])
+                    set is_outer_variable: false
+            }
+        }
+        var is_spread_destructuring_assignment_target false
+        let np AstNode.parent_node_of(node)
+        if np <> null
+        {
+            let parent np as ref[AstNode]
+            if AstNode.parent_node_of(parent) <> null
+            {
+                if AstNode.kind_of(parent) = KindSpreadAssignment
+                {
+                    if Checker.is_destructuring_assignment_target(parent)
+                        set is_spread_destructuring_assignment_target: true
+                }
+            }
+        }
+        var is_module_exports false
+        if (Symbol.flags_of(symbol) & SymbolFlagsModuleExports) <> 0
+            set is_module_exports: true
+        var type_is_automatic false
+        if ty = auto_type
+            set type_is_automatic: true
+        var is_automatic_type_in_non_null false
+        if type_is_automatic
+        {
+            if Checker.kind_or_unknown(np) = KindNonNullExpression
+                set is_automatic_type_in_non_null: true
+        }
+        ; "When the control flow originates in a function expression, arrow
+        ; function, method, or accessor, and we are referencing a closed-over
+        ; const variable or parameter or mutable local variable past its last
+        ; assignment, we extend the origin of the control flow analysis to include
+        ; the immediately enclosing control flow container."
+        ;
+        ; ★ The third conjunct is an OR whose FIRST half is decidable here
+        ; (isConstantVariable is a flag test on the symbol's declaration) and
+        ; whose second ends in isPastLastAssignment. So a closed-over `const`
+        ; extends the container with no stop at all, and only a closed-over
+        ; parameter or `let` reaches the eighth door.
+        var extending true
+        while extending
+        {
+            set extending: false
+            if flow_container = null
+                break
+            let fc flow_container as ref[AstNode]
+            var same false
+            if declaration_container <> null
+            {
+                if (declaration_container as ref[AstNode]) = fc
+                    set same: true
+            }
+            if same
+                break
+            var container_is_closure false
+            if Checker.is_function_expression_or_arrow_function(fc)
+                set container_is_closure: true
+            if Binder.is_object_literal_or_class_expression_method_or_accessor(fc)
+                set container_is_closure: true
+            if container_is_closure = false
+                break
+            var referencing false
+            if this.is_constant_variable(les)
+                set referencing: true
+            if referencing = false
+            {
+                if this.is_parameter_or_mutable_local_variable(les)
+                {
+                    ; isPastLastAssignment -> ensureAssignmentsMarked ->
+                    ; markNodeAssignments, an AST walk that records the last
+                    ; assignment position of every parameter and mutable local.
+                    ; It needs no type, so it is a slice of its own rather than a
+                    ; door into the union room — the eighth wall and the only one
+                    ; here that is not getUnionType.
+                    this.record_unported("mark-node-assignments", KindIdentifier)
+                    return null
+                }
+            }
+            if referencing = false
+                break
+            set flow_container: Checker.get_control_flow_container(fc)
+            set extending: true
+        }
+        ; isNeverInitialized, behind its one reader.
+        var is_never_initialized false
+        if is_outer_variable
+        {
+            if AstNode.kind_of(decl) = KindVariableDeclaration
+            {
+                var in_for_in_or_of false
+                let dl AstNode.parent_node_of(decl)
+                if dl <> null
+                {
+                    let ds AstNode.parent_node_of(dl as ref[AstNode])
+                    if ds <> null
+                    {
+                        let dsk AstNode.kind_of(ds as ref[AstNode])
+                        if dsk = KindForInStatement
+                            set in_for_in_or_of: true
+                        if dsk = KindForOfStatement
+                            set in_for_in_or_of: true
+                    }
+                }
+                if in_for_in_or_of = false
+                {
+                    if AstNode.initializer_of(decl) = null
+                    {
+                        if AstNode.exclamation_token_of(decl) = null
+                        {
+                            if this.is_mutable_local_variable_declaration(decl)
+                            {
+                                ; isSymbolAssignedDefinitely, the same walk the
+                                ; loop above waits on.
+                                this.record_unported("mark-node-assignments", KindVariableDeclaration)
+                                return null
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        var assume_initialized false
+        if is_parameter
+            set assume_initialized: true
+        if is_alias
+            set assume_initialized: true
+        if is_outer_variable
+        {
+            if is_never_initialized = false
+                set assume_initialized: true
+        }
+        if is_spread_destructuring_assignment_target
+            set assume_initialized: true
+        if is_module_exports
+            set assume_initialized: true
+        if this.is_same_scoped_binding_element(node, decl)
+            set assume_initialized: true
+        if assume_initialized = false
+        {
+            if type_is_automatic = false
+            {
+                if Checker.strict_null_checks() = false
+                    set assume_initialized: true
+                if (ty.flags & (TypeFlagsAnyOrUnknown | TypeFlagsVoid)) <> 0
+                    set assume_initialized: true
+                if Checker.is_in_type_query(node)
+                    set assume_initialized: true
+                if this.is_in_ambient_or_type_node(node)
+                    set assume_initialized: true
+                if Checker.kind_or_unknown(np) = KindExportSpecifier
+                    set assume_initialized: true
+            }
+        }
+        if Checker.kind_or_unknown(np) = KindNonNullExpression
+            set assume_initialized: true
+        if AstNode.kind_of(decl) = KindVariableDeclaration
+        {
+            if AstNode.exclamation_token_of(decl) <> null
+                set assume_initialized: true
+        }
+        if (AstNode.flags_of(decl) & NodeFlagsAmbient) <> 0
+            set assume_initialized: true
+        var initial: ref[Type]? null
+        if is_automatic_type_in_non_null
+            set initial: undefined_type
+        if initial = null
+        {
+            if assume_initialized
+            {
+                if is_parameter
+                {
+                    set initial: this.remove_optionality_from_declared_type(ty, decl)
+                    if initial = null
+                        return null
+                }
+                if initial = null
+                    set initial: ty
+            }
+        }
+        if initial = null
+        {
+            if type_is_automatic
+                set initial: undefined_type
+        }
+        if initial = null
+        {
+            ; getOptionalType(t, false) — `getUnionType([t, undefinedType])`, and
+            ; the wall this whole chapter stands at. It is the NINTH door and the
+            ; one that decides how much of the corpus this slice reaches: an
+            ; uninitialized `let` whose declared type does not already admit
+            ; undefined is exactly the shape TS2454 is about.
+            this.record_unported("get-optional-type", KindIdentifier)
+            return null
+        }
+        if this.unported_mark() <> outer_mark
+            return null
+        let flow_type this.get_flow_type_of_reference_ex(node, ty, initial, flow_container, null)
+        if flow_type = null
+            return null
+        let ft flow_type as ref[Type]
+        if type_is_automatic
+        {
+            ; The two implicit-any reports and convertAutoToAny, behind
+            ; isEvolvingArrayOperationTarget. ★The conjunction is asked in the
+            ; opposite order from the reference's, and that is a decision rather
+            ; than an accident: `!isEvolvingArrayOperationTarget(node) && t ==
+            ; autoType` evaluates the CALL first upstream, and the call can stop
+            ; here, where the second term is a pointer comparison that decides the
+            ; answer on its own. Reordering two side-effect-free terms of an AND
+            ; cannot change what it answers; asking the stopping one first would
+            ; have put a stop on every identifier in the corpus.
+            if this.is_evolving_array_operation_target(node) = false
+            {
+                this.record_unported("get-evolving-array-type", KindIdentifier)
+                return null
+            }
+        }
+        if assume_initialized = false
+        {
+            if Checker.contains_undefined_type(ty) = false
+            {
+                if Checker.contains_undefined_type(ft)
+                {
+                    ; TS2454, and it is WRITTEN rather than left for the union
+                    ; slice even though nothing can reach it today: the only way
+                    ; here is an initial type from getOptionalType, which is the
+                    ; ninth door above. It is written because the day that door
+                    ; opens, this report is what the corpus sees — and a report
+                    ; landing in a slice whose subject is a type CONSTRUCTOR
+                    ; would be a diagnostic with no chapter of its own.
+                    this.error_on_node(node, DiagVariable_0_is_used_before_being_assigned)
+                    return ty
+                }
+            }
+        }
+        if assignment_kind <> AssignmentKindNone
+        {
+            this.record_unported("get-base-type-of-literal-type", KindIdentifier)
+            return null
+        }
+        ft
     }
 
     function check_expression_worker(this, node: ref[AstNode], check_mode: int) returns ref[Type]?
@@ -17219,10 +18978,19 @@ define Checker
         ; GetStrictOptionValue — strict_null_checks' header has the reading), so the
         ; function is LIVE and not inert. What it needs is
         ; isPropertyInitializedInConstructor, which synthesizes a `this.p` reference
-        ; and asks getFlowTypeOfReferenceEx: the flow graph, which this port's binder
-        ; does not build. ★It is the same wall checkAllCodePathsInNonVoidFunction
-        ; ReturnOrThrow stands behind, so the tag is shared rather than named after
-        ; either caller.
+        ; and asks getFlowTypeOfReferenceEx.
+        ;
+        ; ★★★ THE GRAPH LANDED IN SLICE 92 AND THE WALK IN SLICE 93, AND THIS ROW IS
+        ; STILL HERE — the sentence that used to stand at this line ("the flow
+        ; graph, which this port's binder does not build") named the wrong wall.
+        ; What holds it is `getOptionalType(propType, false)`, the INITIAL type this
+        ; caller passes, which is `getUnionType([t, undefinedType])`. ★★★So the tag
+        ; it shares with checkAllCodePathsInNonVoidFunctionReturnOrThrow was two
+        ; walls wearing one name, and slice 93 wired the other one: that caller
+        ; wants isReachableFlowNode, which asks for no type at all. **A shared tag
+        ; is a claim that two callers wait on the same thing; check it before
+        ; believing it.** The tag stays `flow-graph` until this caller lands, so the
+        ; work list keeps naming what the reader would go looking for.
         this.record_unported("flow-graph", AstNode.kind_of(node))
     }
 
@@ -19173,8 +20941,9 @@ define Checker
     ; ★★★ SLICE 77 MEASURED THIS ROW AS CFG-BLOCKED AND THAT IS TRUE OF HALF OF IT.
     ; Its sentence — *the return-annotation chapter is CFG-blocked and not
     ; type-node-blocked, which the row's name suggests and is not true* — was read
-    ; off `functionHasImplicitReturn`, which is `EndFlowNode` + `isReachableFlowNode`
-    ; and is a graph this binder does not build. What it did not ask is what that
+    ; off `functionHasImplicitReturn`, which is `EndFlowNode` + `isReachableFlowNode`.
+    ; ★That half is ANSWERED since slice 93 and the row is closed; what follows is
+    ; the reasoning that was already true of the other half. What it did not ask is what that
     ; answer is FOR: every one of the switch's first three cases is guarded by
     ; `t != nil`, and the fourth by `NoImplicitReturns == TSTrue`. **So for a
     ; function with NO return annotation the CFG question is asked for a value that
@@ -19909,9 +21678,76 @@ define Checker
         if AstNode.kind_of(body as ref[AstNode]) <> KindBlock
             return
         ; functionHasImplicitReturn — `fn.BodyData().EndFlowNode != nil &&
-        ; c.isReachableFlowNode(endFlowNode)`. THE control-flow graph, and the row
-        ; slice 77 named `flow-graph` precisely because two chapters share it.
-        this.record_unported("flow-graph", AstNode.kind_of(fn))
+        ; c.isReachableFlowNode(endFlowNode)`, and it is ANSWERED since slice 93.
+        ;
+        ; ★★★ IT IS THE HALF OF THE FLOW CHAPTER THAT NEEDS NO TYPE, AND THAT IS
+        ; WHY THIS CALLER LANDS WHERE checkPropertyInitialization DOES NOT. Both
+        ; stood behind the tag `flow-graph`; one of them wants a reachability walk
+        ; over the graph and the other wants a flow TYPE for a synthesized `this.p`
+        ; whose initial type is getOptionalType. Sharing a tag made them look like
+        ; one wall (slice 77 named it precisely because two chapters share it), and
+        ; they are two.
+        ; ★★★ THE MARK IS CHECKED HERE AND STAGE 2 IS WHY. isReachableFlowNode
+        ; answers a BOOL, so the getEffectsSignature stop inside its Call arm
+        ; cannot travel out through the answer — and that arm's honest answer is
+        ; *reachable*, which is the direction that INVENTS. Measured: without this
+        ; guard, `class C { err(): never { super.throw() } }` reports TS2534 twice
+        ; where the reference reports nothing, because a callee returning never
+        ; makes the end point unreachable and only getEffectsSignature knows that.
+        ; ★It is ONE unit of 18 242 and NOT ONE of the 1 473 at stage 1 — slice
+        ; 64's *confirm at stage 2 once* earning its rule in a single run.
+        let fhir_mark this.unported_mark()
+        let fhir this.function_has_implicit_return(fn)
+        if this.unported_mark() <> fhir_mark
+            return
+        if fhir = false
+            return
+        var has_explicit_return false
+        if (AstNode.flags_of(fn) & NodeFlagsHasExplicitReturn) <> 0
+            set has_explicit_return: true
+        ; The errorNode walk: the return type annotation, else the JSDoc full
+        ; signature, else the function itself.
+        var error_node: ref[AstNode]? AstNode.type_of(fn)
+        if error_node = null
+            set error_node: AstNode.full_signature_of(fn)
+        if error_node = null
+            set error_node: fn
+        ; The four-arm switch, in the reference's order — a `switch` with no
+        ; subject is an ORDERED chain (§3.5u).
+        if (ty.flags & TypeFlagsNever) <> 0
+        {
+            this.error_on_node(error_node, DiagA_function_returning_never_cannot_have_a_reachable_end_point)
+            return
+        }
+        if has_explicit_return = false
+        {
+            this.error_on_node(error_node, DiagA_function_whose_declared_type_is_neither_undefined_void_nor_any_must_return_a_value)
+            return
+        }
+        ; isTypeAssignableTo(undefinedType, t) — the assignability chapter, and the
+        ; only term of the four this port cannot ask. ★The arm below it is the
+        ; noImplicitReturns one, dead under this harness by the option, which is
+        ; why the stop is the LAST thing here rather than a fall-through.
+        if Checker.strict_null_checks()
+        {
+            this.record_unported("is-type-assignable-to", AstNode.kind_of(fn))
+            return
+        }
+        if Checker.no_implicit_returns()
+            this.record_unported("no-implicit-returns", AstNode.kind_of(fn))
+    }
+
+    ; functionHasImplicitReturn — two reads and the reachability walk.
+    ;
+    ; ★ The slot is on the FUNCTION node and not on its body: upstream it is
+    ; `fn.BodyData().EndFlowNode`, i.e. a field of the function-like data, and the
+    ; binder writes it through `n.end_flow_node` at the container's close.
+    function function_has_implicit_return(this, fn: ref[AstNode]) returns bool
+    {
+        let end AstNode.end_flow_node_of(fn)
+        if end = null
+            return false
+        this.is_reachable_flow_node(end as ref[FlowNode])
     }
 
     ; isPrivateWithinAmbient. ★`ast.HasModifier` and `ast.HasSyntacticModifier` are
