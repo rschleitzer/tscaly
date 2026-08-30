@@ -172,15 +172,21 @@ mempin_of() {
 # count while the row count stands; the JS arm moves the JSLITERAL count; and a
 # wrong type identity, a wrong object-flag or a wrong position moves only the
 # CHECKSUM.
+#
+# ★ NUL-DELIMITED SINCE SLICE 101, AND THE FIX IS NOT COSMETIC: `xargs` splits on
+# WHITESPACE, the stage-2 corpus holds one unit whose name contains a space, and
+# from it onward the `-n 2` pairing shifts by one — which redirects the dumper's
+# stdout INTO A CORPUS FILE. Invisible at stage 1, where no unit path has a space.
+# See §3.5eu finding nine.
 objgate() {
   local i=0 u
   rm -rf "$WORK/oout" "$WORK/opairs"; mkdir -p "$WORK/oout"
   while IFS= read -r u; do
-    printf '%s\n%s\n' "$u" "$(printf '%s/oout/%06d' "$WORK" "$i")"
+    printf '%s\0%s\0' "$u" "$(printf '%s/oout/%06d' "$WORK" "$i")"
     i=$((i+1))
   done < "$WORK/units.txt" > "$WORK/opairs"
-  LIMIT=$LIMIT xargs -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --objlits "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/opairs"
-  cat "$WORK"/oout/* > "$WORK/obj.all"
+  LIMIT=$LIMIT xargs -0 -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --objlits "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/opairs"
+  find "$WORK/oout" -type f -print0 | xargs -0 cat > "$WORK/obj.all"
   local n a3 props js
   n=$(grep -c '^O ' "$WORK/obj.all")
   a3=$(grep '^O ' "$WORK/obj.all" | awk '$6==3' | wc -l | tr -d ' ')
@@ -197,11 +203,11 @@ memgate() {
   local i=0 u
   rm -rf "$WORK/mout" "$WORK/mpairs"; mkdir -p "$WORK/mout"
   while IFS= read -r u; do
-    printf '%s\n%s\n' "$u" "$(printf '%s/mout/%06d' "$WORK" "$i")"
+    printf '%s\0%s\0' "$u" "$(printf '%s/mout/%06d' "$WORK" "$i")"
     i=$((i+1))
   done < "$WORK/units.txt" > "$WORK/mpairs"
-  LIMIT=$LIMIT xargs -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --members "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/mpairs"
-  cat "$WORK"/mout/* > "$WORK/mem.all"
+  LIMIT=$LIMIT xargs -0 -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --members "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/mpairs"
+  find "$WORK/mout" -type f -print0 | xargs -0 cat > "$WORK/mem.all"
   local r pr cf
   r=$(grep -c '^R ' "$WORK/mem.all")
   pr=$(grep -c '^P ' "$WORK/mem.all")

@@ -209,15 +209,21 @@ mempin_of() {
 # predicate moves SENSITIVE alone; getContextualSignature moves CTXSIG; the two
 # assignment arms move ANSWERED (a row that reached a type); and a wrong identity,
 # a wrong arm or a wrong position moves only the CHECKSUM.
+#
+# ★ NUL-DELIMITED SINCE SLICE 101, AND THE FIX IS NOT COSMETIC: `xargs` splits on
+# WHITESPACE, the stage-2 corpus holds one unit whose name contains a space, and
+# from it onward the `-n 2` pairing shifts by one — which redirects the dumper's
+# stdout INTO A CORPUS FILE. Invisible at stage 1, where no unit path has a space.
+# See §3.5eu finding nine.
 fngate() {
   local i=0 u
   rm -rf "$WORK/fout" "$WORK/fpairs"; mkdir -p "$WORK/fout"
   while IFS= read -r u; do
-    printf '%s\n%s\n' "$u" "$(printf '%s/fout/%06d' "$WORK" "$i")"
+    printf '%s\0%s\0' "$u" "$(printf '%s/fout/%06d' "$WORK" "$i")"
     i=$((i+1))
   done < "$WORK/units.txt" > "$WORK/fpairs"
-  LIMIT=$LIMIT xargs -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --functions "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/fpairs"
-  cat "$WORK"/fout/* > "$WORK/fn.all"
+  LIMIT=$LIMIT xargs -0 -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --functions "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/fpairs"
+  find "$WORK/fout" -type f -print0 | xargs -0 cat > "$WORK/fn.all"
   local n se cs an
   n=$(grep -c '^F ' "$WORK/fn.all")
   se=$(grep '^F ' "$WORK/fn.all" | awk '$4==1' | wc -l | tr -d ' ')
@@ -231,11 +237,11 @@ memgate() {
   local i=0 u
   rm -rf "$WORK/mout" "$WORK/mpairs"; mkdir -p "$WORK/mout"
   while IFS= read -r u; do
-    printf '%s\n%s\n' "$u" "$(printf '%s/mout/%06d' "$WORK" "$i")"
+    printf '%s\0%s\0' "$u" "$(printf '%s/mout/%06d' "$WORK" "$i")"
     i=$((i+1))
   done < "$WORK/units.txt" > "$WORK/mpairs"
-  LIMIT=$LIMIT xargs -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --members "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/mpairs"
-  cat "$WORK"/mout/* > "$WORK/mem.all"
+  LIMIT=$LIMIT xargs -0 -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --members "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/mpairs"
+  find "$WORK/mout" -type f -print0 | xargs -0 cat > "$WORK/mem.all"
   local r pr cf
   r=$(grep -c '^R ' "$WORK/mem.all")
   pr=$(grep -c '^P ' "$WORK/mem.all")

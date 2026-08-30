@@ -155,15 +155,21 @@ withpin_of() {
 # should not moves the ARM-1 count, a wrong thisArgument moves the ANCHORED count
 # (rows whose argid is not 0) at every other column unchanged, and a wrong type
 # identity or a wrong printed name moves only the CHECKSUM.
+#
+# ★ NUL-DELIMITED SINCE SLICE 101, AND THE FIX IS NOT COSMETIC: `xargs` splits on
+# WHITESPACE, the stage-2 corpus holds one unit whose name contains a space, and
+# from it onward the `-n 2` pairing shifts by one — which redirects the dumper's
+# stdout INTO A CORPUS FILE. Invisible at stage 1, where no unit path has a space.
+# See §3.5eu finding nine.
 withgate() {
   local i=0 u
   rm -rf "$WORK/wout" "$WORK/wpairs"; mkdir -p "$WORK/wout"
   while IFS= read -r u; do
-    printf '%s\n%s\n' "$u" "$(printf '%s/wout/%06d' "$WORK" "$i")"
+    printf '%s\0%s\0' "$u" "$(printf '%s/wout/%06d' "$WORK" "$i")"
     i=$((i+1))
   done < "$WORK/units.txt" > "$WORK/wpairs"
-  LIMIT=$LIMIT xargs -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --withthis "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/wpairs"
-  cat "$WORK"/wout/* > "$WORK/with.all"
+  LIMIT=$LIMIT xargs -0 -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --withthis "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/wpairs"
+  find "$WORK/wout" -type f -print0 | xargs -0 cat > "$WORK/with.all"
   local n a1 anc q
   n=$(grep -c '^W ' "$WORK/with.all")
   a1=$(grep '^W ' "$WORK/with.all" | awk '$5==1' | wc -l | tr -d ' ')

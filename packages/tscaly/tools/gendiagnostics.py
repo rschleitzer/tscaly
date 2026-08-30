@@ -89,6 +89,14 @@ SOURCES = [
     # spell them as bare numbers. It costs 4 new entries: the scrape is by NAME
     # and this file's other uses are already in the table.
     os.path.join(SUB, "internal/binder/nameresolver.go"),
+    # Slice 101. relater.go joins under the same per-FILE rule, and it is the file
+    # the rule was written for: the ASSIGNABILITY RELATION reports, and its own
+    # message — `Type_0_is_not_assignable_to_type_1`, TS2322 — appears in NO other
+    # source of this list, so without this line the port would have to spell the
+    # most common error the TypeScript checker emits as a bare number. The scrape is
+    # by NAME and most of relater.go's other messages are already in the table
+    # through checker.go, so the cost is small and stated with the diff.
+    os.path.join(SUB, "internal/checker/relater.go"),
 ]
 DST = os.path.join(REPO, "packages/tscaly/0.1.0/tscaly/DiagnosticCodes.scaly")
 

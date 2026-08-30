@@ -163,17 +163,21 @@ trefpin_of() {
 # apart without a diff: a chapter that stops answering moves the COUNT, a printer
 # that cannot name what the chapter built moves the UNNAMED column, and a WRONG
 # name or a wrong symbol moves the CHECKSUM at both counts unchanged.
+#
+# ★ NUL-DELIMITED SINCE SLICE 101, AND THE FIX IS NOT COSMETIC: `xargs` splits on
+# WHITESPACE, the stage-2 corpus holds one unit whose name contains a space, and
+# from it onward the `-n 2` pairing shifts by one — which redirects the dumper's
+# stdout INTO A CORPUS FILE. Invisible at stage 1, where no unit path has a space.
+# See §3.5eu finding nine.
 trefgate() {
   local i=0 u
   rm -rf "$WORK/tout" "$WORK/tpairs"; mkdir -p "$WORK/tout"
   while IFS= read -r u; do
-    printf '%s
-%s
-' "$u" "$(printf '%s/tout/%06d' "$WORK" "$i")"
+    printf '%s\0%s\0' "$u" "$(printf '%s/tout/%06d' "$WORK" "$i")"
     i=$((i+1))
   done < "$WORK/units.txt" > "$WORK/tpairs"
-  LIMIT=$LIMIT xargs -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --typerefs "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/tpairs"
-  cat "$WORK"/tout/* > "$WORK/trefs.all"
+  LIMIT=$LIMIT xargs -0 -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --typerefs "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/tpairs"
+  find "$WORK/tout" -type f -print0 | xargs -0 cat > "$WORK/trefs.all"
   local n q
   n=$(grep -c '^X ' "$WORK/trefs.all")
   q=$(grep -c ' ?$' "$WORK/trefs.all")
