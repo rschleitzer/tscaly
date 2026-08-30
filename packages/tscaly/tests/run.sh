@@ -370,6 +370,14 @@ rm -f "$OUT/.built-from-patched-tree"
 # .json exclusion slice 19 closed. Both sides now derive the kind from the unit's
 # NAME and clamp it, and .tsx clamps to itself.
 #
+# ★★★ .mts FIXTURES JOINED IN SLICE 100, for the same one-line-widening reason and
+# with a sharper one of its own: checkGrammarArrowFunction's FIRST report fires
+# only in a `.mts` or `.cts` file, so the extension IS the input. With the glob at
+# `*.ts` a fixture carrying it was invisible to every yardstick here, and the only
+# witness left would have been a submodule case — which §3.5cw's rule says is a
+# gate that can move under a pin bump. Both sides derive the script kind from the
+# unit's NAME already, and `.mts` clamps to TS on both.
+#
 # ★★★ .js FIXTURES JOINED IN SLICE 50, and the reason is that the JSDOC REPARSER
 # had no local fixture at all: it runs only for a JavaScript file, and this
 # collector took `*.ts` and `*.tsx` only — so every one of its constructs was
@@ -381,7 +389,7 @@ rm -f "$OUT/.built-from-patched-tree"
 # widening rather than a mode.
 cases=()
 while IFS= read -r f; do cases+=("$f"); done < <(
-  find "$PKG/tests/fixtures" \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' \) 2>/dev/null | sort
+  find "$PKG/tests/fixtures" \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.mts' \) 2>/dev/null | sort
   find "$SUB/testdata/tests/cases/compiler" "$SUB/testdata/tests/cases/conformance" \
     \( -name '*.ts' -o -name '*.tsx' \) 2>/dev/null | sort
   if [ "$STAGE" -ge 2 ]; then

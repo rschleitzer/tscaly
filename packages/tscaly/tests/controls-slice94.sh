@@ -172,15 +172,21 @@ unionpin_of() {
 # files are concatenated in a fixed order. A shared pipe would interleave and the
 # checksum would move on its own — an instrument that disagrees with itself is
 # worse than none.
+#
+# ★ NUL-DELIMITED SINCE SLICE 101, AND THE FIX IS NOT COSMETIC: `xargs` splits on
+# WHITESPACE, the stage-2 corpus holds one unit whose name contains a space, and
+# from it onward the `-n 2` pairing shifts by one — which redirects the dumper's
+# stdout INTO A CORPUS FILE. Invisible at stage 1, where no unit path has a space.
+# See §3.5eu finding nine.
 flowgate() {
   local i=0 u
   rm -rf "$WORK/flowout" "$WORK/pairs"; mkdir -p "$WORK/flowout"
   while IFS= read -r u; do
-    printf '%s\n%s\n' "$u" "$(printf '%s/flowout/%06d' "$WORK" "$i")"
+    printf '%s\0%s\0' "$u" "$(printf '%s/flowout/%06d' "$WORK" "$i")"
     i=$((i+1))
   done < "$WORK/units.txt" > "$WORK/pairs"
-  LIMIT=$LIMIT xargs -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --flow "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/pairs"
-  cat "$WORK"/flowout/* > "$WORK/flow.all"
+  LIMIT=$LIMIT xargs -0 -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --flow "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/pairs"
+  find "$WORK/flowout" -type f -print0 | xargs -0 cat > "$WORK/flow.all"
   local f v a
   f=$(grep -c '^F ' "$WORK/flow.all"); v=$(grep -c '^V ' "$WORK/flow.all"); a=$(grep -c '^A ' "$WORK/flow.all")
   echo "$f $v $a $(cksum < "$WORK/flow.all" | cut -d' ' -f1)"
@@ -196,11 +202,11 @@ uniongate() {
   local i=0 u
   rm -rf "$WORK/uout" "$WORK/upairs"; mkdir -p "$WORK/uout"
   while IFS= read -r u; do
-    printf '%s\n%s\n' "$u" "$(printf '%s/uout/%06d' "$WORK" "$i")"
+    printf '%s\0%s\0' "$u" "$(printf '%s/uout/%06d' "$WORK" "$i")"
     i=$((i+1))
   done < "$WORK/units.txt" > "$WORK/upairs"
-  LIMIT=$LIMIT xargs -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --unions "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/upairs"
-  cat "$WORK"/uout/* > "$WORK/unions.all"
+  LIMIT=$LIMIT xargs -0 -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --unions "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/upairs"
+  find "$WORK/uout" -type f -print0 | xargs -0 cat > "$WORK/unions.all"
   local n q
   n=$(grep -c '^U ' "$WORK/unions.all")
   q=$(grep -c ' ?$' "$WORK/unions.all")
