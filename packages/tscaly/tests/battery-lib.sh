@@ -190,6 +190,56 @@ callpin_of() {
   done
 }
 
+# ★★★ THE TYPEPIN — slice 109's instrument, and it closes a hole the other fourteen
+# had from the start: NONE OF THEM SEES THE DUMP. `tags_of` greps the UNPORTED line
+# out of the dumper's output and throws the rest away, `diags_of` asks for the C
+# section alone, and every gate below reads a side channel. So the T SECTION — the
+# thing the checker yardstick actually compares, and the whole product of a slice
+# that ports an arm of getTypeOfNode — was measurable by no row of any battery from
+# 103 to 108.
+#
+# ★★ IT IS THE FULL DUMP AND NOT A COUNT, because the failure this chapter produces
+# is a WRONG NAME at a right position: an arm that answers `any` where the reference
+# answers a type writes the same number of lines. A count moves for a missing answer
+# and never for a wrong one.
+typepin_of() {
+  local f
+  for f in $PINFILES; do
+    printf '%s\t%s\n' "$(basename "$f")" \
+      "$(run_limited "$WORK/tscaly_types" "$f" 2>/dev/null | tr '\n' '|')"
+  done
+}
+
+# ★★★ THE WHOLE-CORPUS TYPEGATE, beside the pin for the relgate's reason, and it is
+# the gate this family was missing: FOUR NUMBERS AND A CHECKSUM over every unit's
+# own dump. A unit that stops answering moves ANSWERING against REPORTING; an arm
+# that answers fewer nodes moves the T-LINE count; and an arm that answers a
+# DIFFERENT NAME at the same position moves only the CHECKSUM — which is the one
+# breakage no other instrument in this file can see.
+#
+# ★ It needs no oracle: it is our side against our side, which is what a control
+# battery measures. The yardstick's own agreement is run.sh's job.
+#
+# ★ NUL-delimited and concatenated through `find | xargs cat`, for §3.5eu finding
+# nine's two reasons: one stage-2 unit's path contains a SPACE, which shifts an
+# `xargs -n 2` pairing and redirects the dumper's stdout into a CORPUS FILE, and a
+# glob over 17 552 files is *Argument list too long*.
+typegate() {
+  local i=0 u
+  rm -rf "$WORK/tout" "$WORK/tpairs"; mkdir -p "$WORK/tout"
+  while IFS= read -r u; do
+    printf '%s\0%s\0' "$u" "$(printf '%s/tout/%06d' "$WORK" "$i")"
+    i=$((i+1))
+  done < "$WORK/units.txt" > "$WORK/tpairs"
+  LIMIT=$LIMIT xargs -0 -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/tpairs"
+  local ans rep tl
+  ans=$(grep -l '^T ' "$WORK"/tout/* 2>/dev/null | wc -l | tr -d ' ')
+  rep=$(grep -l '^UNPORTED ' "$WORK"/tout/* 2>/dev/null | wc -l | tr -d ' ')
+  find "$WORK/tout" -type f -print0 | xargs -0 cat > "$WORK/type.all"
+  tl=$(grep -c '^T ' "$WORK/type.all")
+  echo "$ans $rep $tl $(cksum < "$WORK/type.all" | cut -d' ' -f1)"
+}
+
 # ★★★ THE WHOLE-CORPUS RELGATE, beside the pin for slice 92's h08/h11/h25 reason:
 # a fixture is written around the arm its author is thinking of, and the shape
 # that distinguishes an arm is usually not that shape.
@@ -332,11 +382,11 @@ stopgate() {   # writes "matched units speaking events other" to stdout
   echo "$m $u $s $e $o"
 }
 
-DIAG_BASE=""; DIAG_LINES=""; DIAG_DIAGS=""; STOP_BASE=""; REL_BASE=""; KIND_BASE=""; FORK_BASE=""; CALL_BASE=""
+DIAG_BASE=""; DIAG_LINES=""; DIAG_DIAGS=""; STOP_BASE=""; REL_BASE=""; KIND_BASE=""; FORK_BASE=""; CALL_BASE=""; TYPE_BASE=""
 
 baseline() {
   echo "################################################################"
-  bold "BASELINE — thirteen instruments"
+  bold "BASELINE — fifteen instruments"
   if ! build_bins; then
     red "the unpatched tree did not build — every row below would be measuring that."
     sed 's/^/    /' "$WORK/build.log"
@@ -361,6 +411,7 @@ baseline() {
   objpin_of > "$WORK/base.obj"
   mempin_of > "$WORK/base.mem"
   callpin_of > "$WORK/base.call"
+  typepin_of > "$WORK/base.type"
   find "$PKG/tests/out/cases" -path '*/units/*' -type f \
        \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' -o -name '*.mjs' -o -name '*.cjs' -o -name '*.mts' \) \
        | sort > "$WORK/units.txt"
@@ -369,6 +420,7 @@ baseline() {
   KIND_BASE=$(kindgate)
   FORK_BASE=$(forkgate)
   CALL_BASE=$(callgate)
+  TYPE_BASE=$(typegate)
   echo
   echo "  the STOPPIN on the unpatched tree:"
   sed 's/^/    /' "$WORK/base.stops"
@@ -388,12 +440,16 @@ baseline() {
   echo "  the CALLPIN on the unpatched tree:"
   sed 's/^/    /' "$WORK/base.call"
   echo
+  echo "  the TYPEPIN on the unpatched tree:"
+  cut -c1-200 "$WORK/base.type" | sed 's/^/    /'
+  echo
   echo "  BASELINE   diagcheck $DIAG_BASE consistent, $DIAG_LINES speaking, $DIAG_DIAGS diagnostics"
   echo "             stopgate  (matched units speaking events other) = $STOP_BASE"
   echo "             relgate   (rows related notrelated couldnotanswer checksum) over $(wc -l < "$WORK/units.txt" | tr -d ' ') units = $REL_BASE"
   echo "             kindgate  (rows true false couldnotanswer checksum) over the same units = $KIND_BASE"
   echo "             forkgate  (rows true false couldnotanswer checksum | routes | branches) = $FORK_BASE"
   echo "             callgate  (rows resolved untyped errorcall couldnotanswer checksum) = $CALL_BASE"
+  echo "             typegate  (units answering, units reporting, T lines, checksum) = $TYPE_BASE"
 }
 
 
@@ -439,12 +495,14 @@ control() {   # $1 = label, $2 = files, $3 = patch
   objpin_of > "$WORK/ctl.obj"
   mempin_of > "$WORK/ctl.mem"
   callpin_of > "$WORK/ctl.call"
+  typepin_of > "$WORK/ctl.type"
   stop=$(stopgate)
-  local rel_g kind_g fork_g call_g
+  local rel_g kind_g fork_g call_g type_g
   rel_g=$(relgate)
   kind_g=$(kindgate)
   fork_g=$(forkgate)
   call_g=$(callgate)
+  type_g=$(typegate)
   local restored=1
   i=0
   for f in $files; do
@@ -568,11 +626,24 @@ control() {   # $1 = label, $2 = files, $3 = patch
     green "callgate  MOVED   $CALL_BASE -> $call_g   (rows resolved untyped errorcall couldnotanswer checksum)"
     moved=1
   fi
+  if cmp -s "$WORK/base.type" "$WORK/ctl.type"; then
+    echo "  typepin   unmoved — all $NPIN pin files answer the same DUMP."
+  else
+    green "typepin   RED"
+    diff "$WORK/base.type" "$WORK/ctl.type" | cut -c1-240 | sed 's/^/    /'
+    moved=1
+  fi
+  if [ "$type_g" = "$TYPE_BASE" ]; then
+    echo "  typegate  unmoved — $type_g"
+  else
+    green "typegate  MOVED   $TYPE_BASE -> $type_g   (units answering, units reporting, T lines, checksum)"
+    moved=1
+  fi
   if [ "$moved" = 0 ]; then
     if [ "$speaking" != "$DIAG_LINES" ] || [ "$diags" != "$DIAG_DIAGS" ]; then
-      echo "  ungated on all fourteen, WITH A NUMBER: $DIAG_LINES/$DIAG_DIAGS -> $speaking/$diags."
+      echo "  ungated on all sixteen, WITH A NUMBER: $DIAG_LINES/$DIAG_DIAGS -> $speaking/$diags."
     else
-      red "UNGATED ON ALL FOURTEEN AND NOTHING MOVED AT ALL."
+      red "UNGATED ON ALL SIXTEEN AND NOTHING MOVED AT ALL."
       echo "  Decide which of §3.5v's four kinds this is. A row that predicted"
       echo "  this is a measurement; a row that did not is a hole in the battery."
     fi
