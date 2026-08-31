@@ -25,6 +25,14 @@
 # typegate 147 1339 1555 <cksum> -> 147 1339 1555 <other cksum>. Read the DIFFERENCES
 # against the list above; the checksums are tree-dependent and are never pinned here.
 #
+# ★★ AND THE DELTAS DRIFT TOO, WHICH THE PARAGRAPH ABOVE DID NOT SAY. Two of the four
+# are properties of the patch AND of the corpus: `callgate resolved -22` and `typegate
+# checksum only` have held since slice 109, while relgate and stopgate move with every
+# unit the slice unblocks. Measured on slice 112's tree: callgate 244 22 4 5 213 -> 244 0
+# 4 5 235, relgate rows -11 related -7 couldnotanswer -3, stopgate matched -17 speaking
+# -17 events -52. **Read the two STABLE deltas as the gate and the other two as a
+# reading**, or this file teaches the reader to ignore a red the way its own §3.5 note says.
+#
 # ★ It runs in about 80 s (baseline plus one row) and needs a stage-1 run.sh tree. Run it
 # after any edit to battery-lib.sh, and read the gate lines rather than their colour.
 . "$(dirname "$0")/battery-lib.sh"

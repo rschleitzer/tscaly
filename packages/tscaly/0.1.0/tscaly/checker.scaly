@@ -770,6 +770,61 @@ define DeclaredTypeLink
     }
 }
 
+; One row of c.cachedTypes at CachedTypeKindWidened — see get_widened_type's
+; header for why that memo is load-bearing here and why ONE kind of the
+; reference's two-part key is one table rather than a general one.
+define WidenedTypeLink
+(
+    source: ref[Type]?
+    widened: ref[Type]?
+)
+{
+    init(s: ref[Type]?)
+    {
+        set source: s
+        set widened: null
+    }
+}
+
+; checker.WideningContext.
+;
+; ★★ FOUR OF ITS FIVE SLOTS ARE NAMED RATHER THAN DECLARED, which is the other
+; half of §3.5be's rule. `parent`, `propertyName`, `resolvedProperties`,
+; `childContexts` and the `widenedTypes` memo are read by getSiblingsOfContext,
+; getPropertiesOfContext and getChildContext — all three behind ONE stop in
+; get_widened_type_of_object_literal — so a slot for them is a slot no instrument
+; in this suite can reach, and `propertyName` would additionally have to be a
+; borrowed name pair. `siblings` is declared because the union arm FILLS it.
+define WideningContext
+(
+    siblings: ref[Array[ref[Type]?]]?
+)
+{
+    init(s: ref[Array[ref[Type]?]]?)
+    {
+        set siblings: s
+    }
+}
+
+; checkAndAggregateReturnExpressionTypes' three locals, in one record because the
+; visitor writes all three and the walk carries them down. Upstream they are
+; captured by the closure; here the closure does not survive (§3.9d) and the
+; state has to travel as an argument.
+define ReturnAggregate
+(
+    types: ref[Array[ref[Type]?]]
+    has_no_expression: bool
+    has_never: bool
+)
+{
+    init(ts: ref[Array[ref[Type]?]])
+    {
+        set types: ts
+        set has_no_expression: false
+        set has_never: false
+    }
+}
+
 ; One row of c.valueSymbolLinks — the OTHER per-symbol links table, and the one
 ; getTypeOfSymbol memoises into. It is a second table rather than three more
 ; slots on DeclaredTypeLink because the reference keys them separately and the
@@ -3314,6 +3369,13 @@ define Checker
     ; `t.AsInterfaceType().thisType` the same object on both routes.
     declared_type_links: ref[Array[ref[DeclaredTypeLink]?]]
 
+    ; ── c.cachedTypes, at the one kind in use (slice 112) ───────────────────
+    ;
+    ; declared_type_links' idiom keyed on the TYPE pointer. Upstream's key is
+    ; (kind, typeId) over one map; CachedTypeKindWidened is the only kind this
+    ; port reads, so the kind half is the table's name.
+    widened_type_links: ref[Array[ref[WidenedTypeLink]?]]
+
     ; ── c.typeAliasLinks (slice 105) ────────────────────────────────────────
     ;
     ; declared_type_links' idiom, keyed on the SYMBOL POINTER for the same reason.
@@ -3639,6 +3701,9 @@ define Checker
         let dt host.allocate(sizeof Array[ref[DeclaredTypeLink]?], alignof Array[ref[DeclaredTypeLink]?]) as pointer[Array[ref[DeclaredTypeLink]?]]
         set *dt: Array[ref[DeclaredTypeLink]?]()
         set c.declared_type_links: dt
+        let wtl host.allocate(sizeof Array[ref[WidenedTypeLink]?], alignof Array[ref[WidenedTypeLink]?]) as pointer[Array[ref[WidenedTypeLink]?]]
+        set *wtl: Array[ref[WidenedTypeLink]?]()
+        set c.widened_type_links: wtl
         let tal host.allocate(sizeof Array[ref[TypeAliasLink]?], alignof Array[ref[TypeAliasLink]?]) as pointer[Array[ref[TypeAliasLink]?]]
         set *tal: Array[ref[TypeAliasLink]?]()
         set c.type_alias_links: tal
@@ -4650,6 +4715,28 @@ define Checker
         }
         let fresh &DeclaredTypeLink^host(sym)
         declared_type_links.add(fresh)
+        fresh
+    }
+
+    ; ── c.cachedTypes[CachedTypeKindWidened] ────────────────────────────────
+
+    function widened_type_link_of(this, t: ref[Type]) returns ref[WidenedTypeLink]
+    {
+        let len widened_type_links.get_length() as int
+        var i 0
+        while i < len
+        {
+            let row widened_type_links[i]
+            if row <> null
+            {
+                let r row as ref[WidenedTypeLink]
+                if r.source = t
+                    return r
+            }
+            set i: i + 1
+        }
+        let fresh &WidenedTypeLink^host(t)
+        widened_type_links.add(fresh)
         fresh
     }
 
@@ -6099,10 +6186,7 @@ define Checker
             return this.get_type_of_instantiated_symbol(symbol)
         let f Symbol.flags_of(symbol)
         if (f & SymbolFlagsAccessor) <> 0
-        {
-            this.record_unported("get-type-of-accessors", 0)
-            return null
-        }
+            return this.get_type_of_accessors(symbol)
         if (f & (SymbolFlagsVariable | SymbolFlagsProperty)) <> 0
             return this.get_type_of_variable_or_parameter_or_property(symbol)
         if (f & (SymbolFlagsFunction | SymbolFlagsMethod | SymbolFlagsClass | SymbolFlagsEnum | SymbolFlagsValueModule)) <> 0
@@ -6126,6 +6210,221 @@ define Checker
     ; getTypeOfFuncClassEnumModule. The memo is the whole function, and its hit is
     ; OBSERVABLE here (see value_symbol_links' note) — which is what makes this
     ; the first links table in this port that earns its keep.
+    ; ── slice 112: getTypeOfAccessors ────────────────────────────────────────
+    ;
+    ; The accessor's own type, which get_type_of_symbol has reported at since
+    ; slice 67. Its THIRD resolution step is getReturnTypeFromBody — a getter with
+    ; a body and no return annotation is the same shape a function declaration is
+    ; — which is why it lands with that chapter and not before it.
+    ;
+    ; ★★★ THE FIVE MESSAGE ARGUMENTS COST NOTHING, and that is a property of this
+    ; port rather than of the slice: a diagnostic here is a CODE and a RANGE
+    ; (check_no_type_arguments' header states the rule), so the symbolToString
+    ; calls the reference threads through all five reports are not asked. The two
+    ; errorOrSuggestion calls are ERRORS because noImplicitAny is TRUE under this
+    ; harness.
+    function get_type_of_accessors(this, symbol: ref[Symbol]) returns ref[Type]?
+    {
+        let links this.value_symbol_link_of(symbol)
+        if links.resolved_type <> null
+            return links.resolved_type
+        if this.push_type_resolution(symbol, null, null, TypeSystemPropertyNameType) = false
+            return error_type
+        let mark this.unported_mark()
+        let getter Checker.get_declaration_of_kind(symbol, KindGetAccessor)
+        let setter Checker.get_declaration_of_kind(symbol, KindSetAccessor)
+        let accessor this.find_auto_accessor_declaration(symbol)
+        ; "We try to resolve a getter type annotation, a setter type annotation, or
+        ; a getter function body return type inference, in that order."
+        var t this.get_annotated_accessor_type(getter)
+        if this.unported_mark() <> mark
+        {
+            this.pop_type_resolution_defensively()
+            return null
+        }
+        if t = null
+        {
+            set t: this.get_annotated_accessor_type(setter)
+            if this.unported_mark() <> mark
+            {
+                this.pop_type_resolution_defensively()
+                return null
+            }
+        }
+        if t = null
+        {
+            set t: this.get_annotated_accessor_type(accessor)
+            if this.unported_mark() <> mark
+            {
+                this.pop_type_resolution_defensively()
+                return null
+            }
+        }
+        if t = null
+        {
+            if getter <> null
+            {
+                if AstNode.body_of(getter as ref[AstNode]) <> null
+                {
+                    set t: this.get_return_type_from_body(getter as ref[AstNode], CheckModeNormal)
+                    if this.unported_mark() <> mark
+                    {
+                        this.pop_type_resolution_defensively()
+                        return null
+                    }
+                }
+            }
+        }
+        if t = null
+        {
+            if accessor <> null
+            {
+                set t: this.get_widened_type_for_variable_like_declaration(accessor as ref[AstNode], true)
+                if this.unported_mark() <> mark
+                {
+                    this.pop_type_resolution_defensively()
+                    return null
+                }
+            }
+        }
+        if t = null
+        {
+            var reported false
+            if setter <> null
+            {
+                if this.is_private_within_ambient(setter as ref[AstNode]) = false
+                {
+                    this.error_on_node(setter as ref[AstNode], DiagProperty_0_implicitly_has_type_any_because_its_set_accessor_lacks_a_parameter_type_annotation)
+                    set reported: true
+                }
+            }
+            if reported = false
+            {
+                if getter <> null
+                {
+                    if this.is_private_within_ambient(getter as ref[AstNode]) = false
+                    {
+                        this.error_on_node(getter as ref[AstNode], DiagProperty_0_implicitly_has_type_any_because_its_get_accessor_lacks_a_return_type_annotation)
+                        set reported: true
+                    }
+                }
+            }
+            if reported = false
+            {
+                if accessor <> null
+                {
+                    if this.is_private_within_ambient(accessor as ref[AstNode]) = false
+                        this.error_on_node(accessor as ref[AstNode], DiagMember_0_implicitly_has_an_1_type)
+                }
+            }
+            set t: any_type
+        }
+        ; ★★★ THE `else if` CHAIN IS NOT A CHAIN OF `if`s AND THE SETTER ARM PROVES
+        ; IT: a symbol with BOTH a getter and a setter, neither annotated, reports
+        ; TS7032 and NOT TS7033. `reported` is what carries the reference's
+        ; else-if here, because a `switch` with no subject is an ORDERED chain
+        ; (§3.5u) and this one has side effects in every arm.
+        if this.pop_type_resolution() = false
+        {
+            var circ: ref[AstNode]? null
+            if this.get_annotated_accessor_type_node(getter) <> null
+                set circ: getter
+            if circ = null
+            {
+                if this.get_annotated_accessor_type_node(setter) <> null
+                    set circ: setter
+            }
+            if circ = null
+            {
+                ; The reference reports on the SETTER in the accessor arm too, and
+                ; that is transcribed rather than corrected — see §3.5v.
+                if this.get_annotated_accessor_type_node(accessor) <> null
+                    set circ: setter
+            }
+            if circ <> null
+                this.error_on_node(circ as ref[AstNode], DiagX_0_is_referenced_directly_or_indirectly_in_its_own_type_annotation)
+            else
+            {
+                if getter <> null
+                {
+                    if Checker.no_implicit_any()
+                        this.error_on_node(getter as ref[AstNode], DiagX_0_implicitly_has_return_type_any_because_it_does_not_have_a_return_type_annotation_and_is_referenced_directly_or_indirectly_in_one_of_its_return_expressions)
+                }
+            }
+            set t: any_type
+        }
+        if links.resolved_type = null
+            set links.resolved_type: t
+        links.resolved_type
+    }
+
+    ; ast.GetDeclarationOfKind.
+    function get_declaration_of_kind(symbol: ref[Symbol], kind: int) returns ref[AstNode]?
+    {
+        let n Symbol.declaration_count(symbol)
+        var i 0
+        while i < n
+        {
+            let d Symbol.declaration_at(symbol, i)
+            if d <> null
+            {
+                if AstNode.kind_of(d as ref[AstNode]) = kind
+                    return d
+            }
+            set i: i + 1
+        }
+        null
+    }
+
+    ; core.Find(symbol.Declarations, ast.IsAutoAccessorPropertyDeclaration).
+    function find_auto_accessor_declaration(this, symbol: ref[Symbol]) returns ref[AstNode]?
+    {
+        let n Symbol.declaration_count(symbol)
+        var i 0
+        while i < n
+        {
+            let d Symbol.declaration_at(symbol, i)
+            if d <> null
+            {
+                if b.is_auto_accessor_property_declaration(d as ref[AstNode])
+                    return d
+            }
+            set i: i + 1
+        }
+        null
+    }
+
+    ; getAnnotatedAccessorType and getAnnotatedAccessorTypeNode.
+    function get_annotated_accessor_type(this, accessor: ref[AstNode]?) returns ref[Type]?
+    {
+        let node this.get_annotated_accessor_type_node(accessor)
+        if node = null
+            return null
+        this.get_type_from_type_node(node as ref[AstNode])
+    }
+
+    function get_annotated_accessor_type_node(this, accessor: ref[AstNode]?) returns ref[AstNode]?
+    {
+        if accessor = null
+            return null
+        let a accessor as ref[AstNode]
+        let k AstNode.kind_of(a)
+        if k = KindGetAccessor
+            return AstNode.type_of(a)
+        if k = KindPropertyDeclaration
+            return AstNode.type_of(a)
+        if k = KindSetAccessor
+        {
+            ; getEffectiveSetAccessorTypeAnnotationNode — the VALUE PARAMETER's
+            ; annotation, which is where `set x(v: T)` keeps the accessor's type.
+            let param Checker.get_set_accessor_value_parameter(a)
+            if param = null
+                return null
+            return AstNode.type_of(param as ref[AstNode])
+        }
+        null
+    }
+
     function get_type_of_func_class_enum_module(this, symbol: ref[Symbol]) returns ref[Type]?
     {
         let links this.value_symbol_link_of(symbol)
@@ -7147,8 +7446,11 @@ define Checker
     ; reportErrorsFromWidening stands behind ObjectFlagsContainsWideningType, which
     ; no type this slice can make carries — create_widening_type answers the
     ; NON-widening type under strictNullChecks, which is its own header's finding.
+    ; ★The third of the three is a CALL since slice 112 rather than a stop, and the
+    ; zero is unchanged: what moved is that an arrival would now be answered.
     function widen_type_for_variable_like_declaration(this, t: ref[Type]?, declaration: ref[AstNode], report_errors: bool) returns ref[Type]?
     {
+        let mark this.unported_mark()
         if t <> null
         {
             let ty t as ref[Type]
@@ -7160,12 +7462,13 @@ define Checker
             }
             if report_errors
             {
-                if (ty.object_flags & ObjectFlagsContainsWideningType) <> 0
-                {
-                    ; reportErrorsFromWidening — see the header.
-                    this.record_unported("report-errors-from-widening", 0)
+                ; reportErrorsFromWidening, ported in slice 112. ★The header's
+                ; third zero — *no type this slice can make carries
+                ; ContainsWideningType* — is why this call has never had input and
+                ; why the port of it costs nothing here.
+                this.report_errors_from_widening(declaration, ty, WideningKindNormal)
+                if this.unported_mark() <> mark
                     return null
-                }
             }
             if (ty.flags & TypeFlagsUniqueESSymbol) <> 0
             {
@@ -7950,21 +8253,295 @@ define Checker
         null
     }
 
-    ; getWidenedType / getWidenedTypeWithContext, reduced to the gate that decides
-    ; whether there is anything to do. ObjectFlagsRequiresWidening is the union of
-    ; the two "contains" bits, and no type this slice makes carries either — so the
-    ; identity arm is the ported one and the five widening arms (any/nullable, the
-    ; object literal, the union, the intersection and the array or tuple) stand
-    ; behind one report. The memo on CachedTypeKindWidened goes with them: it keys
-    ; a computation that cannot run.
+    ; ── slice 112: getWidenedType, WHOLE ─────────────────────────────────────
+    ;
+    ; getWidenedType, getWidenedTypeWithContext and getWidenedTypeOfObjectLiteral
+    ; with the two property helpers under it.
+    ;
+    ; ★★★ THE NOTE THAT STOOD HERE HAD EXPIRED TWO SLICES BEFORE IT WAS READ. It
+    ; said the five widening arms could stand behind ONE report because *no type
+    ; this slice makes carries either bit* — true of slice 69's tree, and false
+    ; since slice 99: ObjectFlagsContainsObjectOrArrayLiteral is one half of
+    ; RequiresWidening and create_object_literal_type sets it on every type it
+    ; mints. That is the whole row, measured rather than argued: 91 arrivals over
+    ; 49 units, every one of them at TypeFlagsObject and none at any other flag —
+    ; so the OBJECT-LITERAL arm is the live one and the other four are not.
+    ;
+    ; ★★★ THE MEMO IS PORTED AND IT IS NOT AN OPTIMISATION. This function MINTS a
+    ; type, so without the cache two widenings of one object literal answer two
+    ; DIFFERENT types, and type identity is read all over this file — the
+    ; `core.Same` short circuit in filter_undefined_out, the interning in
+    ; get_union_type_from_sorted_list. Upstream keys it in `c.cachedTypes` under
+    ; CachedTypeKindWidened; here it is one link list beside the other nine,
+    ; because exactly ONE kind of that key is in use and a two-part key with a
+    ; single reader is a table nobody can check.
     function get_widened_type(this, t: ref[Type]) returns ref[Type]?
+        this.get_widened_type_with_context(t, null)
+
+    function get_widened_type_with_context(this, t: ref[Type], context: ref[WideningContext]?) returns ref[Type]?
     {
-        if (t.object_flags & ObjectFlagsRequiresWidening) <> 0
+        if (t.object_flags & ObjectFlagsRequiresWidening) = 0
+            return t
+        if context = null
         {
-            this.record_unported("get-widened-type", t.flags)
+            let cached this.widened_type_link_of(t).widened
+            if cached <> null
+                return cached
+        }
+        let mark this.unported_mark()
+        ; The reference's `switch` with no subject — an ORDERED chain (§3.5u), and
+        ; `result` staying nil is its own case: the fall-through answers `t`.
+        var result: ref[Type]? null
+        if (t.flags & (TypeFlagsAny | TypeFlagsNullable)) <> 0
+            set result: any_type
+        else
+        {
+            if Checker.is_object_literal_type(t)
+                set result: this.get_widened_type_of_object_literal(t, context)
+            else
+            {
+                if (t.flags & TypeFlagsUnion) <> 0
+                    set result: this.get_widened_type_of_union(t, context)
+                else
+                {
+                    if (t.flags & TypeFlagsIntersection) <> 0
+                    {
+                        ; getIntersectionType over the widened constituents.
+                        ; Nothing in this port mints an intersection, so the arm
+                        ; is a report rather than a comment (§3.5v).
+                        this.record_unported("get-intersection-type", t.flags)
+                        return null
+                    }
+                    if this.is_array_or_tuple_type(t)
+                    {
+                        ; createTypeReference over the widened type arguments.
+                        this.record_unported("widen-array-or-tuple-type", t.flags)
+                        return null
+                    }
+                }
+            }
+        }
+        if this.unported_mark() <> mark
+            return null
+        if result = null
+            return t
+        if context = null
+        {
+            let link this.widened_type_link_of(t)
+            set link.widened: result
+        }
+        result
+    }
+
+    ; The union arm, lifted out of the chain because `core.SameMap` plus the
+    ; `core.Some` that picks the reduction is four statements and the chain above
+    ; is already four deep.
+    ;
+    ; ★ A NULLABLE CONSTITUENT IS NOT WIDENED and that is the reference's own test,
+    ; not a shortcut: `undefined | T` must keep its `undefined` while T widens, and
+    ; the any/nullable arm above would turn the constituent into `any`.
+    function get_widened_type_of_union(this, t: ref[Type], context: ref[WideningContext]?) returns ref[Type]?
+    {
+        let types Checker.union_types_of(t)
+        if types = null
+            return null
+        let list types as ref[Array[ref[Type]?]]
+        var union_context context
+        if union_context = null
+            set union_context: &WideningContext^host(list)
+        let n list.get_length() as int
+        let widened this.new_type_list(null)
+        var has_empty_object false
+        var i 0
+        while i < n
+        {
+            let c list[i]
+            if c = null
+                return null
+            let ct c as ref[Type]
+            var w: ref[Type]? ct
+            if (ct.flags & TypeFlagsNullable) = 0
+                set w: this.get_widened_type_with_context(ct, union_context)
+            if w = null
+                return null
+            if this.is_empty_object_type(w as ref[Type])
+                set has_empty_object: true
+            widened.add(w)
+            set i: i + 1
+        }
+        var reduction UnionReductionLiteral
+        if has_empty_object
+            set reduction: UnionReductionSubtype
+        this.get_union_type_ex(widened, reduction)
+    }
+
+    ; getWidenedTypeOfObjectLiteral.
+    ;
+    ; ★★★ THE CONTEXT HALF IS ONE STOP AND THE POPULATION SAYS SO. Every read of a
+    ; WideningContext — the `widenedTypes` memo, getPropertiesOfContext, the
+    ; undefined-property fill and getChildContext — is reachable only from the
+    ; UNION arm above, i.e. only for a union that CONTAINS an object literal. A
+    ; top-level getWidenedType passes nil and never sees one, which is the whole
+    ; measured row.
+    function get_widened_type_of_object_literal(this, t: ref[Type], context: ref[WideningContext]?) returns ref[Type]?
+    {
+        if context <> null
+        {
+            ; context.widenedTypes, getPropertiesOfContext, getUndefinedProperty
+            ; and getChildContext — the sibling machinery.
+            this.record_unported("get-properties-of-context", t.flags)
             return null
         }
-        t
+        let props this.get_properties_of_object_type(t)
+        let members SymbolTable.create(host)
+        if props <> null
+        {
+            let pl props as ref[Array[ref[Symbol]?]]
+            let n pl.get_length() as int
+            var i 0
+            while i < n
+            {
+                let p pl[i]
+                if p = null
+                    return null
+                let prop p as ref[Symbol]
+                let widened this.get_widened_property(prop, context)
+                if widened = null
+                    return null
+                SymbolTable.set_entry(host, members, Symbol.name_data_of(prop), Symbol.name_len_of(prop), widened)
+                set i: i + 1
+            }
+        }
+        let infos this.get_index_infos_of_type(t)
+        var widened_infos: ref[Array[ref[IndexInfo]?]]? null
+        if infos <> null
+        {
+            let il infos as ref[Array[ref[IndexInfo]?]]
+            let n il.get_length() as int
+            let out this.new_index_info_list()
+            var i 0
+            while i < n
+            {
+                let info il[i]
+                if info = null
+                    return null
+                let ii info as ref[IndexInfo]
+                var wv: ref[Type]? ii.value_type
+                if wv <> null
+                    set wv: this.get_widened_type(wv as ref[Type])
+                if wv = null
+                    return null
+                out.add(this.new_index_info(ii.key_type, wv, ii.is_readonly, ii.declaration))
+                set i: i + 1
+            }
+            set widened_infos: out
+        }
+        let made this.new_anonymous_type(t.symbol, members, null, null, widened_infos)
+        if made = null
+            return null
+        let result made as ref[Type]
+        ; "Retain js literal flag through widening"
+        set result.object_flags: result.object_flags | (t.object_flags & (ObjectFlagsJSLiteral | ObjectFlagsNonInferrableType))
+        result
+    }
+
+    ; getWidenedProperty. ★The accessor arm is the reference's own early return and
+    ; not a reduction: a get accessor has already widened its return value, so a
+    ; non-Property symbol comes back unchanged.
+    function get_widened_property(this, prop: ref[Symbol], context: ref[WideningContext]?) returns ref[Symbol]?
+    {
+        if (Symbol.flags_of(prop) & SymbolFlagsProperty) = 0
+            return prop
+        let original this.get_type_of_symbol(prop)
+        if original = null
+            return null
+        if context <> null
+        {
+            ; context.getChildContext — see get_widened_type_of_object_literal.
+            this.record_unported("get-properties-of-context", Symbol.flags_of(prop))
+            return null
+        }
+        let widened this.get_widened_type_with_context(original as ref[Type], null)
+        if widened = null
+            return null
+        if widened = original
+            return prop
+        this.create_symbol_with_type(prop, widened)
+    }
+
+    ; isArrayOrTupleType. ★isArrayType is `getTargetType(t) == globalArrayType ||
+    ; globalReadonlyArrayType`, and neither global is minted here (the lib is
+    ; §3.11), so the first disjunct is FALSE for every type this port can build
+    ; and the answer is isTupleType's alone.
+    function is_array_or_tuple_type(this, t: ref[Type]) returns bool
+        Checker.is_tuple_type(t)
+
+    ; isEmptyObjectType.
+    ;
+    ; ★ isGenericMappedType is `objectFlags&Mapped != 0 && isGenericIndexType(...)`
+    ; and ObjectFlagsMapped has no writer here — it is not declared at all, on
+    ; §3.5be's rule — so the conjunct is false and `!isGenericMappedType(t)` is the
+    ; constant true this reduction leaves out.
+    function is_empty_object_type(this, t: ref[Type]) returns bool
+    {
+        if (t.flags & TypeFlagsObject) <> 0
+        {
+            let sm this.resolve_structured_type_members(t)
+            if sm = null
+                return false
+            return Checker.is_empty_resolved_type(sm as ref[StructuredMembers])
+        }
+        if (t.flags & TypeFlagsNonPrimitive) <> 0
+            return true
+        if (t.flags & TypeFlagsUnion) <> 0
+        {
+            let types Checker.union_types_of(t)
+            if types = null
+                return false
+            let list types as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            var i 0
+            while i < n
+            {
+                let c list[i]
+                if c <> null
+                {
+                    if this.is_empty_object_type(c as ref[Type])
+                        return true
+                }
+                set i: i + 1
+            }
+            return false
+        }
+        if (t.flags & TypeFlagsIntersection) <> 0
+        {
+            ; core.Every over the constituents. Nothing mints an intersection.
+            this.record_unported("is-empty-object-type-intersection", t.flags)
+            return false
+        }
+        false
+    }
+
+    ; isEmptyResolvedType. ★Its first conjunct is `t != c.anyFunctionType`, and
+    ; anyFunctionType is one of the eleven marker object types NewChecker builds
+    ; that still have no reader here (initialize_intrinsic_types' header) — so the
+    ; comparison is a constant TRUE and is left out with its reason rather than
+    ; written against a type that does not exist.
+    function is_empty_resolved_type(sm: ref[StructuredMembers]) returns bool
+    {
+        if SymbolTable.length(sm.members) <> 0
+            return false
+        if sm.signatures <> null
+        {
+            if ((sm.signatures as ref[Array[ref[Signature]?]]).get_length() as int) <> 0
+                return false
+        }
+        if sm.index_infos <> null
+        {
+            if ((sm.index_infos as ref[Array[ref[IndexInfo]?]]).get_length() as int) <> 0
+                return false
+        }
+        true
     }
 
     ; addOptionalityEx, whole since slice 94. It stands behind strictNullChecks,
@@ -14299,6 +14876,59 @@ define Checker
     }
 
     ; getUnionTypeWorker.
+    ; removeSubtypes' two early exits, asked as a question so the caller can keep
+    ; the list it already has.
+    ;
+    ; ★ `hasEmptyObject` is the reference's own conjunction and its first term is
+    ; the caller's `includes&Object`; the second walks the set for an object type
+    ; whose resolved members are empty. isGenericMappedType is false here for the
+    ; reason is_empty_object_type records.
+    function remove_subtypes_is_identity(this, types: ref[Array[ref[Type]?]], has_object_types: bool) returns bool
+    {
+        let n types.get_length() as int
+        if n < 2
+            return true
+        var has_empty_object false
+        if has_object_types
+        {
+            var i 0
+            while i < n
+            {
+                let c types[i]
+                if c <> null
+                {
+                    let ct c as ref[Type]
+                    if (ct.flags & TypeFlagsObject) <> 0
+                    {
+                        let sm this.resolve_structured_type_members(ct)
+                        if sm = null
+                            return false
+                        if Checker.is_empty_resolved_type(sm as ref[StructuredMembers])
+                            set has_empty_object: true
+                    }
+                }
+                set i: i + 1
+            }
+        }
+        if has_empty_object
+            return false
+        ; "if none of those are present we can exclude primitive types from the
+        ; subtype check" — the loop body is entered only for a STRUCTURED or
+        ; INSTANTIABLE source, so a set with none is returned unchanged.
+        var i 0
+        while i < n
+        {
+            let c types[i]
+            if c <> null
+            {
+                if ((c as ref[Type]).flags & TypeFlagsStructuredOrInstantiable) <> 0
+                    return false
+            }
+            set i: i + 1
+        }
+        true
+    }
+
     function get_union_type_worker(this, types: ref[Array[ref[Type]?]], union_reduction: int) returns ref[Type]?
     {
         var type_set this.new_type_list(null)
@@ -14376,14 +15006,29 @@ define Checker
                 this.record_unported("remove-constrained-type-variables", includes)
                 return null
             }
-            ; removeSubtypes, whose own body is isTypeSubtypeOf — the assignability
-            ; relation, a dimension of its own. No caller in this port passes
-            ; Subtype today; the ones upstream that do are inference and the array
-            ; literal.
+            ; removeSubtypes, ported in slice 112 down to the ONE branch that
+            ; needs isTypeSubtypeOf.
+            ;
+            ; ★★★ ITS TWO EARLY EXITS ARE THE WHOLE OF THE COMMON CASE AND THEY ARE
+            ; THE REFERENCE'S OWN. A set of fewer than two types returns unchanged,
+            ; and so does one in which no constituent is STRUCTURED and no empty
+            ; object type is present — `removeSubtypes` compares nothing there,
+            ; because the only possible supertype of a primitive is an empty object
+            ; type. That is exactly the return-type chapter's input: a union of
+            ; return-expression types is a union of literals and intrinsics.
             if (union_reduction & UnionReductionSubtype) <> 0
             {
-                this.record_unported("remove-subtypes", includes)
-                return null
+                var has_object false
+                if (includes & TypeFlagsObject) <> 0
+                    set has_object: true
+                if this.remove_subtypes_is_identity(type_set, has_object) = false
+                {
+                    ; The subtype comparison itself — isTypeSubtypeOf, i.e. the
+                    ; assignability relation under the strict-subtype rules, which
+                    ; is a dimension of its own.
+                    this.record_unported("remove-subtypes", includes)
+                    return null
+                }
             }
             if (type_set.get_length() as int) = 0
             {
@@ -14586,20 +15231,46 @@ define Checker
         out
     }
 
-    ; getRegularTypeOfLiteralType, for the two arms this port can answer. Its UNION
-    ; arm is `mapType` over the constituents memoised on the union, and both halves
-    ; of that are a chapter away — the memo slot is named in UnionTypeData's header
-    ; and the walk carries the `map-type` tag get_widened_literal_type already uses.
+    ; getRegularTypeOfLiteralType, WHOLE since slice 112 — the note that stood here
+    ; called its union arm *a chapter away*, and the chapter is mapType, which that
+    ; slice needs anyway.
+    ;
+    ; ★★ THE `u.regularType` MEMO IS NOT CARRIED AND THAT IS OBSERVABLY FREE, which
+    ; is a different argument from the widened-type memo one screen up. Unions are
+    ; INTERNED here (get_union_type_from_sorted_list consults find_union_type), so
+    ; recomputing this answers the SAME object rather than an equal one — where
+    ; get_widened_type_of_object_literal mints a fresh anonymous type on every call
+    ; and its memo is therefore load-bearing.
     function get_regular_type_of_literal_type(this, t: ref[Type]) returns ref[Type]?
     {
         if (t.flags & TypeFlagsFreshable) <> 0
             return Checker.literal_regular_type_of(t)
-        if (t.flags & TypeFlagsUnion) <> 0
-        {
-            this.record_unported("map-type", t.flags)
+        if (t.flags & TypeFlagsUnion) = 0
+            return t
+        let types Checker.union_types_of(t)
+        if types = null
             return null
+        let list types as ref[Array[ref[Type]?]]
+        let n list.get_length() as int
+        let mapped this.new_type_list(null)
+        var changed false
+        var i 0
+        while i < n
+        {
+            let c list[i]
+            if c = null
+                return null
+            let m this.get_regular_type_of_literal_type(c as ref[Type])
+            if m = null
+                return null
+            if m <> c
+                set changed: true
+            mapped.add(m)
+            set i: i + 1
         }
-        t
+        if changed = false
+            return t
+        this.get_union_type_ex(mapped, UnionReductionLiteral)
     }
 
     ; NewChecker's intrinsic block. The order is the reference's, because the type
@@ -16138,12 +16809,110 @@ define Checker
         }
         out.append(": ")
         let mark this.unported_mark()
-        let pt this.get_type_of_symbol(ps)
+        var pt this.get_type_of_symbol(ps)
         if this.unported_mark() <> mark
             return false
         if pt = null
             return false
+        ; serializeTypeForDeclaration's `addUndefinedForParameter`.
+        ;
+        ; ★★★ IT IS THE ONE PLACE THE PRINTER ASKS THE EMIT RESOLVER, AND IT IS NOT
+        ; DECORATION: `method(a = 0, b)` prints `a: number | undefined` because `a`
+        ; is INITIALIZED and yet NOT optional — a required parameter follows it, so
+        ; `isOptionalParameter` says no and the `?` cannot carry the meaning.
+        ; ★Slice 112 is where it became visible: the method's own type is printed
+        ; only once its return type is inferred, so every unit with this shape used
+        ; to stop.
+        if pd <> null
+        {
+            if this.requires_adding_implicit_undefined(pd as ref[AstNode])
+            {
+                if this.unported_mark() <> mark
+                    return false
+                set pt: this.get_optional_type(pt as ref[Type], false)
+                if this.unported_mark() <> mark
+                    return false
+                if pt = null
+                    return false
+            }
+        }
         this.type_to_string(pt, out)
+    }
+
+    ; EmitResolver.requiresAddingImplicitUndefined at its PARAMETER arm, which is
+    ; the only one this printer reaches — the property arm needs the reverse-mapped
+    ; symbol links, and nothing here mints one.
+    ;
+    ; ★ `enclosingDeclaration` is nil at every arrival from typeToString, so
+    ; isRequiredInitializedParameter's parameter-property fork answers FALSE rather
+    ; than TRUE; it is written as the reference has it and not collapsed, because
+    ; the nil is the CALLER's and a second caller would have another.
+    function requires_adding_implicit_undefined(this, parameter: ref[AstNode]) returns bool
+    {
+        var wants false
+        if this.is_required_initialized_parameter(parameter)
+            set wants: true
+        if this.is_optional_uninitialized_parameter_property(parameter)
+            set wants: true
+        if wants = false
+            return false
+        this.declared_parameter_type_contains_undefined(parameter) = false
+    }
+
+    function is_required_initialized_parameter(this, parameter: ref[AstNode]) returns bool
+    {
+        if Checker.strict_null_checks() = false
+            return false
+        let mark this.unported_mark()
+        let opt this.is_optional_parameter(parameter)
+        if this.unported_mark() <> mark
+            return false
+        if opt
+            return false
+        if AstNode.initializer_of(parameter) = null
+            return false
+        if b.has_syntactic_modifier(parameter, ModifierFlagsParameterPropertyModifier)
+        {
+            ; `enclosingDeclaration != nil && IsFunctionLikeDeclaration(...)` — the
+            ; printer passes nil, so this is false here.
+            return false
+        }
+        true
+    }
+
+    function is_optional_uninitialized_parameter_property(this, parameter: ref[AstNode]) returns bool
+    {
+        if Checker.strict_null_checks() = false
+            return false
+        let mark this.unported_mark()
+        let opt this.is_optional_parameter(parameter)
+        if this.unported_mark() <> mark
+            return false
+        if opt = false
+            return false
+        if AstNode.initializer_of(parameter) <> null
+            return false
+        b.has_syntactic_modifier(parameter, ModifierFlagsParameterPropertyModifier)
+    }
+
+    ; declaredParameterTypeContainsUndefined. ★The reference's own comment says why
+    ; the error type counts: *allow error type here to avoid confusing errors that
+    ; the annotation has to contain undefined*.
+    function declared_parameter_type_contains_undefined(this, parameter: ref[AstNode]) returns bool
+    {
+        let type_node AstNode.type_of(parameter)
+        if type_node = null
+            return false
+        let mark this.unported_mark()
+        let t this.get_type_from_type_node(type_node as ref[AstNode])
+        if this.unported_mark() <> mark
+            return false
+        if t = null
+            return false
+        let ty t as ref[Type]
+        if this.is_error_type(ty)
+            return true
+        Checker.contains_undefined_type(ty)
     }
 
     ; parameterToParameterDeclarationName — the DECLARATION's own name node when
@@ -16163,11 +16932,37 @@ define Checker
         let nm name as ref[AstNode]
         let k AstNode.kind_of(nm)
         if k = KindIdentifier
-            return this.write_declaration_name(nm, out)
+            return this.write_identifier_name(nm, out)
         if k = KindQualifiedName
-            return this.write_declaration_name(AstNode.qualified_right_of(nm), out)
+            return this.write_identifier_name(AstNode.qualified_right_of(nm), out)
         this.record_unported("parameter-binding-pattern-name", k)
         false
+    }
+
+    ; ★★★ A SYNTHESIZED IDENTIFIER HAS NO SOURCE AND THE PRINTER IS NOT
+    ; DeclarationNameToString. Upstream this path CLONES the identifier and hands
+    ; it to the emit printer, which writes a synthesized node's own text; the
+    ; scanner function write_declaration_name transcribes answers `(Missing)` for
+    ; the empty range such a node carries, and that is right where it is used — in
+    ; a DIAGNOSTIC. The two are separated here rather than in that function for
+    ; exactly that reason.
+    ;
+    ; ★★ THE SHAPE THAT SEPARATES THEM IS THE JSDOC REPARSER'S `@this` PARAMETER:
+    ; it has a name, an Identifier reading `this`, and no source range at all, so
+    ; `/** @this {string} */ function f(a) {}` printed
+    ; `((Missing): string, a: number) => void`. Slice 112 is where it became
+    ; visible, because until the return type was inferred the unit stopped.
+    function write_identifier_name(this, name: ref[AstNode]?, out: ref[StringBuilder]) returns bool
+    {
+        if name = null
+            return Checker.write_keyword(out, "(Missing)")
+        let nm name as ref[AstNode]
+        if AstNode.pos_of(nm) = AstNode.end_of(nm)
+        {
+            out.append(AstNode.identifier_text_of(nm), AstNode.identifier_text_length_of(nm) as size_t)
+            return true
+        }
+        this.write_declaration_name(nm, out)
     }
 
     ; The symbol's own NAME, which is the fallback wherever a declaration cannot
@@ -27337,6 +28132,36 @@ define Checker
     ; contextual type* is a real answer the reference gives in most of the corpus.
     ; What makes it a defensible one HERE is that the arm reads the reference's own
     ; branch rather than guessing: where the reference would compute, this stops.
+    ; getContextualTypeForReturnExpression. ★Both of its non-plain arms are the
+    ; iteration and awaited dimensions again — a generator's contextual return
+    ; type goes through getIterationTypeOfGeneratorFunctionReturnType and an
+    ; async one through getAwaitedTypeNoAlias and createPromiseLikeType — so each
+    ; is one stop at the flag that selects it.
+    function get_contextual_type_for_return_expression(this, node: ref[AstNode], context_flags: int) returns ref[Type]?
+    {
+        let fn Checker.get_containing_function(node)
+        if fn = null
+            return null
+        let mark this.unported_mark()
+        let contextual this.get_contextual_return_type(fn as ref[AstNode], context_flags)
+        if this.unported_mark() <> mark
+            return null
+        if contextual = null
+            return null
+        let function_flags b.get_function_flags(fn as ref[AstNode])
+        if (function_flags & FunctionFlagsGenerator) <> 0
+        {
+            this.record_unported("get-iteration-type-of-generator-function-return-type", function_flags)
+            return null
+        }
+        if (function_flags & FunctionFlagsAsync) <> 0
+        {
+            this.record_unported("get-awaited-type-no-alias", function_flags)
+            return null
+        }
+        contextual
+    }
+
     function get_contextual_type(this, node: ref[AstNode], context_flags: int) returns ref[Type]?
     {
         ; "We cannot answer semantic questions within a with block, do not proceed
@@ -27361,19 +28186,12 @@ define Checker
             return this.get_contextual_type_for_initializer_expression(node, context_flags)
         if pk = KindBindingElement
             return this.get_contextual_type_for_initializer_expression(node, context_flags)
-        ; getContextualTypeForReturnExpression, and behind it the signature of the
-        ; containing function — the return-type chapter, which this port stops at
-        ; from the other end as `get-return-type-from-body`.
+        ; getContextualTypeForReturnExpression, ported in slice 112 with the
+        ; return-type chapter it stood in front of.
         if pk = KindArrowFunction
-        {
-            this.record_unported("get-contextual-type-for-return", pk)
-            return null
-        }
+            return this.get_contextual_type_for_return_expression(node, context_flags)
         if pk = KindReturnStatement
-        {
-            this.record_unported("get-contextual-type-for-return", pk)
-            return null
-        }
+            return this.get_contextual_type_for_return_expression(node, context_flags)
         if pk = KindYieldExpression
         {
             this.record_unported("get-contextual-type-for-yield", pk)
@@ -29850,12 +30668,17 @@ define Checker
         }
         if outer
         {
+            ; The reference's `exprType`, which defaults to undefinedType for a
+            ; bare `return;`. ★The note that stood here said its only reader in
+            ; this port's reach was the constructor arm, *which stops anyway* —
+            ; slice 112 gives both readers a body, so the answer is kept.
+            var expr_type: ref[Type]? undefined_type
             if expr_node <> null
             {
-                ; The reference's `exprType`. Its ONLY reader in this port's reach is
-                ; the constructor arm, which stops anyway, so the answer is discarded
-                ; and the call is kept for the diagnostics it raises on the way.
-                this.check_expression_cached(expr_node as ref[AstNode])
+                let ck_mark this.unported_mark()
+                set expr_type: this.check_expression_cached(expr_node as ref[AstNode])
+                if this.unported_mark() <> ck_mark
+                    return
             }
             let ck AstNode.kind_of(fn)
             if ck = KindSetAccessor
@@ -29866,8 +30689,23 @@ define Checker
             }
             if ck = KindConstructor
             {
+                ; TS2409. ★It is the assignability relation's answer that decides
+                ; it, not a shape: the constructor's return type is the class's
+                ; instance type, and `return this` passes where `return 1` does
+                ; not.
                 if expr_node <> null
-                    this.record_unported("check-type-assignable-to-and-optionally-elaborate", ck)
+                {
+                    if return_type = null
+                        return
+                    if expr_type = null
+                        return
+                    let cmark this.unported_mark()
+                    let ok this.check_type_assignable_to_and_optionally_elaborate(expr_type as ref[Type], return_type as ref[Type], node, expr_node)
+                    if this.unported_mark() <> cmark
+                        return
+                    if ok = false
+                        this.error_on_node(node, DiagReturn_type_of_constructor_signature_must_be_assignable_to_the_instance_type_of_the_class)
+                }
                 return
             }
             let mark this.unported_mark()
@@ -29889,10 +30727,13 @@ define Checker
                 ; iteration type was nil*; here a stop is a SECOND way to answer nil,
                 ; so the mark is compared before the OrElse — slice 82's rule at the
                 ; site that rule was written for.
-                this.unwrap_return_type(return_type as ref[Type], function_flags, fn)
+                let unwrapped this.unwrap_return_type(return_type as ref[Type], function_flags, fn)
                 if this.unported_mark() <> mark
                     return
-                this.record_unported("check-return-expression", ck)
+                var urt return_type as ref[Type]
+                if unwrapped <> null
+                    set urt: unwrapped as ref[Type]
+                this.check_return_expression(fn, urt, node, expr_node, expr_type, false)
             }
             return
         }
@@ -37205,6 +38046,152 @@ define Checker
 
     ; checkSignatureDeclaration, whole, with three of its steps written down rather
     ; than ported and each saying which kind of absence it is.
+    ; ast.GetNextJSDocCommentLocation — the eight parent kinds a JSDoc comment is
+    ; allowed to sit on for a child, plus the first declaration of a
+    ; VariableDeclarationList.
+    function get_next_jsdoc_comment_location(node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let parent_opt AstNode.parent_node_of(node)
+        if parent_opt = null
+            return null
+        let parent parent_opt as ref[AstNode]
+        let pk AstNode.kind_of(parent)
+        if pk = KindPropertyAssignment
+            return parent
+        if pk = KindExportAssignment
+            return parent
+        if pk = KindPropertyDeclaration
+            return parent
+        if pk = KindVariableDeclaration
+            return parent
+        if pk = KindSatisfiesExpression
+            return parent
+        if pk = KindReturnStatement
+            return parent
+        if pk = KindVariableStatement
+            return parent
+        if pk = KindExpressionStatement
+            return parent
+        if pk = KindVariableDeclarationList
+        {
+            if AstNode.child_in_list(AstNode.variable_declarations_of(parent), 0) = node
+                return parent
+        }
+        null
+    }
+
+    ; getAllJSDocTags, asked as the ONE question its caller here needs: could
+    ; checkUnmatchedJSDocParameters REPORT on this node?
+    ;
+    ; ★★★ ASKING *does it have @param tags?* IS TOO WIDE, AND THE BATTERY IS WHAT
+    ; SAID SO. The first version of this stop fired on any node with a @param tag
+    ; and swallowed `checker_jsdoc_reparse_this.js` — the ONLY unit in the corpus
+    ; that witnesses the printer's synthesized-identifier repair one screen over —
+    ; so row g12 came back UNGATED with its fix unwitnessed. **A stop added in one
+    ; part of a slice can take the only input away from a repair made in another,
+    ; and nothing but a control battery reports that.**
+    ;
+    ; ★★ THE NARROW QUESTION IS THE REFERENCE'S OWN SKIP TEST and it is exact: a
+    ; tag whose index is an EXCLUDED (binding-pattern) parameter, or whose name is
+    ; the name of a parameter, is `continue`d in the ordinary branch AND is a
+    ; `return` in the arguments branch. So if no tag survives it, NEITHER branch can
+    ; report and there is nothing to stop for. ★`@this` prepends a synthesized
+    ; parameter, which is why `/** @this {T} @param {U} a */ function f(a)` has both
+    ; names in the set and reports nothing.
+    function jsdoc_parameters_may_report(this, node: ref[AstNode]) returns bool
+    {
+        if (AstNode.flags_of(node) & NodeFlagsJSDoc) <> 0
+            return false
+        var tags: ref[Array[ref[AstNode]?]]? null
+        var cur: ref[AstNode]? node
+        while cur <> null
+        {
+            let c cur as ref[AstNode]
+            let docs Parser.eager_jsdoc(p, c)
+            if docs <> null
+            {
+                let list docs as ref[Array[ref[AstNode]?]]
+                let n list.get_length() as int
+                if n <> 0
+                {
+                    let t AstNode.jsdoc_tags_of(list[n - 1])
+                    if t <> null
+                    {
+                        set tags: t
+                        set cur: null
+                    }
+                }
+            }
+            if cur <> null
+                set cur: Checker.get_next_jsdoc_comment_location(c)
+        }
+        if tags = null
+            return false
+        Checker.jsdoc_tag_survives_the_parameters(tags as ref[Array[ref[AstNode]?]], AstNode.parameters_of(node))
+    }
+
+    function jsdoc_tag_survives_the_parameters(tags: ref[Array[ref[AstNode]?]], params: ref[Array[ref[AstNode]?]]?) returns bool
+    {
+        let pn AstNode.list_count(params)
+        let n tags.get_length() as int
+        var index 0
+        var i 0
+        while i < n
+        {
+            let tag tags[i]
+            set i: i + 1
+            if tag = null
+                continue
+            if AstNode.kind_of(tag as ref[AstNode]) <> KindJSDocParameterTag
+                continue
+            ; "if IsIdentifier(name) && len(name.Text()) == 0 { continue }" — the
+            ; filter that builds `jsdocParameters`, so an empty name does not take
+            ; an INDEX either.
+            let nm AstNode.jsdoc_param_name_of(tag)
+            var named true
+            if Checker.kind_or_unknown(nm) = KindIdentifier
+            {
+                if AstNode.identifier_text_length_of(nm) = 0
+                    set named: false
+            }
+            if named = false
+                continue
+            let idx index
+            set index: index + 1
+            ; excludedParameters — the indices whose PARAMETER is a binding pattern.
+            if idx < pn
+            {
+                if AstNode.is_binding_pattern(AstNode.name_of(AstNode.child_in_list(params, idx)))
+                    continue
+            }
+            if Checker.kind_or_unknown(nm) = KindIdentifier
+            {
+                if Checker.parameter_names_hold(params, nm as ref[AstNode])
+                    continue
+            }
+            return true
+        }
+        false
+    }
+
+    function parameter_names_hold(params: ref[Array[ref[AstNode]?]]?, name: ref[AstNode]) returns bool
+    {
+        let n AstNode.list_count(params)
+        var i 0
+        while i < n
+        {
+            let p AstNode.child_in_list(params, i)
+            let pname AstNode.name_of(p)
+            if Checker.kind_or_unknown(pname) = KindIdentifier
+            {
+                if Checker.compare_names(AstNode.identifier_text_of(pname), AstNode.identifier_text_length_of(pname), AstNode.identifier_text_of(name), AstNode.identifier_text_length_of(name)) = 0
+                    return true
+            }
+            set i: i + 1
+        }
+        false
+    }
+
     procedure check_signature_declaration(this, node: ref[AstNode])
     {
         let k AstNode.kind_of(node)
@@ -37243,20 +38230,35 @@ define Checker
 
         this.check_type_parameters(AstNode.type_parameters_of(node))
 
-        ; checkUnmatchedJSDocParameters — UNREACHABLE, and it takes two conditions
-        ; rather than one. getAllJSDocTags returns nil unless the node carries
-        ; NodeFlagsHasJSDoc, and check_source_element_worker reports
-        ; `check-jsdoc-comments` and RETURNS for any node that does — but that gate
-        ; alone is NOT the argument, because the function walks UPWARDS through
-        ; GetNextJSDocCommentLocation and an ancestor's tags would count. That walk
-        ; goes to the parent only for eight kinds (PropertyAssignment,
-        ; ExportAssignment, PropertyDeclaration, VariableDeclaration,
-        ; SatisfiesExpression, ReturnStatement, VariableStatement,
-        ; ExpressionStatement, and a VariableDeclarationList's first declaration),
-        ; and a function declaration's parent is a SourceFile, a Block or a
-        ; ModuleBlock — none of them. So the walk stops at the node itself and the
-        ; gate decides. ★It expires for a DIFFERENT arm the moment one whose parent
-        ; can be a VariableStatement lands: a function EXPRESSION.
+        ; checkUnmatchedJSDocParameters.
+        ;
+        ; ★★★ THE UNREACHABILITY PROOF THAT STOOD HERE WAS FALSE, AND SLICE 112 IS
+        ; WHERE IT SHOWED. It rested on *check_source_element_worker reports
+        ; `check-jsdoc-comments` and RETURNS for any node that [carries JSDoc]* —
+        ; check_jsdoc_comment stops for a @link and for NOTHING else, so no gate has
+        ; ever stood in front of this call. What hid it is that every unit reaching
+        ; it stopped LATER, inside getReturnTypeFromBody; with that wall gone
+        ; `conformance_jsdoc_jsdocParamTag` completes and is missing two TS8024
+        ; lines. **A proof about a GATE is only as good as the gate's own
+        ; condition** (§3.5p), and this one named a function without reading it.
+        ;
+        ; ★★★ THE STOP IS SCOPED TO A JAVASCRIPT FILE AND THAT IS EXACT RATHER THAN
+        ; CONSERVATIVE. Both reports of the reference's non-arguments branch are
+        ; `isJs`-gated: the qualified-name one literally, and the ordinary one
+        ; through `errorOrSuggestion(isJs, …)`, which files a SUGGESTION in a
+        ; TypeScript file — a list the oracle's C section does not carry. So in a
+        ; .ts unit this function cannot put a line in the dump, and only a .js one
+        ; owes a row.
+        ;
+        ; ★★ WHAT IS BEHIND IT is containsArgumentsReference — a walk that resolves
+        ; every identifier against c.argumentsSymbol — and isArrayType, i.e. the
+        ; global `Array` (§3.11). The branch it selects decides which of the two
+        ; reports can fire at all, so the function cannot be split at it.
+        if Parser.is_in_js_file(node)
+        {
+            if this.jsdoc_parameters_may_report(node)
+                this.record_unported("check-unmatched-jsdoc-parameters", k)
+        }
 
         this.check_source_elements(AstNode.parameters_of(node))
 
@@ -37564,11 +38566,16 @@ define Checker
             {
                 if sig.resolved_return_type = null
                 {
-                    ; getReturnTypeFromBody — the chapter the work list already
-                    ; names from the other end, and the one wall this slice leaves
-                    ; standing in its own middle.
-                    this.record_unported("get-return-type-from-body", AstNode.kind_of(node))
-                    return
+                    ; getReturnTypeFromBody — the wall slice 100 left standing in
+                    ; its own middle, and slice 112's chapter. ★The memo is written
+                    ; through the reference's own second test: the call can resolve
+                    ; the slot on its way, and overwriting it would replace a
+                    ; memoised answer with a recomputed one.
+                    let rt this.get_return_type_from_body(node, check_mode)
+                    if this.unported_mark() <> mark
+                        return
+                    if sig.resolved_return_type = null
+                        set sig.resolved_return_type: rt
                 }
             }
         }
@@ -38238,14 +39245,21 @@ define Checker
             return
         }
         let expr_mark this.unported_mark()
-        this.check_expression(body)
+        let expr_type this.check_expression(body)
         if this.unported_mark() <> expr_mark
             return
         if return_type = null
             return
-        ; unwrapReturnType then checkReturnExpression — the return-type chapter
-        ; again, and the assignability report TS2322 behind it.
-        this.record_unported("check-return-expression", AstNode.kind_of(body))
+        ; "we need to check assignability of the awaited type of the expression
+        ; body against the promised type of its return type annotation" — the
+        ; reference's own comment for why unwrapReturnType stands here.
+        let function_flags b.get_function_flags(node)
+        let promised this.unwrap_return_type(return_type as ref[Type], function_flags, node)
+        if this.unported_mark() <> expr_mark
+            return
+        if promised = null
+            return
+        this.check_return_expression(node, promised as ref[Type], body, body, expr_type, false)
     }
 
     procedure check_function_or_method_declaration(this, node: ref[AstNode])
@@ -38547,6 +39561,783 @@ define Checker
         return_type
     }
 
+    ; ── slice 112: the inferred return type ──────────────────────────────────
+    ;
+    ; getReturnTypeFromBody, checkAndAggregateReturnExpressionTypes and the
+    ; widening chain the answer goes through. It is the frontier's first row by
+    ; either aggregation — 184+144+113+46 arrivals over 227 units, at
+    ; FunctionDeclaration, ArrowFunction, FunctionExpression and MethodDeclaration
+    ; — and it is the reason a body with no return annotation has never had a type
+    ; in this port: `getReturnTypeOfSignature`'s default arm ends here.
+    ;
+    ; ★★★ THE ASYNC AND GENERATOR HALVES ARE TWO OTHER DIMENSIONS AND EVERY ONE OF
+    ; THEIR ARMS IS A STOP. An async function's body type goes through
+    ; checkAwaitedType/unwrapAwaitedType and its answer is wrapped by
+    ; createPromiseType, which needs the global `Promise` — i.e. the lib (§3.11); a
+    ; generator's needs checkAndAggregateYieldOperandTypes, getIntersectionType and
+    ; createGeneratorType. Neither is a piece of THIS chapter that was left out:
+    ; they are the awaited and the iteration dimensions, which unwrap_return_type's
+    ; own header already separates from this one.
+    ;
+    ; ★★★ THE LITERAL WIDENING IS DECIDED BY `isUnitType` AND THAT IS WHY A UNION
+    ; OF TWO RETURNS IS NOT WIDENED. `function f() { return 1 }` answers `number`
+    ; and `function f() { return 1; return "s" }` answers `"s" | 1` — the second is
+    ; not a unit type, so the contextual-widening block is skipped whole and the
+    ; literals survive. That is the reference's own shape and it reads like a
+    ; defect until the two are put side by side, which is what the fixture does.
+
+    ; someType at the ONE predicate the empty-return arm calls it with (§3.9e's
+    ; rule, and some_type_accepts_void is the sibling this follows).
+    function some_type_is_undefined(t: ref[Type]) returns bool
+    {
+        if (t.flags & TypeFlagsUnion) = 0
+            return (t.flags & TypeFlagsUndefined) <> 0
+        let types Checker.union_types_of(t)
+        if types = null
+            return false
+        let list types as ref[Array[ref[Type]?]]
+        let n list.get_length() as int
+        var i 0
+        while i < n
+        {
+            let c list[i]
+            if c <> null
+            {
+                if ((c as ref[Type]).flags & TypeFlagsUndefined) <> 0
+                    return true
+            }
+            set i: i + 1
+        }
+        false
+    }
+
+    ; isUnitType. ★TypeFlagsUnit carries Undefined and Null, so `return null` and
+    ; `return undefined` take the contextual-widening block too — and come out
+    ; unchanged, because getWidenedLiteralType has no arm for either.
+    function is_unit_type(t: ref[Type]) returns bool
+        (t.flags & TypeFlagsUnit) <> 0
+
+    ; getWidenedUniqueESSymbolType. ★TypeFlagsUniqueESSymbol is set only by
+    ; getESSymbolLikeTypeForNode, which no ported arm calls (report_implicit_any's
+    ; header records the same zero), so the first arm has no input at all — and the
+    ; UNION arm has plenty, because `return true` widens to `boolean` and boolean
+    ; IS a union here.
+    ;
+    ; ★★ mapType IS WRITTEN INTO THE FUNCTION AND NOT BESIDE IT, which is §3.9e's
+    ; rule at the shape that makes it easiest: the reference's `f` is this function,
+    ; so the callback and its walk are one recursion. ★The `origin` block is
+    ; skipped — nothing writes UnionTypeData.origin (its own header) — and the
+    ; `changed` flag is the reference's own: an unchanged map answers the ORIGINAL
+    ; union rather than an equal one.
+    function get_widened_unique_es_symbol_type(this, t: ref[Type]) returns ref[Type]?
+    {
+        if (t.flags & TypeFlagsUniqueESSymbol) <> 0
+            return es_symbol_type
+        if (t.flags & TypeFlagsUnion) = 0
+            return t
+        let types Checker.union_types_of(t)
+        if types = null
+            return null
+        let list types as ref[Array[ref[Type]?]]
+        let n list.get_length() as int
+        let mapped this.new_type_list(null)
+        var changed false
+        var i 0
+        while i < n
+        {
+            let c list[i]
+            if c = null
+                return null
+            let m this.get_widened_unique_es_symbol_type(c as ref[Type])
+            if m = null
+                return null
+            if m <> c
+                set changed: true
+            mapped.add(m)
+            set i: i + 1
+        }
+        if changed = false
+            return t
+        this.get_union_type_ex(mapped, UnionReductionLiteral)
+    }
+
+    ; getWidenedLiteralLikeTypeForContextualType.
+    function get_widened_literal_like_type_for_contextual_type(this, t: ref[Type], contextual_type: ref[Type]?) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        var v: ref[Type]? t
+        if this.is_literal_of_contextual_type(t, contextual_type) = false
+        {
+            let widened this.get_widened_literal_type(t)
+            if this.unported_mark() <> mark
+                return null
+            if widened = null
+                return null
+            set v: this.get_widened_unique_es_symbol_type(widened as ref[Type])
+            if this.unported_mark() <> mark
+                return null
+            if v = null
+                return null
+        }
+        this.get_regular_type_of_literal_type(v as ref[Type])
+    }
+
+    ; getWidenedLiteralLikeTypeForContextualReturnTypeIfNeeded. ★The async arm is
+    ; GetPromisedTypeOfPromise, i.e. the lib's `Promise` again — and it is only
+    ; reachable from a caller this slice stops before, so it is written as the stop
+    ; the reference's own switch shape asks for rather than left out.
+    function get_widened_literal_like_type_for_contextual_return_type_if_needed(this, t: ref[Type]?, contextual_signature_return_type: ref[Type]?, is_async: bool) returns ref[Type]?
+    {
+        if t = null
+            return null
+        let ty t as ref[Type]
+        if Checker.is_unit_type(ty) = false
+            return ty
+        var contextual_type: ref[Type]? null
+        if contextual_signature_return_type <> null
+        {
+            if is_async
+            {
+                this.record_unported("get-promised-type-of-promise", ty.flags)
+                return null
+            }
+            set contextual_type: contextual_signature_return_type
+        }
+        this.get_widened_literal_like_type_for_contextual_type(ty, contextual_type)
+    }
+
+    ; getContextualSignatureForFunctionLikeDeclaration, whole.
+    function get_contextual_signature_for_function_like_declaration(this, node: ref[AstNode]) returns ref[Signature]?
+    {
+        var contextual false
+        if Checker.is_function_expression_or_arrow_function(node)
+            set contextual: true
+        if Checker.is_object_literal_method(node)
+            set contextual: true
+        if contextual = false
+            return null
+        this.get_contextual_signature(node)
+    }
+
+    ; isResolvingReturnTypeOfSignature. ★`signature.composite` is nil for every
+    ; signature this file can mint (see Signature), so the first disjunct is dead
+    ; and the function is the second one.
+    function is_resolving_return_type_of_signature(this, signature: ref[Signature]) returns bool
+    {
+        if signature.resolved_return_type <> null
+            return false
+        this.find_resolution_cycle_start_index(null, null, signature, TypeSystemPropertyNameResolvedReturnType) >= 0
+    }
+
+    ; getContextualReturnType. ★Its two filterType arms are the generator and async
+    ; dimensions again — the predicates ask getIterationTypeOfGeneratorFunction
+    ; ReturnType and getAwaitedTypeOfPromise — so they are one stop each, at the
+    ; flag that selects them.
+    function get_contextual_return_type(this, function_decl: ref[AstNode], context_flags: int) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let annotated this.get_return_type_from_annotation(function_decl)
+        if this.unported_mark() <> mark
+            return null
+        if annotated <> null
+            return annotated
+        let signature this.get_contextual_signature_for_function_like_declaration(function_decl)
+        if this.unported_mark() <> mark
+            return null
+        if signature <> null
+        {
+            if this.is_resolving_return_type_of_signature(signature as ref[Signature]) = false
+            {
+                let rt this.get_return_type_of_signature(signature as ref[Signature])
+                if this.unported_mark() <> mark
+                    return null
+                let flags b.get_function_flags(function_decl)
+                if (flags & FunctionFlagsGenerator) <> 0
+                {
+                    this.record_unported("check-generator-instantiation-assignability-to-return-type", flags)
+                    return null
+                }
+                if (flags & FunctionFlagsAsync) <> 0
+                {
+                    this.record_unported("get-awaited-type-of-promise", flags)
+                    return null
+                }
+                return rt
+            }
+        }
+        let iife AstNode.get_immediately_invoked_function_expression(function_decl)
+        if iife <> null
+            return this.get_contextual_type(iife as ref[AstNode], context_flags)
+        null
+    }
+
+    ; reportErrorsFromWidening, WHOLE — and it retires the stop
+    ; widen_type_for_variable_like_declaration has carried since slice 69.
+    ;
+    ; ★★ ITS GUARD IS ObjectFlagsContainsWideningType AND THAT BIT STILL HAS ONE
+    ; PRODUCER: create_widening_type answers the NON-widening type under
+    ; strictNullChecks, so `null` and `undefined` in expression position do not
+    ; carry it — what does is the undefinedWideningType intrinsic itself, which
+    ; reaches a caller here only through an omitted element or an implicit any.
+    procedure report_errors_from_widening(this, declaration: ref[AstNode], t: ref[Type], widening_kind: int)
+    {
+        if Checker.no_implicit_any() = false
+            return
+        if (t.object_flags & ObjectFlagsContainsWideningType) = 0
+            return
+        var report false
+        if widening_kind = WideningKindNormal
+            set report: true
+        else
+        {
+            if AstNode.is_function_like_declaration(declaration)
+            {
+                ; shouldReportErrorsFromWideningWithContextualSignature — its three
+                ; arms are getIterationTypeOfGeneratorFunctionReturnType,
+                ; getAwaitedTypeNoAlias and isGenericType, none of which exists
+                ; here.
+                this.record_unported("should-report-errors-from-widening-with-contextual-signature", widening_kind)
+                return
+            }
+        }
+        if report = false
+            return
+        if this.report_widening_errors_in_type(t)
+            return
+        this.report_implicit_any(declaration, t, widening_kind)
+    }
+
+    ; reportWideningErrorsInType. ★The array-or-tuple arm is is_array_or_tuple_type
+    ; again — false for everything this port can build — and the object-literal arm
+    ; is the one with input.
+    function report_widening_errors_in_type(this, t: ref[Type]) returns bool
+    {
+        if (t.object_flags & ObjectFlagsContainsWideningType) = 0
+            return false
+        if (t.flags & TypeFlagsUnion) <> 0
+        {
+            let types Checker.union_types_of(t)
+            if types = null
+                return false
+            let list types as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            var i 0
+            while i < n
+            {
+                let c list[i]
+                if c <> null
+                {
+                    if this.is_empty_object_type(c as ref[Type])
+                        return true
+                }
+                set i: i + 1
+            }
+            var reported false
+            set i: 0
+            while i < n
+            {
+                let c list[i]
+                if c <> null
+                {
+                    if this.report_widening_errors_in_type(c as ref[Type])
+                        set reported: true
+                }
+                set i: i + 1
+            }
+            return reported
+        }
+        if this.is_array_or_tuple_type(t)
+        {
+            ; getTypeArguments over the walk. Nothing mints a tuple here.
+            this.record_unported("report-widening-errors-in-tuple", t.flags)
+            return false
+        }
+        if Checker.is_object_literal_type(t)
+        {
+            ; The property walk's report needs symbolToString and TypeToString of
+            ; the WIDENED property type, and its `valueDeclaration.Parent ==
+            ; t.symbol.ValueDeclaration` term is a declaration comparison this port
+            ; can make — but the whole arm is behind ContainsWideningType on a
+            ; property, which nothing here produces.
+            this.record_unported("report-widening-errors-in-object-literal", t.flags)
+            return false
+        }
+        false
+    }
+
+    ; ast.ForEachReturnStatement with checkAndAggregateReturnExpressionTypes' own
+    ; visitor folded in — the SECOND copy of that walk in this file, beside
+    ; for_each_return_statement_is_context_sensitive, and written as a second
+    ; function for the reason §3.9d gives: the callback does not survive, so the
+    ; walk and its visitor are one function.
+    procedure for_each_return_statement_aggregate(this, node: ref[AstNode], fn: ref[AstNode], function_flags: int, check_mode: int, agg: ref[ReturnAggregate])
+    {
+        let mark this.unported_mark()
+        let k AstNode.kind_of(node)
+        if k = KindReturnStatement
+        {
+            this.aggregate_one_return(node, fn, function_flags, check_mode, agg)
+            return
+        }
+        if Checker.kind_can_contain_return_statement(k) = false
+            return
+        let n AstNode.child_count(node)
+        var i 0
+        while i < n
+        {
+            let child AstNode.child_at(node, i)
+            if child <> null
+            {
+                this.for_each_return_statement_aggregate(child as ref[AstNode], fn, function_flags, check_mode, agg)
+                if this.unported_mark() <> mark
+                    return
+            }
+            set i: i + 1
+        }
+    }
+
+    ; The visitor body, lifted out of the walk so the walk stays the walk.
+    procedure aggregate_one_return(this, return_statement: ref[AstNode], fn: ref[AstNode], function_flags: int, check_mode: int, agg: ref[ReturnAggregate])
+    {
+        let mark this.unported_mark()
+        let expr0 AstNode.expression_of(return_statement)
+        if expr0 = null
+        {
+            set agg.has_no_expression: true
+            return
+        }
+        var e Parser.skip_parentheses(expr0)
+        if e = null
+            return
+        if (function_flags & FunctionFlagsAsync) <> 0
+        {
+            if AstNode.kind_of(e as ref[AstNode]) = KindAwaitExpression
+            {
+                ; "`return await` is also safe to unwrap here"
+                set e: Parser.skip_parentheses(AstNode.expression_of(e as ref[AstNode]))
+                if e = null
+                    return
+            }
+        }
+        let expr e as ref[AstNode]
+        ; "Bare calls to this same function don't contribute to inference"
+        if AstNode.kind_of(expr) = KindCallExpression
+        {
+            let callee AstNode.expression_of(expr)
+            if callee <> null
+            {
+                if AstNode.kind_of(callee as ref[AstNode]) = KindIdentifier
+                {
+                    let ct this.check_expression_cached(callee as ref[AstNode])
+                    if this.unported_mark() <> mark
+                        return
+                    var same false
+                    let fn_symbol AstNode.symbol_of(fn)
+                    let merged this.get_merged_symbol(fn_symbol)
+                    if ct <> null
+                    {
+                        if (ct as ref[Type]).symbol = merged
+                            set same: true
+                    }
+                    if same
+                    {
+                        var needs_constant_reference false
+                        if fn_symbol <> null
+                        {
+                            let vd Symbol.value_declaration_of(fn_symbol as ref[Symbol])
+                            if vd <> null
+                            {
+                                if Checker.is_function_expression_or_arrow_function(vd as ref[AstNode])
+                                    set needs_constant_reference: true
+                            }
+                        }
+                        if needs_constant_reference
+                        {
+                            ; isConstantReference — isSymbolAssigned over the
+                            ; assignment graph, which is the flow dimension.
+                            this.record_unported("is-constant-reference", AstNode.kind_of(expr))
+                            return
+                        }
+                        set agg.has_never: true
+                        return
+                    }
+                }
+            }
+        }
+        let cm check_mode xor (check_mode & CheckModeSkipGenericFunctions)
+        var t this.check_expression_cached_ex(expr, cm)
+        if this.unported_mark() <> mark
+            return
+        if t = null
+            return
+        if (function_flags & FunctionFlagsAsync) <> 0
+        {
+            ; checkAwaitedType then unwrapAwaitedType — the awaited dimension.
+            this.record_unported("check-awaited-type", AstNode.kind_of(expr))
+            return
+        }
+        if ((t as ref[Type]).flags & TypeFlagsNever) <> 0
+            set agg.has_never: true
+        if this.is_const_context(expr)
+        {
+            set t: this.get_regular_type_of_literal_type(t as ref[Type])
+            if this.unported_mark() <> mark
+                return
+            if t = null
+                return
+        }
+        ; core.AppendIfUnique.
+        let list agg.types
+        let n list.get_length() as int
+        var i 0
+        while i < n
+        {
+            if list[i] = t
+                return
+            set i: i + 1
+        }
+        list.add(t)
+    }
+
+    ; checkAndAggregateReturnExpressionTypes. The reference answers a PAIR; here
+    ; the list is the answer and `never_returning` is an out-cell, and a stop is
+    ; separated by the caller's mark rather than by a nil list.
+    ;
+    ; ★ mayReturnNever is folded in at its one use.
+    function check_and_aggregate_return_expression_types(this, fn: ref[AstNode], check_mode: int, never_returning: ref[bool]) returns ref[Array[ref[Type]?]]?
+    {
+        let mark this.unported_mark()
+        set never_returning: false
+        let function_flags b.get_function_flags(fn)
+        let agg &ReturnAggregate^host(this.new_type_list(null))
+        let fhir this.function_has_implicit_return(fn)
+        if this.unported_mark() <> mark
+            return null
+        set agg.has_no_expression: fhir
+        let body AstNode.body_of(fn)
+        if body <> null
+            this.for_each_return_statement_aggregate(body as ref[AstNode], fn, function_flags, check_mode, agg)
+        if this.unported_mark() <> mark
+            return null
+        let types agg.types
+        let n types.get_length() as int
+        if n = 0
+        {
+            if agg.has_no_expression = false
+            {
+                var never agg.has_never
+                if Checker.may_return_never(fn)
+                    set never: true
+                if never
+                {
+                    set never_returning: true
+                    return types
+                }
+            }
+        }
+        if Checker.strict_null_checks()
+        {
+            if n <> 0
+            {
+                if agg.has_no_expression
+                {
+                    var present false
+                    var i 0
+                    while i < n
+                    {
+                        if types[i] = undefined_type
+                            set present: true
+                        set i: i + 1
+                    }
+                    if present = false
+                        types.add(undefined_type)
+                }
+            }
+        }
+        types
+    }
+
+    ; mayReturnNever.
+    function may_return_never(fn: ref[AstNode]) returns bool
+    {
+        let k AstNode.kind_of(fn)
+        if k = KindFunctionExpression
+            return true
+        if k = KindArrowFunction
+            return true
+        if k = KindMethodDeclaration
+            return Checker.kind_or_unknown(AstNode.parent_node_of(fn)) = KindObjectLiteralExpression
+        false
+    }
+
+    ; getReturnTypeFromBody, whole for the plain (non-async, non-generator) half.
+    function get_return_type_from_body(this, fn: ref[AstNode], check_mode: int) returns ref[Type]?
+    {
+        let body_opt AstNode.body_of(fn)
+        if body_opt = null
+            return error_type
+        let body body_opt as ref[AstNode]
+        let function_flags b.get_function_flags(fn)
+        var is_async false
+        if (function_flags & FunctionFlagsAsync) <> 0
+            set is_async: true
+        var is_generator false
+        if (function_flags & FunctionFlagsGenerator) <> 0
+            set is_generator: true
+        let mark this.unported_mark()
+        var return_type: ref[Type]? null
+        if AstNode.kind_of(body) <> KindBlock
+        {
+            let cm check_mode xor (check_mode & CheckModeSkipGenericFunctions)
+            set return_type: this.check_expression_cached_ex(body, cm)
+            if this.unported_mark() <> mark
+                return null
+            if return_type = null
+                return null
+            if this.is_const_context(body)
+            {
+                set return_type: this.get_regular_type_of_literal_type(return_type as ref[Type])
+                if this.unported_mark() <> mark
+                    return null
+                if return_type = null
+                    return null
+            }
+            if is_async
+            {
+                this.record_unported("check-awaited-type", AstNode.kind_of(fn))
+                return null
+            }
+        }
+        else
+        {
+            if is_generator
+            {
+                this.record_unported("check-and-aggregate-yield-operand-types", AstNode.kind_of(fn))
+                return null
+            }
+            var never_returning false
+            let types this.check_and_aggregate_return_expression_types(fn, check_mode, &never_returning)
+            if this.unported_mark() <> mark
+                return null
+            if types = null
+                return null
+            if never_returning
+            {
+                if is_async
+                {
+                    ; createPromiseReturnType over neverType — the lib's Promise.
+                    this.record_unported("create-promise-return-type", AstNode.kind_of(fn))
+                    return null
+                }
+                return never_type
+            }
+            let list types as ref[Array[ref[Type]?]]
+            if (list.get_length() as int) = 0
+            {
+                let contextual this.get_contextual_return_type(fn, ContextFlagsNone)
+                if this.unported_mark() <> mark
+                    return null
+                var empty_answer: ref[Type] void_type
+                if contextual <> null
+                {
+                    let unwrapped this.unwrap_return_type(contextual as ref[Type], function_flags, fn)
+                    if this.unported_mark() <> mark
+                        return null
+                    var probe: ref[Type] void_type
+                    if unwrapped <> null
+                        set probe: unwrapped as ref[Type]
+                    if Checker.some_type_is_undefined(probe)
+                        set empty_answer: undefined_type
+                }
+                if is_async
+                {
+                    this.record_unported("create-promise-return-type", AstNode.kind_of(fn))
+                    return null
+                }
+                return empty_answer
+            }
+            set return_type: this.get_union_type_ex(list, UnionReductionSubtype)
+            if this.unported_mark() <> mark
+                return null
+            if return_type = null
+                return null
+        }
+        if return_type <> null
+        {
+            let rt return_type as ref[Type]
+            this.report_errors_from_widening(fn, rt, WideningKindFunctionReturn)
+            if this.unported_mark() <> mark
+                return null
+            if Checker.is_unit_type(rt)
+            {
+                let contextual_signature this.get_contextual_signature_for_function_like_declaration(fn)
+                if this.unported_mark() <> mark
+                    return null
+                var contextual_type: ref[Type]? null
+                if contextual_signature <> null
+                {
+                    let own this.get_signature_from_declaration(fn)
+                    if this.unported_mark() <> mark
+                        return null
+                    if contextual_signature = own
+                    {
+                        ; "if !isGenerator" — the generator arm is stopped above.
+                        set contextual_type: return_type
+                    }
+                    else
+                    {
+                        let crt this.get_return_type_of_signature(contextual_signature as ref[Signature])
+                        if this.unported_mark() <> mark
+                            return null
+                        if crt = null
+                            return null
+                        ; instantiateContextualType — its whole body is behind
+                        ; `isGenericType(contextualType) && node has an inference
+                        ; context`, and getInferenceContext answers nil at every
+                        ; arrival here (contextually_check's own header), so the
+                        ; reference's function is the identity.
+                        set contextual_type: crt
+                    }
+                }
+                set return_type: this.get_widened_literal_like_type_for_contextual_return_type_if_needed(return_type, contextual_type, is_async)
+                if this.unported_mark() <> mark
+                    return null
+                if return_type = null
+                    return null
+            }
+            set return_type: this.get_widened_type(return_type as ref[Type])
+            if this.unported_mark() <> mark
+                return null
+            if return_type = null
+                return null
+        }
+        ; `fallbackReturnType` is voidType and the generator arm is the only writer
+        ; of the other value, so the fallback is one constant here.
+        if return_type = null
+            return void_type
+        ; The generator and async tails are both stopped above.
+        return_type
+    }
+
+    ; checkReturnExpression, whole — and it is what the `check-return-expression`
+    ; row has stood in front of at two call sites since slice 63.
+    ;
+    ; ★★ THE CONDITIONAL ARM RECURSES ON BOTH BRANCHES AND CHECKS THEM WITH
+    ; checkExpression RATHER THAN THE CACHED FORM, which is the reference's own
+    ; choice and matters for the C section: each branch is reported against
+    ; ITSELF, not against the conditional, and `inConditionalExpression` is what
+    ; moves the error node from the statement to the expression.
+    procedure check_return_expression(this, container: ref[AstNode], unwrapped_return_type: ref[Type], node: ref[AstNode], expr: ref[AstNode]?, expr_type: ref[Type]?, in_conditional_expression: bool)
+    {
+        let mark this.unported_mark()
+        let function_flags b.get_function_flags(container)
+        if expr <> null
+        {
+            let unwrapped_expr Parser.skip_parentheses(expr)
+            if unwrapped_expr <> null
+            {
+                if AstNode.kind_of(unwrapped_expr as ref[AstNode]) = KindConditionalExpression
+                {
+                    let ue unwrapped_expr as ref[AstNode]
+                    let when_true AstNode.conditional_when_true_of(ue)
+                    let when_false AstNode.conditional_when_false_of(ue)
+                    if when_true <> null
+                    {
+                        let tt this.check_expression(when_true as ref[AstNode])
+                        if this.unported_mark() <> mark
+                            return
+                        this.check_return_expression(container, unwrapped_return_type, node, when_true, tt, true)
+                        if this.unported_mark() <> mark
+                            return
+                    }
+                    if when_false <> null
+                    {
+                        let ft this.check_expression(when_false as ref[AstNode])
+                        if this.unported_mark() <> mark
+                            return
+                        this.check_return_expression(container, unwrapped_return_type, node, when_false, ft, true)
+                    }
+                    return
+                }
+            }
+        }
+        var in_return_statement false
+        if AstNode.kind_of(node) = KindReturnStatement
+            set in_return_statement: true
+        if (function_flags & FunctionFlagsAsync) <> 0
+        {
+            ; checkAwaitedType on the expression type — the awaited dimension.
+            this.record_unported("check-awaited-type", AstNode.kind_of(node))
+            return
+        }
+        if expr_type = null
+            return
+        var effective_expr expr
+        if expr <> null
+            set effective_expr: this.get_effective_check_node(expr as ref[AstNode])
+        var error_node effective_expr
+        if in_return_statement
+        {
+            if in_conditional_expression = false
+                set error_node: node
+        }
+        if error_node = null
+            return
+        this.check_type_assignable_to_and_optionally_elaborate(expr_type as ref[Type], unwrapped_return_type, error_node as ref[AstNode], effective_expr)
+    }
+
+    ; getEffectiveCheckNode — ast.SkipOuterExpressions at the two kinds it passes
+    ; in a TypeScript file, Parentheses and Satisfies. ★The JavaScript arm adds
+    ; ExcludeJSDocTypeAssertion, which does not add a kind: it REMOVES the
+    ; parenthesis case for a `(x as T)` the JSDoc reparser built, so the test is
+    ; written where the reference puts it rather than folded away.
+    function get_effective_check_node(this, argument: ref[AstNode]) returns ref[AstNode]
+    {
+        let exclude_jsdoc Parser.is_in_js_file(argument)
+        var n argument
+        repeat
+        {
+            let k AstNode.kind_of(n)
+            if k = KindSatisfiesExpression
+            {
+                let inner AstNode.expression_of(n)
+                if inner = null
+                    return n
+                set n: inner as ref[AstNode]
+                continue
+            }
+            if k <> KindParenthesizedExpression
+                return n
+            if exclude_jsdoc
+            {
+                if Checker.is_jsdoc_type_assertion(n)
+                    return n
+            }
+            let inner AstNode.expression_of(n)
+            if inner = null
+                return n
+            set n: inner as ref[AstNode]
+        }
+    }
+
+    ; ast.IsJSDocTypeAssertion. ★Its `IsInJSFile` conjunct is asked by the caller
+    ; above, which is the only one here.
+    function is_jsdoc_type_assertion(node: ref[AstNode]) returns bool
+    {
+        if AstNode.kind_of(node) <> KindParenthesizedExpression
+            return false
+        let expr AstNode.expression_of(node)
+        if expr = null
+            return false
+        let e expr as ref[AstNode]
+        if AstNode.kind_of(e) <> KindAsExpression
+            return false
+        let tn AstNode.type_of(e)
+        if tn = null
+            return false
+        (AstNode.flags_of(tn as ref[AstNode]) & NodeFlagsReparsed) <> 0
+    }
+
     ; getReturnTypeOfFullSignature over getSignatureOfFullSignatureType, whose three
     ; conjuncts are all syntactic — a JavaScript file, one of four function-like
     ; kinds, and a FullSignature slot that is filled. A TypeScript file answers
@@ -38619,11 +40410,20 @@ define Checker
             return this.get_type_from_type_node(return_type as ref[AstNode])
         if k = KindGetAccessor
         {
-            ; `hasBindableName(declaration) && getAnnotatedAccessorType(GetDeclaration
-            ; OfKind(getSymbolOfDeclaration(declaration), KindSetAccessor))` — a getter
-            ; with no return annotation borrows the SETTER's parameter annotation.
-            this.record_unported("get-annotated-accessor-type", k)
-            return null
+            ; "hasBindableName(declaration) && getAnnotatedAccessorType(...)" — a
+            ; getter with no return annotation borrows the SETTER's parameter
+            ; annotation, which slice 112's accessor chapter makes askable. ★The
+            ; guard's late-bound half is checkComputedPropertyName's stop, exactly
+            ; as it is at check_accessor_declaration's own hasBindableName.
+            if b.has_dynamic_name(declaration)
+            {
+                this.record_unported("is-late-bindable-name", k)
+                return null
+            }
+            let sym this.get_symbol_of_declaration(declaration)
+            if sym = null
+                return null
+            return this.get_annotated_accessor_type(Checker.get_declaration_of_kind(sym as ref[Symbol], KindSetAccessor))
         }
         this.get_return_type_of_full_signature(declaration)
     }
@@ -39106,11 +40906,20 @@ define Checker
         {
             if Binder.node_is_missing(AstNode.body_of(decl)) = false
             {
-                this.pop_type_resolution_defensively()
-                this.record_unported("get-return-type-from-body", AstNode.kind_of(decl))
-                return null
+                set t: this.get_return_type_from_body(decl, CheckModeNormal)
+                if this.unported_mark() <> mark
+                {
+                    this.pop_type_resolution_defensively()
+                    return null
+                }
+                if t = null
+                {
+                    this.pop_type_resolution_defensively()
+                    return null
+                }
             }
-            set t: any_type
+            else
+                set t: any_type
         }
         ; The two call-chain arms. Both bits are declared and neither has a writer
         ; in this port (see SignatureFlags), so the tests stand where the reference
@@ -43121,13 +44930,21 @@ define Checker
             this.record_unported("is-late-bindable-name", AstNode.kind_of(node))
         else
             this.check_accessor_declaration_flags(node)
-        ; getTypeOfAccessors — the accessor's own type, which is the arm
-        ; get_type_of_symbol has reported at since slice 67. Everything the
-        ; reference does with the value is behind it:
-        ; checkAllCodePathsInNonVoidFunctionReturnOrThrow takes it as the return
-        ; type, and slice 82's collapse makes that call a no-op for a nil one under
-        ; this harness anyway.
-        this.record_unported("get-type-of-accessors", AstNode.kind_of(node))
+        ; getTypeOfAccessors, ported in slice 112 with the getter-body inference its
+        ; third resolution step is. ★The value's one reader here is
+        ; checkAllCodePathsInNonVoidFunctionReturnOrThrow, and slice 82's collapse
+        ; is what makes the getter arm mean something: the call is a no-op for a
+        ; NIL return type and not for an inferred one.
+        let acc_mark this.unported_mark()
+        let acc_symbol this.get_symbol_of_declaration(node)
+        var accessor_return_type: ref[Type]? null
+        if acc_symbol <> null
+            set accessor_return_type: this.get_type_of_accessors(acc_symbol as ref[Symbol])
+        if this.unported_mark() = acc_mark
+        {
+            if AstNode.kind_of(node) = KindGetAccessor
+                this.check_all_code_paths_in_non_void_function_return_or_throw(node, accessor_return_type)
+        }
         ; ★ The body walk runs PAST the report, for check_source_elements' reason:
         ; diagcheck compares the C section whether or not the dump is suppressed, so
         ; the statements after the first report are exactly where an invented
