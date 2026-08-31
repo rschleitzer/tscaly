@@ -41,6 +41,11 @@
 #   packages/tscaly/tests/run.sh                      # stage 1
 #   packages/tscaly/tests/controls-slice108.sh 2>&1 | tee /tmp/battery108.log
 #
+# ★★★ IT COSTS 35 s OF BASELINE PLUS ~50 s PER ROW — about 31 MINUTES for all 36, and
+# that number is MEASURED (baseline alone, baseline+1, baseline+3, baseline+4 heavy).
+# The first draft of this header said *2 h 20 min*, inferred from how often its author
+# looked at the log rather than from a clock. See the method note in §4.
+#
 # ★★ A ROW FILTER (slice 100). `controls-slice108.sh g05 g08` runs the baseline and
 # then only the named rows. ★The baseline is NEVER skipped: every verdict below is a
 # comparison against it.
