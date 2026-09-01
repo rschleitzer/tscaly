@@ -1096,6 +1096,12 @@ define AliasSymbolLink
     ; read by the emit resolver, which this port does not have; the bit is carried
     ; because the marking WALK has reporting side effects and must not run twice.
     referenced: bool
+
+    ; links.immediateTarget — getImmediateAliasedSymbol's memo. It is a SECOND
+    ; target beside `alias_target` and not a duplicate of it: `alias_target` is the
+    ; END of the chain (resolveAlias follows an alias to an alias), this one is the
+    ; ONE hop the symbol's own declaration names.
+    immediate_target: ref[Symbol]?
 )
 {
     init(sym: ref[Symbol]?)
@@ -1104,6 +1110,7 @@ define AliasSymbolLink
         set alias_target: null
         set type_only_declaration: null
         set referenced: false
+        set immediate_target: null
     }
 }
 
@@ -1352,6 +1359,13 @@ define CheckFlagsLate: int 1 << 12
 ; corpus can reach. A bit with a reader and no writer, on CheckFlagsLate's own
 ; convention.
 define CheckFlagsDeferredType: int 1 << 16
+
+; ★★★ `Unresolved` GETS A WRITER IN SLICE 114, and until then the note in
+; get_type_from_type_alias_reference proved its arm unreachable from the one
+; producer the reference has. That producer is
+; getUnresolvedSymbolForEntityName, which is now here — so the bit is a bit and
+; the arm is code.
+define CheckFlagsUnresolved: int 1 << 20
 
 ; ── the TypeMapper (slice 86) ───────────────────────────────────────────────
 ;
@@ -3480,6 +3494,17 @@ define Checker
     ; SEVENTH and EIGHTH time, both keyed on the SYMBOL pointer. See each record's
     ; own header for why the first one's memo may not use nil as *uncomputed*.
     alias_symbol_links: ref[Array[ref[AliasSymbolLink]?]]
+
+    ; c.unresolvedSymbols — the path-keyed table getUnresolvedSymbolForEntityName
+    ; mints into. It is a SymbolTable and not an association list because its key
+    ; IS a name: `A.B.C` as bytes, which is what a SymbolTable is keyed on.
+    unresolved_symbols: ref[SymbolTable]
+
+    ; c.errorTypes — one errorType per (alias symbol, type arguments). An
+    ; ASSOCIATION LIST, for TypeInstantiation's reason: upstream keys a hash and
+    ; buys a collision question with it, and this list holds one entry per
+    ; unresolved name in a unit.
+    error_types: ref[Array[ref[Type]?]]
     module_symbol_links: ref[Array[ref[ModuleSymbolLink]?]]
 
     ; ── NewChecker's four singleton signatures (slices 89 and 108) ──────────
@@ -3804,6 +3829,10 @@ define Checker
         let asl host.allocate(sizeof Array[ref[AliasSymbolLink]?], alignof Array[ref[AliasSymbolLink]?]) as pointer[Array[ref[AliasSymbolLink]?]]
         set *asl: Array[ref[AliasSymbolLink]?]()
         set c.alias_symbol_links: asl
+        set c.unresolved_symbols: SymbolTable.create(host)
+        let ets host.allocate(sizeof Array[ref[Type]?], alignof Array[ref[Type]?]) as pointer[Array[ref[Type]?]]
+        set *ets: Array[ref[Type]?]()
+        set c.error_types: ets
         let msl host.allocate(sizeof Array[ref[ModuleSymbolLink]?], alignof Array[ref[ModuleSymbolLink]?]) as pointer[Array[ref[ModuleSymbolLink]?]]
         set *msl: Array[ref[ModuleSymbolLink]?]()
         set c.module_symbol_links: msl
@@ -4890,10 +4919,7 @@ define Checker
             return null
         }
         if (f & SymbolFlagsAlias) <> 0
-        {
-            this.record_unported("get-declared-type-of-alias", 0)
-            return null
-        }
+            return this.get_declared_type_of_alias(symbol)
         ; The reference falls out of the switch answering nil, which
         ; getDeclaredTypeOfSymbol turns into errorType. That is an ANSWER rather
         ; than a hole, so it does not report.
@@ -4920,6 +4946,28 @@ define Checker
         if links.declared_type = null
             set links.declared_type: this.new_type_parameter(symbol)
         links.declared_type
+    }
+
+    ; getDeclaredTypeOfAlias — three lines, and the memo is `declaredTypeLinks`
+    ; rather than the alias table, because what it caches is a TYPE keyed on the
+    ; ALIAS symbol and not on its target.
+    ;
+    ; ★ It has no resolution frame of its own: the recursion it could take part in
+    ; is guarded one level down, in whichever arm getDeclaredTypeOfSymbol picks for
+    ; the resolved symbol.
+    function get_declared_type_of_alias(this, symbol: ref[Symbol]) returns ref[Type]?
+    {
+        let links this.declared_type_link_of(symbol)
+        if links.declared_type <> null
+            return links.declared_type
+        let target this.resolve_alias(symbol)
+        if target = null
+            return null
+        let t this.get_declared_type_of_symbol(target as ref[Symbol])
+        if t = null
+            return null
+        set links.declared_type: t
+        t
     }
 
     ; ── getDeclaredTypeOfTypeAlias ──────────────────────────────────────────
@@ -6380,14 +6428,76 @@ define Checker
             return null
         }
         if (f & SymbolFlagsAlias) <> 0
-        {
-            this.record_unported("get-type-of-alias", 0)
-            return null
-        }
+            return this.get_type_of_alias(symbol)
         ; The reference falls out of the chain answering errorType, which is an
         ; ANSWER rather than a hole — so it does not report, exactly as
         ; try_get_declared_type_of_symbol's tail does not.
         error_type
+    }
+
+    ; ── slice 114: the alias's type ─────────────────────────────────────────
+    ;
+    ; getTypeOfAlias, whole. Every helper it needs was already here — resolveAlias,
+    ; getDeclarationOfAliasSymbol, getTargetOfAliasDeclaration, getSymbolFlags and
+    ; the resolution stack — which is why the chapter this stop named is not the
+    ; work: what the stop was hiding is the WALL BEHIND it, and that wall is one
+    ; line of initializeChecker (see its own note).
+    ;
+    ; ★★★ THE `exportSymbol` COMPUTATION IS DEAD EXCEPT ON THE CIRCULAR PATH and it
+    ; is still evaluated EAGERLY, because getTargetOfAliasDeclaration REPORTS: it is
+    ; the TS2307 for an unresolvable specifier, and moving it inside the popped
+    ; branch would drop that report on every non-circular alias. The reference's
+    ; statement order is the diagnostic order here, not a style.
+    function get_type_of_alias(this, symbol: ref[Symbol]) returns ref[Type]?
+    {
+        let links this.value_symbol_link_of(symbol)
+        if links.resolved_type <> null
+            return links.resolved_type
+        if this.push_type_resolution(symbol, null, null, TypeSystemPropertyNameType) = false
+            return error_type
+        let mark this.unported_mark()
+        let target_symbol this.resolve_alias(symbol)
+        var export_symbol: ref[Symbol]? null
+        let decl this.get_declaration_of_alias_symbol(symbol)
+        if decl <> null
+            set export_symbol: this.get_target_of_alias_declaration(decl as ref[AstNode])
+        if this.unported_mark() <> mark
+        {
+            this.pop_type_resolution_defensively()
+            return null
+        }
+        if target_symbol = null
+        {
+            this.pop_type_resolution_defensively()
+            return null
+        }
+        if links.resolved_type = null
+        {
+            let ts target_symbol as ref[Symbol]
+            if (this.get_symbol_flags(ts) & SymbolFlagsValue) <> 0
+            {
+                let t this.get_type_of_symbol(ts)
+                if this.unported_mark() <> mark
+                {
+                    this.pop_type_resolution_defensively()
+                    return null
+                }
+                set links.resolved_type: t
+            }
+            else
+                set links.resolved_type: error_type
+        }
+        if this.pop_type_resolution() = false
+        {
+            var reported symbol
+            if export_symbol <> null
+                set reported: export_symbol as ref[Symbol]
+            let ignored this.report_circularity_error(reported)
+            if links.resolved_type = null
+                set links.resolved_type: error_type
+            return links.resolved_type
+        }
+        links.resolved_type
     }
 
     ; getTypeOfFuncClassEnumModule. The memo is the whole function, and its hit is
@@ -7233,19 +7343,54 @@ define Checker
             set variable_like: true
         if dk = KindBindingElement
             set variable_like: true
-        if variable_like = false
+        if variable_like
+            set result: this.get_widened_type_for_variable_like_declaration(declaration, true)
+        else
         {
-            ; The eight remaining arms, each of them an EXPRESSION check or a
-            ; declaration kind this port does not reach: PropertyAssignment,
-            ; ShorthandPropertyAssignment, MethodDeclaration (an object-literal
-            ; method), ExportAssignment, the two assignment-declaration kinds
-            ; (BinaryExpression and CallExpression), JsxAttribute and EnumMember.
-            ; The reference's default arm is a panic.
-            this.pop_type_resolution_defensively()
-            this.record_unported("get-type-of-variable-worker-arm", dk)
-            return null
+            ; ★★★ THE ExportAssignment ARM ARRIVES IN SLICE 114 BECAUSE THE ALIAS
+            ; CHAPTER IS WHAT REACHES IT: `export = expr` in one unit and
+            ; `import a = require(...)` in another are the two halves of one shape,
+            ; and until getTypeOfAlias existed nothing asked this symbol for a type.
+            ; ★Note which widener it is — `widenTypeForVariableLikeDeclaration`, the
+            ; INNER one, not the `getWidened…` above it: the outer one computes the
+            ; type from the declaration, and here the type is the checked
+            ; EXPRESSION.
+            if dk = KindExportAssignment
+            {
+                let type_node AstNode.type_of(declaration)
+                if type_node <> null
+                    set result: this.get_type_from_type_node(type_node as ref[AstNode])
+                else
+                {
+                    let e AstNode.expression_of(declaration)
+                    if e = null
+                    {
+                        this.pop_type_resolution_defensively()
+                        this.record_unported("export-assignment-no-expression", dk)
+                        return null
+                    }
+                    let et this.check_expression_cached(e as ref[AstNode])
+                    if this.unported_mark() <> mark
+                    {
+                        this.pop_type_resolution_defensively()
+                        return null
+                    }
+                    set result: this.widen_type_for_variable_like_declaration(et, declaration, false)
+                }
+            }
+            else
+            {
+                ; The seven remaining arms, each of them an EXPRESSION check or a
+                ; declaration kind this port does not reach: PropertyAssignment,
+                ; ShorthandPropertyAssignment, MethodDeclaration (an object-literal
+                ; method), the two assignment-declaration kinds (BinaryExpression
+                ; and CallExpression), JsxAttribute and EnumMember. The reference's
+                ; default arm is a panic.
+                this.pop_type_resolution_defensively()
+                this.record_unported("get-type-of-variable-worker-arm", dk)
+                return null
+            }
         }
-        set result: this.get_widened_type_for_variable_like_declaration(declaration, true)
         if this.unported_mark() <> mark
         {
             this.pop_type_resolution_defensively()
@@ -7268,10 +7413,10 @@ define Checker
     ; and no instrument this package has compares one (slice 68's note), so the
     ; reports are their code and their location alone.
     ;
-    ; ★ The alias branch needs getDeclarationOfAliasSymbol and sits behind a symbol
-    ; flag this arm cannot carry — getTypeOfSymbol routes an alias to its own arm —
-    ; so it is reported rather than written: the caller that can reach it is
-    ; getTypeOfAlias, which is a work-list row of its own.
+    ; ★★★ THE ALIAS BRANCH IS WRITTEN IN SLICE 114 AND THE NOTE THAT STOOD HERE
+    ; NAMED ITS OWN EXPIRY: *"the caller that can reach it is getTypeOfAlias, which
+    ; is a work-list row of its own"*. That row landed, and the branch's other half
+    ; — getDeclarationOfAliasSymbol — had been ported since slice 110.
     function report_circularity_error(this, symbol: ref[Symbol]) returns ref[Type]?
     {
         let vd Symbol.value_declaration_of(symbol)
@@ -7279,8 +7424,10 @@ define Checker
         {
             if (Symbol.flags_of(symbol) & SymbolFlagsAlias) <> 0
             {
-                this.record_unported("get-declaration-of-alias-symbol", 0)
-                return null
+                let node this.get_declaration_of_alias_symbol(symbol)
+                if node <> null
+                    this.error_on_node(node, DiagCircular_definition_of_import_alias_0)
+                return any_type
             }
             ; "Circularities could also result from parameters in function
             ; expressions that end up having themselves as contextual types … we
@@ -9841,6 +9988,32 @@ define Checker
         null
     }
 
+    ; getImmediateAliasedSymbol — the ONE hop the symbol's own declaration names,
+    ; where resolveAlias walks to the end of the chain. Its memo is a field of its
+    ; own for that reason (see AliasSymbolLink.immediate_target).
+    ;
+    ; ★ The reference asserts the ALIAS flag and panics on a missing declaration;
+    ; both are reported here, on this file's rule about assertions.
+    function get_immediate_aliased_symbol(this, symbol: ref[Symbol]) returns ref[Symbol]?
+    {
+        if (Symbol.flags_of(symbol) & SymbolFlagsAlias) = 0
+        {
+            this.record_unported("immediate-aliased-symbol-not-an-alias", Symbol.flags_of(symbol))
+            return null
+        }
+        let links this.alias_symbol_link_of(symbol)
+        if links.immediate_target <> null
+            return links.immediate_target
+        let node this.get_declaration_of_alias_symbol(symbol)
+        if node = null
+        {
+            this.record_unported("immediate-aliased-symbol-no-declaration", Symbol.flags_of(symbol))
+            return null
+        }
+        set links.immediate_target: this.get_target_of_alias_declaration(node as ref[AstNode])
+        links.immediate_target
+    }
+
     ; getTypeOnlyAliasDeclaration.
     function get_type_only_alias_declaration(this, symbol: ref[Symbol]) returns ref[AstNode]?
     {
@@ -9848,6 +10021,137 @@ define Checker
             return null
         this.resolve_alias(symbol)
         this.alias_symbol_link_of(symbol).type_only_declaration
+    }
+
+    ; getTypeOnlyAliasDeclarationEx — "the FIRST type-only alias declaration node
+    ; (if any) in the resolution chain that affects the symbol for the given
+    ; meaning". Its non-Ex twin above is not this function with a default: that one
+    ; asks ONE symbol, this one WALKS, and it stops as soon as the symbol carries
+    ; the meaning asked for.
+    ;
+    ; ★ The walk needs no seen-set of its own: resolveAlias memoises through
+    ; `alias_target`, and a cycle there resolves to unknownSymbol, which is not an
+    ; alias — so the loop's own condition ends it.
+    function get_type_only_alias_declaration_ex(this, symbol: ref[Symbol], meaning: int) returns ref[AstNode]?
+    {
+        var cur symbol
+        while (Symbol.flags_of(cur) & SymbolFlagsAlias) <> 0
+        {
+            if (Symbol.flags_of(cur) & meaning) <> 0
+                return null
+            let resolved this.resolve_alias(cur)
+            let links this.alias_symbol_link_of(cur)
+            if links.type_only_declaration <> null
+                return links.type_only_declaration
+            if resolved = null
+                return null
+            set cur: resolved as ref[Symbol]
+        }
+        null
+    }
+
+    ; ── ast.IsValidTypeOnlyAliasUseSite and its three helpers ────────────────
+    ;
+    ; ★★★ THE PREDICATE IS WRITTEN THE WAY THE REFERENCE WRITES IT — a disjunction
+    ; whose LAST term is a NEGATION — and the negation is what carries almost every
+    ; true answer: a use site that is not an expression at all is valid, so the
+    ; three positive terms are the exceptions to that and not the rule. Reading it
+    ; the other way round (enumerate the valid sites) is the shape that would need
+    ; a fourth term the day the grammar grows one.
+    function is_valid_type_only_alias_use_site(this, use_site: ref[AstNode]) returns bool
+    {
+        if (AstNode.flags_of(use_site) & (NodeFlagsAmbient | NodeFlagsJSDoc)) <> 0
+            return true
+        if Binder.is_part_of_type_query(use_site)
+            return true
+        if Checker.is_identifier_in_non_emitting_heritage_clause(use_site)
+            return true
+        if this.is_part_of_possibly_valid_type_or_abstract_computed_property_name(use_site)
+            return true
+        if AstNode.is_expression_node(use_site)
+            return false
+        if Checker.is_shorthand_property_name_use_site(use_site)
+            return false
+        true
+    }
+
+    ; isIdentifierInNonEmittingHeritageClause. The walk up through property
+    ; accesses and type arguments is what makes `implements A.B.C` one site rather
+    ; than three.
+    function is_identifier_in_non_emitting_heritage_clause(node: ref[AstNode]) returns bool
+    {
+        if AstNode.kind_of(node) <> KindIdentifier
+            return false
+        var parent AstNode.parent_node_of(node)
+        while parent <> null
+        {
+            let pk AstNode.kind_of(parent as ref[AstNode])
+            if pk <> KindPropertyAccessExpression
+            {
+                if pk <> KindExpressionWithTypeArguments
+                    break
+            }
+            set parent: AstNode.parent_node_of(parent as ref[AstNode])
+        }
+        if parent = null
+            return false
+        let p parent as ref[AstNode]
+        if AstNode.kind_of(p) <> KindHeritageClause
+            return false
+        if AstNode.heritage_clause_token_of(p) = KindImplementsKeyword
+            return true
+        let gp AstNode.parent_node_of(p)
+        if gp = null
+            return false
+        AstNode.kind_of(gp as ref[AstNode]) = KindInterfaceDeclaration
+    }
+
+    ; isPartOfPossiblyValidTypeOrAbstractComputedPropertyName.
+    function is_part_of_possibly_valid_type_or_abstract_computed_property_name(this, node: ref[AstNode]) returns bool
+    {
+        var cur node
+        while true
+        {
+            let k AstNode.kind_of(cur)
+            if k <> KindIdentifier
+            {
+                if k <> KindPropertyAccessExpression
+                    break
+            }
+            let up AstNode.parent_node_of(cur)
+            if up = null
+                return false
+            set cur: up as ref[AstNode]
+        }
+        if AstNode.kind_of(cur) <> KindComputedPropertyName
+            return false
+        let parent AstNode.parent_node_of(cur)
+        if parent = null
+            return false
+        let p parent as ref[AstNode]
+        if b.has_syntactic_modifier(p, ModifierFlagsAbstract)
+            return true
+        let gp AstNode.parent_node_of(p)
+        if gp = null
+            return false
+        let gk AstNode.kind_of(gp as ref[AstNode])
+        if gk = KindInterfaceDeclaration
+            return true
+        gk = KindTypeLiteral
+    }
+
+    ; isShorthandPropertyNameUseSite.
+    function is_shorthand_property_name_use_site(use_site: ref[AstNode]) returns bool
+    {
+        if AstNode.kind_of(use_site) <> KindIdentifier
+            return false
+        let parent AstNode.parent_node_of(use_site)
+        if parent = null
+            return false
+        let p parent as ref[AstNode]
+        if AstNode.kind_of(p) <> KindShorthandPropertyAssignment
+            return false
+        AstNode.name_of(p) = use_site
     }
 
     ; getSymbolFlagsEx / getSymbolFlags. ★★★ THE `unknownSymbol` ANSWER IS
@@ -11912,12 +12216,111 @@ define Checker
             return null
         if ignore_errors
             return unknown_symbol
-        ; getUnresolvedSymbolForEntityName — the unresolvedSymbols table, a
-        ; path-keyed side table minting a synthetic TypeAlias symbol per dotted
-        ; name. Its input here is the MISSING name node (see the chapter header),
-        ; not the globals miss.
-        this.record_unported("get-unresolved-symbol", 0)
-        null
+        this.get_unresolved_symbol_for_entity_name(nm as ref[AstNode])
+    }
+
+    ; ── slice 114: the name that resolves to nothing ─────────────────────────
+    ;
+    ; getUnresolvedSymbolForEntityName. ★★★ WHAT IT IS FOR is not error recovery
+    ; but a NAME: the symbol it mints carries the identifier's text and its parent
+    ; chain, an errorType is hung off it in getTypeFromTypeAliasReference, and the
+    ; printer then answers `Widget` where an unrepresented miss would answer `any`.
+    ; Under this harness that is not a corner case — every unit of a multi-file
+    ; corpus case imports from a module the single-file compile cannot resolve.
+    ;
+    ; ★ The table is keyed on the PATH and not on the identifier, so `A.T` and
+    ; `B.T` are two symbols; the parent is minted by the same recursion, which is
+    ; what makes the path unique in the first place.
+    function get_unresolved_symbol_for_entity_name(this, name: ref[AstNode]) returns ref[Symbol]?
+    {
+        let k AstNode.kind_of(name)
+        var identifier name
+        if k = KindQualifiedName
+            set identifier: AstNode.qualified_right_of(name) as ref[AstNode]
+        if k = KindPropertyAccessExpression
+        {
+            let nm AstNode.name_of(name)
+            if nm = null
+                return unknown_symbol
+            set identifier: nm as ref[AstNode]
+        }
+        let text AstNode.identifier_text_of(identifier)
+        let text_len AstNode.identifier_text_length_of(identifier)
+        if text_len = 0
+            return unknown_symbol
+        var parent_symbol: ref[Symbol]? null
+        if k = KindQualifiedName
+        {
+            let left AstNode.qualified_left_of(name)
+            if left = null
+                return unknown_symbol
+            set parent_symbol: this.get_unresolved_symbol_for_entity_name(left as ref[AstNode])
+        }
+        if k = KindPropertyAccessExpression
+        {
+            let e AstNode.expression_of(name)
+            if e = null
+                return unknown_symbol
+            set parent_symbol: this.get_unresolved_symbol_for_entity_name(e as ref[AstNode])
+        }
+        var path_data null as pointer[char]
+        let path_len Checker.unresolved_path(host, parent_symbol, text, text_len, &path_data)
+        let found SymbolTable.get(unresolved_symbols, path_data, path_len)
+        if found <> null
+            return found
+        let result Symbol.create(host, SymbolFlagsTypeAlias, text, text_len)
+        Symbol.set_check_flags(result, CheckFlagsUnresolved)
+        Symbol.set_parent(result, parent_symbol)
+        SymbolTable.set_entry(host, unresolved_symbols, path_data, path_len, result)
+        let links this.type_alias_link_of(result)
+        set links.declared_type: unresolved_type
+        result
+    }
+
+    ; getSymbolPath's answer for the symbol this call is ABOUT to mint — the
+    ; parent's dotted path, a `.`, and the identifier's own text. ★It is written
+    ; as one function rather than as getSymbolPath plus a concatenation because
+    ; the parent chain of an unresolved symbol is itself unresolved, so the whole
+    ; path is a walk over `name_data`/`name_len` pairs with no other producer.
+    function unresolved_path(host: ref[Page], parent: ref[Symbol]?, text: pointer[char], text_len: int, out_data: pointer[pointer[char]]) returns int
+    {
+        var total text_len
+        var p parent
+        while p <> null
+        {
+            let ps p as ref[Symbol]
+            set total: total + Symbol.name_len_of(ps) + 1
+            set p: Symbol.parent_of(ps)
+        }
+        let buf host.allocate((total + 1) as size_t, 1) as pointer[char]
+        ; The chain is walked from the LEAF, so the bytes are filled from the END.
+        var at total
+        set at: at - text_len
+        var i 0
+        while i < text_len
+        {
+            set *(buf + at + i): *(text + i)
+            set i: i + 1
+        }
+        var q parent
+        while q <> null
+        {
+            let qs q as ref[Symbol]
+            set at: at - 1
+            set *(buf + at): "." as char
+            let nl Symbol.name_len_of(qs)
+            let nd Symbol.name_data_of(qs)
+            set at: at - nl
+            var j 0
+            while j < nl
+            {
+                set *(buf + at + j): *(nd + j)
+                set j: j + 1
+            }
+            set q: Symbol.parent_of(qs)
+        }
+        set *out_data: buf
+        total
     }
 
     ; getSymbolFromTypeReference, whole — the symbolNodeLinks memo in front of the
@@ -12153,6 +12556,83 @@ define Checker
         error_type
     }
 
+    ; `c.errorTypes[getAliasKey(alias)]` as a linear scan over (alias symbol,
+    ; alias type arguments) — TypeInstantiation's argument, one dimension over: a
+    ; hash buys O(1) and a collision question with it, and this list holds one
+    ; entry per distinct unresolved name in a unit.
+    function find_error_type(this, symbol: ref[Symbol], args: ref[Array[ref[Type]?]]?) returns ref[Type]?
+    {
+        let n error_types.get_length() as int
+        var i 0
+        while i < n
+        {
+            let row error_types[i]
+            if row <> null
+            {
+                let e row as ref[Type]
+                if e.alias_symbol = symbol
+                {
+                    if Checker.type_lists_equal(e.alias_type_arguments, args)
+                        return e
+                }
+            }
+            set i: i + 1
+        }
+        null
+    }
+
+    function type_lists_equal(a: ref[Array[ref[Type]?]]?, bl: ref[Array[ref[Type]?]]?) returns bool
+    {
+        var an 0
+        if a <> null
+            set an: (a as ref[Array[ref[Type]?]]).get_length() as int
+        var bn 0
+        if bl <> null
+            set bn: (bl as ref[Array[ref[Type]?]]).get_length() as int
+        if an <> bn
+            return false
+        if an = 0
+            return true
+        let al a as ref[Array[ref[Type]?]]
+        let bll bl as ref[Array[ref[Type]?]]
+        var i 0
+        while i < an
+        {
+            if al[i] <> bll[i]
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    ; `core.Map(node.TypeArguments(), c.getTypeFromTypeNode)`. ★It answers null
+    ; for a node with no type arguments, which is the reference's nil slice and
+    ; what makes `Widget` and `Widget<T>` two different cache keys.
+    function type_arguments_from_type_reference_node(this, node: ref[AstNode]) returns ref[Array[ref[Type]?]]?
+    {
+        let args AstNode.type_arguments_of(node)
+        if args = null
+            return null
+        let list args as ref[Array[ref[AstNode]?]]
+        let n list.get_length() as int
+        if n = 0
+            return null
+        let out &Array[ref[Type]?]^host()
+        var i 0
+        while i < n
+        {
+            let a list[i]
+            if a = null
+                return null
+            let t this.get_type_from_type_node(a as ref[AstNode])
+            if t = null
+                return null
+            out.add(t)
+            set i: i + 1
+        }
+        out
+    }
+
     ; ── getTypeFromTypeAliasReference ───────────────────────────────────────
     ;
     ; ★★★ THE `CheckFlagsUnresolved` ARM IS UNREACHABLE IN THIS PORT BY
@@ -12186,6 +12666,33 @@ define Checker
         ; nothing* and for *this port could not get there*. Reading the second as
         ; the first invents an errorType where an honest UNPORTED belongs — and
         ; the alias body below CAN stop, on its own annotation.
+        ;
+        ; ★★★ THE `CheckFlagsUnresolved` ARM IS CODE SINCE SLICE 114 and the note
+        ; that stood over this function is what dated it: it proved the arm
+        ; unreachable *by construction* from the ONE producer the reference has,
+        ; getUnresolvedSymbolForEntityName — and named the two mechanisms the arm
+        ; would need, `Type.alias` and the `errorTypes` cache. That producer landed
+        ; in this slice, so the proof expired and both mechanisms are here.
+        ;
+        ; ★★★ WHAT THE CACHE IS FOR IS NOT SPEED, IT IS IDENTITY. The same
+        ; unresolved name reached twice must answer the SAME type object, because
+        ; every identity comparison downstream is a pointer comparison — which is
+        ; the argument getTypeOfInstantiatedSymbol's memo makes one dimension over.
+        if (Symbol.check_flags_of(symbol) & CheckFlagsUnresolved) <> 0
+        {
+            let mark_u this.unported_mark()
+            let alias_args this.type_arguments_from_type_reference_node(node)
+            if this.unported_mark() <> mark_u
+                return null
+            let cached this.find_error_type(symbol, alias_args)
+            if cached <> null
+                return cached
+            let e this.new_intrinsic_type(TypeFlagsAny, "error")
+            set e.alias_symbol: symbol
+            set e.alias_type_arguments: alias_args
+            error_types.add(e)
+            return e
+        }
         let mark this.unported_mark()
         let t this.get_declared_type_of_symbol(symbol)
         if this.unported_mark() <> mark
@@ -14135,14 +14642,28 @@ define Checker
         null
     }
 
-    ; isErrorType. The second disjunct — `t.flags&Any != 0 && t.alias != nil` — is
-    ; about the `any` getTypeFromTypeAliasReference manufactures for a reference to
-    ; an UNRESOLVED symbol, and `alias` is not a slot this port carries (Type's own
-    ; note names typeToString's alias arm as its reader, which reports). Every type
-    ; that would carry one comes out of a function that stops, so the reduction is
-    ; to the first disjunct and it is exact for every type that exists here.
+    ; isErrorType. ★★★ THE SECOND DISJUNCT IS WRITTEN IN SLICE 114 AND THE NOTE
+    ; THAT STOOD HERE NAMED ITS OWN EXPIRY: it said `alias` is *"not a slot this
+    ; port carries"* and that *"every type that would carry one comes out of a
+    ; function that stops"*. Both halves fell the same afternoon —
+    ; getTypeFromTypeAliasReference's CheckFlagsUnresolved arm manufactures exactly
+    ; those types now.
+    ;
+    ; ★★★ AND IT IS NOT A COSMETIC WIDENING. The reference's own comment is the
+    ; whole design: *"we want those to behave like the errorType"* — so an
+    ; alias-carrying `any` must be REFUSED by the 49 sites that ask this question,
+    ; and the first one to be measured was the property access, where the isAnyLike
+    ; branch answers `apparentType` unless this predicate says otherwise. Without
+    ; it `x.id` on an unresolved `Request` came out as `Request` and not as `any` —
+    ; a well-formed wrong answer three stage-2 units deep.
     function is_error_type(this, t: ref[Type]) returns bool
-        t = error_type
+    {
+        if t = error_type
+            return true
+        if (t.flags & TypeFlagsAny) = 0
+            return false
+        t.alias_symbol <> null
+    }
 
     ; getDefaultFromTypeParameter, whole — the same two-sentinel filter
     ; getBaseConstraintOfType applies, over the other slot.
@@ -15699,9 +16220,20 @@ define Checker
         ; below, so the call is the identity for every type this slice can hold.
         if (t.flags & TypeFlagsAny) <> 0
         {
-            ; t.alias — the type-alias name a type may carry — is not represented
-            ; yet, and cannot be: an alias is set by getTypeFromTypeNode, which
-            ; reports. The arm stands here so the next reader sees where it goes.
+            ; ★★★ THE ALIAS ARM IS CODE SINCE SLICE 114, and the note that stood
+            ; here — *"t.alias … is not represented yet, and CANNOT be: an alias is
+            ; set by getTypeFromTypeNode, which reports"* — was wrong in both
+            ; halves by the time it was read: the two slots have been on `Type`
+            ; since slice 66, and getTypeFromTypeAliasReference's Unresolved arm
+            ; writes them without going near a stop.
+            ;
+            ; ★ It is `ToTypeReferenceNode` and not the general alias path 130
+            ; lines further down in the reference: an `any` carrying an alias
+            ; prints its name UNCONDITIONALLY, with no accessibility question and
+            ; no shouldExpandType — which is what makes an unresolved `Widget`
+            ; print as `Widget` rather than as `any`.
+            if t.alias_symbol <> null
+                return this.write_alias_type_reference(t, out)
             if t = unresolved_type
             {
                 ; The reference wraps the keyword in a SYNTHETIC LEADING COMMENT
@@ -17648,6 +18180,53 @@ define Checker
         true
     }
 
+    ; TypeAlias.ToTypeReferenceNode — the Any arm's printer, and it is NOT
+    ; symbol_to_type_node with a different caller. That one goes through
+    ; write_symbol_name, which reads the symbol's DECLARATIONS; an unresolved
+    ; symbol has none, and the reference's line here is
+    ; `b.symbolToEntityNameNode(t.Symbol())`, which reads `symbol.Name` and walks
+    ; the PARENT chain. So `A.T` prints as `A.T` out of two synthetic symbols that
+    ; were never declared anywhere.
+    function write_alias_type_reference(this, t: ref[Type], out: ref[StringBuilder]) returns bool
+    {
+        let asym t.alias_symbol as ref[Symbol]
+        Checker.write_symbol_entity_name(asym, out)
+        var na 0
+        if t.alias_type_arguments <> null
+            set na: (t.alias_type_arguments as ref[Array[ref[Type]?]]).get_length() as int
+        if na = 0
+        {
+            set wrote_paren_needing_type: false
+            return true
+        }
+        let args t.alias_type_arguments as ref[Array[ref[Type]?]]
+        out.append("<" as char)
+        var i 0
+        while i < na
+        {
+            if i > 0
+                out.append(", ")
+            if this.type_to_string(args[i], out) = false
+                return false
+            set i: i + 1
+        }
+        out.append(">" as char)
+        set wrote_paren_needing_type: false
+        true
+    }
+
+    ; symbolToEntityNameNode — the parent chain joined by dots, LEAF LAST.
+    procedure write_symbol_entity_name(symbol: ref[Symbol], out: ref[StringBuilder])
+    {
+        let parent Symbol.parent_of(symbol)
+        if parent <> null
+        {
+            Checker.write_symbol_entity_name(parent as ref[Symbol], out)
+            out.append("." as char)
+        }
+        out.append(Symbol.name_data_of(symbol), Symbol.name_len_of(symbol) as size_t)
+    }
+
     ; symbolToTypeNode, and the ONE of its two branches this entry point can take.
     ;
     ; ★★★ THE CHAIN IS ONE ELEMENT LONG HERE — write_symbol_name's header proves it
@@ -18277,11 +18856,9 @@ define Checker
                 {
                     if parent_symbol = null
                         return null
-                    ; getImmediateAliasedSymbol: the alias's own target rather than
-                    ; the end of the chain. It needs getTargetOfAliasDeclaration,
-                    ; which this slice does not have.
-                    this.record_unported("get-immediate-aliased-symbol", k)
-                    return null
+                    ; getImmediateAliasedSymbol: the alias's own target rather
+                    ; than the end of the chain.
+                    return this.get_immediate_aliased_symbol(parent_symbol as ref[Symbol])
                 }
             }
             return parent_symbol
@@ -22319,7 +22896,11 @@ define Checker
         ; appear. ★What it waits for is resolveAliasWithDeprecationCheck,
         ; isDeprecatedSymbol and isUncalledFunctionReference — and the first of them
         ; is resolveAlias, which is the alias chapter.
-        let declaration Symbol.value_declaration_of(les)
+        ; ★ `declaration` is a VAR since slice 114: the alias arm below rebinds it
+        ; to getDeclarationOfAliasSymbol's answer. `immediate_declaration` keeps the
+        ; value declaration, which is what isNeverInitialized reads.
+        var declaration Symbol.value_declaration_of(les)
+        let immediate_declaration declaration
         ; ★★★ THE CONTEXTUAL-BINDING-PATTERN EARLY-OUT IS DEAD, PROVED FROM ITS ONE
         ; WRITER. `c.contextualBindingPatterns` is pushed in exactly one place —
         ; getTypeFromBindingPattern, under `includePatternInType` — and that function
@@ -22407,17 +22988,16 @@ define Checker
         ; which every one is answerable and none is worth asking, because the value
         ; it computes has exactly one reader and that reader is the flow call.
         ;
-        ; ★ The ALIAS arm stops one step earlier and under its own name: it needs
-        ; getDeclarationOfAliasSymbol, i.e. resolveAlias, before it can even ask
-        ; whether the declaration is nil — and where that answers nil the reference
-        ; returns `t` without touching the flow at all.
+        ; ★★★ THE ALIAS ARM IS WRITTEN IN SLICE 114 AND IT REBINDS `declaration`,
+        ; which is what the stop that stood here could not do. Its ARGUMENT is
+        ; `symbol` and not `les` — the reference asks the symbol the NAME resolved
+        ; to, not the exported one getExportSymbolOfValueSymbolIfExported handed
+        ; back — and where it answers nil the next line returns `t` without touching
+        ; the flow at all.
         if is_alias
         {
             if (Symbol.flags_of(les) & SymbolFlagsVariable) = 0
-            {
-                this.record_unported("get-declaration-of-alias-symbol", KindIdentifier)
-                return null
-            }
+                set declaration: this.get_declaration_of_alias_symbol(symbol)
         }
         if declaration = null
             return t
@@ -22553,14 +23133,18 @@ define Checker
             set flow_container: Checker.get_control_flow_container(fc)
             set extending: true
         }
-        ; isNeverInitialized, behind its one reader.
+        ; isNeverInitialized, behind its one reader. ★ Its node is
+        ; `immediate_declaration` and NOT `decl`: the two are the same value until
+        ; the alias arm rebinds `declaration`, which is exactly the case the
+        ; reference keeps a second name for.
         var is_never_initialized false
         if is_outer_variable
         {
-            if AstNode.kind_of(decl) = KindVariableDeclaration
+            if Checker.kind_or_unknown(immediate_declaration) = KindVariableDeclaration
             {
+                let imm immediate_declaration as ref[AstNode]
                 var in_for_in_or_of false
-                let dl AstNode.parent_node_of(decl)
+                let dl AstNode.parent_node_of(imm)
                 if dl <> null
                 {
                     let ds AstNode.parent_node_of(dl as ref[AstNode])
@@ -22575,11 +23159,11 @@ define Checker
                 }
                 if in_for_in_or_of = false
                 {
-                    if AstNode.initializer_of(decl) = null
+                    if AstNode.initializer_of(imm) = null
                     {
-                        if AstNode.exclamation_token_of(decl) = null
+                        if AstNode.exclamation_token_of(imm) = null
                         {
-                            if this.is_mutable_local_variable_declaration(decl)
+                            if this.is_mutable_local_variable_declaration(imm)
                             {
                                 ; isSymbolAssignedDefinitely, the same walk the
                                 ; loop above waits on.
@@ -27367,11 +27951,11 @@ define Checker
                     let es this.get_resolved_symbol(n as ref[AstNode])
                     if (Symbol.flags_of(es) & SymbolFlagsAlias) <> 0
                     {
-                        ; getDeclarationOfAliasSymbol — the alias chapter's own
-                        ; reader; the question is whether the reference is through
-                        ; a NAMESPACE IMPORT, and both answers move a TS2540.
-                        this.record_unported("get-declaration-of-alias-symbol", Symbol.flags_of(es))
-                        return false
+                        ; "references through namespace import should be readonly".
+                        let declaration this.get_declaration_of_alias_symbol(es)
+                        if declaration = null
+                            return false
+                        return AstNode.kind_of(declaration as ref[AstNode]) = KindNamespaceImport
                     }
                 }
             }
@@ -31888,9 +32472,32 @@ define Checker
         if lib_file <> null
             this.merge_file_globals(lib_file as ref[AstNode], lib_b as ref[Binder], ambient)
         this.merge_file_globals(file as ref[AstNode], b, ambient)
-        ; The four global-AUGMENTATION passes and every `getGlobalType` line are
-        ; still left out: mergeModuleAugmentation needs mergeSymbolTable, and
-        ; §3.5be's rule keeps a call with no reader out rather than in as a stub.
+        ; ★★★ THE TWO AUGMENTATION LOOPS REPORT SINCE SLICE 114, AND THE REASON THEY
+        ; WERE ABLE TO SAY NOTHING BEFORE IS THAT THEIR UNITS ALL STOPPED FIRST.
+        ; `mergeModuleAugmentation` needs mergeSymbolTable and is still not written;
+        ; what changed is that it also REPORTS — TS2664 for an augmentation whose
+        ; module cannot be found — and the alias chapter took the wall in front of
+        ; those units away. Eight stage-2 units then read as FAIL with a diagnostic
+        ; MISSING, which is the shape §3.5v's fourth reason forbids: an omission
+        ; that can change the output is a stop, not a silence. ★It is asked of the
+        ; FILE and not written unconditionally, so a unit with no augmentation pays
+        ; nothing — and the question is the PARSER's collector, not the checker's.
+        ;
+        ; ★★★ IT STOPS AT THE FIRST OF THE REFERENCE'S TWO LOOPS AND RETURNS, WHICH
+        ; IS THE SAFE DIRECTION RATHER THAN THE FAITHFUL ONE, and the reason is
+        ; diagcheck. Upstream the GLOBAL-scope pass runs HERE — before
+        ; addUndefinedToGlobalsOrErrorOnRedeclaration, deliberately, because it
+        ; changes what that reports — and the non-global pass runs last. Running the
+        ; rest of this procedure without the merge could therefore emit a diagnostic
+        ; the reference does not, and diagcheck's relation is a SUBSEQUENCE: a
+        ; missing line is legal, an extra one is not.
+        if this.file_has_module_augmentation()
+        {
+            this.record_unported("merge-module-augmentation", 0)
+            return
+        }
+        ; Every `getGlobalType` line is still left out, on §3.5be's rule: a call
+        ; with no reader stays out rather than in as a stub.
         this.add_undefined_to_globals_or_error_on_redeclaration()
         ; `c.valueSymbolLinks.Get(c.undefinedSymbol).resolvedType =
         ; c.undefinedWideningType`, and it is why `undefined` gets a TYPE out of
@@ -31898,9 +32505,11 @@ define Checker
         ; next line is `getGlobalType("IArguments")`.
         let ul this.value_symbol_link_of(undefined_symbol)
         set ul.resolved_type: undefined_widening_type
+        ; `c.valueSymbolLinks.Get(c.unknownSymbol).resolvedType = c.errorType`.
+        let kl this.value_symbol_link_of(unknown_symbol)
+        set kl.resolved_type: error_type
         ; `c.valueSymbolLinks.Get(c.globalThisSymbol).resolvedType =
-        ; c.newObjectType(ObjectFlagsAnonymous, c.globalThisSymbol)`. The
-        ; unknownSymbol line between them is already this port's, in create().
+        ; c.newObjectType(ObjectFlagsAnonymous, c.globalThisSymbol)`.
         let gl this.value_symbol_link_of(global_this_symbol)
         set gl.resolved_type: this.new_object_type(ObjectFlagsAnonymous, global_this_symbol)
         ; "Now merge global ambient module declarations."
@@ -31913,6 +32522,89 @@ define Checker
                 this.merge_global_symbol(sym as ref[Symbol])
             set ai: ai + 1
         }
+    }
+
+    ; `len(file.ModuleAugmentations) != 0`, asked of the unit. ★★★ THE COLLECTOR IS
+    ; THE PARSER's (`collectModuleReferences` in references.go) AND NOT THE
+    ; BINDER's, which is why the question is re-asked here rather than read off a
+    ; field: this port has no references pass, and the two conditions that decide
+    ; whether an ambient module is an AUGMENTATION rather than a DECLARATION are
+    ; the collector's own.
+    ;
+    ; ★ The nesting is ONE level and that is the collector's too: it recurses into
+    ; an ambient module's body only when the file is NOT an external module, and
+    ; only there can a nested ambient module with a non-relative name be an
+    ; augmentation.
+    function file_has_module_augmentation(this) returns bool
+    {
+        let stmts AstNode.statements_of(file)
+        if stmts = null
+            return false
+        let list stmts as ref[Array[ref[AstNode]?]]
+        let n list.get_length() as int
+        var i 0
+        while i < n
+        {
+            let st list[i]
+            if st <> null
+            {
+                if this.statement_is_module_augmentation(st as ref[AstNode], false)
+                    return true
+            }
+            set i: i + 1
+        }
+        false
+    }
+
+    function statement_is_module_augmentation(this, node: ref[AstNode], in_ambient_module: bool) returns bool
+    {
+        if AstNode.kind_of(node) <> KindModuleDeclaration
+            return false
+        if Binder.is_ambient_module(node) = false
+            return false
+        ; `inAmbientModule || HasSyntacticModifier(node, Ambient) || file.IsDeclarationFile`
+        var declared in_ambient_module
+        if b.has_syntactic_modifier(node, ModifierFlagsAmbient)
+            set declared: true
+        if b.is_declaration_file_of()
+            set declared: true
+        if declared = false
+            return false
+        let external b.is_external_module_of()
+        if external
+            return true
+        let name AstNode.name_of(node)
+        if in_ambient_module
+        {
+            if name <> null
+            {
+                let nm name as ref[AstNode]
+                if is_external_module_name_relative(AstNode.identifier_text_of(nm), AstNode.identifier_text_length_of(nm)) = false
+                    return true
+            }
+            return false
+        }
+        ; "else if !inAmbientModule": the body is walked with inAmbientModule true.
+        let body AstNode.body_of(node)
+        if body = null
+            return false
+        let inner AstNode.statements_of(body as ref[AstNode])
+        if inner = null
+            return false
+        let list inner as ref[Array[ref[AstNode]?]]
+        let n list.get_length() as int
+        var i 0
+        while i < n
+        {
+            let st list[i]
+            if st <> null
+            {
+                if this.statement_is_module_augmentation(st as ref[AstNode], true)
+                    return true
+            }
+            set i: i + 1
+        }
+        false
     }
 
     ; initializeChecker's LOOP BODY, one file of the program. It was inline until
@@ -34836,12 +35528,13 @@ define Checker
         }
 
         ; BLOCK 4 — TS1361/TS1362, an alias imported or exported with `type` and
-        ; used as a value. A ROW, and the four terms that CAN be asked are asked
-        ; first so the stop names only the units where the missing pair would
-        ; decide: `getTypeOnlyAliasDeclarationEx` walks an alias to the declaration
-        ; that made it type-only, and `IsValidTypeOnlyAliasUseSite` is a nine-arm
-        ; predicate over the use site — neither exists here, and the fork between
-        ; the two codes is the FIRST one's answer, so guessing either would invent.
+        ; used as a value. Slice 114: both halves are here, and the fork between the
+        ; two codes is the FIRST one's answer — the KIND of the declaration that
+        ; made the alias type-only, not anything about the use site.
+        ;
+        ; ★ `addTypeOnlyDeclarationRelatedInfo` is deliberately not written: it adds
+        ; a RELATED INFO to the diagnostic it is handed, and no dump this package
+        ; has compares one (the T section's C lines are code and span).
         if error_location <> null
         {
             if (meaning & SymbolFlagsValue) <> 0
@@ -34849,7 +35542,25 @@ define Checker
                 if (Symbol.flags_of(result) & SymbolFlagsAlias) <> 0
                 {
                     if (Symbol.flags_of(result) & SymbolFlagsValue) = 0
-                        this.record_unported("type-only-alias-use-site", meaning)
+                    {
+                        let el error_location as ref[AstNode]
+                        if this.is_valid_type_only_alias_use_site(el) = false
+                        {
+                            let tod this.get_type_only_alias_declaration_ex(result, SymbolFlagsValue)
+                            if tod <> null
+                            {
+                                let tk AstNode.kind_of(tod as ref[AstNode])
+                                var code DiagX_0_cannot_be_used_as_a_value_because_it_was_imported_using_import_type
+                                if tk = KindExportSpecifier
+                                    set code: DiagX_0_cannot_be_used_as_a_value_because_it_was_exported_using_export_type
+                                if tk = KindExportDeclaration
+                                    set code: DiagX_0_cannot_be_used_as_a_value_because_it_was_exported_using_export_type
+                                if tk = KindNamespaceExport
+                                    set code: DiagX_0_cannot_be_used_as_a_value_because_it_was_exported_using_export_type
+                                this.error_on_node(el, code)
+                            }
+                        }
+                    }
                 }
             }
         }
