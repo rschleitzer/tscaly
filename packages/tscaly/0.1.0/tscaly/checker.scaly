@@ -104,6 +104,9 @@ use tscaly.ast.FlowList
 use tscaly.ast.NodeData
 use tscaly.ast.TokenData
 use tscaly.ast.PropertyAccessData
+; slice 117: the synthetic element access getFlowTypeOfDestructuring builds.
+use tscaly.ast.LiteralData
+use tscaly.ast.ElementAccessData
 use tscaly.parser.Parser
 use tscaly.binder.Binder
 use tscaly.Diagnostics.DiagnosticList
@@ -196,6 +199,34 @@ define ObjectFlagsClassOrInterface: int ObjectFlagsClass | ObjectFlagsInterface
 ; would be invisible.
 define ObjectFlagsContainsIntersections: int 1 << 25
 define ObjectFlagsIsConstrainedTypeVariable: int 1 << 27
+
+; ★ The four genericity bits, slice 117. IsGenericType is the OR of the other two
+; and is written as a literal for ElementFlagsFixed's reason — a global's
+; initializer folds inside ONE precedence level, and `1 << 23 | 1 << 24` mixes the
+; shift with the `|`.
+define ObjectFlagsIsGenericTypeComputed: int 1 << 22
+define ObjectFlagsIsGenericObjectType: int 1 << 23
+define ObjectFlagsIsGenericIndexType: int 1 << 24
+define ObjectFlagsIsGenericType: int 25165824   ; IsGenericObjectType | IsGenericIndexType
+
+; ── AccessFlags (slice 117) ─────────────────────────────────────────────────
+;
+; checker.AccessFlags — the ten bits getIndexedAccessType is steered by. The whole
+; table is declared rather than the four this slice reads, because the flags are
+; passed THROUGH getIndexedAccessTypeOrUndefined into getPropertyTypeForIndexType
+; as one value: a partial table would make the next reader's `accessFlags & X`
+; read as a new decision rather than as a transcription.
+define AccessFlagsNone: int 0
+define AccessFlagsIncludeUndefined: int 1 << 0
+define AccessFlagsNoIndexSignatures: int 1 << 1
+define AccessFlagsWriting: int 1 << 2
+define AccessFlagsCacheSymbol: int 1 << 3
+define AccessFlagsAllowMissing: int 1 << 4
+define AccessFlagsExpressionPosition: int 1 << 5
+define AccessFlagsReportDeprecated: int 1 << 6
+define AccessFlagsSuppressNoImplicitAnyError: int 1 << 7
+define AccessFlagsContextual: int 1 << 8
+define AccessFlagsPersistent: int 1   ; IncludeUndefined
 
 ; ── UnionReduction ──────────────────────────────────────────────────────────
 ;
@@ -7983,10 +8014,7 @@ define Checker
         else
         {
             if dk = KindBindingElement
-            {
-                this.record_unported("get-type-for-binding-element-parent", dk)
-                return null
-            }
+                return this.get_type_for_binding_element(declaration)
         }
         var is_property false
         if dk = KindPropertyDeclaration
@@ -8296,6 +8324,1420 @@ define Checker
                 this.report_implicit_any(declaration, any_type, WideningKindNormal)
         }
         any_type
+    }
+
+    ; ── slice 117: the DESTRUCTURING element's TYPE ──────────────────────────
+    ;
+    ; ★★★ THE CHAPTER IS `getTypeForBindingElement`, AND WHAT MAKES IT A FAMILY
+    ; RATHER THAN A FUNCTION IS THAT ITS ANSWER IS AN INDEXED ACCESS. `const {a} =
+    ; o` binds `a` to `(typeof o)["a"]`, so the whole `T[K]` constructor stands
+    ; between this port and the 74 units the frontier counts — which is why this
+    ; slice opens getIndexedAccessType as well, and why the arms of
+    ; getPropertyTypeForIndexType that need an ELEMENT ACCESS EXPRESSION are
+    ; written with stops rather than left out: this slice's caller passes a
+    ; property NAME as the access node, so `accessExpression` is nil throughout and
+    ; every one of those arms is dead here and live for the element-access reader
+    ; that comes next.
+
+    ; isTypeUsableAsPropertyName.
+    function is_type_usable_as_property_name(t: ref[Type]) returns bool
+        (t.flags & TypeFlagsStringOrNumberLiteralOrUnique) <> 0
+
+    ; ast.IsPropertyName. NOT is_property_name_literal, which is a different list
+    ; four screens down: this one carries the private identifier and the computed
+    ; name and drops the no-substitution template.
+    function is_property_name_kind(k: int) returns bool
+    {
+        if k = KindIdentifier
+            return true
+        if k = KindPrivateIdentifier
+            return true
+        if k = KindStringLiteral
+            return true
+        if k = KindNumericLiteral
+            return true
+        if k = KindComputedPropertyName
+            return true
+        false
+    }
+
+    ; getPropertyNameFromType, as this file writes a text: the DATA pointer is the
+    ; answer and null is the reference's `panic` — a real difference, and it is why
+    ; every caller asks is_type_usable_as_property_name first, exactly as the
+    ; reference does.
+    ;
+    ; ★ THE NUMBER ARM NEEDS STORAGE AND THE CALLER OWNS IT, in write_property_name's
+    ; shape: `buf` is a `char[JSNUM_MAX_TEXT]` the caller declares, and the answer
+    ; points either into the literal's own text or into that buffer. A
+    ; UniqueESSymbol's name has no producer in this port
+    ; (getESSymbolLikeTypeForNode is not written), so it is a stop.
+    function get_property_name_from_type(this, t: ref[Type], buf: pointer[char], out_len: ref[int]) returns pointer[char]
+    {
+        if (t.flags & TypeFlagsStringLiteral) <> 0
+        {
+            set out_len: Checker.literal_text_length_of(t)
+            return Checker.literal_text_of(t)
+        }
+        if (t.flags & TypeFlagsNumberLiteral) <> 0
+        {
+            set out_len: jsnum_to_string(Checker.literal_bits_of(t), buf)
+            return buf
+        }
+        if (t.flags & TypeFlagsUniqueESSymbol) <> 0
+        {
+            this.record_unported("unique-es-symbol-name", 0)
+            set out_len: 0
+            return null
+        }
+        set out_len: 0
+        null
+    }
+
+    ; getLiteralTypeFromPropertyName.
+    ;
+    ; ★★ THE `ast.IsExpression(name)` FALL-THROUGH IS A STOP AND ITS POPULATION IS
+    ; NAMED: GetPropertyNameForPropertyNameNode answers MISSING only for a computed
+    ; name whose expression is not a literal — and the arm above already took every
+    ; computed name — so what is left is a JsxNamespacedName, the one arm
+    ; property_name_text_of deliberately does not carry (its own note says so).
+    function get_literal_type_from_property_name(this, name: ref[AstNode]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let k AstNode.kind_of(name)
+        if k = KindPrivateIdentifier
+            return never_type
+        if k = KindNumericLiteral
+        {
+            let e this.check_expression(name)
+            if this.unported_mark() <> mark
+                return null
+            if e = null
+                return null
+            return this.get_regular_type_of_literal_type(e as ref[Type])
+        }
+        ; ★ THE COMPUTED ARM IS A STOP AND THE STOP IS THE CALLEE'S OWN:
+        ; check_computed_property_name is a PROCEDURE here where the reference
+        ; returns the expression's type, because its second half is the
+        ; late-binding chapter. So this arm calls it for the report and answers
+        ; nothing — the shape §3.5ae warns about is the other one, a guard reading
+        ; a result that has stopped failing.
+        if k = KindComputedPropertyName
+        {
+            this.check_computed_property_name(name)
+            return null
+        }
+        let d AstNode.property_name_text_of(name)
+        if d <> null
+            return this.get_string_literal_type(d, AstNode.property_name_text_length_of(name))
+        this.record_unported("literal-type-from-property-name", k)
+        null
+    }
+
+    ; getPropertyNameFromIndex — the index TYPE first, the access NODE as fallback.
+    function get_property_name_from_index(this, index_type: ref[Type], access_node: ref[AstNode]?, buf: pointer[char], out_len: ref[int]) returns pointer[char]
+    {
+        if Checker.is_type_usable_as_property_name(index_type)
+            return this.get_property_name_from_type(index_type, buf, out_len)
+        if access_node <> null
+        {
+            let an access_node as ref[AstNode]
+            if Checker.is_property_name_kind(AstNode.kind_of(an))
+            {
+                let d AstNode.property_name_text_of(an)
+                if d <> null
+                {
+                    set out_len: AstNode.property_name_text_length_of(an)
+                    return d
+                }
+            }
+        }
+        set out_len: 0
+        null
+    }
+
+    ; ── the genericity tests behind shouldDeferIndexedAccessType ─────────────
+    ;
+    ; ★★ isGenericMappedType AND isGenericStringLikeType ARE WRITTEN AS FLAG TESTS
+    ; THAT ARE ZERO TODAY, not omitted, and each names its expiry: ObjectFlagsMapped
+    ; has no writer in this port, and no template-literal or string-mapping type is
+    ; minted either. **The day one of the three is created these two readers must be
+    ; re-read**; spelling them as the real bit is what lets a grep find them.
+    function is_generic_mapped_type(t: ref[Type]) returns bool
+        (t.object_flags & ObjectFlagsMapped) <> 0
+
+    function is_generic_string_like_type(t: ref[Type]) returns bool
+        (t.flags & (TypeFlagsTemplateLiteral | TypeFlagsStringMapping)) <> 0
+
+    function is_generic_tuple_type(t: ref[Type]) returns bool
+    {
+        if Checker.is_tuple_type(t) = false
+            return false
+        let target Checker.target_of(t)
+        if target = null
+            return false
+        (Checker.tuple_combined_flags_of(target as ref[Type]) & ElementFlagsVariadic) <> 0
+    }
+
+    ; getGenericObjectFlags. ★The union MEMO is the reference's own and it WRITES
+    ; into object_flags, which is why the two predicates below cannot ask the flags
+    ; themselves.
+    function get_generic_object_flags(this, t: ref[Type]) returns int
+    {
+        var combined 0
+        if (t.flags & (TypeFlagsUnionOrIntersection | TypeFlagsSubstitution)) <> 0
+        {
+            if (t.object_flags & ObjectFlagsIsGenericTypeComputed) = 0
+            {
+                if (t.flags & TypeFlagsUnion) <> 0
+                {
+                    let types Checker.union_types_of(t)
+                    if types <> null
+                    {
+                        let list types as ref[Array[ref[Type]?]]
+                        let n list.get_length() as int
+                        var i 0
+                        while i < n
+                        {
+                            let row list[i]
+                            if row <> null
+                                set combined: combined | this.get_generic_object_flags(row as ref[Type])
+                            set i: i + 1
+                        }
+                    }
+                }
+                else
+                {
+                    ; The INTERSECTION and SUBSTITUTION arms. Neither type is minted
+                    ; anywhere in this port — there is no new_intersection_type and
+                    ; TypeFlagsSubstitution has no producer — so the two share one
+                    ; stop rather than an invented zero, which would answer *not
+                    ; generic* for a type the reference may call generic.
+                    this.record_unported("generic-object-flags-composite", 0)
+                    return 0
+                }
+                set t.object_flags: t.object_flags | ObjectFlagsIsGenericTypeComputed | combined
+            }
+            return t.object_flags & ObjectFlagsIsGenericType
+        }
+        if (t.flags & TypeFlagsInstantiableNonPrimitive) <> 0
+            set combined: combined | ObjectFlagsIsGenericObjectType
+        if Checker.is_generic_mapped_type(t)
+            set combined: combined | ObjectFlagsIsGenericObjectType
+        if Checker.is_generic_tuple_type(t)
+            set combined: combined | ObjectFlagsIsGenericObjectType
+        if (t.flags & (TypeFlagsInstantiableNonPrimitive | TypeFlagsIndex)) <> 0
+            set combined: combined | ObjectFlagsIsGenericIndexType
+        if Checker.is_generic_string_like_type(t)
+            set combined: combined | ObjectFlagsIsGenericIndexType
+        combined
+    }
+
+    function is_generic_object_type(this, t: ref[Type]) returns bool
+        (this.get_generic_object_flags(t) & ObjectFlagsIsGenericObjectType) <> 0
+
+    function is_generic_index_type(this, t: ref[Type]) returns bool
+        (this.get_generic_object_flags(t) & ObjectFlagsIsGenericIndexType) <> 0
+
+    ; isGenericReducibleType. ★Its intersection half is isReducibleIntersection,
+    ; which instantiates through the uniqueLiteralMapper this port has no
+    ; equivalent of, so that arm is a stop; the union arm's own guard is
+    ; ContainsIntersections, which cannot be set without an intersection either.
+    function is_generic_reducible_type(this, t: ref[Type]) returns bool
+    {
+        if (t.flags & TypeFlagsUnion) <> 0
+        {
+            if (t.object_flags & ObjectFlagsContainsIntersections) <> 0
+            {
+                let types Checker.union_types_of(t)
+                if types <> null
+                {
+                    let list types as ref[Array[ref[Type]?]]
+                    let n list.get_length() as int
+                    var i 0
+                    while i < n
+                    {
+                        let row list[i]
+                        if row <> null
+                        {
+                            if this.is_generic_reducible_type(row as ref[Type])
+                                return true
+                        }
+                        set i: i + 1
+                    }
+                }
+            }
+        }
+        if (t.flags & TypeFlagsIntersection) <> 0
+        {
+            this.record_unported("is-reducible-intersection", 0)
+            return false
+        }
+        false
+    }
+
+    ; indexTypeLessThan — EVERY constituent of the index is a numeric literal name
+    ; below `limit`.
+    function index_type_less_than_one(this, t: ref[Type], limit: int) returns bool
+    {
+        if (t.flags & TypeFlagsStringOrNumberLiteral) = 0
+            return false
+        var nb char[JSNUM_MAX_TEXT]
+        var nl 0
+        let nd this.get_property_name_from_type(t, &nb[0], &nl)
+        if nd = null
+            return false
+        if Checker.is_numeric_literal_name(nd, nl) = false
+            return false
+        let index jsnum_from_string(nd, nl)
+        if jsnum_at_least(index, jsnum_from_int(0)) = false
+            return false
+        jsnum_at_least(index, jsnum_from_int(limit)) = false
+    }
+
+    function index_type_less_than(this, index_type: ref[Type], limit: int) returns bool
+    {
+        if (index_type.flags & TypeFlagsUnion) <> 0
+        {
+            let types Checker.union_types_of(index_type)
+            if types = null
+                return false
+            let list types as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            var i 0
+            while i < n
+            {
+                let row list[i]
+                if row = null
+                    return false
+                if this.index_type_less_than_one(row as ref[Type], limit) = false
+                    return false
+                set i: i + 1
+            }
+            return true
+        }
+        this.index_type_less_than_one(index_type, limit)
+    }
+
+    ; shouldDeferIndexedAccessType.
+    ;
+    ; ★★ THE TWO TUPLE TERMS NEED getTotalFixedElementCount, WHICH IS fixedLength
+    ; PLUS THE TRAILING FIXED RUN, AND BOTH SIT BEHIND isGenericTupleType — a
+    ; VARIADIC element, which getTupleElementFlags stops on before one is ever
+    ; built. So the term is a stop guarded by the very predicate that has no input,
+    ; rather than a `false` that would be a claim about tuples in general.
+    function should_defer_indexed_access_type(this, object_type: ref[Type], index_type: ref[Type], access_node: ref[AstNode]?) returns bool
+    {
+        if this.is_generic_index_type(index_type)
+            return true
+        if access_node <> null
+        {
+            if AstNode.kind_of(access_node as ref[AstNode]) <> KindIndexedAccessType
+            {
+                if Checker.is_generic_tuple_type(object_type) = false
+                    return false
+                this.record_unported("total-fixed-element-count", 0)
+                return false
+            }
+        }
+        if this.is_generic_object_type(object_type)
+        {
+            if Checker.is_tuple_type(object_type) = false
+                return true
+            this.record_unported("total-fixed-element-count", 0)
+            return false
+        }
+        this.is_generic_reducible_type(object_type)
+    }
+
+
+    ; ── the index SIGNATURE lookups (slice 117) ──────────────────────────────
+
+    ; getIndexInfoOfType.
+    function get_index_info_of_type(this, t: ref[Type], key_type: ref[Type]) returns ref[IndexInfo]?
+        Checker.find_index_info(this.get_index_infos_of_type(t), key_type)
+
+    ; isApplicableIndexType.
+    ;
+    ; ★ THE `numericStringType` DISJUNCT IS LEFT OUT WITH ITS PRODUCER NAMED, not
+    ; folded away: it is the template literal `${number}`, and no template-literal
+    ; type is minted anywhere in this port (is_generic_string_like_type says so at
+    ; its own line). The day one is, this line and that one move together.
+    function is_applicable_index_type(this, source: ref[Type], target: ref[Type]) returns bool
+    {
+        if this.is_type_assignable_to(source, target)
+            return true
+        if target = string_type
+        {
+            if this.is_type_assignable_to(source, number_type)
+                return true
+        }
+        if target = number_type
+        {
+            if (source.flags & TypeFlagsStringLiteral) <> 0
+            {
+                if Checker.is_numeric_literal_name(Checker.literal_text_of(source), Checker.literal_text_length_of(source))
+                    return true
+            }
+        }
+        false
+    }
+
+    ; findApplicableIndexInfo. ★The multi-info arm builds a SYNTHETIC IndexInfo over
+    ; the intersection of the value types; no intersection type is minted in this
+    ; port, so that arm is a stop rather than a wrong single info.
+    function find_applicable_index_info(this, infos: ref[Array[ref[IndexInfo]?]]?, key_type: ref[Type]) returns ref[IndexInfo]?
+    {
+        if infos = null
+            return null
+        let list infos as ref[Array[ref[IndexInfo]?]]
+        let n list.get_length() as int
+        var string_index_info: ref[IndexInfo]? null
+        let applicable &Array[ref[IndexInfo]?]^host()
+        var i 0
+        while i < n
+        {
+            let row list[i]
+            set i: i + 1
+            if row = null
+                continue
+            let info row as ref[IndexInfo]
+            if info.key_type = string_type
+            {
+                set string_index_info: row
+                continue
+            }
+            let kt info.key_type
+            if kt = null
+                continue
+            if this.is_applicable_index_type(key_type, kt as ref[Type])
+                applicable.add(row)
+        }
+        let count applicable.get_length() as int
+        if count = 0
+        {
+            if string_index_info <> null
+            {
+                if this.is_applicable_index_type(key_type, string_type)
+                    return string_index_info
+            }
+            return null
+        }
+        if count = 1
+            return applicable[0]
+        this.record_unported("applicable-index-info-intersection", count)
+        null
+    }
+
+    ; getApplicableIndexInfo.
+    function get_applicable_index_info(this, t: ref[Type], key_type: ref[Type]) returns ref[IndexInfo]?
+        this.find_applicable_index_info(this.get_index_infos_of_type(t), key_type)
+
+    ; isStringIndexSignatureOnlyType — the shortcut getIndexedAccessTypeOrUndefined
+    ; takes before it looks at anything else.
+    function is_string_index_signature_only_type(this, t: ref[Type]) returns bool
+    {
+        if (t.flags & TypeFlagsObject) <> 0
+        {
+            if Checker.is_generic_mapped_type(t)
+                return false
+            let props this.get_properties_of_type(t)
+            if props <> null
+            {
+                if (props as ref[Array[ref[Symbol]?]]).get_length() <> (0 as size_t)
+                    return false
+            }
+            let infos this.get_index_infos_of_type(t)
+            if infos = null
+                return false
+            if (infos as ref[Array[ref[IndexInfo]?]]).get_length() <> (1 as size_t)
+                return false
+            return this.get_index_info_of_type(t, string_type) <> null
+        }
+        if (t.flags & TypeFlagsUnion) <> 0
+        {
+            let types Checker.union_types_of(t)
+            if types = null
+                return false
+            let list types as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            var i 0
+            while i < n
+            {
+                let row list[i]
+                if row = null
+                    return false
+                if this.is_string_index_signature_only_type(row as ref[Type]) = false
+                    return false
+                set i: i + 1
+            }
+            return true
+        }
+        if (t.flags & TypeFlagsIntersection) <> 0
+        {
+            this.record_unported("string-index-signature-only-intersection", 0)
+            return false
+        }
+        false
+    }
+
+
+    ; containsMissingType — the reference builds it as a closure in
+    ; initializeChecker; here it is an ordinary function. ★The union arm reads
+    ; element ZERO only, which is not a shortcut: `missing` sorts first in a union
+    ; by construction, and the reference asks exactly that.
+    function contains_missing_type(this, t: ref[Type]) returns bool
+    {
+        if t = missing_type
+            return true
+        if (t.flags & TypeFlagsUnion) = 0
+            return false
+        let types Checker.union_types_of(t)
+        if types = null
+            return false
+        let list types as ref[Array[ref[Type]?]]
+        if list.get_length() = (0 as size_t)
+            return false
+        let first list[0]
+        if first = null
+            return false
+        (first as ref[Type]) = missing_type
+    }
+
+    ; isJSLiteralType. ★ITS FIRST LINE ANSWERS EVERY CALL UNDER THIS HARNESS —
+    ; *the flag is meaningless under noImplicitAny mode*, and noImplicitAny is TRUE
+    ; here (strict_null_checks' own note gives the derivation). The rest is
+    ; transcribed behind it rather than dropped, up to the instantiable arm, whose
+    ; getResolvedBaseConstraint is a chapter of its own.
+    function is_js_literal_type(this, t: ref[Type]) returns bool
+    {
+        if Checker.no_implicit_any()
+            return false
+        if (t.object_flags & ObjectFlagsJSLiteral) <> 0
+            return true
+        if (t.flags & TypeFlagsUnion) <> 0
+        {
+            let types Checker.union_types_of(t)
+            if types = null
+                return false
+            let list types as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            var i 0
+            while i < n
+            {
+                let row list[i]
+                if row = null
+                    return false
+                if this.is_js_literal_type(row as ref[Type]) = false
+                    return false
+                set i: i + 1
+            }
+            return true
+        }
+        if (t.flags & TypeFlagsInstantiable) <> 0
+        {
+            this.record_unported("js-literal-type-constraint", 0)
+            return false
+        }
+        false
+    }
+
+    ; noUncheckedIndexedAccess — a plain equality against TSTrue, so an unset value
+    ; answers FALSE. It is the FIFTH unset option this port reads and the third
+    ; whose family matters (§3.5cw): this one is NOT in the strict family, so
+    ; `strict` does not turn it on.
+    function no_unchecked_indexed_access() returns bool
+        false
+
+    ; ── getPropertyTypeForIndexType (slice 117) ──────────────────────────────
+    ;
+    ; ★★★ HALF OF IT IS UNREACHABLE FROM THIS SLICE AND THE GUARD SAYS WHICH HALF:
+    ; `accessExpression` is the access node WHEN IT IS AN ElementAccessExpression,
+    ; and the destructuring caller passes a property NAME. So every arm under
+    ; `accessExpression <> null` — the deprecation suggestion, the readonly-write
+    ; report, the symbol cache, the flow type of the access, and the whole
+    ; noImplicitAny *did you mean* cascade — has no input here. They are written as
+    ; STOPS rather than dropped: an element-access reader that arrives to find them
+    ; missing would get a plausible wrong type, which is the one failure the
+    ; yardstick cannot separate from a right one.
+    ;
+    ; ★★ THE TAIL REPORTS ARE LIVE, and they are what makes `const {nope} = o`
+    ; produce TS2339 rather than nothing.
+    function get_property_type_for_index_type(this, original_object_type: ref[Type], object_type: ref[Type], index_type: ref[Type], full_index_type: ref[Type], access_node: ref[AstNode]?, access_flags: int) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        var access_expression: ref[AstNode]? null
+        if access_node <> null
+        {
+            if AstNode.kind_of(access_node as ref[AstNode]) = KindElementAccessExpression
+                set access_expression: access_node
+        }
+        var prop_name: pointer[char] null
+        var prop_len 0
+        var name_buf char[JSNUM_MAX_TEXT]
+        var has_prop_name false
+        var private_access false
+        if access_node <> null
+        {
+            if AstNode.kind_of(access_node as ref[AstNode]) = KindPrivateIdentifier
+                set private_access: true
+        }
+        if private_access = false
+        {
+            set prop_name: this.get_property_name_from_index(index_type, access_node, &name_buf[0], &prop_len)
+            if this.unported_mark() <> mark
+                return null
+            if prop_name <> null
+                set has_prop_name: true
+        }
+        if has_prop_name
+        {
+            if (access_flags & AccessFlagsContextual) <> 0
+            {
+                ; getTypeOfPropertyOfContextualType — the contextual-typing chapter.
+                this.record_unported("get-type-of-property-of-contextual-type", 0)
+                return null
+            }
+            let prop this.get_property_of_type(object_type, prop_name, prop_len)
+            if this.unported_mark() <> mark
+                return null
+            if prop <> null
+            {
+                if access_expression <> null
+                {
+                    ; The five element-access steps: the deprecation suggestion,
+                    ; markPropertyAsReferenced, the readonly-assignment report, the
+                    ; resolvedSymbol cache and the this-property-in-constructor
+                    ; auto type.
+                    this.record_unported("index-type-access-expression", 0)
+                    return null
+                }
+                if (access_flags & AccessFlagsWriting) <> 0
+                {
+                    this.record_unported("get-write-type-of-symbol-index", 0)
+                    return null
+                }
+                let prop_type this.get_type_of_symbol(prop as ref[Symbol])
+                if this.unported_mark() <> mark
+                    return null
+                if prop_type = null
+                    return null
+                if access_node <> null
+                {
+                    if AstNode.kind_of(access_node as ref[AstNode]) = KindIndexedAccessType
+                    {
+                        if this.contains_missing_type(prop_type as ref[Type])
+                        {
+                            let pair this.new_type_list(null)
+                            pair.add(prop_type)
+                            pair.add(undefined_type)
+                            return this.get_union_type(pair)
+                        }
+                    }
+                }
+                return prop_type
+            }
+            ; The TUPLE arm — a numeric name against a tuple. Its answer is
+            ; getTupleElementTypeOutOfStartCount, which is mapType over the tuple's
+            ; rest type; nothing in this slice builds a tuple-typed destructuring
+            ; source, and the arm names itself rather than falling through to the
+            ; index signature below, which would answer for a different question.
+            if Checker.is_numeric_literal_name(prop_name, prop_len)
+            {
+                if this.every_type_is_tuple(object_type)
+                {
+                    this.record_unported("tuple-element-type-out-of-start-count", 0)
+                    return null
+                }
+            }
+        }
+        if (index_type.flags & TypeFlagsNullable) = 0
+        {
+            if this.is_type_assignable_to_kind(index_type, TypeFlagsStringLike | TypeFlagsNumberLike | TypeFlagsESSymbolLike)
+            {
+                if (object_type.flags & (TypeFlagsAny | TypeFlagsNever)) <> 0
+                    return object_type
+                var index_info this.get_applicable_index_info(object_type, index_type)
+                if this.unported_mark() <> mark
+                    return null
+                if index_info = null
+                {
+                    set index_info: this.get_index_info_of_type(object_type, string_type)
+                    if this.unported_mark() <> mark
+                        return null
+                }
+                if index_info <> null
+                {
+                    let info index_info as ref[IndexInfo]
+                    if (access_flags & AccessFlagsNoIndexSignatures) <> 0
+                    {
+                        if info.key_type <> number_type
+                        {
+                            if access_expression <> null
+                                this.record_unported("index-type-access-expression", 0)
+                            return null
+                        }
+                    }
+                    if access_node <> null
+                    {
+                        if info.key_type = string_type
+                        {
+                            if this.is_type_assignable_to_kind(index_type, TypeFlagsString | TypeFlagsNumber) = false
+                            {
+                                this.error_on_node(Checker.index_node_for_access_expression(access_node), DiagType_0_cannot_be_used_as_an_index_type)
+                                if (access_flags & AccessFlagsIncludeUndefined) <> 0
+                                {
+                                    let pair this.new_type_list(null)
+                                    pair.add(info.value_type)
+                                    pair.add(missing_type)
+                                    return this.get_union_type(pair)
+                                }
+                                return info.value_type
+                            }
+                        }
+                    }
+                    ; errorIfWritingToReadonlyIndex — a report on the ACCESS
+                    ; EXPRESSION and nothing without one.
+                    if access_expression <> null
+                    {
+                        if info.is_readonly
+                        {
+                            this.record_unported("error-if-writing-to-readonly-index", 0)
+                            return null
+                        }
+                    }
+                    if (access_flags & AccessFlagsIncludeUndefined) <> 0
+                    {
+                        ; The ENUM exemption: an enum object indexed by its own
+                        ; literal type keeps undefined out. Both halves are asked
+                        ; because the term is a conjunction the reference negates
+                        ; whole.
+                        var enum_self false
+                        if object_type.symbol <> null
+                        {
+                            if (Symbol.flags_of(object_type.symbol as ref[Symbol]) & (SymbolFlagsRegularEnum | SymbolFlagsConstEnum)) <> 0
+                            {
+                                if index_type.symbol <> null
+                                {
+                                    if (index_type.flags & TypeFlagsEnumLiteral) <> 0
+                                    {
+                                        if this.get_parent_of_symbol(index_type.symbol as ref[Symbol]) = object_type.symbol
+                                            set enum_self: true
+                                    }
+                                }
+                            }
+                        }
+                        if enum_self = false
+                        {
+                            let pair this.new_type_list(null)
+                            pair.add(info.value_type)
+                            pair.add(missing_type)
+                            return this.get_union_type(pair)
+                        }
+                    }
+                    return info.value_type
+                }
+                if (index_type.flags & TypeFlagsNever) <> 0
+                    return never_type
+                if this.is_js_literal_type(object_type)
+                    return any_type
+                if this.unported_mark() <> mark
+                    return null
+                if access_expression <> null
+                {
+                    ; isConstEnumObjectType and the whole noImplicitAny report
+                    ; cascade behind it — six diagnostics, three of them with a
+                    ; SUGGESTION computed from the object's members.
+                    this.record_unported("index-type-access-expression", 0)
+                    return null
+                }
+            }
+        }
+        if (access_flags & AccessFlagsAllowMissing) <> 0
+        {
+            if Checker.is_object_literal_type(object_type)
+                return undefined_type
+        }
+        if this.is_js_literal_type(object_type)
+            return any_type
+        if this.unported_mark() <> mark
+            return null
+        if access_node <> null
+        {
+            let index_node Checker.index_node_for_access_expression(access_node)
+            var reported false
+            if AstNode.kind_of(index_node) <> KindBigIntLiteral
+            {
+                if (index_type.flags & (TypeFlagsStringLiteral | TypeFlagsNumberLiteral)) <> 0
+                {
+                    this.error_on_node(index_node, DiagProperty_0_does_not_exist_on_type_1)
+                    set reported: true
+                }
+            }
+            if reported = false
+            {
+                if (index_type.flags & (TypeFlagsString | TypeFlagsNumber)) <> 0
+                {
+                    this.error_on_node(index_node, DiagType_0_has_no_matching_index_signature_for_type_1)
+                    set reported: true
+                }
+            }
+            if reported = false
+                this.error_on_node(index_node, DiagType_0_cannot_be_used_as_an_index_type)
+        }
+        if Checker.is_type_any(index_type)
+            return index_type
+        null
+    }
+
+    ; getIndexNodeForAccessExpression.
+    function index_node_for_access_expression(access_node: ref[AstNode]) returns ref[AstNode]
+    {
+        let k AstNode.kind_of(access_node)
+        if k = KindElementAccessExpression
+        {
+            let a AstNode.element_access_argument_of(access_node)
+            if a <> null
+                return a as ref[AstNode]
+        }
+        if k = KindIndexedAccessType
+        {
+            let it AstNode.indexed_access_index_type_of(access_node)
+            if it <> null
+                return it as ref[AstNode]
+        }
+        if k = KindComputedPropertyName
+        {
+            let e AstNode.expression_of(access_node)
+            if e <> null
+                return e as ref[AstNode]
+        }
+        access_node
+    }
+
+    ; everyType(t, isTupleType), written out because Scaly has no closure value
+    ; here and the predicate is fixed (§3.5e).
+    function every_type_is_tuple(this, t: ref[Type]) returns bool
+    {
+        if (t.flags & TypeFlagsUnion) <> 0
+        {
+            let types Checker.union_types_of(t)
+            if types = null
+                return false
+            let list types as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            var i 0
+            while i < n
+            {
+                let row list[i]
+                if row = null
+                    return false
+                if Checker.is_tuple_type(row as ref[Type]) = false
+                    return false
+                set i: i + 1
+            }
+            return true
+        }
+        Checker.is_tuple_type(t)
+    }
+
+    ; ── getIndexedAccessType (slice 117) ─────────────────────────────────────
+
+    function get_indexed_access_type(this, object_type: ref[Type], index_type: ref[Type]) returns ref[Type]?
+        this.get_indexed_access_type_ex(object_type, index_type, AccessFlagsNone, null)
+
+    ; getIndexedAccessTypeEx — the reference's `core.OrElse(…, c.errorType)`.
+    function get_indexed_access_type_ex(this, object_type: ref[Type], index_type: ref[Type], access_flags: int, access_node: ref[AstNode]?) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let t this.get_indexed_access_type_or_undefined(object_type, index_type, access_flags, access_node)
+        if this.unported_mark() <> mark
+            return null
+        if t = null
+            return error_type
+        t
+    }
+
+    ; getIndexedAccessTypeOrUndefined.
+    ;
+    ; ★★ THE DEFERRAL BRANCH MINTS AN IndexedAccess TYPE AND THIS PORT HAS NO SUCH
+    ; RECORD, so it is a stop; should_defer_indexed_access_type is what decides
+    ; whether it is reached, and its own note says the only route in is a GENERIC
+    ; index or object type — neither of which a destructuring source can be until
+    ; the inference chapter lands.
+    ;
+    ; ★ noUncheckedIndexedAccess is unset under this harness, which is the fifth
+    ; reading of an unset option §3.5cw counts: the flag is asked rather than
+    ; folded, so the day the option is read the line is already right.
+    function get_indexed_access_type_or_undefined(this, object_type_in: ref[Type], index_type_in: ref[Type], access_flags_in: int, access_node: ref[AstNode]?) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        if object_type_in = wildcard_type
+            return wildcard_type
+        if index_type_in = wildcard_type
+            return wildcard_type
+        var object_type: ref[Type] object_type_in
+        let reduced this.get_reduced_type(object_type)
+        if this.unported_mark() <> mark
+            return null
+        if reduced <> null
+            set object_type: reduced as ref[Type]
+        var index_type: ref[Type] index_type_in
+        var access_flags access_flags_in
+        if this.is_string_index_signature_only_type(object_type)
+        {
+            if (index_type.flags & TypeFlagsNullable) = 0
+            {
+                if this.is_type_assignable_to_kind(index_type, TypeFlagsString | TypeFlagsNumber)
+                    set index_type: string_type
+            }
+        }
+        if this.unported_mark() <> mark
+            return null
+        if Checker.no_unchecked_indexed_access()
+        {
+            if (access_flags & AccessFlagsExpressionPosition) <> 0
+                set access_flags: access_flags | AccessFlagsIncludeUndefined
+        }
+        if this.should_defer_indexed_access_type(object_type, index_type, access_node)
+        {
+            if (object_type.flags & TypeFlagsAnyOrUnknown) <> 0
+                return object_type
+            this.record_unported("new-indexed-access-type", 0)
+            return null
+        }
+        if this.unported_mark() <> mark
+            return null
+        let apparent this.get_reduced_apparent_type(object_type)
+        if this.unported_mark() <> mark
+            return null
+        if apparent = null
+            return null
+        let apparent_object_type apparent as ref[Type]
+        if (index_type.flags & TypeFlagsUnion) <> 0
+        {
+            if (index_type.flags & TypeFlagsBoolean) = 0
+            {
+                ; The per-constituent loop, whose two exits are an intersection
+                ; (AccessFlagsWriting) and a union of the property types. The
+                ; intersection has no producer here, so the arm is written and the
+                ; write direction stops.
+                let types Checker.union_types_of(index_type)
+                if types = null
+                    return null
+                let list types as ref[Array[ref[Type]?]]
+                let n list.get_length() as int
+                let prop_types this.new_type_list(null)
+                var was_missing_prop false
+                var i 0
+                while i < n
+                {
+                    let row list[i]
+                    set i: i + 1
+                    if row = null
+                        continue
+                    var extra 0
+                    if was_missing_prop
+                        set extra: AccessFlagsSuppressNoImplicitAnyError
+                    let pt this.get_property_type_for_index_type(object_type, apparent_object_type, row as ref[Type], index_type, access_node, access_flags | extra)
+                    if this.unported_mark() <> mark
+                        return null
+                    if pt <> null
+                        prop_types.add(pt)
+                    else
+                    {
+                        if access_node = null
+                            return null
+                        set was_missing_prop: true
+                    }
+                }
+                if was_missing_prop
+                    return null
+                if (access_flags & AccessFlagsWriting) <> 0
+                {
+                    this.record_unported("indexed-access-intersection", 0)
+                    return null
+                }
+                return this.get_union_type_ex(prop_types, UnionReductionLiteral)
+            }
+        }
+        this.get_property_type_for_index_type(object_type, apparent_object_type, index_type, index_type, access_node, access_flags | AccessFlagsCacheSymbol | AccessFlagsReportDeprecated)
+    }
+
+
+    ; ── filterType and the two facts wrappers (slice 117) ────────────────────
+
+    ; filterType, with the reference's PREDICATE fixed to a TypeFacts mask — the
+    ; only shape this slice calls it in, and §3.5e's rule for a func value whose
+    ; callees are static.
+    ;
+    ; ★★ THE `origin` BRANCH IS NOT PORTED AND THE REASON IS THE RECORD: this port's
+    ; union type has no origin slot, because no DENORMALIZED union is built here
+    ; (get_union_type_from_sorted_list takes no origin either). The branch is a
+    ; refinement of the RESULT and never of the membership, so leaving it out
+    ; cannot change which constituents survive — what it would change is the
+    ; printed form of a union built from an aliased one, and there is none.
+    function filter_type_by_facts(this, t: ref[Type], include: int) returns ref[Type]?
+    {
+        if (t.flags & TypeFlagsUnion) <> 0
+        {
+            let types Checker.union_types_of(t)
+            if types = null
+                return t
+            let list types as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            let filtered this.new_type_list(null)
+            var i 0
+            while i < n
+            {
+                let row list[i]
+                set i: i + 1
+                if row = null
+                    continue
+                if this.has_type_facts(row as ref[Type], include)
+                    filtered.add(row)
+            }
+            if (filtered.get_length() as int) = n
+                return t
+            return this.get_union_type_from_sorted_list(filtered, t.object_flags & (ObjectFlagsPrimitiveUnion | ObjectFlagsContainsIntersections))
+        }
+        if (t.flags & TypeFlagsNever) <> 0
+            return t
+        if this.has_type_facts(t, include)
+            return t
+        never_type
+    }
+
+    ; getTypeWithFacts.
+    function get_type_with_facts(this, t: ref[Type], include: int) returns ref[Type]?
+        this.filter_type_by_facts(t, include)
+
+    ; getNonUndefinedType. ★Its first half maps an INSTANTIABLE constituent onto its
+    ; base constraint, which needs getBaseConstraintOrType — a chapter of its own —
+    ; and someType of a non-instantiable union answers false, so the arm is a stop
+    ; behind a predicate that nothing in this slice can satisfy.
+    function get_non_undefined_type(this, t: ref[Type]) returns ref[Type]?
+    {
+        if (t.flags & TypeFlagsInstantiable) <> 0
+        {
+            this.record_unported("generic-type-with-undefined-constraint", 0)
+            return null
+        }
+        this.get_type_with_facts(t, TypeFactsNEUndefined)
+    }
+
+    ; getTypeOfInitializer — the CACHED type of an initializer expression, so that a
+    ; transient type is recomputed rather than remembered.
+    function get_type_of_initializer(this, node: ref[AstNode]) returns ref[Type]?
+    {
+        ; ★ The reference asks `typeNodeLinks.Has(node)` first; this port's reader
+        ; MINTS on miss, and the two agree — a fresh row's resolved_type is null,
+        ; which is the same fall-through. What it costs is one row per uncached
+        ; initializer, which is the table's own design (see type_node_link_of).
+        let links this.type_node_link_of(node)
+        let t links.resolved_type
+        if t <> null
+            return t
+        this.get_type_of_expression(node)
+    }
+
+    ; ── the binding element's TYPE (slice 117) ───────────────────────────────
+
+    ; getTypeForBindingElementParent. ★The cached resolvedType is read only under
+    ; CheckModeNormal AND only when no optionality was folded into it, which is the
+    ; reference's own condition and not an optimisation: the cache is filled by
+    ; getTypeOfVariableOrParameterOrProperty, which passes includeOptionality TRUE.
+    function get_type_for_binding_element_parent(this, node: ref[AstNode], check_mode: int) returns ref[Type]?
+    {
+        if check_mode = CheckModeNormal
+        {
+            let mark this.unported_mark()
+            let symbol this.symbol_of_declaration(node)
+            if this.unported_mark() <> mark
+                return null
+            if symbol <> null
+            {
+                let links this.value_symbol_link_of(symbol as ref[Symbol])
+                let resolved links.resolved_type
+                if resolved <> null
+                {
+                    var optional false
+                    if Checker.strict_null_checks()
+                    {
+                        if Checker.is_optional_declaration(node)
+                            set optional: true
+                    }
+                    if optional = false
+                        return resolved
+                }
+            }
+        }
+        this.get_type_for_variable_like_declaration(node, false, check_mode)
+    }
+
+    ; getTypeForBindingElement.
+    function get_type_for_binding_element(this, declaration: ref[AstNode]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        var check_mode CheckModeNormal
+        if AstNode.dot_dot_dot_token_of(declaration) <> null
+            set check_mode: CheckModeRestBindingElement
+        let parent AstNode.parent_node_of(declaration)
+        if parent = null
+            return null
+        let grandparent AstNode.parent_node_of(parent as ref[AstNode])
+        if grandparent = null
+            return null
+        let parent_type this.get_type_for_binding_element_parent(grandparent as ref[AstNode], check_mode)
+        if this.unported_mark() <> mark
+            return null
+        if parent_type = null
+            return null
+        this.get_binding_element_type_from_parent_type(declaration, parent_type as ref[Type], false)
+    }
+
+    ; getBindingElementTypeFromParentType.
+    ;
+    ; ★★★ THIS IS WHERE `const {a} = o` BECOMES `(typeof o)["a"]`, and the two
+    ; patterns take genuinely different routes: an OBJECT pattern indexes, an ARRAY
+    ; pattern iterates. The array half is a row of its own — checkIteratedType
+    ; OrElementType with IterationUseDestructuring, the iteration-type family — and
+    ; so is the object REST element, whose answer is getRestType over the spreadable
+    ; properties.
+    ;
+    ; ★★ THE UNDEFINED-STRIPPING PRELUDE IS NOT DECORATION. `const {a} = o` where
+    ; the DECLARATION has an initializer removes `undefined` from the parent type
+    ; before indexing, because a destructuring of a possibly-undefined value has
+    ; already been reported; without it every property of an optional source comes
+    ; out one union member too wide.
+    function get_binding_element_type_from_parent_type(this, declaration: ref[AstNode], parent_type_in: ref[Type], no_tuple_bounds_check: bool) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        if Checker.is_type_any(parent_type_in)
+            return parent_type_in
+        let pattern_opt AstNode.parent_node_of(declaration)
+        if pattern_opt = null
+            return null
+        let pattern pattern_opt as ref[AstNode]
+        var parent_type: ref[Type] parent_type_in
+        var ambient_parameter false
+        if Checker.strict_null_checks()
+        {
+            if (AstNode.flags_of(declaration) & NodeFlagsAmbient) <> 0
+            {
+                if Binder.is_part_of_parameter_declaration(declaration)
+                    set ambient_parameter: true
+            }
+        }
+        if ambient_parameter
+        {
+            ; GetNonNullableType, whose strict arm is getAdjustedTypeWithFacts —
+            ; the removeNullableByIntersection family. Its whole population here is
+            ; a destructured parameter of an AMBIENT signature.
+            this.record_unported("get-non-nullable-type", 0)
+            return null
+        }
+        else
+        {
+            if Checker.strict_null_checks()
+            {
+                let pattern_parent AstNode.parent_node_of(pattern)
+                if pattern_parent <> null
+                {
+                    let pinit AstNode.initializer_of(pattern_parent as ref[AstNode])
+                    if pinit <> null
+                    {
+                        let it this.get_type_of_initializer(pinit as ref[AstNode])
+                        if this.unported_mark() <> mark
+                            return null
+                        if it <> null
+                        {
+                            if this.has_type_facts(it as ref[Type], TypeFactsEQUndefined) = false
+                            {
+                                let stripped this.get_type_with_facts(parent_type, TypeFactsNEUndefined)
+                                if this.unported_mark() <> mark
+                                    return null
+                                if stripped = null
+                                    return null
+                                set parent_type: stripped as ref[Type]
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        var access_flags AccessFlagsExpressionPosition
+        var allow_missing no_tuple_bounds_check
+        if this.has_default_value(declaration)
+            set allow_missing: true
+        if allow_missing
+            set access_flags: access_flags | AccessFlagsAllowMissing
+        var t: ref[Type]? null
+        let pk AstNode.kind_of(pattern)
+        if pk = KindObjectBindingPattern
+        {
+            if AstNode.dot_dot_dot_token_of(declaration) <> null
+            {
+                ; getRestType — Omit over the spreadable properties, plus the
+                ; TS2700 report when the source is not an object type.
+                this.record_unported("get-rest-type", pk)
+                return null
+            }
+            let name Checker.property_name_or_name_of(declaration)
+            if name = null
+                return null
+            let index_type this.get_literal_type_from_property_name(name as ref[AstNode])
+            if this.unported_mark() <> mark
+                return null
+            if index_type = null
+                return null
+            let declared_type this.get_indexed_access_type_ex(parent_type, index_type as ref[Type], access_flags, name)
+            if this.unported_mark() <> mark
+                return null
+            if declared_type = null
+                return null
+            set t: this.get_flow_type_of_destructuring(declaration, declared_type as ref[Type])
+            if this.unported_mark() <> mark
+                return null
+        }
+        else
+        {
+            ; The ARRAY pattern. Its first statement is already the iteration-type
+            ; family and every branch below it reads that answer, so the arm is one
+            ; row rather than four.
+            this.record_unported("check-iterated-type-or-element-type", pk)
+            return null
+        }
+        if t = null
+            return null
+        if AstNode.initializer_of(declaration) = null
+            return t
+        let root Checker.walk_up_binding_elements_and_patterns(declaration)
+        var root_annotated false
+        if root <> null
+        {
+            if AstNode.type_of(root as ref[AstNode]) <> null
+                set root_annotated: true
+        }
+        if root_annotated
+        {
+            ; "In strict null checking mode, if a default value of a non-undefined
+            ; type is specified, remove undefined from the final type."
+            if Checker.strict_null_checks()
+            {
+                let init_type this.check_declaration_initializer(declaration, CheckModeNormal, null)
+                if this.unported_mark() <> mark
+                    return null
+                if init_type = null
+                    return null
+                if this.has_type_facts(init_type as ref[Type], TypeFactsIsUndefined) = false
+                    return this.get_non_undefined_type(t as ref[Type])
+            }
+            return t
+        }
+        let nu this.get_non_undefined_type(t as ref[Type])
+        if this.unported_mark() <> mark
+            return null
+        if nu = null
+            return null
+        let init_type this.check_declaration_initializer(declaration, CheckModeNormal, null)
+        if this.unported_mark() <> mark
+            return null
+        if init_type = null
+            return null
+        let pair this.new_type_list(null)
+        pair.add(nu)
+        pair.add(init_type)
+        let widened_source this.get_union_type_ex(pair, UnionReductionSubtype)
+        if this.unported_mark() <> mark
+            return null
+        if widened_source = null
+            return null
+        this.widen_type_inferred_from_initializer(declaration, widened_source)
+    }
+
+    ; ── the destructuring's FLOW type (slice 117) ────────────────────────────
+    ;
+    ; ★★★ THE REFERENCE SYNTHESIZES `obj["x"]` SO THAT THE FLOW ANALYSER DOES NOT
+    ; HAVE TO KNOW THE FIVE DESTRUCTURING FORMS, and this port can do it since
+    ; slice 94 built new_synthetic_node for checkPropertyInitialization. What it
+    ; owes on top of that node is the ELEMENT-ACCESS half of two flow predicates:
+    ; get_accessed_property_name's element arm and is_matching_reference's element
+    ; SOURCE arm — both of which slice 94 left as stops with the note that they had
+    ; no producer, and this is the producer.
+    function get_flow_type_of_destructuring(this, node: ref[AstNode], declared_type: ref[Type]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let reference this.get_synthetic_element_access(node)
+        if this.unported_mark() <> mark
+            return null
+        if reference = null
+            return declared_type
+        this.get_flow_type_of_reference(reference as ref[AstNode], declared_type)
+    }
+
+    ; getParentElementAccess.
+    function get_parent_element_access(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let parent AstNode.parent_node_of(node)
+        if parent = null
+            return null
+        let ancestor_opt AstNode.parent_node_of(parent as ref[AstNode])
+        if ancestor_opt = null
+            return null
+        let ancestor ancestor_opt as ref[AstNode]
+        let k AstNode.kind_of(ancestor)
+        if k = KindBindingElement
+            return this.get_synthetic_element_access(ancestor)
+        if k = KindPropertyAssignment
+            return this.get_synthetic_element_access(ancestor)
+        if k = KindArrayLiteralExpression
+            return this.get_synthetic_element_access(parent as ref[AstNode])
+        if k = KindVariableDeclaration
+            return AstNode.initializer_of(ancestor)
+        if k = KindBinaryExpression
+            return AstNode.binary_right_of(ancestor)
+        null
+    }
+
+    ; getDestructuringPropertyName, in this file's (data, len) shape. ★The ARRAY
+    ; arm's name is the element's INDEX rendered as decimal, which needs storage the
+    ; caller owns — the same buffer discipline get_property_name_from_type uses.
+    function get_destructuring_property_name(this, node: ref[AstNode], buf: pointer[char], out_len: ref[int]) returns pointer[char]
+    {
+        let parent_opt AstNode.parent_node_of(node)
+        if parent_opt = null
+        {
+            set out_len: 0
+            return null
+        }
+        let parent parent_opt as ref[AstNode]
+        let pk AstNode.kind_of(parent)
+        let k AstNode.kind_of(node)
+        if k = KindBindingElement
+        {
+            if pk = KindObjectBindingPattern
+            {
+                let pn Checker.property_name_or_name_of(node)
+                if pn = null
+                {
+                    set out_len: 0
+                    return null
+                }
+                return this.get_literal_property_name_text(pn as ref[AstNode], out_len)
+            }
+        }
+        if k = KindPropertyAssignment
+            return this.get_literal_property_name_text(AstNode.name_of(node), out_len)
+        if k = KindShorthandPropertyAssignment
+            return this.get_literal_property_name_text(AstNode.name_of(node), out_len)
+        var indexed false
+        if pk = KindArrayLiteralExpression
+            set indexed: true
+        if pk = KindArrayBindingPattern
+            set indexed: true
+        if indexed
+        {
+            let elements AstNode.elements_of(parent)
+            let n AstNode.list_count(elements)
+            var i 0
+            while i < n
+            {
+                if AstNode.child_in_list(elements, i) = node
+                {
+                    set out_len: jsnum_to_string(jsnum_from_int(i), buf)
+                    return buf
+                }
+                set i: i + 1
+            }
+        }
+        set out_len: 0
+        null
+    }
+
+    ; getLiteralPropertyNameText — getLiteralTypeFromPropertyName, then the name off
+    ; the resulting literal type. ★It goes through the TYPE rather than through the
+    ; node's text because a computed name whose expression is a literal has a text
+    ; the node itself does not carry.
+    function get_literal_property_name_text(this, name: ref[AstNode]?, out_len: ref[int]) returns pointer[char]
+    {
+        if name = null
+        {
+            set out_len: 0
+            return null
+        }
+        let mark this.unported_mark()
+        let t this.get_literal_type_from_property_name(name as ref[AstNode])
+        if this.unported_mark() <> mark
+        {
+            set out_len: 0
+            return null
+        }
+        if t = null
+        {
+            set out_len: 0
+            return null
+        }
+        let ty t as ref[Type]
+        if Checker.is_type_usable_as_property_name(ty) = false
+        {
+            set out_len: 0
+            return null
+        }
+        var nb char[JSNUM_MAX_TEXT]
+        this.get_property_name_from_type(ty, &nb[0], out_len)
+    }
+
+    ; getSyntheticElementAccess.
+    ;
+    ; ★★ THE PARENTHESIS ARM IS A STOP RATHER THAN A SECOND SYNTHESIS: a parent
+    ; access that is not a left-hand-side expression is wrapped, and the wrapper
+    ; would have to carry a flow node of its own for is_matching_reference to walk
+    ; through. Its population is a destructuring off a comma or an assignment
+    ; expression, which no arm of this slice reaches.
+    function get_synthetic_element_access(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let mark this.unported_mark()
+        let parent_access this.get_parent_element_access(node)
+        if this.unported_mark() <> mark
+            return null
+        if parent_access = null
+            return null
+        let pa parent_access as ref[AstNode]
+        let flow Checker.get_flow_node_of_node(pa)
+        if flow = null
+            return null
+        var nb char[JSNUM_MAX_TEXT]
+        var name_len 0
+        let name_data this.get_destructuring_property_name(node, &nb[0], &name_len)
+        if this.unported_mark() <> mark
+            return null
+        if name_data = null
+            return null
+        if Binder.is_left_hand_side_expression(pa) = false
+        {
+            this.record_unported("synthetic-element-access-parenthesized", AstNode.kind_of(pa))
+            return null
+        }
+        ; The literal's text is COPIED onto the checker's page: `nb` is a stack
+        ; buffer for the array arm, and the node outlives this frame.
+        let text_data host.allocate((name_len as size_t) + (1 as size_t), 1 as size_t) as pointer[char]
+        var ci 0
+        while ci < name_len
+        {
+            set *(text_data + (ci as size_t)): *(name_data + (ci as size_t))
+            set ci: ci + 1
+        }
+        set *(text_data + (name_len as size_t)): 0 as char
+        let literal this.new_synthetic_node(KindStringLiteral, NodeData.StringLiteral(LiteralData(text_data, name_len, TokenFlagsNone)))
+        set literal.pos: AstNode.pos_of(node)
+        set literal.end: AstNode.end_of(node)
+        let result this.new_synthetic_node(KindElementAccessExpression, NodeData.ElementAccessExpression(ElementAccessData(pa, null, literal)))
+        set result.pos: AstNode.pos_of(node)
+        set result.end: AstNode.end_of(node)
+        set literal.parent: result
+        set result.parent: node
+        set result.flow_node: flow
+        result
     }
 
     ; ── slice 72: the declaration's INITIALIZER ──────────────────────────────
@@ -24169,9 +25611,53 @@ define Checker
             }
             return false
         }
+        ; ★★ THE ELEMENT-ACCESS SOURCE ARM, SLICE 117, AND IT SHARES THE PROPERTY
+        ; ACCESS'S BODY BECAUSE THE REFERENCE'S `case` DOES — the two kinds are one
+        ; label there. What is written separately is the second half, which
+        ; compares two element accesses by their ARGUMENT SYMBOL rather than by a
+        ; name; that needs isConstantVariable and isSymbolAssigned, and its
+        ; population is `a[i]` against `a[i]` with a const `i`, which no
+        ; destructuring synthesizes.
         if sk = KindElementAccessExpression
         {
-            this.record_unported("is-matching-reference-source", sk)
+            if Parser.is_access_expression(target)
+            {
+                var source_name: pointer[char] null
+                var source_len 0
+                if this.get_accessed_property_name(source, &source_name, &source_len) = false
+                    return false
+                var target_name: pointer[char] null
+                var target_len 0
+                if this.get_accessed_property_name(target, &target_name, &target_len) = false
+                    return false
+                if source_len <> target_len
+                    return false
+                if Checker.text_equals(source_name, Slice[char](target_len, target_name)) = false
+                    return false
+                let se AstNode.expression_of(source)
+                let te AstNode.expression_of(target)
+                if se = null
+                    return false
+                if te = null
+                    return false
+                return this.is_matching_reference(se as ref[AstNode], te as ref[AstNode])
+            }
+            if tk = KindElementAccessExpression
+            {
+                let sa AstNode.element_access_argument_of(source)
+                let ta AstNode.element_access_argument_of(target)
+                if sa <> null
+                {
+                    if ta <> null
+                    {
+                        if AstNode.kind_of(sa as ref[AstNode]) = KindIdentifier
+                        {
+                            if AstNode.kind_of(ta as ref[AstNode]) = KindIdentifier
+                                this.record_unported("matching-element-access-by-symbol", sk)
+                        }
+                    }
+                }
+            }
             return false
         }
         if sk = KindQualifiedName
@@ -24234,9 +25720,29 @@ define Checker
             set out_len: AstNode.identifier_text_length_of(name)
             return true
         }
+        ; ★★ SLICE 117 IS THE PRODUCER SLICE 94 SAID THIS ARM HAD NONE OF.
+        ; getFlowTypeOfDestructuring synthesizes `obj["x"]` with a STRING LITERAL
+        ; argument, so the literal half of tryGetElementAccessExpressionName is
+        ; exactly what the destructuring needs; the ENTITY-NAME half —
+        ; `obj[SomeEnum.A]`, whose name comes from the argument's TYPE — still has
+        ; no producer and keeps the stop.
         if k = KindElementAccessExpression
         {
-            this.record_unported("try-get-element-access-expression-name", k)
+            let arg AstNode.element_access_argument_of(access)
+            if arg = null
+                return false
+            let a arg as ref[AstNode]
+            if Parser.is_string_or_numeric_literal_like(a)
+            {
+                set out_data: AstNode.literal_text_of(a)
+                set out_len: AstNode.literal_text_length_of(a)
+                return true
+            }
+            if Checker.is_entity_name_expression(a)
+            {
+                this.record_unported("try-get-name-from-entity-name-expression", k)
+                return false
+            }
             return false
         }
         if k = KindBindingElement
@@ -25218,6 +26724,7 @@ define Checker
     ; they are decided by the resolved symbol's FLAGS.
     function check_identifier(this, node: ref[AstNode], check_mode: int) returns ref[Type]?
     {
+        let ident_mark this.unported_mark()
         if Checker.is_this_in_type_query(node)
             return this.check_this_expression(node)
         let symbol this.get_resolved_symbol(node)
@@ -25246,15 +26753,37 @@ define Checker
         if local_or_export = null
             return error_type
         let les local_or_export as ref[Symbol]
-        ; ★★ THE DEPRECATION BLOCK IS A SUGGESTION SITE AND IS SKIPPED RATHER THAN
-        ; STOPPED. `addDeprecatedSuggestion` builds a diagnostic and hands it to
-        ; addSuggestionDiagnostic, which GetDiagnostics does not read — so it can
-        ; never put a line into a C section, which is the whole thing this yardstick
-        ; compares (see record_suggestion's own note). A stop here would have cost
-        ; the chapter for every symbol in the corpus to protect a line that cannot
-        ; appear. ★What it waits for is resolveAliasWithDeprecationCheck,
-        ; isDeprecatedSymbol and isUncalledFunctionReference — and the first of them
-        ; is resolveAlias, which is the alias chapter.
+        ; ★★★ THE DEPRECATION BLOCK WAS SKIPPED BECAUSE ITS PRODUCT IS A SUGGESTION,
+        ; AND THAT ARGUMENT WAS RIGHT ABOUT THE PRODUCT AND WRONG ABOUT THE CALL —
+        ; slice 117 found it at STAGE 2, on one unit in 18 391. The note that stood
+        ; here reasoned correctly that `addDeprecatedSuggestion` can never put a line
+        ; into a C section, and then dropped the whole block including
+        ; `resolveAliasWithDeprecationCheck`, whose first step is **resolveAlias** —
+        ; and resolving an alias to a module that does not exist REPORTS TS2307.
+        ; `import { X } from "./m"; const X = 42; X;` is the shape: the merged symbol
+        ; carries the Alias flag, the reference reports the missing module a second
+        ; time at the identifier, and this port reported it once.
+        ;
+        ; ★★★ THE TRANSFERABLE HALF: **a call is not a suggestion just because its
+        ; RESULT is.** A skip justified by what a routine PRODUCES has to be checked
+        ; against what it does on the way — and nothing local says so, because the
+        ; suggestion is the only thing visible at the call site.
+        ;
+        ; ★ What stays skipped is the suggestion itself, for the reason the old note
+        ; gives; isUncalledFunctionReference is not asked, because the count it would
+        ; move is not compared either.
+        let target_symbol this.resolve_alias_with_deprecation_check(les, node)
+        if this.unported_mark() <> ident_mark
+            return null
+        if target_symbol <> null
+        {
+            let tsym target_symbol as ref[Symbol]
+            if Symbol.declaration_count(tsym) <> 0
+            {
+                if this.is_deprecated_symbol(tsym)
+                    set suggestion_count: suggestion_count + 1
+            }
+        }
         ; ★ `declaration` is a VAR since slice 114: the alias arm below rebinds it
         ; to getDeclarationOfAliasSymbol's answer. `immediate_declaration` keeps the
         ; value declaration, which is what isNeverInitialized reads.
@@ -28135,8 +29664,109 @@ define Checker
     ; ★ The non-strict half of every pair is DEAD under this harness for
     ; get_apparent_type's reason — strict_null_checks is a constant TRUE here — and
     ; is written as the reference's own test rather than folded away.
+    ; isEmptyResolvedType and isEmptyObjectType, slice 117.
+    ;
+    ; ★ `t.AsType() != c.anyFunctionType` is TRUE for every type this port can
+    ; build: the anyFunctionType sentinel has no producer here (§3.5be), so the term
+    ; is written as the containment argument it is rather than as a comparison
+    ; against a field that does not exist.
+    function is_empty_resolved_type(this, t: ref[Type]) returns bool
+    {
+        let sm this.resolve_structured_type_members(t)
+        if sm = null
+            return false
+        let m sm as ref[StructuredMembers]
+        if m.properties <> null
+        {
+            if (m.properties as ref[Array[ref[Symbol]?]]).get_length() <> (0 as size_t)
+                return false
+        }
+        if m.signatures <> null
+        {
+            if (m.signatures as ref[Array[ref[Signature]?]]).get_length() <> (0 as size_t)
+                return false
+        }
+        if m.index_infos <> null
+        {
+            if (m.index_infos as ref[Array[ref[IndexInfo]?]]).get_length() <> (0 as size_t)
+                return false
+        }
+        true
+    }
+
+    function is_empty_object_type(this, t: ref[Type]) returns bool
+    {
+        if (t.flags & TypeFlagsObject) <> 0
+        {
+            if Checker.is_generic_mapped_type(t)
+                return false
+            return this.is_empty_resolved_type(t)
+        }
+        if (t.flags & TypeFlagsNonPrimitive) <> 0
+            return true
+        if (t.flags & TypeFlagsUnion) <> 0
+        {
+            let types Checker.union_types_of(t)
+            if types = null
+                return false
+            let list types as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            var i 0
+            while i < n
+            {
+                let row list[i]
+                if row <> null
+                {
+                    if this.is_empty_object_type(row as ref[Type])
+                        return true
+                }
+                set i: i + 1
+            }
+            return false
+        }
+        if (t.flags & TypeFlagsIntersection) <> 0
+        {
+            this.record_unported("empty-object-type-intersection", 0)
+            return false
+        }
+        false
+    }
+
+    ; isFunctionObjectType. ★★ THE SECOND DISJUNCT IS THE ONLY WALL AND THE
+    ; REFERENCE'S OWN COMMENT IS WHY: *a quick check for a "bind" property before
+    ; performing the more expensive subtype check*. No signatures and no member
+    ; named `bind` answers FALSE with no relation asked, which is every ordinary
+    ; object type; a `bind` member and no signature is where isTypeSubtypeOf against
+    ; the global Function type is needed, and that is the stop.
+    function is_function_object_type(this, t: ref[Type]) returns bool
+    {
+        if (t.object_flags & ObjectFlagsEvolvingArray) <> 0
+            return false
+        let sm this.resolve_structured_type_members(t)
+        if sm = null
+            return false
+        let m sm as ref[StructuredMembers]
+        if m.signatures <> null
+        {
+            if (m.signatures as ref[Array[ref[Signature]?]]).get_length() <> (0 as size_t)
+                return true
+        }
+        if m.members = null
+            return false
+        ; ★ `bind` is a REAL property name, so the lookup key is the plain bytes —
+        ; internal_name would put the 0xFE prefix in front of it and the table would
+        ; never answer (see internal_name_unprefixed's own note at `this`).
+        var bd null as pointer[char]
+        let bl Binder.internal_name_unprefixed(host, "bind", &bd)
+        if SymbolTable.get(m.members as pointer[SymbolTable], bd, bl) = null
+            return false
+        this.record_unported("is-function-object-type", t.object_flags)
+        false
+    }
+
     function get_type_facts_worker(this, t: ref[Type], caller_only_needs: int) returns int
     {
+        let facts_mark this.unported_mark()
         var base: ref[Type]? t
         if (t.flags & (TypeFlagsIntersection | TypeFlagsInstantiable)) <> 0
         {
@@ -28263,12 +29893,49 @@ define Checker
             ; possibly produce, return zero so we can skip resolving members."
             if (caller_only_needs & possible) = 0
                 return TypeFactsNone
-            ; The three arms below it are ONE row, because they are one wall:
-            ; isEmptyObjectType wants isGenericMappedType and the anyFunctionType
-            ; sentinel (§3.5be — still unminted), isFunctionObjectType wants
-            ; isTypeSubtypeOf and globalFunctionType (the relation and §3.11).
-            this.record_unported("is-function-object-type", ty.object_flags)
-            return TypeFactsNone
+            ; ★★★ THE THREE ARMS BELOW WERE ONE ROW AND THE WALL WAS SMALLER THAN
+            ; THE NOTE SAID — slice 117 opened it because the destructuring chapter
+            ; asks this function about the SOURCE of every `const {a} = o`. The
+            ; sentence that stood here read *isFunctionObjectType wants
+            ; isTypeSubtypeOf and globalFunctionType*, which is true of the SECOND
+            ; disjunct only: the reference's own comment calls the first one *a
+            ; quick check for a "bind" property before performing the more
+            ; expensive subtype check*, so an object type with no call signature and
+            ; no member named `bind` answers FALSE without the relation. The
+            ; population behind the relation is an object that HAS a `bind` member
+            ; and no signatures, and that is the stop.
+            ;
+            ; ★★ isEmptyObjectType's own two terms are answerable too: the
+            ; anyFunctionType sentinel is unminted, so `resolved != anyFunctionType`
+            ; is TRUE by the same containment argument that made it look like a
+            ; wall, and isGenericMappedType is the zero flag test declared with the
+            ; indexed-access family. What is left is three lengths.
+            if (ty.object_flags & ObjectFlagsAnonymous) <> 0
+            {
+                if this.is_empty_object_type(ty)
+                {
+                    if this.unported_mark() <> facts_mark
+                        return TypeFactsNone
+                    if Checker.strict_null_checks()
+                        return TypeFactsEmptyObjectStrictFacts
+                    return TypeFactsEmptyObjectFacts
+                }
+                if this.unported_mark() <> facts_mark
+                    return TypeFactsNone
+            }
+            if this.is_function_object_type(ty)
+            {
+                if this.unported_mark() <> facts_mark
+                    return TypeFactsNone
+                if Checker.strict_null_checks()
+                    return TypeFactsFunctionStrictFacts
+                return TypeFactsFunctionFacts
+            }
+            if this.unported_mark() <> facts_mark
+                return TypeFactsNone
+            if Checker.strict_null_checks()
+                return TypeFactsObjectStrictFacts
+            return TypeFactsObjectFacts
         }
         if (flags & TypeFlagsVoid) <> 0
             return TypeFactsVoidFacts
@@ -28337,6 +30004,42 @@ define Checker
 
     function check_non_null_type(this, t: ref[Type], node: ref[AstNode]) returns ref[Type]?
         this.check_non_null_type_with_reporter(t, node, false)
+
+    ; checkNonNullNonVoidType, slice 117 — checkNonNullType plus a VOID report.
+    ;
+    ; ★★★ ITS ENTITY-NAME HALF HAS NO INPUT FROM THIS SLICE'S CALLER AND THE REASON
+    ; IS THE ARGUMENT, NOT THE POPULATION. Both call sites in
+    ; checkVariableLikeDeclaration pass the DECLARATION as the error node, and a
+    ; VariableDeclaration is not an entity-name expression under any tree the parser
+    ; builds — so the three reports the reference chooses between collapse to the
+    ; last one here. The fork is transcribed with a stop on the text rather than
+    ; folded away, because the FIRST caller that passes an expression (the `.`
+    ; access family, checkNonNullNonVoidType's other upstream reader) would
+    ; otherwise get TS2532 where the reference gives TS18048.
+    function check_non_null_non_void_type(this, t: ref[Type], node: ref[AstNode]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let non_null this.check_non_null_type(t, node)
+        if this.unported_mark() <> mark
+            return null
+        if non_null = null
+            return null
+        let nn non_null as ref[Type]
+        if (nn.flags & TypeFlagsVoid) <> 0
+        {
+            if Checker.is_entity_name_expression(node)
+            {
+                ; entityNameToString, whose answer decides between TS18050, TS18048
+                ; and TS2532 — the first on the exact text `undefined`, the second
+                ; on a text under 100 characters. Both are questions about the
+                ; SOURCE TEXT of the name, which is scanner.GetTextOfNode.
+                this.record_unported("entity-name-to-string", AstNode.kind_of(node))
+                return nn
+            }
+            this.error_on_node(node, DiagObject_is_possibly_undefined)
+        }
+        nn
+    }
 
     ; checkNonNullTypeWithReporter.
     ;
@@ -30029,15 +31732,14 @@ define Checker
             set error_node: AstNode.qualified_right_of(node)
         if k = KindImportType
             set error_node: node
+        ; ★★★ THE BINDING-ELEMENT ARM WENT LIVE IN SLICE 117 AND THE NOTE THAT
+        ; STOOD HERE NAMED ITS OWN EXPIRY: *checkPropertyAccessibility is called
+        ; from the two access heads and from the binding-element check, and the
+        ; latter is not ported*. It is ported now, and the arm is one line —
+        ; getBindingElementPropertyName is PropertyNameOrName, so `{ a: x } = o`
+        ; reports on `a` and `{ a } = o` on the single `a` either way.
         if k = KindBindingElement
-        {
-            ; getBindingElementPropertyName — the propertyName-or-name fork, which
-            ; this path does not reach: checkPropertyAccessibility is called from
-            ; the two access heads and from the binding-element check, and the
-            ; latter is not ported.
-            this.record_unported("binding-element-property-name", KindBindingElement)
-            return false
-        }
+            set error_node: Checker.property_name_or_name_of(node)
         if error_node = null
             set error_node: AstNode.name_of(node)
         this.check_property_accessibility_at_location(node, is_super, writing, t, prop, error_node)
@@ -34252,7 +35954,76 @@ define Checker
                 if AstNode.kind_of(prop_name) = KindComputedPropertyName
                     this.record_unported("check-computed-property-name", KindBindingElement)
             }
-            this.record_unported("get-type-for-binding-element-parent", KindBindingElement)
+            ; ★★★ THE FOURTH STEP, SLICE 117 — the PRIVATE/PROTECTED access check on
+            ; the property a binding element destructures. `getTypeForBinding
+            ; ElementParent` is computed unconditionally in the reference, which is
+            ; why the whole walk stood behind one row until the indexed access
+            ; landed.
+            ;
+            ; ★★ markPropertyAsReferenced IS NOT WRITTEN AND IT IS NOT A STOP.
+            ; Its whole effect is a bit in `symbolReferenceLinks`, whose only
+            ; reader upstream is checkUnusedIdentifiers — a chapter this port does
+            ; not have — so a report here would claim the unit is unmeasured where
+            ; the reference produces the same output either way (§3.5cx). **The
+            ; reader that would make it observable is the unused-locals check**, and
+            ; this line moves in that slice.
+            let bp_mark this.unported_mark()
+            var parent_check_mode CheckModeNormal
+            if AstNode.dot_dot_dot_token_of(node) <> null
+                set parent_check_mode: CheckModeRestBindingElement
+            let bparent AstNode.parent_node_of(AstNode.parent_node_of(node))
+            if bparent <> null
+            {
+                let bp bparent as ref[AstNode]
+                let parent_type this.get_type_for_binding_element_parent(bp, parent_check_mode)
+                if this.unported_mark() = bp_mark
+                {
+                    let prop_name_name Checker.property_name_or_name_of(node)
+                    var eligible false
+                    if parent_type <> null
+                    {
+                        if prop_name_name <> null
+                        {
+                            if AstNode.is_binding_pattern(prop_name_name as ref[AstNode]) = false
+                                set eligible: true
+                        }
+                    }
+                    if eligible
+                    {
+                        let expr_type this.get_literal_type_from_property_name(prop_name_name as ref[AstNode])
+                        if this.unported_mark() = bp_mark
+                        {
+                            if expr_type <> null
+                            {
+                                let et expr_type as ref[Type]
+                                if Checker.is_type_usable_as_property_name(et)
+                                {
+                                    var nb char[JSNUM_MAX_TEXT]
+                                    var nl 0
+                                    let nd this.get_property_name_from_type(et, &nb[0], &nl)
+                                    if nd <> null
+                                    {
+                                        let property this.get_property_of_type(parent_type as ref[Type], nd, nl)
+                                        if property <> null
+                                        {
+                                            ; "A destructuring is never a write-only
+                                            ; reference."
+                                            var is_super false
+                                            let binit AstNode.initializer_of(bp)
+                                            if binit <> null
+                                            {
+                                                if AstNode.kind_of(binit as ref[AstNode]) = KindSuperKeyword
+                                                    set is_super: true
+                                            }
+                                            this.check_property_accessibility(node, is_super, false, parent_type as ref[Type], property as ref[Symbol])
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         ; ★★★ THE ELEMENT WALK AND THE BINDING-PATTERN VALIDATION ARE TWO
         ; SEPARATE `if ast.IsBindingPattern(name)` BLOCKS IN THE REFERENCE, and
@@ -34326,8 +36097,75 @@ define Checker
                 }
                 set i: i + 1
             }
+            ; ★★★ SLICE 117 OPENS THIS BLOCK, AND THE TWO NEEDS DIVIDE IT ALONG A
+            ; LINE THAT IS NOT THE OBVIOUS ONE. `needCheckInitializer` is *there is
+            ; something to assign*, `needCheckWidenedType` is *the pattern binds
+            ; NOTHING* — `const [] = xs`, `const {} = o`, `const [,] = xs` — and it
+            ; is the SECOND that decides which check the first one runs: with a
+            ; pattern that binds nothing there is no assignability question worth
+            ; asking, so under strictNullChecks the initializer is only tested for
+            ; being null or void.
+            ;
+            ; ★★ THE REFERENCE COMPUTES THE WIDENED TYPE TWICE and this port does
+            ; too, because the two calls are not the same call: `widenedType` above
+            ; and the argument to checkTypeAssignableToAndOptionallyElaborate are
+            ; separate invocations in the reference, and the memo behind them is
+            ; getTypeOfSymbol's rather than this function's. Hoisting it would be
+            ; right today and a divergence the day a report between them changes an
+            ; answer.
             if need_check_initializer or need_check_widened_type
-                this.record_unported("get-widened-type-for-variable-like-declaration", AstNode.kind_of(node))
+            {
+                let widened_type this.get_widened_type_for_variable_like_declaration(node, false)
+                if need_check_initializer
+                {
+                    let init_type this.check_expression_cached(initializer as ref[AstNode])
+                    if init_type <> null
+                    {
+                        if need_check_widened_type
+                        {
+                            ; strict_null_checks is TRUE under this harness, so the
+                            ; else arm below is what an unset-strict compilation
+                            ; would take and is unreachable here. It is transcribed
+                            ; rather than folded away: the option is a fact about
+                            ; the HARNESS, not about the reference.
+                            if Checker.strict_null_checks()
+                                this.check_non_null_non_void_type(init_type as ref[Type], node)
+                            else
+                            {
+                                if widened_type <> null
+                                    this.check_type_assignable_to_and_optionally_elaborate(init_type as ref[Type], widened_type as ref[Type], node, initializer)
+                            }
+                        }
+                        else
+                        {
+                            let wt2 this.get_widened_type_for_variable_like_declaration(node, false)
+                            if wt2 <> null
+                                this.check_type_assignable_to_and_optionally_elaborate(init_type as ref[Type], wt2 as ref[Type], node, initializer)
+                        }
+                    }
+                }
+                if need_check_widened_type
+                {
+                    if widened_type <> null
+                    {
+                        if AstNode.kind_of(name) = KindArrayBindingPattern
+                        {
+                            ; checkIteratedTypeOrElementType with
+                            ; IterationUseDestructuring — the iteration-type family,
+                            ; whose whole population here is the empty ARRAY pattern
+                            ; `const [] = xs`. It is a row of its own rather than a
+                            ; term folded into this one: the object pattern beside
+                            ; it is answered.
+                            this.record_unported("check-iterated-type-or-element-type", AstNode.kind_of(node))
+                        }
+                        else
+                        {
+                            if Checker.strict_null_checks()
+                                this.check_non_null_non_void_type(widened_type as ref[Type], node)
+                        }
+                    }
+                }
+            }
             return
         }
 
@@ -34368,9 +36206,18 @@ define Checker
         ; three of this function's populations AND for the class, so the work list
         ; showed one 7 695-unit row where the reference asks two questions.
         let before_type this.is_unported()
-        let symbol_type this.get_type_of_symbol(symbol as ref[Symbol])
+        let symbol_type_raw this.get_type_of_symbol(symbol as ref[Symbol])
         if this.is_unported() <> before_type
             return
+        ; ★★★ SLICE 117 PUTS convertAutoToAny BACK ON THIS LINE, AND THE NOTE BELOW
+        ; IT — *convertAutoToAny is still not written* — IS THE EXPIRY §3.5p IS
+        ; ABOUT. It is written now, and its absence here was not invisible: `var x;`
+        ; gets the AUTO type, which PRINTS as `any` and is a DIFFERENT type object,
+        ; so every identity test in the fork below (is_error_type,
+        ; is_type_identical_to) was asking about the wrong one.
+        var symbol_type: ref[Type]? symbol_type_raw
+        if symbol_type_raw <> null
+            set symbol_type: this.convert_auto_to_any(symbol_type_raw as ref[Type])
         ; ★★★ SLICE 70 TAKES THE WHOLE TAIL AND STOPS AT FOUR NAMED PLACES INSIDE
         ; IT, which is the difference between porting a function and porting the
         ; call in front of it. What used to be one 146-unit row reading
@@ -34422,32 +36269,138 @@ define Checker
                         ; ASSIGNABILITY RELATION — the row this call carried for
                         ; thirty-one slices and the head of the work list on both
                         ; stages, ANSWERED by slice 101 wherever neither side is
-                        ; structured. ★convertAutoToAny is still not written: its
-                        ; value is read only here, and the auto type reaches this
-                        ; line from `getTypeOfSymbol`, which stops on the shape that
-                        ; makes one.
-                        ; ★The await-using and using arms behind it need
-                        ; getGlobalAsyncDisposableType and getUnionType, so they are
-                        ; behind this row rather than beside it.
+                        ; structured.
                         this.check_type_assignable_to_and_optionally_elaborate(initializer_type as ref[Type], symbol_type as ref[Type], node, initializer)
+                        ; ★★★ THE `using` ARMS ARE BESIDE THIS CALL AND NOT BEHIND
+                        ; IT, WHICH IS WHAT THE NOTE THAT STOOD HERE GOT WRONG. The
+                        ; reference runs them AFTER the assignability check, in the
+                        ; same `if initializer != nil` block — so while this line
+                        ; was the only thing written, a `using x = f()` had its
+                        ; disposability check silently SKIPPED rather than deferred.
+                        ; Both arms need getGlobalDisposableType, i.e. a lib symbol
+                        ; lookup this port does not have, so the row is named here.
+                        let bsk Binder.combined_node_flags(node) & NodeFlagsBlockScoped
+                        if bsk = NodeFlagsAwaitUsing
+                            this.record_unported("global-disposable-type", bsk)
+                        if bsk = NodeFlagsUsing
+                            this.record_unported("global-disposable-type", bsk)
+                        ; ★★★ THE `using` ARMS ARE BESIDE THIS CALL AND NOT BEHIND
+                        ; IT, WHICH IS WHAT THE NOTE THAT STOOD HERE GOT WRONG. The
+                        ; reference runs them AFTER the assignability check, in the
+                        ; same `if initializer != nil` block — so while this line was
+                        ; the only thing written a `using x = f()` had its
+                        ; disposability check silently SKIPPED rather than deferred.
+                        ; Both arms need getGlobalDisposableType, i.e. a lib symbol
+                        ; lookup this port does not have, so the row is named here.
+                        let bsk Binder.combined_node_flags(node) & NodeFlagsBlockScoped
+                        if bsk = NodeFlagsAwaitUsing
+                            this.record_unported("global-disposable-type", bsk)
+                        if bsk = NodeFlagsUsing
+                            this.record_unported("global-disposable-type", bsk)
                     }
                 }
             }
             ; `if len(symbol.Declarations) > 1 { if core.Some(…!areDeclarationFlags
-            ; Identical…) { TS2687 } }` — areDeclarationFlagsIdentical is a
-            ; modifier comparison over two declarations and is the cheapest thing
-            ; left in this function; it is not ported because nothing else in this
-            ; slice needs it and a report here names it exactly.
+            ; Identical…) { TS2687 } }`, whole since slice 117.
+            ;
+            ; ★★ THE PREDICATE HAS THREE CONJUNCTS AND THE MIDDLE ONE IS NOT
+            ; DECORATION. `d != node` skips this declaration against itself — which
+            ; areDeclarationFlagsIdentical would answer TRUE for anyway — but
+            ; `ast.IsVariableLike(d)` is a real filter: a symbol's declaration list
+            ; holds every declaration that MERGED into it, and a `var x` merged with
+            ; a `function x` reaches this line with a FunctionDeclaration in the
+            ; list, whose optionality and modifiers say nothing about a variable.
             if Symbol.declaration_count(symbol as ref[Symbol]) > 1
-                this.record_unported("are-declaration-flags-identical", AstNode.kind_of(node))
+            {
+                let sym symbol as ref[Symbol]
+                var differs false
+                var di 0
+                let dn Symbol.declaration_count(sym)
+                while di < dn
+                {
+                    let d Symbol.declaration_at(sym, di)
+                    if d <> null
+                    {
+                        let dd d as ref[AstNode]
+                        if dd <> node
+                        {
+                            if Checker.is_variable_like(dd)
+                            {
+                                if this.are_declaration_flags_identical(dd, node) = false
+                                {
+                                    set differs: true
+                                    break
+                                }
+                            }
+                        }
+                    }
+                    set di: di + 1
+                }
+                if differs
+                    this.error_on_node(name, DiagAll_declarations_of_0_must_have_identical_modifiers)
+            }
         }
         else
         {
-            ; The secondary declaration's own three steps, of which the FIRST is
-            ; already a stop: getWidenedTypeForVariableLikeDeclaration is what
-            ; slice 69 ported up to its RequiresWidening gate, and isTypeIdenticalTo
-            ; is the relation again.
-            this.record_unported("get-widened-type-for-variable-like-declaration", AstNode.kind_of(node))
+            ; ★★★ THE SECONDARY DECLARATION, SLICE 117 — `var x: string` after
+            ; `var x: number`. Its three steps are the identity of the two types,
+            ; the initializer's assignability against THIS declaration's type
+            ; rather than the symbol's, and the modifier comparison.
+            ;
+            ; ★★ THE TYPE IT COMPARES AGAINST IS NOT `symbol_type`, AND THAT IS THE
+            ; WHOLE POINT OF THE FORK. `t` is the type of the SYMBOL, which is the
+            ; primary declaration's; `declarationType` is the widened type of THIS
+            ; node, computed fresh. Folding the two would compare a type with
+            ; itself and TS2403 would never fire.
+            let sec_mark this.unported_mark()
+            let dt_raw this.get_widened_type_for_variable_like_declaration(node, false)
+            if this.unported_mark() = sec_mark
+            {
+                if dt_raw <> null
+                {
+                    let declaration_type this.convert_auto_to_any(dt_raw as ref[Type])
+                    ; ★★★ THE RELATION MAY FAIL TO ANSWER, AND `false` IS NOT THAT
+                    ; ANSWER. `isTypeIdenticalTo` always answers upstream; here it
+                    ; runs into check_type_related_to, which STOPS on two structured
+                    ; types — and reading the stop's `false` as *not identical* made
+                    ; `var x: I<{s:string}>` beside `declare var x: I<{s:string}>`
+                    ; report TS2403 at 37 units of the stage-2 corpus. The types
+                    ; yardstick cannot see it (those units are unported and skipped);
+                    ; **diagcheck can, because its relation is a SUBSEQUENCE and an
+                    ; EXTRA line is what a subsequence refuses.**
+                    var report_mismatch false
+                    if this.is_error_type(symbol_type as ref[Type]) = false
+                    {
+                        if this.is_error_type(declaration_type) = false
+                        {
+                            let id_mark this.unported_mark()
+                            let identical this.is_type_identical_to(symbol_type as ref[Type], declaration_type)
+                            if this.unported_mark() = id_mark
+                            {
+                                if identical = false
+                                {
+                                    if (Symbol.flags_of(symbol as ref[Symbol]) & SymbolFlagsAssignment) = 0
+                                        set report_mismatch: true
+                                }
+                            }
+                        }
+                    }
+                    if report_mismatch
+                        this.error_next_variable_or_property_declaration_must_have_same_type(node)
+                    if initializer <> null
+                    {
+                        let it this.check_expression_cached(initializer as ref[AstNode])
+                        if it <> null
+                            this.check_type_assignable_to_and_optionally_elaborate(it as ref[Type], declaration_type, node, initializer)
+                    }
+                    let vd Symbol.value_declaration_of(symbol as ref[Symbol])
+                    if vd <> null
+                    {
+                        if this.are_declaration_flags_identical(node, vd as ref[AstNode]) = false
+                            this.error_on_node(name, DiagAll_declarations_of_0_must_have_identical_modifiers)
+                    }
+                }
+            }
         }
         ; The trailing block, which runs for every declaration that is not a
         ; property: `checkExportsOnMergedDeclarations` (ported, slice 31),
@@ -34465,6 +36418,116 @@ define Checker
         if nk = KindBindingElement
             this.check_var_declared_names_not_shadowed(node)
         this.check_collisions_for_declaration_name(node, AstNode.name_of(node))
+    }
+
+    ; ── slice 117: the three one-liners the fork above was waiting for ───────
+    ;
+    ; ast.IsVariableLike. Eight kinds, and the list is the reference's own — a
+    ; symbol's declaration list is a MERGE, so this is the filter that keeps a
+    ; `function x` out of a modifier comparison between two `var x`.
+    function is_variable_like(node: ref[AstNode]) returns bool
+    {
+        let k AstNode.kind_of(node)
+        if k = KindBindingElement
+            return true
+        if k = KindEnumMember
+            return true
+        if k = KindParameter
+            return true
+        if k = KindPropertyAssignment
+            return true
+        if k = KindPropertyDeclaration
+            return true
+        if k = KindPropertySignature
+            return true
+        if k = KindShorthandPropertyAssignment
+            return true
+        if k = KindVariableDeclaration
+            return true
+        false
+    }
+
+    ; areDeclarationFlagsIdentical, whole.
+    ;
+    ; ★★ ITS FIRST BRANCH IS AN EXEMPTION AND NOT A SHORTCUT: a parameter against a
+    ; variable answers TRUE before either question is asked, because *differences in
+    ; optionality between parameters and variables are allowed* — `function f(a?)`
+    ; and a `var a` merged into one symbol must not report TS2687 for the `?`.
+    ;
+    ; ★ getSelectedModifierFlags is `node.ModifierFlags() & flags`, which is
+    ; `b.modifier_flags` — the UNCOMBINED reading, so a modifier inherited from an
+    ; enclosing `declare` does not enter the comparison. The six interesting flags
+    ; are the reference's list and no other modifier is compared at all.
+    function are_declaration_flags_identical(this, left: ref[AstNode], right: ref[AstNode]) returns bool
+    {
+        let lk AstNode.kind_of(left)
+        let rk AstNode.kind_of(right)
+        if lk = KindParameter
+        {
+            if rk = KindVariableDeclaration
+                return true
+        }
+        if lk = KindVariableDeclaration
+        {
+            if rk = KindParameter
+                return true
+        }
+        if Checker.is_optional_declaration(left) <> Checker.is_optional_declaration(right)
+            return false
+        let interesting ModifierFlagsPrivate | ModifierFlagsProtected | ModifierFlagsAsync | ModifierFlagsAbstract | ModifierFlagsReadonly | ModifierFlagsStatic
+        (b.modifier_flags(left) & interesting) = (b.modifier_flags(right) & interesting)
+    }
+
+    ; convertAutoToAny. The auto type is the control-flow tracked `any` that
+    ; get_type_for_variable_like_declaration hands out for an un-annotated `var`,
+    ; and its array twin; everything the outside world sees is the ordinary any.
+    function convert_auto_to_any(this, t: ref[Type]) returns ref[Type]
+    {
+        if t = auto_type
+            return any_type
+        let aat this.get_auto_array_type()
+        if aat <> null
+        {
+            if t = aat as ref[Type]
+            {
+                let at this.get_any_array_type()
+                if at <> null
+                    return at as ref[Type]
+            }
+        }
+        t
+    }
+
+    ; isTypeIdenticalTo — `isTypeRelatedTo(source, target, identityRelation)`, and
+    ; the identity relation's own arms in is_type_related_to have been there since
+    ; slice 101. What is NOT there is the recursion behind it, so two STRUCTURED
+    ; types compare through check_type_related_to and stop there, which is where
+    ; the row belongs rather than here.
+    function is_type_identical_to(this, source: ref[Type], target: ref[Type]) returns bool
+        this.is_type_related_to(source, target, RelationIdentity)
+
+    ; errorNextVariableOrPropertyDeclarationMustHaveSameType.
+    ;
+    ; ★★★ THE PORT TAKES ONE ARGUMENT WHERE THE REFERENCE TAKES FOUR, AND THAT IS A
+    ; STATEMENT ABOUT THE YARDSTICK RATHER THAN A SIMPLIFICATION. tscaly_types dumps
+    ; a diagnostic as `C pos end code`; the three other parameters are the message's
+    ; INTERPOLATIONS (the declaration's name and the two types rendered by
+    ; TypeToString) and the related-information node, and no yardstick in this suite
+    ; compares either. Carrying them would be a signature nothing can exercise
+    ; (§3.5ar) — the FIRST caller that can is a message-text yardstick, and the note
+    ; is written here so that caller finds it.
+    ;
+    ; ★ The CODE is a fork and it is transcribed: a property redeclaration is TS2717
+    ; and a variable one TS2403, chosen off the NEXT declaration's kind.
+    procedure error_next_variable_or_property_declaration_must_have_same_type(this, next_declaration: ref[AstNode])
+    {
+        let nk AstNode.kind_of(next_declaration)
+        var code DiagSubsequent_variable_declarations_must_have_the_same_type_Variable_0_must_be_of_type_1_but_here_has_type_2
+        if nk = KindPropertyDeclaration
+            set code: DiagSubsequent_property_declarations_must_have_the_same_type_Property_0_must_be_of_type_1_but_here_has_type_2
+        if nk = KindPropertySignature
+            set code: DiagSubsequent_property_declarations_must_have_the_same_type_Property_0_must_be_of_type_1_but_here_has_type_2
+        this.error_on_node(b.get_name_of_declaration(next_declaration), code)
     }
 
     ; ── slice 76: checkVarDeclaredNamesNotShadowed, up to its one resolveName ──
