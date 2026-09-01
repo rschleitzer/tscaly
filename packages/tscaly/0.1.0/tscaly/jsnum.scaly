@@ -32,11 +32,18 @@
 ; big-endian digit array with a decimal point, and every operation on it is a
 ; shift, a round or a digit walk; `floatBits` assembles an IEEE bit pattern out
 ; of a mantissa and an exponent, and `bigFtoa` takes one apart the same way.
-; So the whole conversion runs without a single floating-point operation, and
-; this port never names Scaly's `double`: a double is a `u64` of BITS here, from
-; `jsnum_from_string` to `jsnum_to_string`. That is not a simplification of the
-; reference — it is what the reference's slow path already is, and it is the half
-; of `strconv` that carries no generated tables.
+; So the whole CONVERSION runs without a single floating-point operation, and it
+; is a `u64` of BITS from `jsnum_from_string` to `jsnum_to_string`. That is not a
+; simplification of the reference — it is what the reference's slow path already
+; is, and it is the half of `strconv` that carries no generated tables.
+;
+; ★★★ THAT SENTENCE USED TO READ *this port never names Scaly's `double`* AND
+; SLICE 116 EXPIRED IT (§3.5p). It was a claim about the CONVERSION and was read
+; as a claim about the file: the enum chapter needs jsnum's other half — the
+; Number OPERATIONS, `+`, `%`, `**`, the bitwise five and the three shifts —
+; which are IEEE-754 double arithmetic by definition. They are at the foot of
+; this file, they name `double` inside their own bodies, and every signature
+; there still takes and answers BITS.
 ;
 ; ★★ WHAT IS NOT PORTED, each with the reader that would earn it. Ryū
 ; (`ftoa.go`'s fast path) — it answers the same digits as `roundShortest` by
@@ -1874,4 +1881,238 @@ function jsnum_parse_pseudo_big_int(s: pointer[char], slen: int, out: pointer[ch
         set k: k + 1
     }
     len
+}
+
+; ── the ARITHMETIC half of internal/jsnum (slice 116) ───────────────────────
+;
+; ★★★ THE HEADER'S *this port never names Scaly's `double`* EXPIRES HERE, and the
+; way it expires is §3.5p exactly: the sentence was true of what jsnum was being
+; asked for, not of jsnum. Everything above converts BETWEEN a decimal string and
+; an IEEE bit pattern, and Go's own conversion is integer arithmetic on a digit
+; array — so naming a double there would have bought nothing and cost the exact
+; agreement `tests/numcheck.sh` measures. What arrives with the enum chapter is
+; the other half of the reference file: `x + y`, `x % y`, `x ** y`, the five
+; bitwise operators and the three shifts, i.e. ECMAScript's Number OPERATIONS.
+; Those are IEEE-754 double arithmetic by definition, and reimplementing them on
+; the bit pattern would be writing a soft-float library to avoid a keyword.
+;
+; ★★ THE INTERFACE STAYS BITS AND THAT IS DELIBERATE. Every value crossing into
+; this file is a `u64` — `LiteralTypeData.bits`, `jsnum_from_string`'s answer,
+; `jsnum_to_string`'s input — so a double lives only INSIDE a function here, and
+; no caller of jsnum has to learn a second representation. The bridge is one
+; pointer cast in each direction.
+;
+; ★★★ AND `<>` ON A double IS ORDERED, so it answers FALSE for NaN against
+; itself. Measured: `if nan = nan` does not fire (right) and `if nan <> nan` does
+; not fire either (wrong for JS) — the emitter's inequality is `fcmp one` where
+; ECMAScript's `!==` is `une`. Nothing here may test NaN-ness with a comparison;
+; `jsnum_is_nan` reads the BIT PATTERN, which is what the reference's own
+; `isNonFinite` does one line further on for the same kind of reason.
+
+function fmod(x: double, y: double) returns double extern
+function pow(x: double, y: double) returns double extern
+function trunc(x: double) returns double extern
+
+; The bridge. A `var` of scalar type has a slot, so `&` addresses it and the cast
+; reads the same eight bytes as the other type — the one shape in this package
+; that is a reinterpretation rather than a conversion, and `n as double` (an
+; int-to-float CONVERSION) is what it must not be confused with.
+function jsnum_double_of(bits: u64) returns double
+{
+    var b bits
+    let p &b as pointer[double]
+    *p
+}
+
+function jsnum_bits_of(value: double) returns u64
+{
+    var v value
+    let p &v as pointer[u64]
+    *p
+}
+
+; `isNonFinite`, transcribed: exponent field all ones. One mask instead of the
+; two questions `math.IsNaN(x) || math.IsInf(x, 0)` asks, which is the comment
+; the reference puts over it.
+function jsnum_is_non_finite(bits: u64) returns bool
+    (bits & BITS_INF) = BITS_INF
+
+function jsnum_is_nan(bits: u64) returns bool
+{
+    if (bits & BITS_INF) <> BITS_INF
+        return false
+    (bits & 0x000FFFFFFFFFFFFF) <> (0 as u64)
+}
+
+function jsnum_is_inf(bits: u64) returns bool
+{
+    if (bits & BITS_INF) <> BITS_INF
+        return false
+    (bits & 0x000FFFFFFFFFFFFF) = (0 as u64)
+}
+
+; math.Abs — the sign bit cleared, which is what Go's own implementation is.
+function jsnum_abs(bits: u64) returns u64
+    bits & 0x7FFFFFFFFFFFFFFF
+
+; `a >= b` on two Numbers. It exists because the ONE caller outside the enum
+; chapter compares a magnitude with 32, and a comparison written at the call site
+; would be the second place in the tree that names `double`.
+function jsnum_at_least(a: u64, b: u64) returns bool
+    jsnum_double_of(a) >= jsnum_double_of(b)
+
+function jsnum_from_int(n: int) returns u64
+    jsnum_bits_of(n as double)
+
+; int32 wrap-around — Go's `int32(int64(x))`, i.e. the low 32 bits read as a
+; signed quantity. It is a separate function because ToInt32 and LeftShift both
+; end in it and the second one would otherwise be off by a modulus.
+function jsnum_wrap_int32(v: int) returns int
+{
+    let low v & 4294967295
+    if low >= 2147483648
+        return low - 4294967296
+    low
+}
+
+; ToInt32 (tc39 §7.1.6), and the reference's FAST PATH is deliberately not here.
+; It is `if smi := int32(x); float64(smi) == x { return smi }` — a conversion
+; whose out-of-range behaviour Go leaves to the platform and LLVM makes POISON,
+; so transcribing it would be the one shape in this file that is undefined rather
+; than merely slow. ★It costs nothing in ANSWERS and that is provable rather than
+; assumed: the fast path fires exactly when x is an exact int32, and for such an x
+; the slow path computes trunc(x) = x, fmod(x, 2^32) = x (|x| < 2^32), and a
+; low-32-bit read of x, which is x.
+function jsnum_to_int32(bits: u64) returns int
+{
+    if jsnum_is_non_finite(bits)
+        return 0
+    let x fmod(trunc(jsnum_double_of(bits)), 4294967296.0 as double)
+    jsnum_wrap_int32(x as int)
+}
+
+; ToUint32 — "the only difference is the interpretation of the bits", so it is
+; ToInt32's answer read as an unsigned 32-bit quantity.
+function jsnum_to_uint32(bits: u64) returns u64
+    (jsnum_to_int32(bits) & 4294967295) as u64
+
+function jsnum_to_shift_count(bits: u64) returns int
+    (jsnum_to_uint32(bits) as int) & 31
+
+function jsnum_signed_right_shift(x: u64, y: u64) returns u64
+    jsnum_bits_of((jsnum_to_int32(x) >> jsnum_to_shift_count(y)) as double)
+
+; The one shift whose left operand is UNSIGNED. It is computed on a u64 holding
+; the 32-bit pattern, so `>>` is the logical shift the operator wants; done on
+; `int` it would be arithmetic and every negative input would answer wrong.
+function jsnum_unsigned_right_shift(x: u64, y: u64) returns u64
+    jsnum_bits_of((jsnum_to_uint32(x) >> (jsnum_to_shift_count(y) as u64)) as double)
+
+function jsnum_left_shift(x: u64, y: u64) returns u64
+    jsnum_bits_of(jsnum_wrap_int32(jsnum_to_int32(x) << jsnum_to_shift_count(y)) as double)
+
+function jsnum_bitwise_not(x: u64) returns u64
+    jsnum_bits_of((~jsnum_to_int32(x)) as double)
+
+function jsnum_bitwise_or(x: u64, y: u64) returns u64
+    jsnum_bits_of((jsnum_to_int32(x) | jsnum_to_int32(y)) as double)
+
+function jsnum_bitwise_and(x: u64, y: u64) returns u64
+    jsnum_bits_of((jsnum_to_int32(x) & jsnum_to_int32(y)) as double)
+
+function jsnum_bitwise_xor(x: u64, y: u64) returns u64
+    jsnum_bits_of((jsnum_to_int32(x) xor jsnum_to_int32(y)) as double)
+
+function jsnum_add(x: u64, y: u64) returns u64
+    jsnum_bits_of(jsnum_double_of(x) + jsnum_double_of(y))
+
+function jsnum_subtract(x: u64, y: u64) returns u64
+    jsnum_bits_of(jsnum_double_of(x) - jsnum_double_of(y))
+
+function jsnum_multiply(x: u64, y: u64) returns u64
+    jsnum_bits_of(jsnum_double_of(x) * jsnum_double_of(y))
+
+function jsnum_divide(x: u64, y: u64) returns u64
+    jsnum_bits_of(jsnum_double_of(x) / jsnum_double_of(y))
+
+function jsnum_negate_value(x: u64) returns u64
+    jsnum_bits_of((0.0 as double) - jsnum_double_of(x))
+
+; Remainder (tc39 §6.1.6.1.6). The five special cases are the reference's switch
+; in its order; `math.Mod` is `fmod` and agrees with it on sign by definition.
+function jsnum_remainder(n: u64, d: u64) returns u64
+{
+    if jsnum_is_nan(n)
+        return BITS_NAN
+    if jsnum_is_nan(d)
+        return BITS_NAN
+    if jsnum_is_inf(n)
+        return BITS_NAN
+    if jsnum_is_inf(d)
+        return n
+    let dv jsnum_double_of(d)
+    if dv = (0.0 as double)
+        return BITS_NAN
+    let nv jsnum_double_of(n)
+    if nv = (0.0 as double)
+        return n
+    jsnum_bits_of(fmod(nv, dv))
+}
+
+; Exponentiate (tc39 §6.1.6.1.3). ★★★ THE ONE OPERATOR IN THIS FILE THAT DOES
+; NOT AGREE WITH THE REFERENCE TO THE BIT, and the disagreement is bounded,
+; measured and gated rather than described.
+;
+; TWO CAUSES, and the first is the one a reader will not expect. **Go's
+; `math.Pow` is not libm's `pow`** — it is a Go implementation over Frexp / Log /
+; Exp / Sqrt / Ldexp with its own special cases (`y == 0.5` becomes `Sqrt`, an
+; integer exponent becomes repeated squaring), so the two round differently.
+; Measured by tests/arithcheck.sh over 20 000 pairs, and the first draft of this
+; note got the MAGNITUDE wrong by inheriting it from upstream's comment instead
+; of reading the instrument: **3 867 lines differ — 2 815 of them a NaN PAYLOAD
+; and 1 052 a mantissa, the worst gap 113 ULP (`0.2 ** 254` and its neighbours),
+; and no other operator differs on any line.** ★What DOES agree on every line, in
+; both directions, is the CATEGORY: NaN-ness, an infinity and its sign, the sign
+; of a finite answer, and a zero. That is the half a port owes, and it is what
+; the instrument pins. The second cause is upstream's own: for an integer base
+; and exponent whose result exceeds 53 bits it routes through `big.Int.Exp`,
+; because `math.Pow` is several ULPs off there too — and its comment says the
+; spec calls this value "implementation-approximated", so even that answer is not
+; THE answer.
+;
+; ★★★ WHY THIS IS ACCEPTED RATHER THAN CLOSED, with the price named. Closing it
+; means porting `math.Pow`, `math.Exp` and `math.Log` — roughly 250 lines of
+; coefficient-table numerics whose only reader is this operator. What that would
+; buy, swept over both corpora with comments stripped: **1 021 enum bodies, of
+; which exactly ONE contains `**` at all** (`constEnums.ts`'s `PQ = E ** 2`,
+; where E is 1, and 1 ** 2 is exact in any implementation). So the input that
+; separates the two is not merely absent from the corpus — it is absent by a
+; margin of fifty-three bits.
+;
+; ★★ AND THE ACCEPTANCE IS A GATE, NOT A SILENCE. arithcheck.sh compares this
+; column by CATEGORY exactly and by mantissa against a bound of 512 ULP, and
+; prints the count and the worst gap; a category flip, a gap past the bound, or
+; any drift at all in the other twelve operators turns it red. ★The reader that
+; closes it is a fixture whose enum value is a non-exact power — write one and
+; the numerics have to be built. ★The reader that makes it observable is a fixture
+; someone writes for it, and then this arm has to be built — a big-integer
+; power, which is why it was not built speculatively.
+function jsnum_exponentiate(base_bits: u64, exponent_bits: u64) returns u64
+{
+    let b jsnum_double_of(base_bits)
+    let one 1.0 as double
+    let minus_one (0.0 as double) - one
+    if jsnum_is_inf(exponent_bits)
+    {
+        if b = one
+            return BITS_NAN
+        if b = minus_one
+            return BITS_NAN
+    }
+    if jsnum_is_nan(exponent_bits)
+    {
+        if b = one
+            return BITS_NAN
+    }
+    jsnum_bits_of(pow(b, jsnum_double_of(exponent_bits)))
 }
