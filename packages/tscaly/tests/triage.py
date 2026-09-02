@@ -163,12 +163,14 @@ def main(argv):
         else:
             print(f"triage.py: unknown argument {argv[i]!r}", file=sys.stderr)
             return 2
-    cases_dir = os.path.join(out, "cases")
-    if not os.path.isdir(cases_dir):
-        print(f"triage.py: no artifact tree at {cases_dir} — run tests/run.sh first.",
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import harness as H
+    store = H.Store.open(out)
+    if store is None:
+        print(f"triage.py: no run store at {H.store_path(out)} — run tests/run.sh first.",
               file=sys.stderr)
         return 2
-
+    cases_dir = H.store_path(out)
     counters = {}
     cpath = os.path.join(out, "counters.sh")
     if os.path.isfile(cpath):
@@ -201,40 +203,27 @@ def main(argv):
     crash = collections.Counter()
     crash_ex = collections.defaultdict(list)
 
-    for case in sorted(os.listdir(cases_dir)):
-        cdir = os.path.join(cases_dir, case)
-        if not os.path.isdir(cdir):
-            continue
-        for idx in sorted(os.listdir(cdir)):
-            udir = os.path.join(cdir, idx)
-            if not idx.isdigit() or not os.path.isdir(udir):
+    arts = {a: store.artifacts_of(a) for a in ARTS}
+    for ci, idx, case, key, uname, path, content in store.units(compared_only=False):
+        where = case if idx == 0 else f"{case}[{idx}]"
+        for art in ARTS:
+            a = arts[art].get((ci, idx))
+            if a is None or a["ours"] is None:
                 continue
-            where = case if idx == "0" else f"{case}[{idx}]"
-            for art in ARTS:
-                ours = read(os.path.join(udir, f"{art}.ours"))
-                if ours is None:
-                    continue
-                if ours.startswith(b"UNPORTED "):
-                    # `UNPORTED <pos> <tag> <detail>` — the TAG is the class and the
-                    # DETAIL is usually a kind number, which is the construct.
-                    parts = ours.split(b"\n", 1)[0].split(b" ")
-                    tag = parts[2].decode() if len(parts) > 2 else "<no tag>"
-                    detail = parts[3].decode() if len(parts) > 3 else ""
-                    sig = f"{tag} (detail {detail})" if detail not in ("", "0") else tag
-                    unported[art][sig] += 1
-                    un_ex[art][sig].append(where)
-                    continue
-                if not os.path.exists(os.path.join(udir, f"{art}.diff")):
-                    continue          # matched, accepted, or reported through failures.txt
-                ref_cut = read(os.path.join(udir, f"{art}.ref.cut"))
-                ref = read(os.path.join(udir, f"{art}.ref"))
-                sig = first_difference(ref_cut, ours, ref, art)
-                mismatch[art][sig] += 1
-                mm_ex[art][sig].append(where)
-
-    # The classes that never produce a `.diff` — a dumper that exited, a splitter
-    # that failed, a timeout — exist only in the runner's own failure list. They are
-    # separated by SHAPE, with the case key stripped off so the shape can group.
+            ours = a["ours"]
+            if ours.startswith(b"UNPORTED "):
+                parts = ours.split(b"\n", 1)[0].split(b" ")
+                tag = parts[2].decode() if len(parts) > 2 else "<no tag>"
+                detail = parts[3].decode() if len(parts) > 3 else ""
+                sig = f"{tag} (detail {detail})" if detail not in ("", "0") else tag
+                unported[art][sig] += 1
+                un_ex[art][sig].append(where)
+                continue
+            if a["diff"] is None:
+                continue          # matched, accepted, or reported through failures.txt
+            sig = first_difference(a["cut"], ours, a["ref"], art)
+            mismatch[art][sig] += 1
+            mm_ex[art][sig].append(where)
     fpath = os.path.join(out, "failures.txt")
     for ln in (open(fpath, errors="surrogateescape") if os.path.isfile(fpath) else []):
         ln = ln.rstrip("\n")

@@ -24,40 +24,33 @@ PKG=packages/tscaly
 BIN=${BIN:-$PKG/tests/out/tscaly_types}
 LIMIT=${LIMIT:-3}
 
-if [ ! -d "$PKG/tests/out/cases" ]; then
-  echo "no artifact tree at $PKG/tests/out/cases — run tests/run.sh first." >&2
+if [ ! -f "$PKG/tests/out/run.db" ]; then
+  echo "no run store at $PKG/tests/out/run.db — run tests/run.sh first." >&2
   exit 2
 fi
 
 W=$(mktemp -d -t tscaly-frontier); trap 'rm -rf "$W"' EXIT
-find "$PKG/tests/out/cases" -path '*/units/*' -type f \
-     \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' \
-        -o -name '*.mjs' -o -name '*.cjs' -o -name '*.mts' \) | sort > "$W/units.txt"
-
-# ★ NUL-delimited pairing, for §3.5eu finding nine's reason: one stage-2 unit's path
-# contains a SPACE, and an `xargs -n 2` pairing that shifts redirects the dumper's
-# stdout INTO a corpus file.
-i=0; mkdir -p "$W/o"
-while IFS= read -r u; do
-  printf '%s\0%s\0' "$u" "$(printf '%s/o/%06d' "$W" "$i")"; i=$((i+1))
-done < "$W/units.txt" > "$W/pairs"
-LIMIT=$LIMIT xargs -0 -P 8 -n 2 sh -c \
-  'perl -e "alarm $LIMIT; exec @ARGV" "$0" --stops "$1" > "$2" 2>/dev/null' \
-  "$BIN" < "$W/pairs"
-
-python3 - "$W/o" <<'PY'
-import sys, os, glob, collections
-d = sys.argv[1]
+# ★ ONE `--stops --batch` process per chunk over the store's units (2026-09-02),
+# where this used to be a process and a file per unit; the per-unit inactivity
+# limit is LIMIT, as the alarm was.
+BIN=$BIN LIMIT=$LIMIT W=$W python3 - <<'PY'
+import os, sys, collections
+sys.path.insert(0, "packages/tscaly/tests")
+import harness as H
+store = H.Store.open()
+units = [(p, c) for ci, idx, cname, key, uname, p, c in store.units()]
+got = H.run_batch(os.environ["BIN"], "--stops", units, os.path.join(os.environ["W"], "chunks"), 8, float(os.environ["LIMIT"]))
 sets = []
-for f in glob.glob(os.path.join(d, '*')):
+for p, _ in units:
+    rc, out, err = got.get(p, (1, b"", b""))
     s = set()
-    for line in open(f, errors='replace'):
-        if line.startswith('S '):
+    for line in out.decode("utf-8", "replace").split("\n"):
+        if line.startswith("S "):
             parts = line.split()
             if len(parts) >= 3:
                 s.add((parts[1], parts[2]))
             elif len(parts) >= 2:
-                s.add((parts[1], ''))
+                s.add((parts[1], ""))
     sets.append(s)
 n = len(sets)
 

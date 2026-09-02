@@ -57,10 +57,10 @@ BIN=${BIN:-$OUT/tscaly_types}
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 
-if [ ! -d "$CASES" ]; then
-  red "no artifact tree at $CASES"
+if [ ! -f "$OUT/run.db" ]; then
+  red "no run store at $OUT/run.db"
   echo "  packages/tscaly/tests/run.sh          # then run this"
-  echo "Both inputs are that run's artifacts: the split units and the reference dumps."
+  echo "Both inputs are that run's store: the split units and the reference dumps."
   exit 1
 fi
 
@@ -100,7 +100,7 @@ mkdir -p "$WORK"
 # interpreter. The verdicts, the counters and failures.txt are byte-identical
 # across the change; that check is the whole licence for it.
 
-eval "$(python3 "$(dirname "$0")/checkloop.py" walk "$CASES" "$BIN" "$WORK" "$FILTER" "$OUT/tscaly_types" \
+eval "$(python3 "$(dirname "$0")/checkloop.py" walk "$OUT" "$BIN" "$WORK" "$FILTER" "$OUT/tscaly_types" \
         | sed 's/^\([a-z]*\) \(.*\)$/\1=\2/')" || {
   red "the unit loop failed"
   exit 2

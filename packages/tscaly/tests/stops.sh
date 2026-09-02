@@ -96,8 +96,8 @@ BIN=${BIN:-$OUT/tscaly_types}
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 
-if [ ! -d "$CASES" ]; then
-  red "no artifact tree at $CASES"
+if [ ! -f "$OUT/run.db" ]; then
+  red "no run store at $OUT/run.db"
   echo "  packages/tscaly/tests/run.sh          # then run this"
   exit 1
 fi
@@ -115,7 +115,7 @@ WORK=$OUT/stops.$$
 rm -rf "$WORK"
 mkdir -p "$WORK"
 
-eval "$(python3 "$PKG/tests/checkloop.py" stops "$CASES" "$BIN" "$WORK" "$FILTER" "" \
+eval "$(python3 "$PKG/tests/checkloop.py" stops "$OUT" "$BIN" "$WORK" "$FILTER" "" \
         | sed 's/^\([a-z]*\) \(.*\)$/\1=\2/')" || {
   red "the unit loop failed"
   exit 2

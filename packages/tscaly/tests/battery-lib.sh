@@ -60,8 +60,8 @@ red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
 
-if [ ! -d "$PKG/tests/out/cases" ]; then
-  red "no artifact tree at $PKG/tests/out/cases — run tests/run.sh first."
+if [ ! -f "$PKG/tests/out/run.db" ]; then
+  red "no run store at $PKG/tests/out/run.db — run tests/run.sh first."
   exit 2
 fi
 
@@ -224,18 +224,64 @@ typepin_of() {
 # nine's two reasons: one stage-2 unit's path contains a SPACE, which shifts an
 # `xargs -n 2` pairing and redirects the dumper's stdout into a CORPUS FILE, and a
 # glob over 17 552 files is *Argument list too long*.
+# ★★★ THE FIVE CORPUS GATES READ ONE DUMPER PASS (2026-09-02). Each of them used to
+# spawn its own process per unit — five parses, five binds, five checks of every unit
+# per row, and five files per unit written and deleted again, which on a 27-row
+# battery is about 200 000 file events for the box's endpoint protection to scan
+# (§3.5ck). `tscaly_types --gates` prints the type dump and the four event logs off
+# ONE checker run, separated by `==== TSCALY-SECTION <name>` lines; `gates_pass`
+# runs it once per CHUNK (`tscaly_types --gates --batch`, harness.run_batch) and
+# splits the five sections into the same `<name>.all` files the gates always read,
+# in store order. ★Byte-identity of every section with
+# its standalone flag was measured over all 1 580 stage-1 units when this landed
+# (0 differing), and the gate arithmetic below is the old arithmetic unchanged —
+# only the `.all` files' PRODUCER moved. One pass is ~9 s where five were ~42 s.
+#
+# ★ `.all` is concatenated in SORTED unit order now, where the old per-gate loop
+# used `find`'s directory order; both are stable within a run, and a checksum is
+# only ever compared against the same run's baseline.
+gates_pass() {
+  rm -rf "$WORK/gout"
+  WORK=$WORK LIMIT=$LIMIT python3 - <<'PY'
+import os, sys
+sys.path.insert(0, "packages/tscaly/tests")
+import harness as H
+W = os.environ["WORK"]
+store = H.Store.open()
+units = [(p, c) for ci, idx, cname, key, uname, p, c in store.units()]
+got = H.run_batch(os.path.join(W, "tscaly_types"), "--gates", units, os.path.join(W, "gout"), 8, float(os.environ["LIMIT"]))
+names = ['type', 'rel', 'kind', 'fork', 'call']
+seps = [b'==== TSCALY-SECTION relations\n', b'==== TSCALY-SECTION kinds\n',
+        b'==== TSCALY-SECTION forks\n', b'==== TSCALY-SECTION calls\n']
+outs = {n: open(f'{W}/{n}.all', 'wb') for n in names}
+answering = reporting = 0
+for p, _ in units:
+    rc, rest, err = got.get(p, (1, b"", b""))
+    if rc != 0:
+        rest = b""                 # a killed or crashed dumper: every section empty,
+    parts = []                     # as its files were
+    for sp in seps:
+        if sp in rest:
+            a, rest = rest.split(sp, 1)
+        else:
+            a, rest = rest, b''
+        parts.append(a)
+    parts.append(rest)
+    if any(l.startswith(b'T ') for l in parts[0].split(b'\n')):
+        answering += 1
+    if any(l.startswith(b'UNPORTED ') for l in parts[0].split(b'\n')):
+        reporting += 1
+    for n, part in zip(names, parts):
+        outs[n].write(part)
+for f in outs.values():
+    f.close()
+open(f'{W}/gates.tcount', 'w').write(f'{answering} {reporting}\n')
+PY
+}
+
 typegate() {
-  local i=0 u
-  rm -rf "$WORK/tout" "$WORK/tpairs"; mkdir -p "$WORK/tout"
-  while IFS= read -r u; do
-    printf '%s\0%s\0' "$u" "$(printf '%s/tout/%06d' "$WORK" "$i")"
-    i=$((i+1))
-  done < "$WORK/units.txt" > "$WORK/tpairs"
-  LIMIT=$LIMIT xargs -0 -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/tpairs"
   local ans rep tl
-  ans=$(grep -l '^T ' "$WORK"/tout/* 2>/dev/null | wc -l | tr -d ' ')
-  rep=$(grep -l '^UNPORTED ' "$WORK"/tout/* 2>/dev/null | wc -l | tr -d ' ')
-  find "$WORK/tout" -type f -print0 | xargs -0 cat > "$WORK/type.all"
+  read -r ans rep < "$WORK/gates.tcount"
   tl=$(grep -c '^T ' "$WORK/type.all")
   echo "$ans $rep $tl $(cksum < "$WORK/type.all" | cut -d' ' -f1)"
 }
@@ -259,14 +305,6 @@ typegate() {
 # invisible at stage 1, where no unit path has a space, which is why the pattern
 # survived several slices. See §3.5eu finding nine.
 relgate() {
-  local i=0 u
-  rm -rf "$WORK/rout" "$WORK/rpairs"; mkdir -p "$WORK/rout"
-  while IFS= read -r u; do
-    printf '%s\0%s\0' "$u" "$(printf '%s/rout/%06d' "$WORK" "$i")"
-    i=$((i+1))
-  done < "$WORK/units.txt" > "$WORK/rpairs"
-  LIMIT=$LIMIT xargs -0 -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --relations "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/rpairs"
-  find "$WORK/rout" -type f -print0 | xargs -0 cat > "$WORK/rel.all"
   local n rel no cna
   n=$(grep -c '^A ' "$WORK/rel.all")
   rel=$(grep '^A ' "$WORK/rel.all" | awk '$5==1' | wc -l | tr -d ' ')
@@ -290,14 +328,6 @@ relgate() {
 # 17 552 files — a gate that cannot RUN and a gate that cannot FAIL print the same
 # word.
 kindgate() {
-  local i=0 u
-  rm -rf "$WORK/kout" "$WORK/kpairs"; mkdir -p "$WORK/kout"
-  while IFS= read -r u; do
-    printf '%s\0%s\0' "$u" "$(printf '%s/kout/%06d' "$WORK" "$i")"
-    i=$((i+1))
-  done < "$WORK/units.txt" > "$WORK/kpairs"
-  LIMIT=$LIMIT xargs -0 -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --kinds "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/kpairs"
-  find "$WORK/kout" -type f -print0 | xargs -0 cat > "$WORK/kind.all"
   local n t f cna
   n=$(grep -c '^K ' "$WORK/kind.all")
   t=$(grep '^K ' "$WORK/kind.all" | awk '$6==1' | wc -l | tr -d ' ')
@@ -325,14 +355,6 @@ kindgate() {
 # `xargs -n 2` pairing and redirects the dumper's stdout into a CORPUS FILE, and
 # `cat "$WORK"/fout/*` is *Argument list too long* at 17 552 files.
 forkgate() {
-  local i=0 u
-  rm -rf "$WORK/fout" "$WORK/fpairs"; mkdir -p "$WORK/fout"
-  while IFS= read -r u; do
-    printf '%s\0%s\0' "$u" "$(printf '%s/fout/%06d' "$WORK" "$i")"
-    i=$((i+1))
-  done < "$WORK/units.txt" > "$WORK/fpairs"
-  LIMIT=$LIMIT xargs -0 -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --forks "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/fpairs"
-  find "$WORK/fout" -type f -print0 | xargs -0 cat > "$WORK/fork.all"
   local n t f cna routes branches
   n=$(grep -c '^F ' "$WORK/fork.all")
   t=$(grep '^F ' "$WORK/fork.all" | awk '$6==1' | wc -l | tr -d ' ')
@@ -354,14 +376,6 @@ forkgate() {
 # CHECKSUM. ★NUL-delimited and concatenated through `find | xargs cat`, for §3.5eu
 # finding nine's two reasons.
 callgate() {
-  local i=0 u
-  rm -rf "$WORK/lout" "$WORK/lpairs"; mkdir -p "$WORK/lout"
-  while IFS= read -r u; do
-    printf '%s\0%s\0' "$u" "$(printf '%s/lout/%06d' "$WORK" "$i")"
-    i=$((i+1))
-  done < "$WORK/units.txt" > "$WORK/lpairs"
-  LIMIT=$LIMIT xargs -0 -P 8 -n 2 sh -c 'perl -e "alarm $LIMIT; exec @ARGV" "$0" --calls "$1" > "$2" 2>/dev/null' "$WORK/tscaly_types" < "$WORK/lpairs"
-  find "$WORK/lout" -type f -print0 | xargs -0 cat > "$WORK/call.all"
   local n res cna unt err
   n=$(grep -c '^L ' "$WORK/call.all")
   cna=$(grep '^L ' "$WORK/call.all" | awk '$4==0' | wc -l | tr -d ' ')
@@ -412,9 +426,8 @@ baseline() {
   mempin_of > "$WORK/base.mem"
   callpin_of > "$WORK/base.call"
   typepin_of > "$WORK/base.type"
-  find "$PKG/tests/out/cases" -path '*/units/*' -type f \
-       \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' -o -name '*.mjs' -o -name '*.cjs' -o -name '*.mts' \) \
-       | sort > "$WORK/units.txt"
+  python3 "$PKG/tests/harness.py" units > "$WORK/units.txt"
+  gates_pass
   STOP_BASE=$(stopgate)
   REL_BASE=$(relgate)
   KIND_BASE=$(kindgate)
@@ -496,6 +509,7 @@ control() {   # $1 = label, $2 = files, $3 = patch
   mempin_of > "$WORK/ctl.mem"
   callpin_of > "$WORK/ctl.call"
   typepin_of > "$WORK/ctl.type"
+  gates_pass
   stop=$(stopgate)
   local rel_g kind_g fork_g call_g type_g
   rel_g=$(relgate)
@@ -662,8 +676,8 @@ battery_init() {
   WORK=$(mktemp -d -t tscaly-battery)
   PATCHDIR=$WORK/patches
   mkdir -p "$PATCHDIR"
-  if [ ! -d "$PKG/tests/out/cases" ]; then
-    red "no artifact tree at $PKG/tests/out/cases — run tests/run.sh first."
+  if [ ! -f "$PKG/tests/out/run.db" ]; then
+    red "no run store at $PKG/tests/out/run.db — run tests/run.sh first."
     exit 2
   fi
 }

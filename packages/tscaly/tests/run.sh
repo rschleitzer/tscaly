@@ -219,7 +219,7 @@ oracle_stamp() {
   shasum -a 256 "$PKG/tests/oracle/tokens.go"  "$PKG/tests/oracle/ast.go" \
                 "$PKG/tests/oracle/jsdoc.go"   "$PKG/tests/oracle/split.go" \
                 "$PKG/tests/oracle/symbols.go" "$PKG/tests/oracle/flow.go" \
-                "$PKG/tests/oracle/types.go" \
+                "$PKG/tests/oracle/types.go"   "$PKG/tests/oracle/batch.go" \
     | awk '{print $1}'
   git -C "$SUB" rev-parse HEAD 2>/dev/null
   go version 2>/dev/null
@@ -251,7 +251,7 @@ HAVE=
 [ -f "$STAMP" ] && HAVE=$(cat "$STAMP")
 
 oracles_present() {
-  for o in oracle_tokens oracle_ast oracle_jsdoc oracle_split oracle_symbols oracle_flow oracle_types; do
+  for o in oracle_tokens oracle_ast oracle_jsdoc oracle_split oracle_symbols oracle_flow oracle_types oracle_batch; do
     [ -x "$OUT/$o" ] || return 1
   done
 }
@@ -262,7 +262,7 @@ else
   rm -f "$STAMP"
   mkdir -p "$SUB/oracle/tokens" "$SUB/oracle/ast" "$SUB/oracle/jsdoc" \
            "$SUB/oracle/split" "$SUB/oracle/symbols" "$SUB/oracle/flow" \
-           "$SUB/oracle/types"
+           "$SUB/oracle/types" "$SUB/oracle/batch"
   cp "$PKG/tests/oracle/tokens.go"  "$SUB/oracle/tokens/main.go"
   cp "$PKG/tests/oracle/ast.go"     "$SUB/oracle/ast/main.go"
   cp "$PKG/tests/oracle/jsdoc.go"   "$SUB/oracle/jsdoc/main.go"
@@ -270,13 +270,15 @@ else
   cp "$PKG/tests/oracle/symbols.go" "$SUB/oracle/symbols/main.go"
   cp "$PKG/tests/oracle/flow.go"    "$SUB/oracle/flow/main.go"
   cp "$PKG/tests/oracle/types.go"   "$SUB/oracle/types/main.go"
+  cp "$PKG/tests/oracle/batch.go"   "$SUB/oracle/batch/main.go"
   ( cd "$SUB" && go build -o "$REPO/$OUT/oracle_tokens"  ./oracle/tokens \
               && go build -o "$REPO/$OUT/oracle_ast"     ./oracle/ast \
               && go build -o "$REPO/$OUT/oracle_jsdoc"   ./oracle/jsdoc \
               && go build -o "$REPO/$OUT/oracle_split"   ./oracle/split \
               && go build -o "$REPO/$OUT/oracle_symbols" ./oracle/symbols \
               && go build -o "$REPO/$OUT/oracle_flow"    ./oracle/flow \
-              && go build -o "$REPO/$OUT/oracle_types"   ./oracle/types ) \
+              && go build -o "$REPO/$OUT/oracle_types"   ./oracle/types \
+              && go build -o "$REPO/$OUT/oracle_batch"   ./oracle/batch ) \
     > "$OUT/oracle-build.log" 2>&1
   orc=$?
   rm -rf "$SUB/oracle"
@@ -431,27 +433,10 @@ while IFS= read -r f; do cases+=("$f"); done < <(
 # rather than reasoned — see compare.py, where going wider is slower rather than
 # neutral.
 
-# ★★★ THE REFERENCE DUMPS ARE CACHED, keyed on `$WANT` — the very stamp two
-# hundred lines above decides whether the six oracle binaries need rebuilding.
-# That stamp is the hashes of the six oracle sources, the submodule HEAD sha and
-# the Go version, and this script REFUSES TO RUN AT ALL against a dirty submodule,
-# so it is the complete statement of *which reference is this*; the unit's own
-# BYTES are the rest of the key. Half a stage-2 run's dump work is the oracle
-# side (measured: 5.28 ms/unit of 11.22 ten-wide, i.e. 94 s) and it computes the
-# same answer every time — checked, not assumed: all five oracles are
-# byte-identical across two runs on one unit.
-#
-# ★ It lives at $REPO/.tscaly-refcache, OUTSIDE `packages/`, because the root
-# CLAUDE.md records a 443 317-file artifact tree under `packages/` reddening the
-# LSP suite through scalyls' `*.scaly` walk — derived data has no business in that
-# walk's path. `TSCALY_REFCACHE` moves it; `TSCALY_NO_REFCACHE=1` turns it off,
-# and the run prints its hit and miss counts, because a cache whose hit rate is
-# invisible is a cache nobody can debug.
-#
-# ★ `${cases[@]+"${cases[@]}"}` and not `"${cases[@]}"`: macOS ships bash 3.2,
-# where an EMPTY array under `set -u` is an "unbound variable" error rather than
-# an empty expansion. The preconditions above make an empty list unreachable, so
-# this is a guard against a cryptic failure and not a live path.
+# ★ There is no reference-dump cache any more (2026-09-02): oracle_batch answers the
+# whole stage-1 reference in seconds, in-process, so there is nothing to cache and
+# no 38 000-file tree under $REPO/.tscaly-refcache to scan. Its history is in
+# CLAUDE-history.md under *The runner's history*.
 
 TSCALY_OUT=$OUT \
 TSCALY_ACCEPTED=$ACCEPTED \
@@ -461,7 +446,6 @@ TSCALY_STAGE="$STAGE" \
 TSCALY_PKG_PREFIX="$PKG/tests/" \
 TSCALY_FILTER="$FILTER" \
 TSCALY_ORACLE_STAMP="$WANT" \
-TSCALY_REFCACHE="${TSCALY_REFCACHE:-$REPO/.tscaly-refcache}" \
 python3 "$PKG/tests/compare.py" <<EOF_CASES
 $(printf '%s\n' ${cases[@]+"${cases[@]}"})
 EOF_CASES
@@ -669,7 +653,7 @@ if [ $total_failed -ne 0 ]; then
     printf '    %s\n' "${failures[@]}"
   fi
   echo
-  echo "  full diffs under $OUT/cases/<name>/<artifact>.diff"
+  echo "  every artifact is in $OUT/run.db: python3 $PKG/tests/harness.py show <key> <artifact> diff|ours|ref|cut"
   exit 1
 fi
 
