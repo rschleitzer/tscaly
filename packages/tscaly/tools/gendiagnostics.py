@@ -97,6 +97,14 @@ SOURCES = [
     # by NAME and most of relater.go's other messages are already in the table
     # through checker.go, so the cost is small and stated with the diff.
     os.path.join(SUB, "internal/checker/relater.go"),
+    # Slice 119. jsx.go joins under the same per-FILE rule: the JSX element chapter
+    # reports, and four of its messages appear in NO other source of this list —
+    # TS17004 (the --jsx flag), TS7026 (no interface JSX.IntrinsicElements),
+    # TS2604/TS2607 and the three `Its_..._is_not_a_valid_JSX_element` heads. The
+    # scrape is by NAME and most of jsx.go's other messages are already in the
+    # table through checker.go and grammarchecks.go, so the cost is small and
+    # stated with the diff.
+    os.path.join(SUB, "internal/checker/jsx.go"),
 ]
 DST = os.path.join(REPO, "packages/tscaly/0.1.0/tscaly/DiagnosticCodes.scaly")
 
