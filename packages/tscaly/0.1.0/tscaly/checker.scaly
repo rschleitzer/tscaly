@@ -781,6 +781,12 @@ define MapTypeKindConditionalDistribution: int 2
 ; constituent substituted at `index`, so the three captures are the two lists and
 ; the position.
 define MapTypeKindTemplateLiteralSpan: int 3
+; getBaseTypeOfLiteralTypeForComparison's own union arm — it maps itself over the
+; constituents and captures nothing, so it needs no MapTypeArgs at all.
+define MapTypeKindBaseTypeForComparison: int 4
+; getBaseTypeOfLiteralTypeUnion's mapper, which is get_base_type_of_literal_type
+; itself. Captures nothing either.
+define MapTypeKindBaseTypeOfLiteral: int 5
 
 define MapTypeArgs
 (
@@ -10171,11 +10177,51 @@ define Checker
         }
         let declaration vd as ref[AstNode]
         let dk AstNode.kind_of(declaration)
+        ; `IsSourceFile(declaration) && IsJsonSourceFile(...)` — a `.json` unit's
+        ; module symbol takes the type of its ONE expression statement, widened
+        ; twice: getWidenedLiteralType turns the literals into their base types and
+        ; getWidenedType then widens the object literal's inferred members.
+        ;
+        ; ★★ IsJsonSourceFile is `file.ScriptKind == ScriptKindJSON`, and a Checker
+        ; holds ONE parser — the unit's. Two source files can reach this arm, the
+        ; unit and lib.es5.d.ts, so the kind is asked only of the declaration that
+        ; IS the unit; that is exact rather than a caveat, and it stays exact if a
+        ; later slice gives the Checker more files.
         if dk = KindSourceFile
         {
-            ; isJsonSourceFile — see the header.
-            this.record_unported("get-type-of-json-source-file", 0)
-            return null
+            var json false
+            if declaration = file
+            {
+                if p.script_kind = ScriptKindJSON
+                    set json: true
+            }
+            if json
+            {
+                let statements AstNode.statements_of(declaration)
+                var count 0
+                if statements <> null
+                    set count: (statements as ref[Array[ref[AstNode]?]]).get_length() as int
+                if count = 0
+                {
+                    if empty_object_type = null
+                    {
+                        this.record_unported("empty-object-type-unminted", 0)
+                        return null
+                    }
+                    return empty_object_type
+                }
+                let first (statements as ref[Array[ref[AstNode]?]])[0]
+                let expr AstNode.expression_of(first)
+                if expr = null
+                    return null
+                let et this.check_expression(expr as ref[AstNode])
+                if et = null
+                    return null
+                let widened_literal this.get_widened_literal_type(et as ref[Type])
+                if widened_literal = null
+                    return null
+                return this.get_widened_type(widened_literal as ref[Type])
+            }
         }
         if this.push_type_resolution(symbol, null, null, TypeSystemPropertyNameType) = false
             return this.report_circularity_error(symbol)
@@ -10792,35 +10838,7 @@ define Checker
     function get_flow_type_in_constructor(this, symbol: ref[Symbol], constructor: ref[AstNode]) returns ref[Type]?
     {
         let mark this.unported_mark()
-        let name_data Symbol.name_data_of(symbol)
-        let name_len Symbol.name_len_of(symbol)
-        var private_name false
-        if name_len > 1
-        {
-            if *name_data = 0xFE as char
-            {
-                if *(name_data + (1 as size_t)) = "#" as char
-                    set private_name: true
-            }
-        }
-        var access_data name_data
-        var access_len name_len
-        if private_name
-        {
-            var at 0
-            while at < name_len
-            {
-                if *(name_data + (at as size_t)) = "@" as char
-                {
-                    set access_data: name_data + ((at + 1) as size_t)
-                    set access_len: name_len - (at + 1)
-                    set at: name_len
-                }
-                else
-                    set at: at + 1
-            }
-        }
-        let access_name this.new_synthetic_access_name(private_name, access_data, access_len)
+        let access_name this.new_flow_access_name(symbol)
         let this_node this.new_synthetic_node(KindThisKeyword, NodeData.Token(TokenData()))
         let reference this.new_synthetic_node(KindPropertyAccessExpression, NodeData.PropertyAccessExpression(PropertyAccessData(this_node, null, access_name)))
         set this_node.parent: reference
@@ -10853,6 +10871,124 @@ define Checker
         if this.every_type_is_nullable(ft)
             return null
         this.convert_auto_to_any(flow_type)
+    }
+
+    ; The symbol-name split both flow-in-* functions open with. The reference
+    ; writes it out twice — `strings.HasPrefix(symbol.Name,
+    ; InternalSymbolNamePrefix+"#")` and the `@` cut behind it — and this port
+    ; writes it once, because the second copy would have been the first one's
+    ; transcription rather than a reading.
+    function new_flow_access_name(this, symbol: ref[Symbol]) returns ref[AstNode]
+    {
+        let name_data Symbol.name_data_of(symbol)
+        let name_len Symbol.name_len_of(symbol)
+        var private_name false
+        if name_len > 1
+        {
+            if *name_data = 0xFE as char
+            {
+                if *(name_data + (1 as size_t)) = "#" as char
+                    set private_name: true
+            }
+        }
+        var access_data name_data
+        var access_len name_len
+        if private_name
+        {
+            var at 0
+            while at < name_len
+            {
+                if *(name_data + (at as size_t)) = "@" as char
+                {
+                    set access_data: name_data + ((at + 1) as size_t)
+                    set access_len: name_len - (at + 1)
+                    set at: name_len
+                }
+                else
+                    set at: at + 1
+            }
+        }
+        this.new_synthetic_access_name(private_name, access_data, access_len)
+    }
+
+    ; getFlowTypeInStaticBlocks. The constructor's twin, and the whole difference
+    ; is the LOOP: a static block whose assignments are all null or undefined is
+    ; `continue`d and the next block asked, where the constructor returns nil.
+    ;
+    ; ★ core.Filter(parent.Members(), IsClassStaticBlockDeclaration) is not
+    ; materialised — the reference needs the filtered list only to walk it and to
+    ; ask whether it is empty, and both questions are asked of the member list
+    ; directly (the emptiness by `class_has_static_block`).
+    function get_flow_type_in_static_blocks(this, symbol: ref[Symbol], cls: ref[AstNode]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let members AstNode.member_list_of(cls)
+        if members = null
+            return null
+        let ms members as ref[Array[ref[AstNode]?]]
+        let n ms.get_length() as int
+        var i 0
+        while i < n
+        {
+            let m ms[i]
+            set i: i + 1
+            if m = null
+                continue
+            let member m as ref[AstNode]
+            if AstNode.kind_of(member) <> KindClassStaticBlockDeclaration
+                continue
+            let access_name this.new_flow_access_name(symbol)
+            let this_node this.new_synthetic_node(KindThisKeyword, NodeData.Token(TokenData()))
+            let reference this.new_synthetic_node(KindPropertyAccessExpression, NodeData.PropertyAccessExpression(PropertyAccessData(this_node, null, access_name)))
+            set this_node.parent: reference
+            set reference.parent: member
+            set reference.flow_node: AstNode.return_flow_node_of(member)
+            let flow_type this.get_flow_type_of_property(reference, symbol)
+            if this.unported_mark() <> mark
+                return null
+            if flow_type = null
+                return null
+            let ft flow_type as ref[Type]
+            if Checker.no_implicit_any()
+            {
+                var auto false
+                if ft = auto_type
+                    set auto: true
+                let aat this.get_auto_array_type()
+                if aat <> null
+                {
+                    if ft = (aat as ref[Type])
+                        set auto: true
+                }
+                if auto
+                    this.error_on_node(Symbol.value_declaration_of(symbol), DiagMember_0_implicitly_has_an_1_type)
+            }
+            if this.every_type_is_nullable(ft) = false
+                return this.convert_auto_to_any(flow_type)
+        }
+        null
+    }
+
+    ; `len(core.Filter(parent.Members(), IsClassStaticBlockDeclaration)) != 0`,
+    ; which is the only thing the caller reads off that list before walking it.
+    function class_has_static_block(cls: ref[AstNode]) returns bool
+    {
+        let members AstNode.member_list_of(cls)
+        if members = null
+            return false
+        let ms members as ref[Array[ref[AstNode]?]]
+        let n ms.get_length() as int
+        var i 0
+        while i < n
+        {
+            let m ms[i]
+            set i: i + 1
+            if m = null
+                continue
+            if AstNode.kind_of(m as ref[AstNode]) = KindClassStaticBlockDeclaration
+                return true
+        }
+        false
     }
 
     ; The synthesized access NAME getFlowTypeInConstructor needs: an Identifier,
@@ -11226,13 +11362,58 @@ define Checker
         {
             if dk = KindPropertyDeclaration
             {
-                ; The control-flow analysis of `this.xxx` assignments in the
-                ; constructor or in a static block. Two of its arms are flow types
-                ; and the third is getTypeOfPropertyInBaseClass; the arm can also
-                ; answer NOTHING, which is why it is a stop rather than a
-                ; fallthrough — the difference is observable in the report.
-                this.record_unported("get-flow-type-in-constructor", dk)
-                return null
+                ; "We have a property declaration with no type annotation or
+                ; initializer, in noImplicitAny mode or a .js file. Use control flow
+                ; analysis of this.xxx assignments in the constructor or static
+                ; block to determine the type of the property."
+                ;
+                ; ★★★ THE NOTE THAT STOOD HERE NAMED THREE ARMS AND TWO OF THE
+                ; THREE HAD LANDED — get_flow_type_in_constructor and
+                ; get_type_of_property_in_base_class are both in the file, the
+                ; first of them since the flow chapter. Only the STATIC twin was
+                ; genuinely absent, and it is twenty lines. §3.5eo; the frontier
+                ; ranked the row at +139 over 249 units.
+                ;
+                ; ★ The `t == nil` fall-out is the reference's own and is why this
+                ; is not a fallthrough: a property with no constructor and no
+                ; `declare` answers NOTHING here, and the caller's next arm is a
+                ; different question.
+                let psym AstNode.symbol_of(declaration)
+                if psym = null
+                    return null
+                let sym psym as ref[Symbol]
+                let cls_node AstNode.parent_node_of(declaration)
+                if cls_node = null
+                    return null
+                let cls cls_node as ref[AstNode]
+                let mark2 this.unported_mark()
+                var t: ref[Type]? null
+                if b.has_syntactic_modifier(declaration, ModifierFlagsStatic) = false
+                {
+                    let constructor Checker.find_constructor_declaration(cls)
+                    if constructor <> null
+                        set t: this.get_flow_type_in_constructor(sym, constructor as ref[AstNode])
+                    else
+                    {
+                        if (b.modifier_flags(declaration) & ModifierFlagsAmbient) <> 0
+                            set t: this.get_type_of_property_in_base_class(sym)
+                    }
+                }
+                else
+                {
+                    if Checker.class_has_static_block(cls)
+                        set t: this.get_flow_type_in_static_blocks(sym, cls)
+                    else
+                    {
+                        if (b.modifier_flags(declaration) & ModifierFlagsAmbient) <> 0
+                            set t: this.get_type_of_property_in_base_class(sym)
+                    }
+                }
+                if this.unported_mark() <> mark2
+                    return null
+                if t = null
+                    return null
+                return this.add_optionality_ex(t as ref[Type], true, is_optional)
             }
         }
         if dk = KindJsxAttribute
@@ -31362,11 +31543,14 @@ define Checker
                 return null
             if class_type <> null
             {
-                ; getTypeWithThisArgument(t, classType.thisType, false). The
-                ; interface type's own `thisType` slot is what this needs, and it is
-                ; not reachable from a Type here yet.
-                this.record_unported("type-of-node-this-argument", k)
-                return null
+                ; getTypeWithThisArgument(typeFromTypeNode, classType.thisType,
+                ; false). ★★★The note that stood here was a CLAIM and not a
+                ; chapter — *the interface type's own `thisType` slot is not
+                ; reachable from a Type here yet* — and both halves of it had been
+                ; in the file for slices: `this_type_of` reads the Interface arm's
+                ; own slot and `get_type_with_this_argument` is the reference's
+                ; function whole. §3.5eo, and this is the row it named at +353.
+                return this.get_type_with_this_argument(from_type_node as ref[Type], Checker.this_type_of(class_type as ref[Type]), false)
             }
             return from_type_node
         }
@@ -31380,12 +31564,28 @@ define Checker
             {
                 ; "A SyntaxKind.ExpressionWithTypeArguments is considered a type
                 ; node, except when it occurs in the extends clause of a class."
-                ; The base type is ported; the this-argument substitution is not,
-                ; and the reference applies it unconditionally here — so the arm
-                ; reports rather than answering the bare base type, which would be
-                ; a well-formed wrong answer for any generic base.
-                this.record_unported("type-of-node-class-extends", k)
-                return null
+                ; core.FirstOrNil(getBaseTypes(classType)) and then the
+                ; this-argument substitution; errorType where there is no base.
+                ;
+                ; ★★The MARK is the counter and not the flag, for the reason
+                ; get_base_types' own header gives: the arms above this one report,
+                ; so `is_unported()` is usually already true by the time the walk
+                ; reaches a class's extends clause and a pair built out of it can
+                ; never fire.
+                let ct class_type as ref[Type]
+                let mark this.unported_mark()
+                let bases this.get_base_types(ct)
+                if this.unported_mark() <> mark
+                    return null
+                if bases = null
+                    return error_type
+                let bl bases as ref[Array[ref[Type]?]]
+                if bl.get_length() = 0
+                    return error_type
+                let first bl[0]
+                if first = null
+                    return error_type
+                return this.get_type_with_this_argument(first as ref[Type], Checker.this_type_of(ct), false)
             }
         }
 
@@ -33599,14 +33799,68 @@ define Checker
             {
                 if (flags & FlowFlagsCall) <> 0
                 {
-                    ; getEffectsSignature — the assertion half of the graph, and
-                    ; the first of this slice's seven doors. Two of its three
-                    ; branches END the walk (an `asserts x` whose argument is
-                    ; provably false, and a callee returning never), so guessing
-                    ; *no effects* here would answer REACHABLE where the reference
-                    ; answers unreachable, which is the direction that invents.
-                    this.record_unported("get-effects-signature", Checker.kind_or_unknown(flow.node))
-                    return true
+                    ; getEffectsSignature — the assertion half of the graph.
+                    ;
+                    ; ★★★ THE NOTE THAT STOOD HERE CALLED IT *THE FIRST OF THIS
+                    ; SLICE'S SEVEN DOORS*, AND SLICE 123 OPENED IT. Every function
+                    ; the arm needs — get_effects_signature,
+                    ; get_type_predicate_of_signature, is_false_expression and
+                    ; get_return_type_of_signature — has been in the file since the
+                    ; narrowing engine landed, and nothing re-read the sentence.
+                    ; §3.5eo; the frontier ranked the row at +119 over 424 units.
+                    ;
+                    ; ★ The two ENDING branches are what the old note was right
+                    ; about, and they are the whole content: an `asserts x` whose
+                    ; argument is provably false, and a callee whose return type is
+                    ; never, both answer UNREACHABLE. Everything else falls through
+                    ; to the antecedent.
+                    let mark this.unported_mark()
+                    let signature this.get_effects_signature(flow.node as ref[AstNode])
+                    if this.unported_mark() <> mark
+                        return true
+                    if signature <> null
+                    {
+                        let sig signature as ref[Signature]
+                        let node flow.node as ref[AstNode]
+                        let predicate this.get_type_predicate_of_signature(sig)
+                        if this.unported_mark() <> mark
+                            return true
+                        if predicate <> null
+                        {
+                            let p predicate as ref[TypePredicate]
+                            ; `predicate.t == nil` is the un-annotated `asserts x`,
+                            ; the only shape whose falsity can be read off the
+                            ; ARGUMENT rather than off a type.
+                            if p.kind = TypePredicateKindAssertsIdentifier
+                            {
+                                if p.t = null
+                                {
+                                    if p.parameter_index >= 0
+                                    {
+                                        let args AstNode.call_arguments_of(node)
+                                        if p.parameter_index < AstNode.list_count(args)
+                                        {
+                                            let arg AstNode.child_in_list(args, p.parameter_index)
+                                            if arg <> null
+                                            {
+                                                if this.is_false_expression(arg as ref[AstNode])
+                                                    return false
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let rt this.get_return_type_of_signature(sig)
+                        if this.unported_mark() <> mark
+                            return true
+                        if rt <> null
+                        {
+                            if ((rt as ref[Type]).flags & TypeFlagsNever) <> 0
+                                return false
+                        }
+                    }
+                    set advance: true
                 }
             }
             if advance = false
@@ -42041,10 +42295,13 @@ define Checker
             this.record_unported("check-delete-expression", k)
             return null
         }
+        ; checkVoidExpression, whole: `checkNodeDeferred(node)` and
+        ; `undefinedWideningType`. The operand is checked LATER, off the deferred
+        ; queue, which is why the arm itself asks nothing of it.
         if k = KindVoidExpression
         {
-            this.record_unported("check-void-expression", k)
-            return null
+            this.check_node_deferred(node)
+            return undefined_widening_type
         }
         if k = KindAwaitExpression
             return this.check_await_expression(node)
@@ -42055,10 +42312,7 @@ define Checker
         if k = KindBinaryExpression
             return this.check_binary_expression(node, check_mode)
         if k = KindConditionalExpression
-        {
-            this.record_unported("check-conditional-expression", k)
-            return null
-        }
+            return this.check_conditional_expression(node, check_mode)
         if k = KindSpreadElement
             return this.check_spread_expression(node, check_mode)
         ; `case ast.KindOmittedExpression: return c.undefinedWideningType` — the
@@ -42554,14 +42808,23 @@ define Checker
                 set ask_known_truthy: true
             if ask_known_truthy
             {
-                ; checkTestingKnownTruthyCallableOrAwaitableOrEnumMemberType.
-                ; ★ ITS FIRST STEP IS getTypeFacts, WHICH SLICE 90 LANDED, so the
-                ; reason this is still a row is now the SECOND half of the sentence
-                ; alone: every one of its reports needs the CONTROL-FLOW graph
-                ; (`flow-graph 264`, still the third row of the work list). The line
-                ; moves in the commit that fixed the limit it named — a blocker that
-                ; keeps a retired reason reads as a live one.
-                this.record_unported("check-testing-known-truthy-callable-or-awaitable-or-enum-member-type", op_kind)
+                ; checkTestingKnownTruthyCallableOrAwaitableOrEnumMemberType(left,
+                ; leftType, body) — the `body` here is the STATEMENT the chain hangs
+                ; off, which is what the climb above was for.
+                ;
+                ; ★★★ THE ROW'S NOTE NAMED ITS OWN EXPIRY — *"the line moves in the
+                ; commit that fixed the limit it named"* — and the limit it named,
+                ; the control-flow graph, is not what any of the three reports asks.
+                ; §3.5eo.
+                ; ★ THE BODY IS THE IF STATEMENT'S THEN-BRANCH AND NIL OTHERWISE —
+                ; not the climbed `parent` itself. With `&&` under anything but an
+                ; `if`, the reference has no body to search and the note is decided
+                ; by the binary-chain walk alone.
+                var body: ref[AstNode]? null
+                if Checker.kind_or_unknown(parent) = KindIfStatement
+                    set body: AstNode.then_statement_of(parent as ref[AstNode])
+                if left_type <> null
+                    this.check_testing_known_truthy(left, left_type as ref[Type], body)
             }
             if Binder.is_logical_binary_operator(op_kind)
             {
@@ -42871,28 +43134,50 @@ define Checker
             return result_type
         }
 
-        ; The four relational operators. checkForDisallowedESSymbolOperand runs
-        ; FIRST and is ported whole; the two checkNonNullType calls behind it are
-        ; slice 90, and everything behind THOSE is the relation
-        ; (getBaseTypeOfLiteralTypeForComparison, then reportOperatorErrorUnless)
-        ; with booleanType for an answer.
+        ; The four relational operators, WHOLE since this slice.
+        ; checkForDisallowedESSymbolOperand runs FIRST and is ported whole; the two
+        ; checkNonNullType calls behind it are slice 90; and the relation behind
+        ; THOSE — getBaseTypeOfLiteralTypeForComparison, then
+        ; reportOperatorErrorUnless — is what this slice writes.
+        ;
+        ; ★★★ THE PREDICATE IS A FOUR-LINE DISJUNCTION AND IT IS INLINED RATHER
+        ; THAN PASSED, for §3.5e's reason: Scaly has no closure value here and
+        ; each of the reference's two call sites passes a FIXED lambda. The
+        ; report's own second use of the predicate — getBaseTypesIfUnrelated, which
+        ; re-asks it on the widened operands — decides only the message's
+        ; ARGUMENTS, and the dump carries a code and a span (slice 68), so
+        ; report_operator_error takes neither the types nor the predicate.
         if Checker.is_relational_operator(op_kind)
         {
             if this.check_for_disallowed_es_symbol_operand(left, right, left_type, right_type, op_kind)
             {
-                if left_type <> null
+                if left_type = null
+                    return boolean_type
+                if right_type = null
+                    return boolean_type
+                let mark this.unported_mark()
+                let lt0 this.check_non_null_type(left_type as ref[Type], left)
+                if lt0 = null
+                    return null
+                let rt0 this.check_non_null_type(right_type as ref[Type], right)
+                if rt0 = null
+                    return null
+                let lt this.get_base_type_of_literal_type_for_comparison(lt0 as ref[Type])
+                if lt = null
+                    return null
+                let rt this.get_base_type_of_literal_type_for_comparison(rt0 as ref[Type])
+                if rt = null
+                    return null
+                if this.unported_mark() <> mark
+                    return null
+                if this.relational_operands_are_compatible(lt as ref[Type], rt as ref[Type]) = false
                 {
-                    if right_type <> null
-                    {
-                        let lt this.check_non_null_type(left_type as ref[Type], left)
-                        if lt = null
-                            return null
-                        let rt this.check_non_null_type(right_type as ref[Type], right)
-                        if rt = null
-                            return null
-                    }
+                    if this.unported_mark() <> mark
+                        return null
+                    this.report_operator_error(lt as ref[Type], op_kind, rt as ref[Type], error_node)
                 }
-                this.record_unported("get-base-type-of-literal-type-for-comparison", op_kind)
+                if this.unported_mark() <> mark
+                    return null
             }
             else
                 ; ★★★ THE ERROR PATH ANSWERS SINCE SLICE 94, AND THE LINE IT
@@ -42904,7 +43189,10 @@ define Checker
                 ; answer rather than a row, and the diagnostic
                 ; check_for_disallowed_es_symbol_operand already reported stands.
                 return boolean_type
-            return null
+            ; "The result is always of the Boolean primitive type" — both paths,
+            ; which is what made the `return null` that stood here a REGRESSION the
+            ; moment the true branch stopped reporting.
+            return boolean_type
         }
 
         ; The four equality operators. Two of the three steps inside the
@@ -42935,6 +43223,24 @@ define Checker
                         this.error_on_node_or_null(error_node, DiagThis_condition_will_always_return_0_since_JavaScript_compares_objects_by_reference_not_value)
                 }
                 this.check_na_n_equality(error_node, op_kind, left, right)
+                ; reportOperatorErrorUnless with the equality predicate:
+                ; isTypeEqualityComparableTo(l, r) || isTypeEqualityComparableTo(r, l).
+                if left_type = null
+                    return boolean_type
+                if right_type = null
+                    return boolean_type
+                let lt left_type as ref[Type]
+                let rt right_type as ref[Type]
+                let mark this.unported_mark()
+                var compatible this.is_type_equality_comparable_to(lt, rt)
+                if compatible = false
+                    set compatible: this.is_type_equality_comparable_to(rt, lt)
+                if this.unported_mark() <> mark
+                    return null
+                if compatible = false
+                    this.report_operator_error(lt, op_kind, rt, error_node)
+                if this.unported_mark() <> mark
+                    return null
             }
             ; ★★★ SLICE 90 RECORDED THE ROW ON BOTH PATHS AND SLICE 94 SPLITS THEM,
             ; WHICH IS THE SAME ARGUMENT ARRIVING AT ITS OTHER END. That slice's
@@ -42951,11 +43257,6 @@ define Checker
             ; refuted while the answer was nil. It is safe for the reason g16
             ; names and not despite it: a nil is how this port says *no claim*, and
             ; the closed path no longer answers nil.
-            if (check_mode & CheckModeTypeOnly) = 0
-            {
-                this.record_unported("is-type-equality-comparable-to", op_kind)
-                return null
-            }
             return boolean_type
         }
 
@@ -49530,11 +49831,80 @@ define Checker
         if (t.flags & TypeFlagsBooleanLiteral) <> 0
             return boolean_type
         if (t.flags & TypeFlagsUnion) <> 0
-        {
-            this.record_unported("get-base-type-of-literal-type-union", t.flags)
-            return null
-        }
+            return this.get_base_type_of_literal_type_union(t)
         t
+    }
+
+    ; getBaseTypeOfLiteralTypeUnion — `mapType(t, getBaseTypeOfLiteralType)`.
+    ;
+    ; ★★ THE MEMO IS DELIBERATELY NOT PORTED and it costs nothing observable:
+    ; c.cachedTypes[CachedTypeKindLiteralUnionBaseType] holds the answer, and the
+    ; answer is a union built through get_union_type_ex, which INTERNS — so the
+    ; second ask returns the same Type object with the same id whether or not the
+    ; row was there. What the cache buys upstream is the walk, not the identity,
+    ; and identity is the only thing a dump can see.
+    function get_base_type_of_literal_type_union(this, t: ref[Type]) returns ref[Type]?
+        this.map_type(t, MapTypeKindBaseTypeOfLiteral, null)
+
+    ; getBaseTypeOfLiteralTypeForComparison. The twin of the function above with
+    ; two deliberate differences the reference makes and this port must not smooth
+    ; over: `Enum` joins the NUMBER row (upstream's own comment on the flag says a
+    ; computed enum member value is numeric), and there is no EnumLike arm at all,
+    ; so an enum literal takes the number reading here where the other function
+    ; asks get_base_type_of_enum_like_type.
+    function get_base_type_of_literal_type_for_comparison(this, t: ref[Type]) returns ref[Type]?
+    {
+        if (t.flags & (TypeFlagsStringLiteral | TypeFlagsTemplateLiteral | TypeFlagsStringMapping)) <> 0
+            return string_type
+        if (t.flags & (TypeFlagsNumberLiteral | TypeFlagsEnum)) <> 0
+            return number_type
+        if (t.flags & TypeFlagsBigIntLiteral) <> 0
+            return bigint_type
+        if (t.flags & TypeFlagsBooleanLiteral) <> 0
+            return boolean_type
+        if (t.flags & TypeFlagsUnion) <> 0
+            return this.map_type(t, MapTypeKindBaseTypeForComparison, null)
+        t
+    }
+
+    ; The RELATIONAL operators' `typesAreCompatible` lambda, written out (§3.5e):
+    ; *any on either side is fine; otherwise both operands must be assignable to
+    ; number|bigint, or NEITHER may be and the two must be comparable.*
+    function relational_operands_are_compatible(this, left: ref[Type], right: ref[Type]) returns bool
+    {
+        if Checker.is_type_any(left)
+            return true
+        if Checker.is_type_any(right)
+            return true
+        ; c.numberOrBigIntType, the union minted with the other well-knowns. It is
+        ; asked the way check_arithmetic_operand_type asks it — a nil is a stop and
+        ; not a false, because a false here would REPORT.
+        if number_or_bigint_type = null
+        {
+            this.record_unported("number-or-bigint-type-unminted", TypeFlagsBigIntLike)
+            return false
+        }
+        let n number_or_bigint_type as ref[Type]
+        let left_num this.is_type_assignable_to(left, n)
+        let right_num this.is_type_assignable_to(right, n)
+        if left_num
+        {
+            if right_num
+                return true
+            return false
+        }
+        if right_num
+            return false
+        this.are_types_comparable(left, right)
+    }
+
+    ; isTypeEqualityComparableTo, whole: `target.flags&Nullable != 0 ||
+    ; isTypeComparableTo(source, target)`.
+    function is_type_equality_comparable_to(this, source: ref[Type], target: ref[Type]) returns bool
+    {
+        if (target.flags & TypeFlagsNullable) <> 0
+            return true
+        this.is_type_comparable_to(source, target)
     }
 
     ; ── getFlowTypeOfAccessExpression ────────────────────────────────────────
@@ -52435,20 +52805,486 @@ define Checker
         true
     }
 
-    procedure check_truthiness_expression(this, node: ref[AstNode]?)
+    ; checkTruthinessExpression, whole — and it ANSWERS since this slice.
+    ;
+    ; ★★★ SLICE 88 CLOSED THE OUTER HALF. checkTruthinessOfType was a row here
+    ; from slice 63 until the binary expression needed the same function for
+    ; its `&&` and `||` arms — the `if`, `do` and `while` conditions and the
+    ; left operand of a logical operator are the SAME question, and the arm
+    ; arrives for both at once. What is left in this line is the INNER half,
+    ; checkExpression, whose stop is the expression dispatch's own.
+    ;
+    ; ★★ IT WAS A PROCEDURE AND THE TYPE WAS DROPPED, which is what put
+    ; checkTestingKnownTruthy… *behind that hole rather than beside it* in
+    ; check_if_statement's note. The hole has been closed since slice 88 — the type
+    ; is computed on the line above — so the note outlived its argument the way
+    ; §3.5eo describes, and the fix is the return type.
+    function check_truthiness_expression(this, node: ref[AstNode]?) returns ref[Type]?
     {
         if node = null
-            return
-        ; ★★★ SLICE 88 CLOSES THE OUTER HALF. checkTruthinessOfType was a row here
-        ; from slice 63 until the binary expression needed the same function for
-        ; its `&&` and `||` arms — the `if`, `do` and `while` conditions and the
-        ; left operand of a logical operator are the SAME question, and the arm
-        ; arrives for both at once. What is left in this line is the INNER half,
-        ; checkExpression, whose stop is the expression dispatch's own.
+            return null
         let t this.check_expression(node as ref[AstNode])
         if t = null
-            return
+            return null
         this.check_truthiness_of_type(t as ref[Type], node as ref[AstNode])
+    }
+
+    ; ast.IsModuleExportsAccessExpression — `module.exports` (or
+    ; `module["exports"]`), which is always defined and therefore never worth the
+    ; known-truthy note. IsModuleIdentifier is `module` alone at this pin, not
+    ; `require`.
+    function is_module_exports_access_expression(node: ref[AstNode]) returns bool
+    {
+        if Parser.is_access_expression(node) = false
+            return false
+        let target AstNode.expression_of(node)
+        if Checker.kind_or_unknown(target) <> KindIdentifier
+            return false
+        let module_name Slice[char](6, "module")
+        if Checker.identifier_text_equals(target, module_name) = false
+            return false
+        let name Parser.get_element_or_property_access_name(node)
+        if name = null
+            return false
+        Checker.identifier_text_equals(name, Slice[char](7, "exports"))
+    }
+
+    ; checkConditionalExpression, whole: the condition as a truthiness expression,
+    ; the known-truthy report against the WHEN-TRUE branch as its body, then the
+    ; two branches and their SUBTYPE-reduced union.
+    function check_conditional_expression(this, node: ref[AstNode], check_mode: int) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let cond AstNode.conditional_condition_of(node)
+        let when_true AstNode.conditional_when_true_of(node)
+        let cond_type this.check_truthiness_expression(cond)
+        if this.unported_mark() <> mark
+            return null
+        if cond <> null
+        {
+            if cond_type <> null
+                this.check_testing_known_truthy(cond as ref[AstNode], cond_type as ref[Type], when_true)
+        }
+        if this.unported_mark() <> mark
+            return null
+        if when_true = null
+            return null
+        let type1 this.check_expression_ex(when_true as ref[AstNode], check_mode)
+        if type1 = null
+            return null
+        let when_false AstNode.conditional_when_false_of(node)
+        if when_false = null
+            return null
+        let type2 this.check_expression_ex(when_false as ref[AstNode], check_mode)
+        if type2 = null
+            return null
+        if this.unported_mark() <> mark
+            return null
+        let both this.new_type_list(null)
+        both.add(type1)
+        both.add(type2)
+        ; ★ UnionReductionSubtype, not the default: `a ? 1 : 2` answers `1 | 2` but
+        ; `a ? x : someSubtypeOfX` answers the supertype alone.
+        this.get_union_type_ex(both, UnionReductionSubtype, null, null)
+    }
+
+    ; ── checkTestingKnownTruthyCallableOrAwaitableOrEnumMemberType ───────────
+    ;
+    ; *This condition will always return true since this function is always
+    ; defined* (TS2774) and its two siblings — TS2801 for a Promise and TS2872 for
+    ; an enum literal. Three call sites share it: the `if` statement, the
+    ; conditional expression and the logical-operator pre-pass.
+    ;
+    ; ★★★ THE NOTE THAT HELD IT NAMED ITS OWN EXPIRY AND NOBODY READ IT BACK:
+    ; *"every one of its reports needs the CONTROL-FLOW graph … the line moves in
+    ; the commit that fixed the limit it named"*. None of the three reports asks
+    ; the flow graph at all — what they ask is getSymbolAtLocation, hasTypeFacts,
+    ; getSignaturesOfType and getAwaitedTypeOfPromise, and all four have been in
+    ; the file for slices. §3.5eo.
+    procedure check_testing_known_truthy(this, cond_expr: ref[AstNode], cond_type: ref[Type], body: ref[AstNode]?)
+    {
+        if Checker.strict_null_checks() = false
+            return
+        this.check_testing_known_truthy_types(cond_expr, cond_type, body)
+    }
+
+    ; checkTestingKnownTruthyTypes — the `||`/`??` chain, walked LEFTWARD. Each
+    ; left operand is asked in turn with the SAME condType, which is the
+    ; reference's shape and not an oversight: the type belongs to the whole
+    ; condition and the location moves.
+    procedure check_testing_known_truthy_types(this, cond_expr_in: ref[AstNode], cond_type: ref[Type], body: ref[AstNode]?)
+    {
+        var cond_expr Parser.skip_parentheses(cond_expr_in)
+        if cond_expr = null
+            return
+        this.check_testing_known_truthy_type(cond_expr as ref[AstNode], cond_type, body)
+        while Checker.is_bar_bar_or_question_question(cond_expr)
+        {
+            set cond_expr: Parser.skip_parentheses(AstNode.binary_left_of(cond_expr as ref[AstNode]))
+            if cond_expr = null
+                return
+            this.check_testing_known_truthy_type(cond_expr as ref[AstNode], cond_type, body)
+        }
+    }
+
+    ; `IsBinaryExpression(n) && (op == BarBarToken || op == QuestionQuestionToken)`
+    ; — the loop condition of the walk above. It is NOT
+    ; is_logical_or_coalescing_binary_operator: that one includes `&&`, and a `&&`
+    ; chain is walked by isSymbolUsedInBinaryExpressionChain instead.
+    function is_bar_bar_or_question_question(n: ref[AstNode]?) returns bool
+    {
+        if Checker.kind_or_unknown(n) <> KindBinaryExpression
+            return false
+        let op AstNode.binary_operator_kind(n as ref[AstNode])
+        if op = KindBarBarToken
+            return true
+        op = KindQuestionQuestionToken
+    }
+
+    ; ast.IsLogicalOrCoalescingBinaryExpression — a binary expression whose
+    ; operator is one of `&&`, `||`, `??`.
+    function is_logical_or_coalescing_binary_expression(n: ref[AstNode]?) returns bool
+    {
+        if Checker.kind_or_unknown(n) <> KindBinaryExpression
+            return false
+        Binder.is_logical_or_coalescing_binary_operator(AstNode.binary_operator_kind(n as ref[AstNode]))
+    }
+
+    procedure check_testing_known_truthy_type(this, cond_expr: ref[AstNode], cond_type: ref[Type], body: ref[AstNode]?)
+    {
+        var location: ref[AstNode]? cond_expr
+        if Checker.is_logical_or_coalescing_binary_expression(cond_expr)
+            set location: Parser.skip_parentheses(AstNode.binary_right_of(cond_expr))
+        if location = null
+            return
+        let loc location as ref[AstNode]
+        ; ast.IsModuleExportsAccessExpression — `module.exports`, which is always
+        ; defined and never worth the note.
+        if Checker.is_module_exports_access_expression(loc)
+            return
+        if Checker.is_logical_or_coalescing_binary_expression(loc)
+        {
+            this.check_testing_known_truthy_types(loc, cond_type, body)
+            return
+        }
+        let mark this.unported_mark()
+        var t: ref[Type]? cond_type
+        if loc <> cond_expr
+            set t: this.check_expression(loc)
+        if this.unported_mark() <> mark
+            return
+        if t = null
+            return
+        let ty t as ref[Type]
+        let lk AstNode.kind_of(loc)
+        if (ty.flags & TypeFlagsEnumLiteral) <> 0
+        {
+            if lk = KindPropertyAccessExpression
+            {
+                let owner_expr AstNode.expression_of(loc)
+                if owner_expr = null
+                    return
+                let owner this.get_resolved_symbol_or_nil(owner_expr as ref[AstNode])
+                if this.unported_mark() <> mark
+                    return
+                var enum_owner false
+                if owner <> null
+                {
+                    if (Symbol.flags_of(owner as ref[Symbol]) & SymbolFlagsEnum) <> 0
+                        set enum_owner: true
+                }
+                if enum_owner
+                {
+                    ; "EnumLiteral type at condition with known value is always
+                    ; truthy or always falsy, likely an error". The message's one
+                    ; argument is the literal's truth value and does not reach the
+                    ; dump; the CODE and the SPAN do.
+                    this.error_on_node(loc, DiagThis_condition_will_always_return_0)
+                    return
+                }
+            }
+        }
+        var property_expression_cast false
+        if lk = KindPropertyAccessExpression
+        {
+            let inner AstNode.expression_of(loc)
+            if inner <> null
+            {
+                if Checker.is_type_assertion(inner as ref[AstNode])
+                    set property_expression_cast: true
+            }
+        }
+        if property_expression_cast
+            return
+        if this.has_type_facts(ty, TypeFactsTruthy) = false
+            return
+        if this.unported_mark() <> mark
+            return
+        ; "we de-scope to functions and Promises unreferenced in the block as a
+        ; heuristic to identify the most common bugs."
+        let sigs this.get_signatures_of_type(ty, SignatureKindCall)
+        if this.unported_mark() <> mark
+            return
+        var call_count 0
+        if sigs <> null
+            set call_count: (sigs as ref[Array[ref[Signature]?]]).get_length() as int
+        let awaited this.get_awaited_type_of_promise(ty)
+        if this.unported_mark() <> mark
+            return
+        let is_promise awaited <> null
+        if call_count = 0
+        {
+            if is_promise = false
+                return
+        }
+        var tested_node: ref[AstNode]? null
+        if lk = KindIdentifier
+            set tested_node: loc
+        if lk = KindPropertyAccessExpression
+            set tested_node: AstNode.property_access_name_of(loc)
+        var tested_symbol: ref[Symbol]? null
+        if tested_node <> null
+        {
+            set tested_symbol: this.get_symbol_at_location(tested_node as ref[AstNode], false)
+            if this.unported_mark() <> mark
+                return
+        }
+        if tested_symbol = null
+        {
+            if is_promise = false
+                return
+        }
+        var is_used false
+        if tested_symbol <> null
+        {
+            let sym tested_symbol as ref[Symbol]
+            let parent AstNode.parent_node_of(cond_expr)
+            if Checker.kind_or_unknown(parent) = KindBinaryExpression
+            {
+                if this.is_symbol_used_in_binary_expression_chain(parent as ref[AstNode], sym)
+                    set is_used: true
+            }
+            if is_used = false
+            {
+                if body <> null
+                {
+                    if this.is_symbol_used_in_condition_body(cond_expr, body as ref[AstNode], tested_node, sym)
+                        set is_used: true
+                }
+            }
+            if this.unported_mark() <> mark
+                return
+        }
+        if is_used
+            return
+        if is_promise
+        {
+            this.error_and_maybe_suggest_await(loc, true, DiagThis_condition_will_always_return_true_since_this_0_is_always_defined)
+            return
+        }
+        this.error_on_node(loc, DiagThis_condition_will_always_return_true_since_this_function_is_always_defined_Did_you_mean_to_call_it_instead)
+    }
+
+    ; isSymbolUsedInBinaryExpressionChain — climb the `&&` chain and ask each RIGHT
+    ; operand's subtree for the symbol. The visitor is a MEMBER rather than a
+    ; closure (§3.5e) and the ForEachChild walk is AstNode.child_count/child_at,
+    ; the same pair AstDump uses.
+    function is_symbol_used_in_binary_expression_chain(this, node_in: ref[AstNode], tested_symbol: ref[Symbol]) returns bool
+    {
+        var node: ref[AstNode]? node_in
+        while Checker.kind_or_unknown(node) = KindBinaryExpression
+        {
+            let n node as ref[AstNode]
+            if AstNode.binary_operator_kind(n) <> KindAmpersandAmpersandToken
+                return false
+            if this.subtree_mentions_symbol(AstNode.binary_right_of(n), tested_symbol)
+                return true
+            set node: AstNode.parent_node_of(n)
+        }
+        false
+    }
+
+    ; The `visit` of isSymbolUsedInBinaryExpressionChain: does any IDENTIFIER in
+    ; this subtree resolve to the tested symbol? ★It is asked of the node's
+    ; CHILDREN and not of the node itself, which is ForEachChild's own contract.
+    function subtree_mentions_symbol(this, node: ref[AstNode]?, tested_symbol: ref[Symbol]) returns bool
+    {
+        if node = null
+            return false
+        let n node as ref[AstNode]
+        let count AstNode.child_count(n)
+        var i 0
+        while i < count
+        {
+            let child AstNode.child_at(n, i)
+            set i: i + 1
+            if child = null
+                continue
+            let c child as ref[AstNode]
+            if AstNode.kind_of(c) = KindIdentifier
+            {
+                let sym this.get_symbol_at_location(c, false)
+                if sym <> null
+                {
+                    if (sym as ref[Symbol]) = tested_symbol
+                        return true
+                }
+            }
+            if this.subtree_mentions_symbol(c, tested_symbol)
+                return true
+        }
+        false
+    }
+
+    ; isSymbolUsedInConditionBody. Its visitor is the one above plus the
+    ; SAME-TARGET walk: finding the symbol is enough only when the test was a
+    ; simple identifier, and otherwise the two access chains must agree hop by hop.
+    ;
+    ; ★★★ THE VISITOR'S `return false` IS NOT THIS FUNCTION'S `return false`, AND
+    ; THE DIFFERENCE IS A WHOLE SUBTREE. Upstream `visit` answers per NODE and
+    ; `ForEachChild` keeps going to the next sibling; a `false` there means *this
+    ; child is not it, and do not descend into it* — it does not end the walk. The
+    ; port's recursion is the walk itself, so the same-target verdict sets
+    ; `skip_children` and the sibling loop continues.
+    function is_symbol_used_in_condition_body(this, expr: ref[AstNode], body: ref[AstNode], tested_node: ref[AstNode]?, tested_symbol: ref[Symbol]) returns bool
+    {
+        let count AstNode.child_count(body)
+        var i 0
+        while i < count
+        {
+            let child AstNode.child_at(body, i)
+            set i: i + 1
+            if child = null
+                continue
+            let c child as ref[AstNode]
+            var skip_children false
+            if AstNode.kind_of(c) = KindIdentifier
+            {
+                let sym this.get_symbol_at_location(c, false)
+                var hit false
+                if sym <> null
+                {
+                    if (sym as ref[Symbol]) = tested_symbol
+                        set hit: true
+                }
+                if hit
+                {
+                    ; "If the test was a simple identifier, the above check is
+                    ; sufficient."
+                    if AstNode.kind_of(expr) = KindIdentifier
+                        return true
+                    if Checker.kind_or_unknown(tested_node) = KindIdentifier
+                    {
+                        if Checker.kind_or_unknown(AstNode.parent_node_of(tested_node)) = KindBinaryExpression
+                            return true
+                    }
+                    let verdict this.same_access_target(AstNode.parent_node_of(tested_node), AstNode.parent_node_of(c))
+                    if verdict = 1
+                        return true
+                    if verdict = 0
+                        set skip_children: true
+                }
+            }
+            if skip_children = false
+            {
+                if this.is_symbol_used_in_condition_body(expr, c, tested_node, tested_symbol)
+                    return true
+            }
+        }
+        false
+    }
+
+    ; "Otherwise we need to ensure the symbol is called on the same target" — the
+    ; two access chains walked in step.
+    ;
+    ; ★ THREE ANSWERS AND NOT TWO: 1 same target, 0 different, and −1 for *the
+    ; chain ran out*, which upstream expresses by the `for` condition going false
+    ; and control falling through to the child walk. Folding −1 into 0 would turn a
+    ; chain that simply ended into a decision.
+    function same_access_target(this, tested_in: ref[AstNode]?, child_in: ref[AstNode]?) returns int
+    {
+        var tested tested_in
+        var childx child_in
+        while tested <> null
+        {
+            if childx = null
+                return 0 - 1
+            let tk Checker.kind_or_unknown(tested)
+            let ck Checker.kind_or_unknown(childx)
+            var same_leaf false
+            if tk = KindIdentifier
+            {
+                if ck = KindIdentifier
+                    set same_leaf: true
+            }
+            if tk = KindThisKeyword
+            {
+                if ck = KindThisKeyword
+                    set same_leaf: true
+            }
+            if same_leaf
+            {
+                let ts this.get_symbol_at_location_or_null(tested)
+                let cs this.get_symbol_at_location_or_null(childx)
+                if ts = null
+                {
+                    if cs = null
+                        return 1
+                    return 0
+                }
+                if cs = null
+                    return 0
+                if (ts as ref[Symbol]) = (cs as ref[Symbol])
+                    return 1
+                return 0
+            }
+            if tk = KindPropertyAccessExpression
+            {
+                if ck <> KindPropertyAccessExpression
+                    return 0
+                let tn this.get_symbol_at_location_or_null(AstNode.property_access_name_of(tested as ref[AstNode]))
+                let cn this.get_symbol_at_location_or_null(AstNode.property_access_name_of(childx as ref[AstNode]))
+                var names_agree false
+                if tn = null
+                {
+                    if cn = null
+                        set names_agree: true
+                }
+                else
+                {
+                    if cn <> null
+                    {
+                        if (tn as ref[Symbol]) = (cn as ref[Symbol])
+                            set names_agree: true
+                    }
+                }
+                if names_agree = false
+                    return 0
+                set childx: AstNode.expression_of(childx)
+                set tested: AstNode.expression_of(tested)
+                continue
+            }
+            if tk = KindCallExpression
+            {
+                if ck <> KindCallExpression
+                    return 0
+                set childx: AstNode.expression_of(childx)
+                set tested: AstNode.expression_of(tested)
+                continue
+            }
+            return 0
+        }
+        0 - 1
+    }
+
+    ; getSymbolAtLocation on a node that may be absent — the three comparisons in
+    ; the walk above are between two of these and a nil on either side is a real
+    ; answer rather than a stop.
+    function get_symbol_at_location_or_null(this, node: ref[AstNode]?) returns ref[Symbol]?
+    {
+        if node = null
+            return null
+        this.get_symbol_at_location(node as ref[AstNode], false)
     }
 
     ; checkIfStatement, whole.
@@ -52461,12 +53297,19 @@ define Checker
     ; where it sits.
     ;
     ; ★ checkTestingKnownTruthyCallableOrAwaitableOrEnumMemberType takes the type
-    ; checkTruthinessExpression answers as its second argument, so it is behind that
-    ; hole rather than beside it — no separate report.
+    ; checkTruthinessExpression answers as its second argument. The note that stood
+    ; here called that *a hole rather than a place beside it*; slice 88 closed the
+    ; hole and this slice makes the function return the type, so the call is here.
     procedure check_if_statement(this, node: ref[AstNode])
     {
         this.check_grammar_statement_in_ambient_context(node)
-        this.check_truthiness_expression(AstNode.expression_of(node))
+        let cond AstNode.expression_of(node)
+        let cond_type this.check_truthiness_expression(cond)
+        if cond <> null
+        {
+            if cond_type <> null
+                this.check_testing_known_truthy(cond as ref[AstNode], cond_type as ref[Type], AstNode.then_statement_of(node))
+        }
         let then_statement AstNode.then_statement_of(node)
         this.check_source_element(then_statement)
         if Checker.kind_or_unknown(then_statement) = KindEmptyStatement
@@ -72675,6 +73518,10 @@ define Checker
     {
         if mk = MapTypeKindLowerBoundOfKeyType
             return this.get_lower_bound_of_key_type(t)
+        if mk = MapTypeKindBaseTypeForComparison
+            return this.get_base_type_of_literal_type_for_comparison(t)
+        if mk = MapTypeKindBaseTypeOfLiteral
+            return this.get_base_type_of_literal_type(t)
         if a = null
             return null
         let args a as ref[MapTypeArgs]
@@ -78839,12 +79686,26 @@ define Checker
     ; ★ What is still a fallthrough, each with the caller it would need:
     ; resolveUntypedCall (the call, new, tagged-template, decorator and JSX-opening
     ; kinds — deferred when overload resolution FAILS, which needs the call
-    ; dimension), checkClassExpressionDeferred, the two JSX element kinds,
-    ; checkAssertionDeferred, the void expression and `instanceof`. None of the
-    ; seven has a writer into the list in this port.
+    ; dimension), the two JSX element kinds, checkAssertionDeferred and
+    ; `instanceof`. None of them has a writer into the list in this port.
+    ;
+    ; ★★★ THE VOID ARM IS THIS SLICE'S, AND THE RULE ABOVE IS WHY IT IS HERE AND
+    ; NOT ONE COMMIT LATER: check_expression's KindVoidExpression arm calls
+    ; check_node_deferred, so the writer and this switch had to move together. The
+    ; first draft moved only the writer, and stage 2 answered exactly as this note
+    ; predicts — `void foo` silently never checked `foo`, and the module-not-found
+    ; report the reference files for it went missing on nine units.
     procedure check_deferred_node(this, node: ref[AstNode]?)
     {
         let k AstNode.kind_of(node)
+        if k = KindVoidExpression
+        {
+            ; `c.checkExpression(node.Expression())` — the operand, at last.
+            let operand AstNode.expression_of(node)
+            if operand <> null
+                this.check_expression(operand as ref[AstNode])
+            return
+        }
         if k = KindTypeParameter
         {
             this.check_type_parameter_deferred(node)
@@ -79923,18 +80784,83 @@ define Checker
         false
     }
 
-    ; checkGrammarClassDeclarationHeritageClauses, whole but one loop.
+    ; getIdentifierFromEntityNameExpression — the identifier at the END of an
+    ; entity-name expression: the name itself, or a property access's `.name`.
+    ; Anything else has no identifier and answers nothing.
+    function identifier_from_entity_name_expression(node: ref[AstNode]?) returns ref[AstNode]?
+    {
+        let k Checker.kind_or_unknown(node)
+        if k = KindIdentifier
+            return node
+        if k = KindPropertyAccessExpression
+        {
+            ; kind_or_unknown answered a real kind, so the node is there — the
+            ; unwrap is what that test already proved.
+            return AstNode.property_access_name_of(node as ref[AstNode])
+        }
+        null
+    }
+
+    ; The `@augments`/`@extends` half of checkGrammarClassDeclarationHeritageClauses,
+    ; asked of the extends clause's SINGLE type node. TS8023 fires when the tag
+    ; names a different class than the clause does.
     ;
-    ; ★★★ THE JSDOC `@augments` WALK IS UNREACHABLE HERE, BY CONSTRUCTION RATHER
-    ; THAN BY THE CORPUS. Upstream runs `for _, j := range node.EagerJSDoc(file)`
-    ; over the extends clause's single type, and EagerJSDoc answers nil unless
-    ; NodeFlagsHasJSDoc is set — while check_source_element_worker reports
+    ; ★ The message takes three arguments — the tag's own name, the tag's class and
+    ; the clause's — and none of them reaches the dump, which carries a code and a
+    ; span (slice 68). What the reference's `grammarErrorOnNode(sourceName, …)`
+    ; decides here is the SPAN, and that is the identifier inside the tag.
+    function check_jsdoc_augments_against_extends(this, node: ref[AstNode], target_type: ref[AstNode]?) returns bool
+    {
+        let docs Parser.eager_jsdoc(p, node)
+        if docs = null
+            return false
+        let list docs as ref[Array[ref[AstNode]?]]
+        let count list.get_length() as int
+        var i 0
+        while i < count
+        {
+            let jsdoc list[i]
+            set i: i + 1
+            let tags AstNode.jsdoc_tags_of(jsdoc)
+            if tags = null
+                continue
+            let tl tags as ref[Array[ref[AstNode]?]]
+            let tcount tl.get_length() as int
+            var j 0
+            while j < tcount
+            {
+                let tag tl[j]
+                set j: j + 1
+                if Checker.kind_or_unknown(tag) <> KindJSDocAugmentsTag
+                    continue
+                let source AstNode.jsdoc_class_name_of(tag)
+                let target_name Checker.identifier_from_entity_name_expression(AstNode.expression_of(target_type))
+                let source_name Checker.identifier_from_entity_name_expression(AstNode.expression_of(source))
+                if target_name = null
+                    continue
+                if source_name = null
+                    continue
+                if AstNode.identifier_texts_equal(target_name, source_name)
+                    continue
+                return this.grammar_error_on_node(source_name, DiagJSDoc_0_1_does_not_match_the_extends_2_clause)
+            }
+        }
+        false
+    }
+
+    ; checkGrammarClassDeclarationHeritageClauses, whole.
+    ;
+    ; ★★★ THE JSDOC `@augments` WALK USED TO STAND HERE AS AN UNREACHABILITY CLAIM,
+    ; AND THE CLAIM WAS FALSE THE DAY IT WAS WRITTEN — the fifth sighting of the
+    ; class §3.5p names. It read *check_source_element_worker reports
     ; `check-jsdoc-comments` and RETURNS for any node carrying that flag, one call
-    ; before this arm runs. So the loop's body cannot execute, and it is omitted
-    ; with its condition written down rather than ported as dead code: what it
-    ; needs beyond the walk is getIdentifierFromEntityNameExpression, the tag's
-    ; ClassName and a three-argument message. ★It expires the moment the JSDoc
-    ; comment check is ported — that gate is the whole of the argument.
+    ; before this arm runs*, and check_jsdoc_comment stops for a @link and for
+    ; NOTHING else, so no gate has ever stood in front of it. It surfaced the
+    ; moment get_type_of_node's extends arm stopped reporting: `jsdocExtendsClause-
+    ; Mismatch` completes and is MISSING its TS8023. ★A proof about a gate is only
+    ; as good as the gate's own condition, and this one named a function without
+    ; reading it — exactly what slice 112 had already written down one screen
+    ; further up this file.
     ;
     ; ★★ UPSTREAM PANICS ON A HERITAGE TOKEN THAT IS NEITHER `extends` NOR
     ; `implements`, and the else branch here simply takes the implements reading.
@@ -79970,6 +80896,11 @@ define Checker
                 let types AstNode.heritage_clause_types_of(clause)
                 if AstNode.list_count(types) > 1
                     return this.grammar_error_on_first_token(AstNode.child_in_list(types, 1), DiagClasses_can_only_extend_a_single_class)
+                if AstNode.list_count(types) > 0
+                {
+                    if this.check_jsdoc_augments_against_extends(node, AstNode.child_in_list(types, 0))
+                        return true
+                }
                 set seen_extends_clause: true
             }
             else
