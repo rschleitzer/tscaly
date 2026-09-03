@@ -770,6 +770,10 @@ define MappedKeyState
 define MapTypeKindLowerBoundOfKeyType: int 0
 define MapTypeKindMappedConstituent: int 1
 define MapTypeKindConditionalDistribution: int 2
+; getTemplateLiteralType's own union arm (slice 126): it re-enters itself with ONE
+; constituent substituted at `index`, so the three captures are the two lists and
+; the position.
+define MapTypeKindTemplateLiteralSpan: int 3
 
 define MapTypeArgs
 (
@@ -779,9 +783,14 @@ define MapTypeArgs
     root: ref[ConditionalRoot]?
     check_type: ref[Type]?
     for_constraint: bool
+
+    ; MapTypeKindTemplateLiteralSpan's three (slice 126).
+    texts: ref[Array[ref[String]?]]?
+    types: ref[Array[ref[Type]?]]?
+    index: int
 )
 {
-    init(mp: ref[Type]?, tv: ref[Type]?, m: ref[TypeMapper]?, r: ref[ConditionalRoot]?, ct: ref[Type]?, fc: bool)
+    init(mp: ref[Type]?, tv: ref[Type]?, m: ref[TypeMapper]?, r: ref[ConditionalRoot]?, ct: ref[Type]?, fc: bool, tx: ref[Array[ref[String]?]]?, ty: ref[Array[ref[Type]?]]?, ix: int)
     {
         set mapped: mp
         set type_variable: tv
@@ -789,6 +798,45 @@ define MapTypeArgs
         set root: r
         set check_type: ct
         set for_constraint: fc
+        set texts: tx
+        set types: ty
+        set index: ix
+    }
+}
+
+; addSpans' captured state (slice 126) — §3.21. The builder is a SLOT because the
+; reference resets it when a span opens and a StringBuilder here has none: a fresh
+; builder is put in its place instead.
+define TemplateSpanState
+(
+    sb: ref[StringBuilder]
+    new_texts: ref[Array[ref[String]?]]
+    new_types: ref[Array[ref[Type]?]]
+)
+{
+    init(b: ref[StringBuilder], tx: ref[Array[ref[String]?]], ty: ref[Array[ref[Type]?]])
+    {
+        set sb: b
+        set new_texts: tx
+        set new_types: ty
+    }
+}
+
+; inferFromLiteralPartsToTemplateLiteral's captured state (slice 126) — §3.21
+; again, and this one is the reason that rule exists: `addMatch` captures THREE
+; mutable locals and is called from four places in one loop.
+define TemplateMatchState
+(
+    seg: int
+    pos: int
+    matches: ref[Array[ref[Type]?]]
+)
+{
+    init(sg: int, ps: int, m: ref[Array[ref[Type]?]])
+    {
+        set seg: sg
+        set pos: ps
+        set matches: m
     }
 }
 
@@ -2079,6 +2127,15 @@ define SignatureCheckModeCallback: int SignatureCheckModeBivariantCallback | Sig
 ; the first — the two differ in whether they report, which is a `C` line.
 define SignatureComparerAssignable: int 0
 define SignatureComparerRelaterWorker: int 1
+
+; The three compareSignaturesIdentical takes — `compareTypesIdentical`,
+; `compareTypesSubtypeOf` and the RELATER's `isRelatedToSimple`. ★The first two are
+; plain relation tests on §3.18's rule; the third is the relater's recursion at
+; IntersectionStateNone, which differs from the WORKER arm above only in the
+; intersection state it carries, and that difference is the reason both exist.
+define SignatureComparerIdentical: int 2
+define SignatureComparerSubtypeOf: int 3
+define SignatureComparerRelaterSimple: int 4
 
 define TypePredicateKindThis: int 0
 define TypePredicateKindIdentifier: int 1
@@ -5086,6 +5143,18 @@ define Checker
     ; `jsnum_from_string` of it is neither NaN nor negative zero — the two inputs a
     ; value-keyed table and a bit-keyed table would disagree about.
     string_literal_types: ref[Array[ref[Type]?]]
+
+    ; c.templateLiteralTypes (slice 126). ★A LINEAR table like the three literal
+    ; ones and like union_types, and for find_union_type's reason: the key is
+    ; recoverable off the answer, since a template literal type carries exactly its
+    ; texts and its types.
+    template_literal_types: ref[Array[ref[Type]?]]
+
+    ; c.templateConstraintType — `string | number | boolean | bigint | null |
+    ; undefined`. ★It is built LAZILY rather than in initializeChecker, because
+    ; get_union_type_ex is not callable that early here (the reference builds it in
+    ; its own constructor); the memo is what makes the two the same value.
+    template_constraint_type: ref[Type]?
     number_literal_types: ref[Array[ref[Type]?]]
     bigint_literal_types: ref[Array[ref[Type]?]]
 
@@ -5424,6 +5493,16 @@ define Checker
     ; upstream — which also means the head path never runs `type_to_string` and so
     ; cannot stop where the default path can.
     rel_head_code: int
+
+    ; ★★★ THE COMPARER'S CAPTURES, SLICE 126. `signatureRelatedTo` hands
+    ; compareSignaturesRelated a closure over the relation and over its own
+    ; `intersectionState`; a flag carries neither, so the two travel here and the
+    ; comparer reads them. ★They are SAVED AND RESTORED around every call that can
+    ; recurse — the comparison walks back into is_related_to_ex, which reaches
+    ; signatures_related_to again under a different relation, and a cell that is
+    ; only written is a cell that answers for the wrong comparison.
+    rel_cur_relation: int
+    rel_cur_intersection_state: int
 
     ; The CALLPIN's log (slice 108) — see CallEvent's header.
     call_log: ref[Array[ref[CallEvent]?]]
@@ -5802,6 +5881,8 @@ define Checker
         set c.rel_overflow: false
         set c.rel_reported: false
         set c.rel_head_code: 0
+        set c.rel_cur_relation: RelationAssignable
+        set c.rel_cur_intersection_state: IntersectionStateNone
         let cll host.allocate(sizeof Array[ref[CallEvent]?], alignof Array[ref[CallEvent]?]) as pointer[Array[ref[CallEvent]?]]
         set *cll: Array[ref[CallEvent]?]()
         set c.call_log: cll as ref[Array[ref[CallEvent]?]]
@@ -5856,6 +5937,10 @@ define Checker
         let sl host.allocate(sizeof Array[ref[Type]?], alignof Array[ref[Type]?]) as pointer[Array[ref[Type]?]]
         set *sl: Array[ref[Type]?]()
         set c.string_literal_types: sl
+        let tlt host.allocate(sizeof Array[ref[Type]?], alignof Array[ref[Type]?]) as pointer[Array[ref[Type]?]]
+        set *tlt: Array[ref[Type]?]()
+        set c.template_literal_types: tlt
+        set c.template_constraint_type: null
         let nl host.allocate(sizeof Array[ref[Type]?], alignof Array[ref[Type]?]) as pointer[Array[ref[Type]?]]
         set *nl: Array[ref[Type]?]()
         set c.number_literal_types: nl
@@ -13978,6 +14063,11 @@ define Checker
             return this.get_type_from_literal_type_node(node)
         if k = KindTypeOperator
             return this.get_type_from_type_operator_node(node)
+        ; ★★★ SLICE 126 — the TEMPLATE LITERAL type node. It was the two biggest
+        ; rows of this switch's stop (TemplateLiteralType 108 events,
+        ; TemplateLiteralTypeSpan 112).
+        if k = KindTemplateLiteralType
+            return this.get_type_from_template_type_node(node)
         ; ★★ THE TYPE PREDICATE IS TWO KEYWORDS AND SLICE 94 NAMED IT: *"its other
         ; half is voidType and its guard is a type predicate NODE, which this table
         ; has no arm for at all"*. Both halves are here now, and the guard is the
@@ -24072,6 +24162,948 @@ define Checker
 
     function new_index_type(this, target: ref[Type], index_flags: int) returns ref[Type]
         this.new_type(TypeFlagsIndex, ObjectFlagsNone, null, TypeData.Index(IndexTypeData(target, index_flags)))
+
+    ; ── slice 126: THE TEMPLATE LITERAL TYPE ────────────────────────────
+    ;
+    ; getTypeFromTemplateTypeNode, getTemplateLiteralType and getTemplateStringFor
+    ; Type. ★The STRING MAPPING half — `Uppercase<T>` and its three siblings — is
+    ; deliberately NOT here and is named rather than written: `applyStringMapping`
+    ; is JS case mapping (`ToUpperJS`/`ToLowerJS` over a special-casing table),
+    ; which is a Unicode TABLE and its generator, i.e. a chapter with its own gate.
+    ; Everything below reaches it through getStringMappingType, which stays a stop.
+    function get_type_from_template_type_node(this, node: ref[AstNode]) returns ref[Type]?
+    {
+        let links this.type_node_link_of(node)
+        if links.resolved_type <> null
+            return links.resolved_type
+        let head AstNode.template_head_of(node)
+        if head = null
+            return null
+        let spans AstNode.template_literal_type_spans_of(node)
+        let count AstNode.list_count(spans)
+        let texts this.new_string_list()
+        let types this.new_type_list(null)
+        ; ★ `texts` is one longer than `types`: the HEAD first, then one literal per
+        ; span. TemplateLiteralTypeData's header records the invariant.
+        texts.add(this.literal_text_string(head as ref[AstNode]))
+        var i 0
+        while i < count
+        {
+            let span AstNode.child_in_list(spans, i)
+            let lit AstNode.template_span_literal(span)
+            if lit = null
+                return null
+            texts.add(this.literal_text_string(lit as ref[AstNode]))
+            let st AstNode.template_literal_type_span_type_of(span)
+            if st = null
+                return null
+            let t this.get_type_from_type_node(st as ref[AstNode])
+            if t = null
+                return null
+            types.add(t)
+            set i: i + 1
+        }
+        let made this.get_template_literal_type(texts, types)
+        if made = null
+            return null
+        set links.resolved_type: made
+        links.resolved_type
+    }
+
+    ; A template token's COOKED text as a page-hosted String — `Head.Text()` and
+    ; `span.Literal.Text()`, which is what the texts list holds.
+    function literal_text_string(this, n: ref[AstNode]) returns ref[String]
+    {
+        let len AstNode.literal_text_length_of(n)
+        let s String^host(AstNode.literal_text_of(n) as pointer[const_char], len as size_t)
+        &s
+    }
+
+    ; getTemplateStringForType — `evaluator.AnyToString(value)` for a literal and
+    ; the INTRINSIC NAME for `null`/`undefined`. ★It is the RAW value: no quotes on
+    ; a string, no `n` on a bigint — the printer adds those, this does not.
+    ; ★Everything else answers the EMPTY string, which is why the caller cannot
+    ; distinguish *nothing to add* from *this arm*; the caller's own flag test does.
+    procedure get_template_string_for_type(t: ref[Type], out: ref[StringBuilder])
+    {
+        if (t.flags & TypeFlagsStringLiteral) <> 0
+        {
+            out.append(Checker.literal_text_of(t), Checker.literal_text_length_of(t) as size_t)
+            return
+        }
+        if (t.flags & TypeFlagsNumberLiteral) <> 0
+        {
+            var nb char[JSNUM_MAX_TEXT]
+            let nn jsnum_to_string(Checker.literal_bits_of(t), &nb[0])
+            out.append(&nb[0], nn as size_t)
+            return
+        }
+        if (t.flags & TypeFlagsBooleanLiteral) <> 0
+        {
+            if Checker.literal_bool_of(t)
+                out.append("true")
+            else
+                out.append("false")
+            return
+        }
+        if (t.flags & TypeFlagsBigIntLiteral) <> 0
+        {
+            Checker.write_pseudo_big_int(out, t)
+            return
+        }
+        if (t.flags & (TypeFlagsUndefined | TypeFlagsNull)) <> 0
+            out.append(t.intrinsic_name)
+    }
+
+    ; stringutil.CombineSurrogatePairs — a HIGH surrogate sentinel immediately
+    ; followed by a LOW one becomes the one code point they encode.
+    ;
+    ; ★★ IT IS NOT COSMETIC AND IT IS NOT RARE-ONLY: the reference calls it on
+    ; every text this chapter composes, so a port without it differs on any
+    ; template whose spans SPLIT a surrogate pair — `` `${"\uD83D"}${"\uDE00"}` ``
+    ; is one emoji upstream and two lone sentinels here. ★The fast path is the
+    ; reference's own: no 0xED lead byte, no work.
+    function combined_text(this, sb: ref[StringBuilder]) returns ref[String]?
+    {
+        let src sb.to_string()
+        this.combined_bytes(src.get_buffer() as pointer[char], src.get_length() as int)
+    }
+
+    function combined_bytes(this, data: pointer[char], n: int) returns ref[String]?
+    {
+        var has_lead false
+        var i 0
+        while i < n
+        {
+            if (*(data + i) as int) = 0xED
+                set has_lead: true
+            set i: i + 1
+        }
+        if has_lead = false
+        {
+            let plain String^host(data as pointer[const_char], n as size_t)
+            return &plain
+        }
+        let out StringBuilder^host()
+        set i: 0
+        while i < n
+        {
+            var size 0
+            let r Checker.decode_js_string_rune(data, n, i, &size)
+            var combined false
+            if r >= 0xD800
+            {
+                if r <= 0xDBFF
+                {
+                    var low_size 0
+                    let low Checker.decode_js_string_rune(data, n, i + size, &low_size)
+                    if low >= 0xDC00
+                    {
+                        if low <= 0xDFFF
+                        {
+                            ; SurrogatePairToCodePoint, then the four-byte UTF-8.
+                            let cp (0x10000 + ((r - 0xD800) << 10)) + (low - 0xDC00)
+                            out.append((0xF0 | (cp >> 18)) as char)
+                            out.append((0x80 | ((cp >> 12) & 0x3F)) as char)
+                            out.append((0x80 | ((cp >> 6) & 0x3F)) as char)
+                            out.append((0x80 | (cp & 0x3F)) as char)
+                            set i: (i + size) + low_size
+                            set combined: true
+                        }
+                    }
+                }
+            }
+            if combined = false
+            {
+                out.append(data + i, size as size_t)
+                set i: i + size
+            }
+        }
+        let built out.to_string()
+        let joined String^host(built.get_buffer() as pointer[const_char], built.get_length())
+        &joined
+    }
+
+    function new_string_list(this) returns ref[Array[ref[String]?]]
+    {
+        let a host.allocate(sizeof Array[ref[String]?], alignof Array[ref[String]?]) as pointer[Array[ref[String]?]]
+        set *a: Array[ref[String]?]()
+        a
+    }
+
+    ; §3.21's state record for addSpans, whose closure captures `sb`, `newTexts`
+    ; and `newTypes` and whose walk RECURSES on a nested template literal's own
+    ; lists. ★The builder is a SLOT rather than a parameter because the reference
+    ; RESETS it when a span opens, and a StringBuilder here has no reset — so a
+    ; fresh builder is put in its place, which is the same program.
+    ;
+    ; ★★ IT MUST BE ONE STATE ACROSS THE RECURSION: a nested template's spans
+    ; append to the SAME text under construction and close it in the same lists.
+    function add_template_spans(this, st: ref[TemplateSpanState], texts: ref[Array[ref[String]?]], types: ref[Array[ref[Type]?]]) returns bool
+    {
+        let mark this.unported_mark()
+        let n types.get_length() as int
+        var i 0
+        while i < n
+        {
+            let row types[i]
+            if row = null
+                return false
+            let t row as ref[Type]
+            let tail texts[i + 1]
+            if (t.flags & (TypeFlagsLiteral | TypeFlagsNull | TypeFlagsUndefined)) <> 0
+            {
+                Checker.get_template_string_for_type(t, st.sb)
+                if tail <> null
+                    st.sb.append(tail as ref[String])
+            }
+            else
+            {
+                if (t.flags & TypeFlagsTemplateLiteral) <> 0
+                {
+                    let itx Checker.template_literal_texts_of(t)
+                    let ity Checker.template_literal_types_of(t)
+                    if itx = null
+                        return false
+                    if ity = null
+                        return false
+                    let il itx as ref[Array[ref[String]?]]
+                    let ihead il[0]
+                    if ihead <> null
+                        st.sb.append(ihead as ref[String])
+                    if this.add_template_spans(st, il, ity as ref[Array[ref[Type]?]]) = false
+                        return false
+                    if tail <> null
+                        st.sb.append(tail as ref[String])
+                }
+                else
+                {
+                    var is_span this.is_generic_index_type(t)
+                    if this.unported_mark() <> mark
+                        return false
+                    if is_span = false
+                    {
+                        set is_span: this.is_pattern_literal_placeholder_type(t)
+                        if this.unported_mark() <> mark
+                            return false
+                    }
+                    if is_span = false
+                        return false
+                    st.new_types.add(t)
+                    let closed this.combined_text(st.sb)
+                    if closed = null
+                        return false
+                    st.new_texts.add(closed)
+                    ; `sb.Reset()`.
+                    let fresh StringBuilder^host()
+                    set st.sb: &fresh
+                    if tail <> null
+                        st.sb.append(tail as ref[String])
+                }
+            }
+            set i: i + 1
+        }
+        true
+    }
+
+    ; getTemplateLiteralType, whole.
+    ;
+    ; ★★★ ITS THREE EXITS ARE THE NORMALISATION AND EACH IS LOAD-BEARING: a
+    ; template with no remaining spans is a STRING LITERAL type, a template whose
+    ; texts are all empty over spans that are all `string` IS `string`, and a
+    ; single such span around a pattern literal is that pattern itself. Without
+    ; them `` `${string}` `` would be a distinct type from `string` and nothing
+    ; would ever compare equal.
+    function get_template_literal_type(this, texts: ref[Array[ref[String]?]], types: ref[Array[ref[Type]?]]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let n types.get_length() as int
+        ; core.FindIndex over Never|Union — the constituent this has to distribute.
+        var union_index 0 - 1
+        var i 0
+        while i < n
+        {
+            let row types[i]
+            if row <> null
+            {
+                if ((row as ref[Type]).flags & (TypeFlagsNever | TypeFlagsUnion)) <> 0
+                {
+                    if union_index < 0
+                        set union_index: i
+                }
+            }
+            set i: i + 1
+        }
+        if union_index >= 0
+        {
+            if this.check_cross_product_union(types) = false
+                return error_type
+            let subject types[union_index]
+            if subject = null
+                return null
+            let a &MapTypeArgs^host(null, null, null, null, null, false, texts, types, union_index)
+            return this.map_type(subject as ref[Type], MapTypeKindTemplateLiteralSpan, a)
+        }
+        ; slices.Contains(types, wildcardType).
+        set i: 0
+        while i < n
+        {
+            let row types[i]
+            if row <> null
+            {
+                if (row as ref[Type]) = wildcard_type
+                    return wildcard_type
+            }
+            set i: i + 1
+        }
+        let new_texts this.new_string_list()
+        let new_types this.new_type_list(null)
+        let sb StringBuilder^host()
+        let head texts[0]
+        if head <> null
+            sb.append(head as ref[String])
+        let st &TemplateSpanState^host(&sb, new_texts, new_types)
+        if this.add_template_spans(st, texts, types) = false
+        {
+            if this.unported_mark() <> mark
+                return null
+            return string_type
+        }
+        let last this.combined_text(st.sb)
+        if last = null
+            return null
+        if (new_types.get_length() as int) = 0
+        {
+            let only last as ref[String]
+            return this.get_string_literal_type(only.get_buffer() as pointer[char], only.get_length() as int)
+        }
+        new_texts.add(last)
+        ; `core.Every(newTexts, == "")` and then `core.Every(newTypes, String)`.
+        var all_empty true
+        let tn new_texts.get_length() as int
+        set i: 0
+        while i < tn
+        {
+            let row new_texts[i]
+            if row = null
+                set all_empty: false
+            else
+            {
+                if ((row as ref[String]).get_length() as int) <> 0
+                    set all_empty: false
+            }
+            set i: i + 1
+        }
+        if all_empty
+        {
+            var all_string true
+            let yn new_types.get_length() as int
+            set i: 0
+            while i < yn
+            {
+                let row new_types[i]
+                if row = null
+                    set all_string: false
+                else
+                {
+                    if ((row as ref[Type]).flags & TypeFlagsString) = 0
+                        set all_string: false
+                }
+                set i: i + 1
+            }
+            if all_string
+                return string_type
+            ; Normalize `${Mapping<xxx>}` into Mapping<xxx>.
+            if yn = 1
+            {
+                let only new_types[0]
+                if only <> null
+                {
+                    let ot only as ref[Type]
+                    if this.is_pattern_literal_type(ot)
+                        return ot
+                    if this.unported_mark() <> mark
+                        return null
+                }
+            }
+        }
+        let found this.find_template_literal_type(new_texts, new_types)
+        if found <> null
+            return found
+        let made this.new_template_literal_type(new_texts, new_types)
+        template_literal_types.add(made)
+        made
+    }
+
+    ; getTemplateTypeKey's table, read as find_union_type reads its own: the key is
+    ; the texts and the types, both recoverable off the answer. ★The texts compare
+    ; by CONTENT and the types by IDENTITY, which is what the Go map's key does.
+    function find_template_literal_type(this, texts: ref[Array[ref[String]?]], types: ref[Array[ref[Type]?]]) returns ref[Type]?
+    {
+        let n types.get_length() as int
+        let tn texts.get_length() as int
+        let count template_literal_types.get_length() as int
+        var i 0
+        while i < count
+        {
+            let row template_literal_types[i]
+            if row <> null
+            {
+                let cand row as ref[Type]
+                let ctx Checker.template_literal_texts_of(cand)
+                let cty Checker.template_literal_types_of(cand)
+                if ctx <> null
+                {
+                    if cty <> null
+                    {
+                        let cl ctx as ref[Array[ref[String]?]]
+                        let yl cty as ref[Array[ref[Type]?]]
+                        var same false
+                        if (cl.get_length() as int) = tn
+                        {
+                            if (yl.get_length() as int) = n
+                                set same: true
+                        }
+                        if same
+                        {
+                            var j 0
+                            while j < tn
+                            {
+                                let x cl[j]
+                                let y texts[j]
+                                if x = null
+                                    set same: false
+                                if y = null
+                                    set same: false
+                                if same
+                                {
+                                    if (x as ref[String]) <> (y as ref[String])
+                                        set same: false
+                                }
+                                if same = false
+                                    break
+                                set j: j + 1
+                            }
+                        }
+                        if same
+                        {
+                            var j 0
+                            while j < n
+                            {
+                                if yl[j] <> types[j]
+                                    set same: false
+                                if same = false
+                                    break
+                                set j: j + 1
+                            }
+                        }
+                        if same
+                            return cand
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        null
+    }
+
+    function new_template_literal_type(this, texts: ref[Array[ref[String]?]], types: ref[Array[ref[Type]?]]) returns ref[Type]
+        this.new_type(TypeFlagsTemplateLiteral, ObjectFlagsNone, null, TypeData.TemplateLiteral(TemplateLiteralTypeData(texts, types)))
+
+    ; ── slice 126: the template literal's RELATION and INFERENCE halves ──
+    ;
+    ; getStringLikeTypeForType — anything that is not already string-like is
+    ; wrapped as `` `${T}` ``, which is what lets the matcher work uniformly.
+    function get_string_like_type_for_type(this, t: ref[Type]) returns ref[Type]?
+    {
+        if (t.flags & (TypeFlagsAny | TypeFlagsStringLike)) <> 0
+            return t
+        let texts this.new_string_list()
+        texts.add(this.empty_string())
+        texts.add(this.empty_string())
+        let types this.new_type_list(null)
+        types.add(t)
+        this.get_template_literal_type(texts, types)
+    }
+
+    function empty_string(this) returns ref[String]
+    {
+        let s String^host()
+        &s
+    }
+
+    ; templateLiteralTypesDefinitelyUnrelated — two templates whose STARTING or
+    ; ENDING texts disagree over their common length can never be related, which is
+    ; the cheap refusal in front of the matcher.
+    function template_literal_types_definitely_unrelated(source: ref[Type], target: ref[Type]) returns bool
+    {
+        let stx Checker.template_literal_texts_of(source)
+        let ttx Checker.template_literal_texts_of(target)
+        if stx = null
+            return false
+        if ttx = null
+            return false
+        let sl stx as ref[Array[ref[String]?]]
+        let tl ttx as ref[Array[ref[String]?]]
+        let s_start sl[0]
+        let t_start tl[0]
+        let s_end sl[(sl.get_length() as int) - 1]
+        let t_end tl[(tl.get_length() as int) - 1]
+        if s_start = null
+            return false
+        if t_start = null
+            return false
+        if s_end = null
+            return false
+        if t_end = null
+            return false
+        let ss s_start as ref[String]
+        let ts t_start as ref[String]
+        let se s_end as ref[String]
+        let te t_end as ref[String]
+        var start_len ss.get_length() as int
+        if (ts.get_length() as int) < start_len
+            set start_len: ts.get_length() as int
+        var end_len se.get_length() as int
+        if (te.get_length() as int) < end_len
+            set end_len: te.get_length() as int
+        if Checker.bytes_equal(ss.get_buffer() as pointer[char], 0, ts.get_buffer() as pointer[char], 0, start_len) = false
+            return true
+        Checker.bytes_equal(se.get_buffer() as pointer[char], (se.get_length() as int) - end_len, te.get_buffer() as pointer[char], (te.get_length() as int) - end_len, end_len) = false
+    }
+
+    ; `value == <a C string>` — the FULL comparison, which is what the reference's
+    ; string equality is. ★text_equals compares only its SLICE's length and says
+    ; nothing about the other side, so it cannot answer this: a prefix would pass.
+    function text_equals_cstr(d: pointer[char], n: int, lit: pointer[const_char]) returns bool
+    {
+        let p lit as pointer[char]
+        var i 0
+        while i < n
+        {
+            if *(p + i) = (0 as char)
+                return false
+            if *(p + i) <> *(d + i)
+                return false
+            set i: i + 1
+        }
+        *(p + n) = (0 as char)
+    }
+
+    function bytes_equal(a: pointer[char], a_from: int, b: pointer[char], b_from: int, n: int) returns bool
+    {
+        var i 0
+        while i < n
+        {
+            if *(a + (a_from + i)) <> *(b + (b_from + i))
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    ; strings.Index(hay[from:], needle) — the offset IN hay, or −1.
+    function index_of_bytes(hay: pointer[char], hay_len: int, from: int, needle: pointer[char], needle_len: int) returns int
+    {
+        if needle_len = 0
+            return from
+        var i from
+        while (i + needle_len) <= hay_len
+        {
+            if Checker.bytes_equal(hay, i, needle, 0, needle_len)
+                return i
+            set i: i + 1
+        }
+        0 - 1
+    }
+
+    ; isValidNumberString — `jsnum.FromString(s)` is neither NaN nor infinite.
+    ; ★`roundTripOnly` is FALSE at both call sites this port has, so the
+    ; `n.String() == s` half is the parameter's, not the body's.
+    function is_valid_number_string(data: pointer[char], n: int) returns bool
+    {
+        if n = 0
+            return false
+        let v jsnum_from_string(data, n)
+        if jsnum_is_nan(v)
+            return false
+        jsnum_is_inf(v) = false
+    }
+
+    ; isValidTypeForTemplateLiteralPlaceholder — may `source` stand in the hole a
+    ; template literal leaves for `target`?
+    ;
+    ; ★★ THE BIGINT ARM IS A STOP AND IT IS NARROW: isValidBigIntString runs a
+    ; FRESH SCANNER over the value with an error hook, which is machinery of its
+    ; own; every other arm is here.
+    function is_valid_type_for_template_literal_placeholder(this, source: ref[Type], target: ref[Type], comparer: int) returns bool
+    {
+        let mark this.unported_mark()
+        if (target.flags & TypeFlagsIntersection) <> 0
+        {
+            let ts Checker.intersection_types_of(target)
+            if ts = null
+                return false
+            let list ts as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            var i 0
+            while i < n
+            {
+                let row list[i]
+                if row = null
+                    return false
+                let ct row as ref[Type]
+                var ok false
+                if empty_type_literal_type <> null
+                {
+                    if ct = (empty_type_literal_type as ref[Type])
+                        set ok: true
+                }
+                if ok = false
+                {
+                    if this.is_valid_type_for_template_literal_placeholder(source, ct, comparer) = false
+                        return false
+                }
+                set i: i + 1
+            }
+            return true
+        }
+        if (target.flags & TypeFlagsString) <> 0
+            return true
+        if this.compare_types_by_comparer(comparer, source, target)
+            return true
+        if this.unported_mark() <> mark
+            return false
+        if (source.flags & TypeFlagsStringLiteral) <> 0
+        {
+            let vd Checker.literal_text_of(source)
+            let vn Checker.literal_text_length_of(source)
+            if (target.flags & TypeFlagsNumber) <> 0
+                return Checker.is_valid_number_string(vd, vn)
+            if (target.flags & TypeFlagsBigInt) <> 0
+            {
+                this.record_unported("is-valid-big-int-string", target.flags)
+                return false
+            }
+            ; `value == target.AsIntrinsicType().intrinsicName`. ★A BOOLEAN LITERAL
+            ; is an intrinsic type upstream and a LITERAL type here, so its name is
+            ; read off the value rather than off the slot.
+            if (target.flags & TypeFlagsBooleanLiteral) <> 0
+            {
+                if Checker.literal_bool_of(target)
+                    return Checker.text_equals_cstr(vd, vn, "true")
+                return Checker.text_equals_cstr(vd, vn, "false")
+            }
+            if (target.flags & (TypeFlagsUndefined | TypeFlagsNull)) <> 0
+                return Checker.text_equals_cstr(vd, vn, target.intrinsic_name)
+            if (target.flags & TypeFlagsStringMapping) <> 0
+                return this.is_member_of_string_mapping(source, target)
+            if (target.flags & TypeFlagsTemplateLiteral) <> 0
+                return this.is_type_matched_by_template_literal_type(source, target, comparer)
+            return false
+        }
+        if (source.flags & TypeFlagsTemplateLiteral) <> 0
+        {
+            ; `` `${T}` `` — a template with two EMPTY texts and one type is that
+            ; type, so the comparison is on the type itself.
+            let stx Checker.template_literal_texts_of(source)
+            let sty Checker.template_literal_types_of(source)
+            if stx = null
+                return false
+            if sty = null
+                return false
+            let tl stx as ref[Array[ref[String]?]]
+            if (tl.get_length() as int) <> 2
+                return false
+            let t0 tl[0]
+            let t1 tl[1]
+            if t0 = null
+                return false
+            if t1 = null
+                return false
+            if ((t0 as ref[String]).get_length() as int) <> 0
+                return false
+            if ((t1 as ref[String]).get_length() as int) <> 0
+                return false
+            let yl sty as ref[Array[ref[Type]?]]
+            let only yl[0]
+            if only = null
+                return false
+            return this.compare_types_by_comparer(comparer, only as ref[Type], target)
+        }
+        false
+    }
+
+    ; isMemberOfStringMapping. ★Its third arm needs getStringMappingType, which is
+    ; the case-mapping chapter, so it stops there and nowhere else.
+    function is_member_of_string_mapping(this, source: ref[Type], target: ref[Type]) returns bool
+    {
+        if (target.flags & TypeFlagsAny) <> 0
+            return true
+        if (target.flags & (TypeFlagsString | TypeFlagsTemplateLiteral)) <> 0
+            return this.is_type_assignable_to(source, target)
+        if (target.flags & TypeFlagsStringMapping) <> 0
+        {
+            this.record_unported("apply-target-string-mapping-to-source", target.flags)
+            return false
+        }
+        false
+    }
+
+    ; isTypeMatchedByTemplateLiteralType — the matcher, then every inference
+    ; against the placeholder it filled.
+    function is_type_matched_by_template_literal_type(this, source: ref[Type], target: ref[Type], comparer: int) returns bool
+    {
+        let inferences this.infer_types_from_template_literal_type(source, target)
+        if inferences = null
+            return false
+        let list inferences as ref[Array[ref[Type]?]]
+        let tty Checker.template_literal_types_of(target)
+        if tty = null
+            return false
+        let tl tty as ref[Array[ref[Type]?]]
+        let n list.get_length() as int
+        if (tl.get_length() as int) < n
+            return false
+        var i 0
+        while i < n
+        {
+            let inf list[i]
+            let ph tl[i]
+            if inf = null
+                return false
+            if ph = null
+                return false
+            if this.is_valid_type_for_template_literal_placeholder(inf as ref[Type], ph as ref[Type], comparer) = false
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    ; inferTypesFromTemplateLiteralType — the two source shapes. ★A source
+    ; template whose texts are EXACTLY the target's contributes its own types
+    ; unchanged; anything else goes through the matcher.
+    function infer_types_from_template_literal_type(this, source: ref[Type], target: ref[Type]) returns ref[Array[ref[Type]?]]?
+    {
+        if (source.flags & TypeFlagsStringLiteral) <> 0
+        {
+            let texts this.new_string_list()
+            let v String^host(Checker.literal_text_of(source) as pointer[const_char], Checker.literal_text_length_of(source) as size_t)
+            texts.add(&v)
+            return this.infer_from_literal_parts_to_template_literal(texts, null, target)
+        }
+        if (source.flags & TypeFlagsTemplateLiteral) <> 0
+        {
+            if Checker.template_texts_equal(source, target)
+                return Checker.template_literal_types_of(source)
+            let stx Checker.template_literal_texts_of(source)
+            let sty Checker.template_literal_types_of(source)
+            if stx = null
+                return null
+            return this.infer_from_literal_parts_to_template_literal(stx as ref[Array[ref[String]?]], sty, target)
+        }
+        null
+    }
+
+    ; The source text at `index` — the trailing segment is the END text with the
+    ; target's own suffix already removed.
+    function template_source_text(source_texts: ref[Array[ref[String]?]], last_source_index: int, remaining_end: ref[String], index: int) returns ref[String]
+    {
+        if index < last_source_index
+        {
+            let row source_texts[index]
+            if row <> null
+                return row as ref[String]
+        }
+        remaining_end
+    }
+
+    ; addMatch — the closure over `seg`, `pos` and `matches`.
+    ;
+    ; ★★ THE TWO ARMS ARE *the match lies inside ONE source segment* (a plain
+    ; substring, so a string literal type) and *it spans several* (so a template
+    ; literal type built from the partial texts and the types between them).
+    procedure add_template_match(this, st: ref[TemplateMatchState], source_texts: ref[Array[ref[String]?]], source_types: ref[Array[ref[Type]?]]?, last_source_index: int, remaining_end: ref[String], s: int, p: int)
+    {
+        if s = st.seg
+        {
+            let seg_text Checker.template_source_text(source_texts, last_source_index, remaining_end, s)
+            let cut this.combined_bytes((seg_text.get_buffer() as pointer[char]) + st.pos, p - st.pos)
+            if cut = null
+                return
+            let only cut as ref[String]
+            let mt this.get_string_literal_type(only.get_buffer() as pointer[char], only.get_length() as int)
+            st.matches.add(mt)
+        }
+        else
+        {
+            let match_texts this.new_string_list()
+            let first source_texts[st.seg]
+            if first = null
+                return
+            let fs first as ref[String]
+            let head String^host(((fs.get_buffer() as pointer[char]) + st.pos) as pointer[const_char], ((fs.get_length() as int) - st.pos) as size_t)
+            match_texts.add(&head)
+            var k st.seg + 1
+            while k < s
+            {
+                match_texts.add(source_texts[k])
+                set k: k + 1
+            }
+            let tail_text Checker.template_source_text(source_texts, last_source_index, remaining_end, s)
+            let tail String^host(tail_text.get_buffer() as pointer[const_char], p as size_t)
+            match_texts.add(&tail)
+            let between this.new_type_list(null)
+            if source_types <> null
+            {
+                let sl source_types as ref[Array[ref[Type]?]]
+                var j st.seg
+                while j < s
+                {
+                    if j < (sl.get_length() as int)
+                        between.add(sl[j])
+                    set j: j + 1
+                }
+            }
+            let mt this.get_template_literal_type(match_texts, between)
+            if mt = null
+                return
+            st.matches.add(mt)
+        }
+        set st.seg: s
+        set st.pos: p
+    }
+
+    ; inferFromLiteralPartsToTemplateLiteral — the matcher itself: it walks the
+    ; TARGET's delimiters and cuts the source into the pieces between them.
+    ;
+    ; ★★★ THE EMPTY-DELIMITER ARM CONSUMES ONE CODE POINT AT A TIME AND THE
+    ; REFERENCE SAYS WHY: `` `${A}${B}` `` has nothing to search for, so the split
+    ; is the string ITERATOR's, not UTF-16 code-unit indexing — and it must use
+    ; DecodeJSStringRune, because a lone surrogate is stored as an invalid-UTF-8
+    ; sentinel that plain UTF-8 decoding would break into stray bytes. That is a
+    ; deliberate divergence from Strada, documented upstream at this line.
+    function infer_from_literal_parts_to_template_literal(this, source_texts: ref[Array[ref[String]?]], source_types: ref[Array[ref[Type]?]]?, target: ref[Type]) returns ref[Array[ref[Type]?]]?
+    {
+        let ttx Checker.template_literal_texts_of(target)
+        if ttx = null
+            return null
+        let target_texts ttx as ref[Array[ref[String]?]]
+        let last_source_index (source_texts.get_length() as int) - 1
+        let s0 source_texts[0]
+        let sl source_texts[last_source_index]
+        if s0 = null
+            return null
+        if sl = null
+            return null
+        let source_start s0 as ref[String]
+        let source_end sl as ref[String]
+        let last_target_index (target_texts.get_length() as int) - 1
+        let t0 target_texts[0]
+        let tl target_texts[last_target_index]
+        if t0 = null
+            return null
+        if tl = null
+            return null
+        let target_start t0 as ref[String]
+        let target_end tl as ref[String]
+        let ss_len source_start.get_length() as int
+        let se_len source_end.get_length() as int
+        let ts_len target_start.get_length() as int
+        let te_len target_end.get_length() as int
+        if last_source_index = 0
+        {
+            if ss_len < (ts_len + te_len)
+                return null
+        }
+        ; HasPrefix and HasSuffix.
+        if ss_len < ts_len
+            return null
+        if Checker.bytes_equal(source_start.get_buffer() as pointer[char], 0, target_start.get_buffer() as pointer[char], 0, ts_len) = false
+            return null
+        if se_len < te_len
+            return null
+        if Checker.bytes_equal(source_end.get_buffer() as pointer[char], se_len - te_len, target_end.get_buffer() as pointer[char], 0, te_len) = false
+            return null
+        let remaining_end String^host(source_end.get_buffer() as pointer[const_char], (se_len - te_len) as size_t)
+        let st &TemplateMatchState^host(0, ts_len, this.new_type_list(null))
+        var i 1
+        while i < last_target_index
+        {
+            let drow target_texts[i]
+            if drow = null
+                return null
+            let delim drow as ref[String]
+            let dn delim.get_length() as int
+            if dn > 0
+            {
+                var sseg st.seg
+                var p st.pos
+                var found false
+                while found = false
+                {
+                    let hay Checker.template_source_text(source_texts, last_source_index, &remaining_end, sseg)
+                    let d Checker.index_of_bytes(hay.get_buffer() as pointer[char], hay.get_length() as int, p, delim.get_buffer() as pointer[char], dn)
+                    if d >= 0
+                    {
+                        set p: d
+                        set found: true
+                    }
+                    else
+                    {
+                        set sseg: sseg + 1
+                        if sseg = (source_texts.get_length() as int)
+                            return null
+                        set p: 0
+                    }
+                }
+                this.add_template_match(st, source_texts, source_types, last_source_index, &remaining_end, sseg, p)
+                set st.pos: st.pos + dn
+            }
+            else
+            {
+                let seg_text Checker.template_source_text(source_texts, last_source_index, &remaining_end, st.seg)
+                if st.pos < (seg_text.get_length() as int)
+                {
+                    var size 0
+                    Checker.decode_js_string_rune(seg_text.get_buffer() as pointer[char], seg_text.get_length() as int, st.pos, &size)
+                    this.add_template_match(st, source_texts, source_types, last_source_index, &remaining_end, st.seg, st.pos + size)
+                }
+                else
+                {
+                    if st.seg < last_source_index
+                        this.add_template_match(st, source_texts, source_types, last_source_index, &remaining_end, st.seg + 1, 0)
+                    else
+                        return null
+                }
+            }
+            set i: i + 1
+        }
+        let final_text Checker.template_source_text(source_texts, last_source_index, &remaining_end, last_source_index)
+        this.add_template_match(st, source_texts, source_types, last_source_index, &remaining_end, last_source_index, final_text.get_length() as int)
+        st.matches
+    }
+
+    ; c.templateConstraintType, memoized on first use — see the slot's note.
+    function get_template_constraint_type(this) returns ref[Type]?
+    {
+        if template_constraint_type <> null
+            return template_constraint_type
+        let list this.new_type_list(null)
+        list.add(string_type)
+        list.add(number_type)
+        list.add(boolean_type)
+        list.add(bigint_type)
+        list.add(null_type)
+        list.add(undefined_type)
+        let t this.get_union_type(list)
+        if t = null
+            return null
+        set template_constraint_type: t
+        template_constraint_type
+    }
+
 
     ; getLiteralTypeFromProperties — the enumerating half: a union of the literal
     ; types of every property name plus every index signature's key type.
@@ -58259,15 +59291,25 @@ define Checker
     ; The `compareTypes` func value, as the two-armed dispatch §3.18 prescribes.
     ; ★The `reportErrors` argument every arm upstream IGNORES is dropped:
     ; `compareTypesAssignable` is `isTypeRelatedTo` and nothing else.
+    ; ★★★ SLICE 126 — THE RELATER ARM IS REAL, AND WHAT IT NEEDED WAS NOT A
+    ; PARAMETER BUT TWO CELLS. Upstream the comparer is a CLOSURE over the relater
+    ; and over `signatureRelatedTo`'s own `intersectionState`; here the flag can
+    ; carry neither, so `rel_cur_relation` and `rel_cur_intersection_state` stand
+    ; where the closure's captures stood — §3.20's cell, one chapter over. The
+    ; stop that used to live here read *the two differ in whether they report*,
+    ; which is true and was never the blocker: the relation and the intersection
+    ; state were.
     function compare_types_by_comparer(this, comparer: int, source: ref[Type], target: ref[Type]) returns bool
     {
         if comparer = SignatureComparerAssignable
             return this.is_type_related_to(source, target, RelationAssignable)
-        ; The RELATER's own recursive worker. It reports into the error chain, which
-        ; this port has no writer for, so an alias for the arm above would be a
-        ; silently different answer on the reporting path.
-        this.record_unported("signature-comparer-relater-worker", comparer)
-        false
+        if comparer = SignatureComparerIdentical
+            return this.is_type_related_to(source, target, RelationIdentity)
+        if comparer = SignatureComparerSubtypeOf
+            return this.is_type_related_to(source, target, RelationSubtype)
+        if comparer = SignatureComparerRelaterSimple
+            return this.is_related_to_ex(source, target, rel_cur_relation, null, IntersectionStateNone, RecursionFlagsBoth)
+        this.is_related_to_ex(source, target, rel_cur_relation, null, rel_cur_intersection_state, RecursionFlagsBoth)
     }
 
     ; compareTypePredicateRelatedTo — the type predicate's own half of the return
@@ -61668,13 +62710,14 @@ define Checker
         this.get_type_from_type_node(node)
     }
 
-    ; checkTemplateLiteralType, whose per-span recursion is ported and whose
-    ; assignability check against the template constraint is the stop.
+    ; checkTemplateLiteralType, whole since slice 126. ★The loop is written in the
+    ; reference's own order — recurse, resolve, check — so a span's own subtree
+    ; speaks before this line does.
     ;
-    ; ★ The loop is written in the reference's own order — recurse, resolve, check —
-    ; so the tag a span's own subtree records comes first and the stop only speaks
-    ; for a span whose type walks silently. record_unported keeps the FIRST tag,
-    ; which is what makes writing it in order rather than hoisting it correct.
+    ; ★★ THE PER-SPAN CHECK IS AGAINST THE TEMPLATE CONSTRAINT AND IT REPORTS: the
+    ; reference asks `checkTypeAssignableTo(type, templateConstraintType, span.Type)`
+    ; with TS2322's default head, so it is one of the few grammar-shaped checks that
+    ; goes through the relation.
     procedure check_template_literal_type(this, node: ref[AstNode])
     {
         let spans AstNode.template_literal_type_spans_of(node)
@@ -61683,11 +62726,21 @@ define Checker
         while i < count
         {
             let span AstNode.child_in_list(spans, i)
-            this.check_source_element(AstNode.template_literal_type_span_type_of(span))
-            this.record_unported("get-type-from-type-node", KindTemplateLiteralTypeSpan)
+            let st AstNode.template_literal_type_span_type_of(span)
+            this.check_source_element(st)
+            if st <> null
+            {
+                let t this.get_type_from_type_node(st as ref[AstNode])
+                if t <> null
+                {
+                    let tc this.get_template_constraint_type()
+                    if tc <> null
+                        this.check_type_assignable_to(t as ref[Type], tc as ref[Type], st, 0)
+                }
+            }
             set i: i + 1
         }
-        this.record_unported("get-type-from-type-node", KindTemplateLiteralType)
+        this.get_type_from_type_node(node)
     }
 
     ; checkMappedType, whose grammar check and three recursions are ported.
@@ -67414,6 +68467,29 @@ define Checker
             let m this.prepend_type_mapping(args.check_type, t, args.mapper)
             return this.get_conditional_type(args.root as ref[ConditionalRoot], m, args.for_constraint, null)
         }
+        ; getTemplateLiteralType's own distribution — core.ReplaceElement at the
+        ; captured index, then the whole thing again.
+        if mk = MapTypeKindTemplateLiteralSpan
+        {
+            if args.texts = null
+                return null
+            if args.types = null
+                return null
+            let tx args.texts as ref[Array[ref[String]?]]
+            let ty args.types as ref[Array[ref[Type]?]]
+            let repl this.new_type_list(null)
+            let n ty.get_length() as int
+            var i 0
+            while i < n
+            {
+                if i = args.index
+                    repl.add(t)
+                else
+                    repl.add(ty[i])
+                set i: i + 1
+            }
+            return this.get_template_literal_type(tx, repl)
+        }
         null
     }
 
@@ -67624,7 +68700,7 @@ define Checker
         }
         if distribute
         {
-            let a &MapTypeArgs^host(null, null, new_mapper as ref[TypeMapper]?, root, check_type, for_constraint)
+            let a &MapTypeArgs^host(null, null, new_mapper as ref[TypeMapper]?, root, check_type, for_constraint, null, null, 0)
             set result: this.map_type_with_alias(distribution_type as ref[Type], MapTypeKindConditionalDistribution, a, alias)
         }
         if distribute = false
@@ -68173,7 +69249,7 @@ define Checker
                     return null
                 if reduced = null
                     return null
-                let a &MapTypeArgs^host(t, type_variable, m, null, null, false)
+                let a &MapTypeArgs^host(t, type_variable, m, null, null, false, null, null, 0)
                 return this.map_type_with_alias(reduced as ref[Type], MapTypeKindMappedConstituent, a, alias)
             }
         }
@@ -78135,18 +79211,47 @@ define Checker
             this.record_unported("single-element-generic-tuple", target.flags)
             return false
         }
-        ; The thirteen-arm switch in front of `default`. ★★SIX OF THE ARMS HAVE NO
-        ; INPUT AND IT IS ONE SENTENCE FOR ALL OF THEM: an IndexedAccess, an Index,
-        ; a Conditional, a TemplateLiteral, a StringMapping and a mapped type are
-        ; each a `get-type-from-type-node` row, so nothing this checker can mint
-        ; carries their flags. They are asked as one guard rather than dropped, so
-        ; that the arm which mints the first of them finds the fork here.
+        ; The thirteen-arm switch in front of `default`. ★★THE GUARD BELOW WAS ONE
+        ; SENTENCE FOR SIX ARMS — *an IndexedAccess, an Index, a Conditional, a
+        ; TemplateLiteral, a StringMapping and a mapped type are each a
+        ; `get-type-from-type-node` row, so nothing this checker can mint carries
+        ; their flags* — and it was asked as one guard *so that the arm which mints
+        ; the first of them finds the fork here*. ★★★SLICE 126 IS THAT ARM: the
+        ; TEMPLATE LITERAL is minted now, so its own arm is written and the guard
+        ; keeps the four that still have no producer.
         if (target.flags & TypeFlagsTypeParameter) <> 0
         {
             this.record_unported("structured-target-type-parameter", src.flags)
             return false
         }
-        if (target.flags & (TypeFlagsIndexedAccess | TypeFlagsIndex | TypeFlagsConditional | TypeFlagsTemplateLiteral | TypeFlagsStringMapping)) <> 0
+        if (target.flags & TypeFlagsTemplateLiteral) <> 0
+        {
+            if (src.flags & TypeFlagsTemplateLiteral) <> 0
+            {
+                ; ★ The COMPARABLE relation asks only that the two templates are
+                ; not definitely unrelated — the placeholders are not compared at
+                ; all, which is what makes `` `a${number}` `` comparable to
+                ; `` `a${string}` ``.
+                if relation = RelationComparable
+                {
+                    if Checker.template_literal_types_definitely_unrelated(src, target)
+                        return false
+                    return true
+                }
+                ; `instantiateType(source, reportUnreliableMapper)` — the result is
+                ; DISCARDED and the mapper is nil here, so the call is the identity;
+                ; see compare_signatures_related's header for the same argument.
+            }
+            return this.is_type_matched_by_template_literal_type(src, target, SignatureComparerRelaterWorker)
+        }
+        if (target.flags & TypeFlagsStringMapping) <> 0
+        {
+            if (src.flags & TypeFlagsStringMapping) = 0
+                return this.is_member_of_string_mapping(src, target)
+            this.record_unported("structured-target-string-mapping", target.flags)
+            return false
+        }
+        if (target.flags & (TypeFlagsIndexedAccess | TypeFlagsIndex | TypeFlagsConditional)) <> 0
         {
             this.record_unported("structured-target-instantiable", target.flags)
             return false
@@ -78325,19 +79430,123 @@ define Checker
         null
     }
 
+    ; propertiesIdenticalTo — the identity relation's property half.
+    ;
+    ; ★★★ `excludeProperties` AND ITS SET ARE NOT PORTED HERE, AND THE REASON IS
+    ; THE CALLERS' rather than an omission: the set is non-empty at exactly ONE
+    ; call site upstream, typeRelatedToDiscriminatedType's, and that function runs
+    ; for the assignable and comparable relations only — the identity relation
+    ; never reaches it. So on this path the set is empty at all three call sites
+    ; and `excludeProperties` is the identity. It comes back with the
+    ; discriminated-union chapter, where its set has a writer.
+    ;
+    ; ★ Both sides must be Object: the identity of two unions is
+    ; `eachTypeRelatedToSomeType`'s question, not this one's.
+    function properties_identical_to(this, source: ref[Type], target: ref[Type], relation: int) returns bool
+    {
+        if (source.flags & TypeFlagsObject) = 0
+            return false
+        if (target.flags & TypeFlagsObject) = 0
+            return false
+        let mark this.unported_mark()
+        let sprops this.get_properties_of_object_type(source)
+        let tprops this.get_properties_of_object_type(target)
+        if this.unported_mark() <> mark
+            return false
+        var sn 0
+        if sprops <> null
+            set sn: (sprops as ref[Array[ref[Symbol]?]]).get_length() as int
+        var tn 0
+        if tprops <> null
+            set tn: (tprops as ref[Array[ref[Symbol]?]]).get_length() as int
+        if sn <> tn
+            return false
+        if sn = 0
+            return true
+        let slist sprops as ref[Array[ref[Symbol]?]]
+        let save_relation rel_cur_relation
+        set rel_cur_relation: relation
+        var answer true
+        var i 0
+        while i < sn
+        {
+            let row slist[i]
+            if row = null
+                set answer: false
+            if answer
+            {
+                let sp row as ref[Symbol]
+                let tp this.get_property_of_object_type(target, Symbol.name_data_of(sp), Symbol.name_len_of(sp))
+                if this.unported_mark() <> mark
+                    set answer: false
+                else
+                {
+                    if tp = null
+                        set answer: false
+                    else
+                    {
+                        if this.compare_properties(sp, tp as ref[Symbol], SignatureComparerRelaterSimple) = false
+                            set answer: false
+                    }
+                }
+            }
+            if answer = false
+                break
+            set i: i + 1
+        }
+        set rel_cur_relation: save_relation
+        answer
+    }
+
+    ; compareProperties — two members are identical when they are PUBLIC with the
+    ; same name, optionality and type, or NON-PUBLIC and originating in the same
+    ; declaration with the same type. ★The accessibility fork is exclusive: the
+    ; optionality is compared only for the public pair, because a private pair
+    ; that shares a declaration shares its optionality by construction.
+    function compare_properties(this, source_prop: ref[Symbol], target_prop: ref[Symbol], comparer: int) returns bool
+    {
+        if source_prop = target_prop
+            return true
+        let mark this.unported_mark()
+        let sa this.get_declaration_modifier_flags_from_symbol(source_prop) & ModifierFlagsNonPublicAccessibilityModifier
+        let ta this.get_declaration_modifier_flags_from_symbol(target_prop) & ModifierFlagsNonPublicAccessibilityModifier
+        if this.unported_mark() <> mark
+            return false
+        if sa <> ta
+            return false
+        if sa <> 0
+        {
+            if this.get_target_symbol(source_prop) <> this.get_target_symbol(target_prop)
+                return false
+        }
+        else
+        {
+            if (Symbol.flags_of(source_prop) & SymbolFlagsOptional) <> (Symbol.flags_of(target_prop) & SymbolFlagsOptional)
+                return false
+        }
+        if this.is_readonly_symbol(source_prop) <> this.is_readonly_symbol(target_prop)
+            return false
+        let st this.get_non_missing_type_of_symbol(source_prop)
+        let tt this.get_non_missing_type_of_symbol(target_prop)
+        if this.unported_mark() <> mark
+            return false
+        if st = null
+            return false
+        if tt = null
+            return false
+        this.compare_types_by_comparer(comparer, st as ref[Type], tt as ref[Type])
+    }
+
     ; propertiesRelatedTo — the object half. See the worker's header for why not
     ; one of its eleven reports is written.
     function properties_related_to(this, source: ref[Type], target: ref[Type], relation: int, error_node: ref[AstNode]?, optionals_only: bool, intersection_state: int) returns bool
     {
-        ; propertiesIdenticalTo. ★★★It is slice 117's TS2403 wall, one function
-        ; deeper: `isTypeIdenticalTo` no longer stops in `is_related_to_ex`, it
-        ; stops here — which is a better place for it, because the stop now names
-        ; the thing that is missing rather than the door it came through.
+        ; propertiesIdenticalTo, ported in slice 126. ★★★It was slice 117's TS2403
+        ; wall and the stop stood here rather than in is_related_to_ex, which is
+        ; what made it findable: the stop named the thing that was missing rather
+        ; than the door it came through.
         if relation = RelationIdentity
-        {
-            this.record_unported("properties-identical-to", target.flags)
-            return false
-        }
+            return this.properties_identical_to(source, target, relation)
         ; The TUPLE-target arm — twenty conditions over the element infos, four
         ; arity reports and a per-position comparison.
         if Checker.is_tuple_type(target)
@@ -78516,48 +79725,809 @@ define Checker
         this.is_related_to_ex(est as ref[Type], et, relation, null, intersection_state, RecursionFlagsBoth)
     }
 
-    ; signaturesRelatedTo — the EMPTY-TARGET case, which is exact, and a stop for
-    ; everything else.
+    ; ── slice 126: the SIGNATURE relation ───────────────────────────────
     ;
-    ; ★★★ THE EMPTY CASE IS NOT A SPECIAL CASE, IT IS THE REFERENCE WITH THE LOOP
-    ; UNROLLED ZERO TIMES: all three arms of the switch iterate over
-    ; `targetSignatures`, the middle one additionally needs it to be of length one,
-    ; and `result` starts at True — so a target with no signatures of this kind is
-    ; True by every path. The construct-abstract check and the visibility check in
-    ; front of the switch both require BOTH lists non-empty. ★The two
-    ; `anyFunctionType` tests have no input: this port mints no such marker.
+    ; signaturesRelatedTo, whole but for the two `anyFunctionType` tests, which
+    ; have no input: this port mints no such marker.
+    ;
+    ; ★★★ THE THREE ARMS ARE A DISPATCH ON HOW THE TWO LISTS LINE UP, not three
+    ; different relations. The PAIRWISE arm is two instantiations of ONE anonymous
+    ; type, or two references to one target, where the reference erases the type
+    ; parameters because they are known to be the same and compares position by
+    ; position; the SINGLE arm is the ordinary function-to-function case and erases
+    ; only for the comparable relation; the N×M arm is the overload matrix. ★The
+    ; empty-target reading the stub carried is still exactly right and is now the
+    ; loop running zero times rather than a special case.
+    ;
+    ; ★★★ EVERY REPORT IN THIS CHAPTER IS A CHAIN LINK AND IS DROPPED, on the
+    ; worker's rule: `Relater.reportError` appends to `errorInfo` and
+    ; report_relation_error emits ONE diagnostic whose CODE is the head, so a link
+    ; carries neither a code nor a span of its own and is invisible in a dump in
+    ; both directions. That covers all three of this chapter's — *Cannot assign an
+    ; abstract constructor type to a non-abstract constructor type*, *Cannot assign
+    ; a 0 constructor type to a 1 constructor type* and *Type 0 provides no match
+    ; for the signature 1* — which is also why `getErrorState`/`restoreErrorState`
+    ; and `shouldElaborateErrors` drop out of the N×M arm: all three are chain
+    ; plumbing and this port has no chain.
     function signatures_related_to(this, source: ref[Type], target: ref[Type], kind: int, relation: int, error_node: ref[AstNode]?, intersection_state: int) returns bool
     {
         if relation = RelationIdentity
-        {
-            this.record_unported("signatures-identical-to", target.flags)
-            return false
-        }
+            return this.signatures_identical_to(source, target, kind, relation)
+        let mark this.unported_mark()
+        let ss this.get_signatures_of_type(source, kind)
         let ts this.get_signatures_of_type(target, kind)
-        if ts = null
+        if this.unported_mark() <> mark
+            return false
+        var sn 0
+        if ss <> null
+            set sn: (ss as ref[Array[ref[Signature]?]]).get_length() as int
+        var tn 0
+        if ts <> null
+            set tn: (ts as ref[Array[ref[Signature]?]]).get_length() as int
+        if tn = 0
             return true
-        if ((ts as ref[Array[ref[Signature]?]]).get_length() as int) = 0
+        let tlist ts as ref[Array[ref[Signature]?]]
+        ; The abstract-constructor rule and the constructor visibilities, both of
+        ; which need BOTH lists non-empty.
+        if kind = SignatureKindConstruct
+        {
+            if sn <> 0
+            {
+                let s0row (ss as ref[Array[ref[Signature]?]])[0]
+                let t0row tlist[0]
+                if s0row <> null
+                {
+                    if t0row <> null
+                    {
+                        let s0 s0row as ref[Signature]
+                        let t0 t0row as ref[Signature]
+                        if (s0.flags & SignatureFlagsAbstract) <> 0
+                        {
+                            if (t0.flags & SignatureFlagsAbstract) = 0
+                                return false
+                        }
+                        if this.constructor_visibilities_are_compatible(s0, t0) = false
+                            return false
+                    }
+                }
+            }
+        }
+        ; ★ Two instantiations of one anonymous type (typically a METHOD's type), or
+        ; two references to one generic target.
+        var pairwise false
+        if (source.object_flags & ObjectFlagsInstantiated) <> 0
+        {
+            if (target.object_flags & ObjectFlagsInstantiated) <> 0
+            {
+                if source.symbol = target.symbol
+                    set pairwise: true
+            }
+        }
+        if pairwise = false
+        {
+            if (source.object_flags & ObjectFlagsReference) <> 0
+            {
+                if (target.object_flags & ObjectFlagsReference) <> 0
+                {
+                    if Checker.target_of(source) = Checker.target_of(target)
+                        set pairwise: true
+                }
+            }
+        }
+        if pairwise
+        {
+            ; ★★ The reference indexes the SOURCE list with the TARGET's index and
+            ; relies on the two being parallel — a shorter source list is an
+            ; out-of-range PANIC there, so it cannot arise. Here it would be an
+            ; exit 15, which takes the unit's six dumps with it, so the shape is
+            ; marked unanswered instead of trapped or silently answered false.
+            if sn < tn
+            {
+                this.record_unported("signatures-related-pairwise-arity", tn)
+                return false
+            }
+            let slist ss as ref[Array[ref[Signature]?]]
+            var i 0
+            while i < tn
+            {
+                let srow slist[i]
+                let trow tlist[i]
+                if srow = null
+                    return false
+                if trow = null
+                    return false
+                if this.signature_related_to(srow as ref[Signature], trow as ref[Signature], true, relation, error_node, intersection_state) = false
+                    return false
+                set i: i + 1
+            }
             return true
-        this.record_unported("signatures-related-to", target.flags)
+        }
+        if sn = 1
+        {
+            if tn = 1
+            {
+                let srow (ss as ref[Array[ref[Signature]?]])[0]
+                let trow tlist[0]
+                if srow = null
+                    return false
+                if trow = null
+                    return false
+                ; For a single signature the type parameters are erased only for
+                ; the comparable relation; otherwise a generic source is
+                ; instantiated in the target's context, which is
+                ; compare_signatures_related's own stop.
+                var erase_generics false
+                if relation = RelationComparable
+                    set erase_generics: true
+                return this.signature_related_to(srow as ref[Signature], trow as ref[Signature], erase_generics, relation, error_node, intersection_state)
+            }
+        }
+        ; The N×M matrix: every target signature needs SOME source signature.
+        var ti 0
+        while ti < tn
+        {
+            let trow tlist[ti]
+            if trow = null
+                return false
+            let t trow as ref[Signature]
+            var matched false
+            var si 0
+            while si < sn
+            {
+                let srow (ss as ref[Array[ref[Signature]?]])[si]
+                if srow <> null
+                {
+                    if this.signature_related_to(srow as ref[Signature], t, true, relation, error_node, intersection_state)
+                        set matched: true
+                }
+                if matched
+                    break
+                set si: si + 1
+            }
+            if matched = false
+                return false
+            set ti: ti + 1
+        }
+        true
+    }
+
+    ; constructorVisibilitiesAreCompatible, whole. Its report is a chain link and
+    ; drops with `visibilityToString`, which existed only to name the two
+    ; accessibilities in that message.
+    function constructor_visibilities_are_compatible(this, source_signature: ref[Signature], target_signature: ref[Signature]) returns bool
+    {
+        if source_signature.declaration = null
+            return true
+        if target_signature.declaration = null
+            return true
+        ; ★ `node.ModifierFlags()` is the UNCOMBINED reading — see
+        ; are_declaration_flags_identical's note.
+        let sa b.modifier_flags(source_signature.declaration as ref[AstNode]) & ModifierFlagsNonPublicAccessibilityModifier
+        let ta b.modifier_flags(target_signature.declaration as ref[AstNode]) & ModifierFlagsNonPublicAccessibilityModifier
+        ; Public, protected and private are all assignable to private.
+        if ta = ModifierFlagsPrivate
+            return true
+        ; Public and protected are assignable to protected.
+        if ta = ModifierFlagsProtected
+        {
+            if sa <> ModifierFlagsPrivate
+                return true
+        }
+        ; Only public is assignable to public.
+        if ta <> ModifierFlagsProtected
+        {
+            if sa = 0
+                return true
+        }
         false
     }
 
-    ; indexSignaturesRelatedTo — the same reading, and the same reason: the body is
-    ; one loop over the TARGET's index infos with `result` seeded True.
+    ; signatureRelatedTo — the check mode off the relation, the erasure, and the
+    ; comparer. ★The reference builds a CLOSURE over the relation and over its own
+    ; `intersectionState` here; the two cells carry both, which is what
+    ; signature_related_to_core saves and restores.
+    function signature_related_to(this, source: ref[Signature], target: ref[Signature], erase: bool, relation: int, error_node: ref[AstNode]?, intersection_state: int) returns bool
+    {
+        var check_mode SignatureCheckModeNone
+        if relation = RelationSubtype
+            set check_mode: SignatureCheckModeStrictTopSignature
+        if relation = RelationStrictSubtype
+            set check_mode: SignatureCheckModeStrictTopSignature | SignatureCheckModeStrictArity
+        if erase
+        {
+            let es this.get_erased_signature(source)
+            if es = null
+                return false
+            let et this.get_erased_signature(target)
+            if et = null
+                return false
+            return this.signature_related_to_core(es as ref[Signature], et as ref[Signature], check_mode, relation, intersection_state)
+        }
+        this.signature_related_to_core(source, target, check_mode, relation, intersection_state)
+    }
+
+    ; The call itself, split off so the erased and the unerased pair reach ONE
+    ; save/restore of the two cells rather than two copies of it.
+    function signature_related_to_core(this, source: ref[Signature], target: ref[Signature], check_mode: int, relation: int, intersection_state: int) returns bool
+    {
+        let save_relation rel_cur_relation
+        let save_state rel_cur_intersection_state
+        set rel_cur_relation: relation
+        set rel_cur_intersection_state: intersection_state
+        let answer this.compare_signatures_related(source, target, check_mode, SignatureComparerRelaterWorker)
+        set rel_cur_relation: save_relation
+        set rel_cur_intersection_state: save_state
+        answer
+    }
+
+    ; signaturesIdenticalTo — the identity relation's signature half. ★Its comparer
+    ; is `isRelatedToSimple`, the relater's recursion at IntersectionStateNone, so
+    ; the relation travels in the cell and the intersection state does not.
+    function signatures_identical_to(this, source: ref[Type], target: ref[Type], kind: int, relation: int) returns bool
+    {
+        let mark this.unported_mark()
+        let ss this.get_signatures_of_type(source, kind)
+        let ts this.get_signatures_of_type(target, kind)
+        if this.unported_mark() <> mark
+            return false
+        var sn 0
+        if ss <> null
+            set sn: (ss as ref[Array[ref[Signature]?]]).get_length() as int
+        var tn 0
+        if ts <> null
+            set tn: (ts as ref[Array[ref[Signature]?]]).get_length() as int
+        if sn <> tn
+            return false
+        if sn = 0
+            return true
+        let slist ss as ref[Array[ref[Signature]?]]
+        let tlist ts as ref[Array[ref[Signature]?]]
+        let save_relation rel_cur_relation
+        set rel_cur_relation: relation
+        var answer true
+        var i 0
+        while i < sn
+        {
+            let srow slist[i]
+            let trow tlist[i]
+            if srow = null
+                set answer: false
+            if trow = null
+                set answer: false
+            if answer
+            {
+                if this.compare_signatures_identical(srow as ref[Signature], trow as ref[Signature], false, false, false, SignatureComparerRelaterSimple) = false
+                    set answer: false
+            }
+            if answer = false
+                break
+            set i: i + 1
+        }
+        set rel_cur_relation: save_relation
+        answer
+    }
+
+    ; isMatchingSignature — the required/optional/rest arity match, and the
+    ; partial one, which asks only that the target need no fewer arguments.
+    function is_matching_signature(this, source: ref[Signature], target: ref[Signature], partial_match: bool) returns bool
+    {
+        let spc this.get_parameter_count(source)
+        let tpc this.get_parameter_count(target)
+        let smin this.get_min_argument_count(source)
+        let tmin this.get_min_argument_count(target)
+        let srest this.has_effective_rest_parameter(source)
+        let trest this.has_effective_rest_parameter(target)
+        if spc = tpc
+        {
+            if smin = tmin
+            {
+                if srest = trest
+                    return true
+            }
+        }
+        if partial_match
+        {
+            if smin <= tmin
+                return true
+        }
+        false
+    }
+
+    ; getConstraintOrUnknownFromTypeParameter / getDefaultOrUnknownFromTypeParameter
+    ; — the two `?? unknownType` readings compareSignaturesIdentical needs so that
+    ; a parameter with no constraint compares equal to another with none.
+    function get_constraint_or_unknown_from_type_parameter(this, t: ref[Type]) returns ref[Type]?
+    {
+        let r this.get_constraint_from_type_parameter(t)
+        if r <> null
+            return r
+        unknown_type
+    }
+
+    function get_default_or_unknown_from_type_parameter(this, t: ref[Type]) returns ref[Type]?
+    {
+        let r this.get_default_from_type_parameter(t)
+        if r <> null
+            return r
+        unknown_type
+    }
+
+    ; typePredicateKindsMatch, whole.
+    function type_predicate_kinds_match(a: ref[TypePredicate], b: ref[TypePredicate]) returns bool
+    {
+        if a.kind <> b.kind
+            return false
+        a.parameter_index = b.parameter_index
+    }
+
+    ; compareTypePredicatesIdentical. ★Its `source == target` arm answers TRUE for
+    ; two nils as well, which is a predicate pair with no type on either side —
+    ; the same reading compare_type_predicate_related_to's note records.
+    function compare_type_predicates_identical(this, source: ref[TypePredicate]?, target: ref[TypePredicate]?, comparer: int) returns bool
+    {
+        if source = null
+            return false
+        if target = null
+            return false
+        let s source as ref[TypePredicate]
+        let t target as ref[TypePredicate]
+        if Checker.type_predicate_kinds_match(s, t) = false
+            return false
+        if s.t = t.t
+            return true
+        if s.t = null
+            return false
+        if t.t = null
+            return false
+        this.compare_types_by_comparer(comparer, s.t as ref[Type], t.t as ref[Type])
+    }
+
+    ; compareSignaturesIdentical, split at the one line that REASSIGNS `source`:
+    ; the generic arm instantiates it with the target's type parameters and
+    ; continues, so the continuation is a tail helper rather than a rebound
+    ; parameter.
+    function compare_signatures_identical(this, source: ref[Signature], target: ref[Signature], partial_match: bool, ignore_this_types: bool, ignore_return_types: bool, comparer: int) returns bool
+    {
+        if source = target
+            return true
+        let mark this.unported_mark()
+        if this.is_matching_signature(source, target, partial_match) = false
+            return false
+        if this.unported_mark() <> mark
+            return false
+        let stpc Checker.type_parameter_count_of_signature(source)
+        let ttpc Checker.type_parameter_count_of_signature(target)
+        if stpc <> ttpc
+            return false
+        if ttpc = 0
+            return this.compare_signatures_identical_tail(source, target, ignore_this_types, ignore_return_types, comparer)
+        ; The type parameters' CONSTRAINTS and DEFAULTS must match, read through a
+        ; mapper from the source's parameters onto the target's.
+        let mapper this.new_type_mapper(source.type_parameters, target.type_parameters)
+        let sps source.type_parameters as ref[Array[ref[Type]?]]
+        let tps target.type_parameters as ref[Array[ref[Type]?]]
+        var i 0
+        while i < ttpc
+        {
+            let srow sps[i]
+            let trow tps[i]
+            if srow = null
+                return false
+            if trow = null
+                return false
+            let sp srow as ref[Type]
+            let tp trow as ref[Type]
+            var ok false
+            if sp = tp
+                set ok: true
+            if ok = false
+            {
+                let sc this.get_constraint_or_unknown_from_type_parameter(sp)
+                let tc this.get_constraint_or_unknown_from_type_parameter(tp)
+                if this.unported_mark() <> mark
+                    return false
+                if sc <> null
+                {
+                    if tc <> null
+                    {
+                        let isc this.instantiate_type(sc as ref[Type], mapper)
+                        if isc <> null
+                        {
+                            if this.compare_types_by_comparer(comparer, isc as ref[Type], tc as ref[Type])
+                            {
+                                let sd this.get_default_or_unknown_from_type_parameter(sp)
+                                let td this.get_default_or_unknown_from_type_parameter(tp)
+                                if this.unported_mark() <> mark
+                                    return false
+                                if sd <> null
+                                {
+                                    if td <> null
+                                    {
+                                        let isd this.instantiate_type(sd as ref[Type], mapper)
+                                        if isd <> null
+                                        {
+                                            if this.compare_types_by_comparer(comparer, isd as ref[Type], td as ref[Type])
+                                                set ok: true
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if ok = false
+                return false
+            set i: i + 1
+        }
+        let inst this.instantiate_signature_ex(source, mapper, true)
+        if inst = null
+            return false
+        this.compare_signatures_identical_tail(inst as ref[Signature], target, ignore_this_types, ignore_return_types, comparer)
+    }
+
+    ; The rest of compareSignaturesIdentical: the `this` types, the parameter
+    ; positions and the return. ★The parameter comparison is written in the
+    ; reference's own order — `compareTypes(t, s)`, target first — because a
+    ; comparer need not be symmetric.
+    function compare_signatures_identical_tail(this, source: ref[Signature], target: ref[Signature], ignore_this_types: bool, ignore_return_types: bool, comparer: int) returns bool
+    {
+        let mark this.unported_mark()
+        if ignore_this_types = false
+        {
+            let stt this.get_this_type_of_signature(source)
+            if this.unported_mark() <> mark
+                return false
+            if stt <> null
+            {
+                let ttt this.get_this_type_of_signature(target)
+                if this.unported_mark() <> mark
+                    return false
+                if ttt <> null
+                {
+                    if this.compare_types_by_comparer(comparer, stt as ref[Type], ttt as ref[Type]) = false
+                        return false
+                }
+            }
+        }
+        let count this.get_parameter_count(target)
+        if this.unported_mark() <> mark
+            return false
+        var i 0
+        while i < count
+        {
+            let sat this.get_type_at_position(source, i)
+            let tat this.get_type_at_position(target, i)
+            if this.unported_mark() <> mark
+                return false
+            if sat = null
+                return false
+            if tat = null
+                return false
+            if this.compare_types_by_comparer(comparer, tat as ref[Type], sat as ref[Type]) = false
+                return false
+            set i: i + 1
+        }
+        if ignore_return_types
+            return true
+        let sp this.get_type_predicate_of_signature(source)
+        let tp this.get_type_predicate_of_signature(target)
+        if this.unported_mark() <> mark
+            return false
+        var have_predicate false
+        if sp <> null
+            set have_predicate: true
+        if tp <> null
+            set have_predicate: true
+        if have_predicate
+            return this.compare_type_predicates_identical(sp, tp, comparer)
+        let sr this.get_return_type_of_signature(source)
+        let tr this.get_return_type_of_signature(target)
+        if this.unported_mark() <> mark
+            return false
+        if sr = null
+            return false
+        if tr = null
+            return false
+        this.compare_types_by_comparer(comparer, sr as ref[Type], tr as ref[Type])
+    }
+
+    ; ── slice 126: the INDEX-SIGNATURE relation ─────────────────────────
+    ;
+    ; indexSignaturesRelatedTo, whole. ★The stub's reading holds unchanged — the
+    ; body is one loop over the TARGET's index infos with `result` seeded True, so
+    ; a target with none is True — and the loop now runs.
+    ;
+    ; ★★ THE FIRST ARM IS THE `any` INDEX SIGNATURE'S LICENCE: as long as the
+    ; target has a STRING index whose value type is `any`, and the relation is not
+    ; the strict subtype one, every index info of the target is satisfied without
+    ; looking at the source at all. It is what makes `{}` assignable to
+    ; `{ [k: string]: any }`.
     function index_signatures_related_to(this, source: ref[Type], target: ref[Type], source_is_primitive: bool, relation: int, error_node: ref[AstNode]?, intersection_state: int) returns bool
     {
         if relation = RelationIdentity
-        {
-            this.record_unported("index-signatures-identical-to", target.flags)
-            return false
-        }
+            return this.index_signatures_identical_to(source, target)
+        let mark this.unported_mark()
         let infos this.get_index_infos_of_type(target)
+        if this.unported_mark() <> mark
+            return false
         if infos = null
             return true
-        if ((infos as ref[Array[ref[IndexInfo]?]]).get_length() as int) = 0
+        let list infos as ref[Array[ref[IndexInfo]?]]
+        let n list.get_length() as int
+        if n = 0
             return true
-        this.record_unported("index-signatures-related-to", target.flags)
+        ; `core.Some(indexInfos, info.keyType == stringType)`.
+        var target_has_string_index false
+        var i 0
+        while i < n
+        {
+            let row list[i]
+            if row <> null
+            {
+                if (row as ref[IndexInfo]).key_type = string_type
+                    set target_has_string_index: true
+            }
+            set i: i + 1
+        }
+        set i: 0
+        while i < n
+        {
+            let row list[i]
+            if row <> null
+            {
+                let ti row as ref[IndexInfo]
+                if ti.value_type = null
+                    return false
+                let tv ti.value_type as ref[Type]
+                var decided false
+                if relation <> RelationStrictSubtype
+                {
+                    if source_is_primitive = false
+                    {
+                        if target_has_string_index
+                        {
+                            if (tv.flags & TypeFlagsAny) <> 0
+                                set decided: true
+                        }
+                    }
+                }
+                if decided = false
+                {
+                    var generic_mapped false
+                    if Checker.is_generic_mapped_type(source)
+                    {
+                        if target_has_string_index
+                            set generic_mapped: true
+                    }
+                    if generic_mapped
+                    {
+                        let tt this.get_template_type_from_mapped_type(source)
+                        if this.unported_mark() <> mark
+                            return false
+                        if tt = null
+                            return false
+                        if this.is_related_to_ex(tt as ref[Type], tv, relation, error_node, IntersectionStateNone, RecursionFlagsBoth) = false
+                            return false
+                    }
+                    else
+                    {
+                        if this.type_related_to_index_info(source, ti, relation, error_node, intersection_state) = false
+                            return false
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        true
+    }
+
+    ; typeRelatedToIndexInfo. ★Its report — *Index signature for type 0 is missing
+    ; in type 1* — is a chain link and drops for signatures_related_to's reason.
+    ;
+    ; ★★ THE SECOND ARM'S THREE CONDITIONS ARE WHAT KEEPS `{ [x: string]: xxx }` A
+    ; STRICT SUBTYPE OF `{}` AND NOT THE OTHER WAY ROUND: an intersection
+    ; constituent never counts as having an INFERRED index signature, and under the
+    ; strict subtype relation only a fresh object literal does.
+    function type_related_to_index_info(this, source: ref[Type], target_info: ref[IndexInfo], relation: int, error_node: ref[AstNode]?, intersection_state: int) returns bool
+    {
+        let mark this.unported_mark()
+        if target_info.key_type = null
+            return false
+        let source_info this.get_applicable_index_info(source, target_info.key_type as ref[Type])
+        if this.unported_mark() <> mark
+            return false
+        if source_info <> null
+            return this.index_info_related_to(source_info as ref[IndexInfo], target_info, relation, error_node, intersection_state)
+        if (intersection_state & IntersectionStateSource) = 0
+        {
+            var fresh_or_lenient false
+            if relation <> RelationStrictSubtype
+                set fresh_or_lenient: true
+            if (source.object_flags & ObjectFlagsFreshLiteral) <> 0
+                set fresh_or_lenient: true
+            if fresh_or_lenient
+            {
+                if this.is_object_type_with_inferable_index(source)
+                    return this.members_related_to_index_info(source, target_info, relation, error_node, intersection_state)
+                if this.unported_mark() <> mark
+                    return false
+            }
+        }
         false
+    }
+
+    ; membersRelatedToIndexInfo — the source's own PROPERTIES against the target's
+    ; index signature, then its own index infos. ★The `exactOptionalPropertyTypes`
+    ; fork decides whether an optional property's `undefined` is stripped before
+    ; the comparison; a NUMBER key never strips it.
+    ;
+    ; ★★ THE INTERSECTION SOURCE IS THE ONE STOP: it needs
+    ; getPropertiesOfUnionOrIntersectionType, which is createUnionOrIntersection
+    ; Property's chapter and reports under the tag get_properties_of_type already
+    ; uses for it.
+    function members_related_to_index_info(this, source: ref[Type], target_info: ref[IndexInfo], relation: int, error_node: ref[AstNode]?, intersection_state: int) returns bool
+    {
+        let mark this.unported_mark()
+        if target_info.key_type = null
+            return false
+        if target_info.value_type = null
+            return false
+        let key_type target_info.key_type as ref[Type]
+        let value_type target_info.value_type as ref[Type]
+        if (source.flags & TypeFlagsIntersection) <> 0
+        {
+            this.record_unported("get-properties-of-union-or-intersection-type", source.flags)
+            return false
+        }
+        let props this.get_properties_of_object_type(source)
+        if this.unported_mark() <> mark
+            return false
+        if props <> null
+        {
+            let plist props as ref[Array[ref[Symbol]?]]
+            let pn plist.get_length() as int
+            var i 0
+            while i < pn
+            {
+                let row plist[i]
+                if row <> null
+                {
+                    let prop row as ref[Symbol]
+                    ; Ignored JSX and symbol-named members are skipped.
+                    if Checker.is_ignored_jsx_property(source, prop) = false
+                    {
+                        let lit this.get_literal_type_from_property(prop, TypeFlagsStringOrNumberLiteralOrUnique, false)
+                        if this.unported_mark() <> mark
+                            return false
+                        if lit = null
+                            return false
+                        if this.is_applicable_index_type(lit as ref[Type], key_type)
+                        {
+                            let prop_type this.get_non_missing_type_of_symbol(prop)
+                            if this.unported_mark() <> mark
+                                return false
+                            if prop_type = null
+                                return false
+                            let pt prop_type as ref[Type]
+                            var keep true
+                            if Checker.exact_optional_property_types() = false
+                            {
+                                if (pt.flags & TypeFlagsUndefined) = 0
+                                {
+                                    if key_type <> number_type
+                                    {
+                                        if (Symbol.flags_of(prop) & SymbolFlagsOptional) <> 0
+                                            set keep: false
+                                    }
+                                }
+                            }
+                            if keep
+                            {
+                                if this.is_related_to_ex(pt, value_type, relation, error_node, intersection_state, RecursionFlagsBoth) = false
+                                    return false
+                            }
+                            else
+                            {
+                                let stripped this.get_type_with_facts(pt, TypeFactsNEUndefined)
+                                if this.unported_mark() <> mark
+                                    return false
+                                if stripped = null
+                                    return false
+                                if this.is_related_to_ex(stripped as ref[Type], value_type, relation, error_node, intersection_state, RecursionFlagsBoth) = false
+                                    return false
+                            }
+                        }
+                    }
+                }
+                set i: i + 1
+            }
+        }
+        let infos this.get_index_infos_of_type(source)
+        if this.unported_mark() <> mark
+            return false
+        if infos = null
+            return true
+        let ilist infos as ref[Array[ref[IndexInfo]?]]
+        let inn ilist.get_length() as int
+        var j 0
+        while j < inn
+        {
+            let row ilist[j]
+            if row <> null
+            {
+                let info row as ref[IndexInfo]
+                if info.key_type = null
+                    return false
+                if this.is_applicable_index_type(info.key_type as ref[Type], key_type)
+                {
+                    if this.index_info_related_to(info, target_info, relation, error_node, intersection_state) = false
+                        return false
+                }
+            }
+            set j: j + 1
+        }
+        true
+    }
+
+    ; indexInfoRelatedTo — the value types, and its two reports are links.
+    function index_info_related_to(this, source_info: ref[IndexInfo], target_info: ref[IndexInfo], relation: int, error_node: ref[AstNode]?, intersection_state: int) returns bool
+    {
+        if source_info.value_type = null
+            return false
+        if target_info.value_type = null
+            return false
+        this.is_related_to_ex(source_info.value_type as ref[Type], target_info.value_type as ref[Type], relation, error_node, intersection_state, RecursionFlagsBoth)
+    }
+
+    ; indexSignaturesIdenticalTo. ★It asks for the source's index info AT THE
+    ; TARGET'S KEY TYPE — getIndexInfoOfType, an exact key match, not the
+    ; applicable one — and it compares `isReadonly` as well, which is the one place
+    ; in the relation where a modifier is part of identity.
+    function index_signatures_identical_to(this, source: ref[Type], target: ref[Type]) returns bool
+    {
+        let mark this.unported_mark()
+        let sinfos this.get_index_infos_of_type(source)
+        let tinfos this.get_index_infos_of_type(target)
+        if this.unported_mark() <> mark
+            return false
+        var sn 0
+        if sinfos <> null
+            set sn: (sinfos as ref[Array[ref[IndexInfo]?]]).get_length() as int
+        var tn 0
+        if tinfos <> null
+            set tn: (tinfos as ref[Array[ref[IndexInfo]?]]).get_length() as int
+        if sn <> tn
+            return false
+        if tn = 0
+            return true
+        let tlist tinfos as ref[Array[ref[IndexInfo]?]]
+        var i 0
+        while i < tn
+        {
+            let row tlist[i]
+            if row = null
+                return false
+            let ti row as ref[IndexInfo]
+            if ti.key_type = null
+                return false
+            if ti.value_type = null
+                return false
+            let si this.get_index_info_of_type(source, ti.key_type as ref[Type])
+            if this.unported_mark() <> mark
+                return false
+            if si = null
+                return false
+            let s_info si as ref[IndexInfo]
+            if s_info.value_type = null
+                return false
+            if this.is_related_to_ex(s_info.value_type as ref[Type], ti.value_type as ref[Type], RelationIdentity, null, IntersectionStateNone, RecursionFlagsBoth) = false
+                return false
+            if s_info.is_readonly <> ti.is_readonly
+                return false
+            set i: i + 1
+        }
+        true
     }
 
     ; reportErrorResults, whole — and it is four containment proofs and one call.
@@ -82082,6 +84052,324 @@ define Checker
     ; remove the constituents they matched and re-form the rest — so by the time
     ; the switch is reached the pair is the residue rather than the argument. The
     ; type-variable arm in between is where a candidate is actually recorded.
+    ; inferToTemplateLiteralType, slice 126.
+    ;
+    ; ★★★ THE `never` FALLBACK IS THE POINT OF THE OUTER CONDITION AND THE
+    ; REFERENCE EXPLAINS IT: when the target is nothing BUT placeholders and the
+    ; matcher fails, inferring `never` for each is what makes the later assignment
+    ; check FAIL. Making no inference at all would leave the constraint `string`,
+    ; which on instantiation collapses every placeholder and the check would
+    ; succeed — *a pointless and confusing outcome*.
+    ;
+    ; ★★ THE PREFERRED-TYPE SEARCH is the 30-arm `choose` closure, lifted into
+    ; template_preferred_type: it runs only for a STRING LITERAL source against a
+    ; TYPE VARIABLE target whose base constraint is neither `any` nor contains
+    ; `string`, and it picks the constraint constituent the literal really belongs
+    ; to so that `` `${"42"}` `` infers the NUMBER 42 where the constraint says
+    ; number.
+    procedure infer_to_template_literal_type(this, n: ref[InferenceState], source: ref[Type], target: ref[Type])
+    {
+        let mark this.unported_mark()
+        let matches this.infer_types_from_template_literal_type(source, target)
+        if this.unported_mark() <> mark
+            return
+        let tty Checker.template_literal_types_of(target)
+        if tty = null
+            return
+        let types tty as ref[Array[ref[Type]?]]
+        var have_matches false
+        if matches <> null
+        {
+            if ((matches as ref[Array[ref[Type]?]]).get_length() as int) <> 0
+                set have_matches: true
+        }
+        var all_texts_empty true
+        let ttx Checker.template_literal_texts_of(target)
+        if ttx = null
+            return
+        let texts ttx as ref[Array[ref[String]?]]
+        let tn texts.get_length() as int
+        var i 0
+        while i < tn
+        {
+            let row texts[i]
+            if row = null
+                set all_texts_empty: false
+            else
+            {
+                if ((row as ref[String]).get_length() as int) <> 0
+                    set all_texts_empty: false
+            }
+            set i: i + 1
+        }
+        var proceed have_matches
+        if all_texts_empty
+            set proceed: true
+        if proceed = false
+            return
+        let count types.get_length() as int
+        set i: 0
+        while i < count
+        {
+            let trow types[i]
+            if trow = null
+                return
+            let tt trow as ref[Type]
+            var src: ref[Type]? never_type
+            if have_matches
+            {
+                let ml matches as ref[Array[ref[Type]?]]
+                if i >= (ml.get_length() as int)
+                    return
+                set src: ml[i]
+            }
+            if src = null
+                return
+            let sv src as ref[Type]
+            var inferred false
+            if (sv.flags & TypeFlagsStringLiteral) <> 0
+            {
+                if (tt.flags & TypeFlagsTypeVariable) <> 0
+                {
+                    let info Checker.get_inference_info_for_type(n, tt)
+                    if info <> null
+                    {
+                        let ii info as ref[InferenceInfo]
+                        if ii.type_parameter = null
+                            return
+                        let constraint this.get_base_constraint_of_type(ii.type_parameter as ref[Type])
+                        if this.unported_mark() <> mark
+                            return
+                        if constraint <> null
+                        {
+                            let cn constraint as ref[Type]
+                            if Checker.is_type_any(cn) = false
+                            {
+                                let preferred this.template_preferred_type(sv, cn)
+                                if this.unported_mark() <> mark
+                                    return
+                                if preferred <> null
+                                {
+                                    this.infer_from_types(n, preferred as ref[Type], tt)
+                                    set inferred: true
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if inferred = false
+                this.infer_from_types(n, sv, tt)
+            if this.unported_mark() <> mark
+                return
+            set i: i + 1
+        }
+    }
+
+    ; The preferred-type fold over the constraint's constituents. It answers null
+    ; when the fold ends at `never`, which is the reference's *no preferred type,
+    ; infer from the string literal itself*.
+    function template_preferred_type(this, source: ref[Type], constraint: ref[Type]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        ; `allTypeFlags` over constraint.Distributed().
+        var all_flags 0
+        let parts this.distributed_types(constraint)
+        let n parts.get_length() as int
+        var i 0
+        while i < n
+        {
+            let row parts[i]
+            if row <> null
+                set all_flags: all_flags | (row as ref[Type]).flags
+            set i: i + 1
+        }
+        ; A constraint containing `string` needs no preferred type at all.
+        if (all_flags & TypeFlagsString) <> 0
+            return null
+        let sd Checker.literal_text_of(source)
+        let sn Checker.literal_text_length_of(source)
+        if (all_flags & TypeFlagsNumberLike) <> 0
+        {
+            ; isValidNumberString(str, roundTripOnly: true) — the round trip is the
+            ; half is_valid_number_string does not carry, so it is asked here.
+            var ok Checker.is_valid_number_string(sd, sn)
+            if ok
+            {
+                var nb char[JSNUM_MAX_TEXT]
+                let nn jsnum_to_string(jsnum_from_string(sd, sn), &nb[0])
+                if nn <> sn
+                    set ok: false
+                else
+                {
+                    if Checker.bytes_equal(&nb[0], 0, sd, 0, sn) = false
+                        set ok: false
+                }
+            }
+            if ok = false
+                set all_flags: all_flags & ~TypeFlagsNumberLike
+        }
+        if (all_flags & TypeFlagsBigIntLike) <> 0
+        {
+            ; isValidBigIntString — a fresh SCANNER with an error hook.
+            this.record_unported("is-valid-big-int-string", all_flags)
+            return null
+        }
+        var matching never_type
+        set i: 0
+        while i < n
+        {
+            let row parts[i]
+            if row <> null
+            {
+                let picked this.template_choose_type(matching, row as ref[Type], source, sd, sn, all_flags)
+                if this.unported_mark() <> mark
+                    return null
+                if picked = null
+                    return null
+                set matching: picked as ref[Type]
+            }
+            set i: i + 1
+        }
+        if (matching.flags & TypeFlagsNever) <> 0
+            return null
+        matching
+    }
+
+    ; `Type.Distributed()` — a union's constituents, `never`'s nothing, and
+    ; anything else itself.
+    function distributed_types(this, t: ref[Type]) returns ref[Array[ref[Type]?]]
+    {
+        if (t.flags & TypeFlagsUnion) <> 0
+        {
+            let ts Checker.union_types_of(t)
+            if ts <> null
+                return ts as ref[Array[ref[Type]?]]
+        }
+        let out this.new_type_list(null)
+        if (t.flags & TypeFlagsNever) <> 0
+            return out
+        out.add(t)
+        out
+    }
+
+    ; The `choose` closure of inferToTemplateLiteralType, arm for arm and in the
+    ; reference's own order — it is a FOLD, so `left` is what has been chosen so
+    ; far and `right` the next constituent.
+    function template_choose_type(this, left: ref[Type], right: ref[Type], source: ref[Type], sd: pointer[char], sn: int, all_flags: int) returns ref[Type]?
+    {
+        if (right.flags & all_flags) = 0
+            return left
+        if (left.flags & TypeFlagsString) <> 0
+            return left
+        if (right.flags & TypeFlagsString) <> 0
+            return source
+        if (left.flags & TypeFlagsTemplateLiteral) <> 0
+            return left
+        if (right.flags & TypeFlagsTemplateLiteral) <> 0
+        {
+            if this.is_type_matched_by_template_literal_type(source, right, SignatureComparerAssignable)
+                return source
+            return left
+        }
+        if (left.flags & TypeFlagsStringMapping) <> 0
+            return left
+        if (right.flags & TypeFlagsStringMapping) <> 0
+        {
+            ; `str == applyStringMapping(right.symbol, str)` — the case-mapping
+            ; chapter again.
+            this.record_unported("apply-string-mapping", right.flags)
+            return null
+        }
+        if (left.flags & TypeFlagsStringLiteral) <> 0
+            return left
+        if (right.flags & TypeFlagsStringLiteral) <> 0
+        {
+            if Checker.literal_text_length_of(right) = sn
+            {
+                if Checker.bytes_equal(Checker.literal_text_of(right), 0, sd, 0, sn)
+                    return right
+            }
+            return left
+        }
+        if (left.flags & TypeFlagsNumber) <> 0
+            return left
+        if (right.flags & TypeFlagsNumber) <> 0
+            return this.get_number_literal_type(jsnum_from_string(sd, sn))
+        if (left.flags & TypeFlagsEnum) <> 0
+            return left
+        if (right.flags & TypeFlagsEnum) <> 0
+            return this.get_number_literal_type(jsnum_from_string(sd, sn))
+        if (left.flags & TypeFlagsNumberLiteral) <> 0
+            return left
+        if (right.flags & TypeFlagsNumberLiteral) <> 0
+        {
+            if Checker.literal_bits_of(right) = jsnum_from_string(sd, sn)
+                return right
+            return left
+        }
+        if (left.flags & TypeFlagsBigInt) <> 0
+            return left
+        if (right.flags & TypeFlagsBigInt) <> 0
+        {
+            ; parseBigIntLiteralType.
+            this.record_unported("parse-big-int-literal-type", right.flags)
+            return null
+        }
+        if (left.flags & TypeFlagsBigIntLiteral) <> 0
+            return left
+        if (right.flags & TypeFlagsBigIntLiteral) <> 0
+        {
+            let sb StringBuilder^host()
+            Checker.write_pseudo_big_int(&sb, right)
+            let txt sb.to_string()
+            if (txt.get_length() as int) = sn
+            {
+                if Checker.bytes_equal(txt.get_buffer() as pointer[char], 0, sd, 0, sn)
+                    return right
+            }
+            return left
+        }
+        if (left.flags & TypeFlagsBoolean) <> 0
+            return left
+        if (right.flags & TypeFlagsBoolean) <> 0
+        {
+            if Checker.text_equals_cstr(sd, sn, "true")
+                return true_type
+            if Checker.text_equals_cstr(sd, sn, "false")
+                return false_type
+            return boolean_type
+        }
+        if (left.flags & TypeFlagsBooleanLiteral) <> 0
+            return left
+        if (right.flags & TypeFlagsBooleanLiteral) <> 0
+        {
+            var matched Checker.text_equals_cstr(sd, sn, "false")
+            if Checker.literal_bool_of(right)
+                set matched: Checker.text_equals_cstr(sd, sn, "true")
+            if matched
+                return right
+            return left
+        }
+        if (left.flags & TypeFlagsUndefined) <> 0
+            return left
+        if (right.flags & TypeFlagsUndefined) <> 0
+        {
+            if Checker.text_equals_cstr(sd, sn, right.intrinsic_name)
+                return right
+            return left
+        }
+        if (left.flags & TypeFlagsNull) <> 0
+            return left
+        if (right.flags & TypeFlagsNull) <> 0
+        {
+            if Checker.text_equals_cstr(sd, sn, right.intrinsic_name)
+                return right
+            return left
+        }
+        left
+    }
+
     procedure infer_from_types(this, n: ref[InferenceState], source_in: ref[Type], target_in: ref[Type])
     {
         var source source_in
@@ -82602,9 +84890,7 @@ define Checker
         }
         if (target.flags & TypeFlagsTemplateLiteral) <> 0
         {
-            ; inferTypesFromTemplateLiteralType — the matcher that splits a string
-            ; literal along the template's texts. The template-literal chapter.
-            this.record_unported("infer-to-template-literal-type", target.flags)
+            this.infer_to_template_literal_type(n, source, target)
             return
         }
         ; the default arm
