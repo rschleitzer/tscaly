@@ -25,9 +25,12 @@
 // first is in the window.
 //
 // ★ The assignment is written `Before.b` and not `this.b` deliberately. `this.b = 1`
-// inside a static block reaches global-object-property-augment, a stop in another
-// chapter, and the stop would take the rest of the unit's diagnostics with it — the
-// file would then gate nothing (§3.5ap).
+// inside a static block used to reach `global-object-property-augment`, a stop in
+// another chapter that would have taken the rest of the unit's diagnostics with it
+// (§3.5ap). That stop is gone since slice 127 and a NEW one stands in the same
+// place — `js-file-nonexistent-property` for a JS file, and on the TypeScript side
+// the static block's `this` is looked up on the instance side — so the spelling
+// stays as it is: what the fixture gates is the position window, not the lookup.
 
 class Before {
     static { Before.b = 1; }
