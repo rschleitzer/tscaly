@@ -98,7 +98,7 @@ o.write("    ; states \u2014 so calling into the checker from here would be a ca
 o.write("    ; module declared LATER. Twelve lines is the price of not testing that.\n")
 o.write("    function bytes_are(name: Slice[char], t: pointer[const_char]) returns bool\n")
 o.write("    {\n")
-o.write("        if name = null\n")
+o.write("        if name.data = null\n")
 o.write("            return false\n")
 o.write("        var i: int 0\n")
 o.write("        while i < name.length\n")
