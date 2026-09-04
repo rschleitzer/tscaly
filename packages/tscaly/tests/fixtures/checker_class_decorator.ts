@@ -1,10 +1,11 @@
-// Slice 51. checkDecorators past its guard — the report this slice places, and
-// the reason the guard is ported rather than the whole function: a class with no
-// decorator returns at the first line and the check continues to
-// checkCollisionsForDeclarationName, which is where nearly every class in the
-// corpus lands.
+// Slice 51 wrote this for checkDecorators' STOP; slice 134 ported the function
+// and the unit is a MATCH. It stays as the smallest decorated class in the
+// corpus — `@dec` on a class whose decorator is an undeclared name, so the walk
+// runs resolveDecorator, reports the unresolved identifier and resolves an
+// untyped call, which is the shortest path through the whole chapter.
 //
-// ★ It has to be the FIRST statement of the unit to be observable at all: the
-// unported report keeps the first, and every other declaration kind that could
-// introduce `dec` reports before it.
+// ★ The claim slice 51 attached to it is still true and is what makes it a
+// coverage fixture rather than a duplicate: a class with NO decorator returns at
+// checkDecorators' first line, so nothing else in the corpus reaches the body
+// through this shape.
 @dec class C {}
