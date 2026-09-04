@@ -41,6 +41,12 @@ SUB = os.path.join(REPO, "packages/tscaly/_submodules/typescript-go")
 TABLE = os.path.join(SUB, "internal/diagnostics/diagnostics_generated.go")
 SOURCES = [
     os.path.join(SUB, "internal/scanner/scanner.go"),
+    # Slice 140. regexp.go joins under the same per-FILE rule, and it is the
+    # clearest case of it: the REGULAR EXPRESSION grammar reports, and 34 of its
+    # 37 messages appear in NO other source of this list — the whole TS1499-TS1534
+    # block plus TS1005's neighbours. Without this line the port would have to
+    # spell an entire grammar's diagnostics as bare numbers.
+    os.path.join(SUB, "internal/scanner/regexp.go"),
     os.path.join(SUB, "internal/parser/parser.go"),
     # Slice 21. jsdoc.go is the parser's second grammar and sits in the same
     # package; six of its messages appear nowhere else, so the port would have
