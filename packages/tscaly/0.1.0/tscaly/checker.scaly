@@ -799,6 +799,14 @@ define MapTypeKindDefinitelyFalsyPart: int 6
 ; MapTypeArgs grew four int slots rather than reusing `index`: that one belongs to
 ; the template-literal span.
 define MapTypeKindContextualElement: int 7
+; getWidenedLiteralType's own union arm, slice 139 — it maps ITSELF over the
+; constituents and captures nothing, exactly as the two base-type mappers above
+; do. ★The stop it replaces read *mapType over getWidenedLiteralType, i.e.
+; getUnionType again* — a note whose two premises (this dispatcher, and the union
+; type) had both been in the file for a dozen slices (§3.5eo).
+define MapTypeKindWidenedLiteral: int 8
+; getMutableArrayOrTupleType's own union arm, slice 139. Captures nothing.
+define MapTypeKindMutableArrayOrTuple: int 9
 
 define MapTypeArgs
 (
@@ -2738,6 +2746,11 @@ define CachedSignature
 define SignatureCacheKindInstantiation: int 0
 define SignatureCacheKindBase: int 1
 define SignatureCacheKindErased: int 2
+; getOptionalCallSignature's two rows, slice 139 — the reference's SignatureKeyInner
+; and SignatureKeyOuter, which it likewise keeps in `cachedSignatures` beside the
+; other two.
+define SignatureCacheKindOptionalInner: int 3
+define SignatureCacheKindOptionalOuter: int 4
 
 ; The reference's *InferenceState — the per-inferTypes scratch the walk threads.
 ;
@@ -2843,10 +2856,28 @@ define DeferredTypeMapperData
 
 ; MergedTypeMapper (slice 122) — `m2.Map(m1.Map(t))`, a PLAIN composition of the
 ; two maps. Its sibling CompositeTypeMapper instantiates through m2 instead of
-; mapping through it, and that one still has no writer here: both its callers
-; (instantiate_symbol's already-instantiated branch and instantiate_signature's
-; fresh-type-parameter branch) are still stops.
+; mapping through it, and slice 139 gives that one its writers: the two this
+; header named as stops — instantiate_symbol's already-instantiated branch and
+; instantiate_signature's fresh-type-parameter branch — are the whole of
+; combine_type_mappers' caller list.
 define MergedTypeMapperData
+(
+    m1: ref[TypeMapper]?
+    m2: ref[TypeMapper]?
+)
+
+; CompositeTypeMapper (slice 139) — the same two slots as Merged and a DIFFERENT
+; composition, which is the entire point of carrying both.
+;
+; ★★★ MERGED MAPS THROUGH m2, COMPOSITE INSTANTIATES THROUGH IT. Upstream:
+; `t1 := m.m1.Map(t); if t1 != t { return m.c.instantiateType(t1, m.m2) }; return
+; m.m2.Map(t)`. So when m1 answered something NEW, m2 is applied to the whole
+; result RECURSIVELY (a type reference's arguments, a signature's parameters)
+; instead of being asked about the top-level type alone — and that is what makes
+; a two-stage substitution correct: the fresh type parameters instantiate_signature
+; mints are the TARGETS of m1, and every constraint that mentions them has to be
+; rewritten by m2 wherever it occurs, not only when it IS the type.
+define CompositeTypeMapperData
 (
     m1: ref[TypeMapper]?
     m2: ref[TypeMapper]?
@@ -2898,6 +2929,7 @@ define TypeMapperData union
     ArrayToSingle: ArrayToSingleTypeMapperData
     Deferred: DeferredTypeMapperData
     Merged: MergedTypeMapperData
+    Composite: CompositeTypeMapperData
     Inference: InferenceTypeMapperData
     Reliability: ReliabilityTypeMapperData
 )
@@ -10593,6 +10625,42 @@ define Checker
     ; require symbol — it comes from a lib this compilation does not load) and the
     ; JSON source file (a SourceFile is a value declaration only for a JSON module,
     ; which needs a program).
+    ; getTypeOfPrototypeProperty — the declared type of the symbol's PARENT, with
+    ; `any` supplied for each of the class's type parameters (TypeScript 1.0 spec
+    ; 8.4). ★★★THE NOTE THAT STOOD AT ITS CALL SITE SAID *the parent walk is
+    ; getParentOfSymbol, which this port does not have* — and get_parent_of_symbol
+    ; has been in this file for dozens of slices (§3.5eo).
+    ;
+    ; ★ The reference indexes `AsInterfaceType()` without a guard, because a
+    ; prototype's parent is a CLASS and a class's declared type is an interface
+    ; type. Here a null answer is reported the way every other absent
+    ; precondition is, so the shape that would panic upstream says so instead.
+    function get_type_of_prototype_property(this, prototype: ref[Symbol]) returns ref[Type]?
+    {
+        let parent this.get_parent_of_symbol(prototype)
+        if parent = null
+            return null
+        let class_type this.get_declared_type_of_symbol(parent as ref[Symbol])
+        if class_type = null
+            return null
+        let ct class_type as ref[Type]
+        let type_parameters this.interface_type_parameters_of(ct)
+        if type_parameters = null
+            return class_type
+        let tps type_parameters as ref[Array[ref[Type]?]]
+        let n tps.get_length() as int
+        if n = 0
+            return class_type
+        let args &Array[ref[Type]?]^host()
+        var i 0
+        while i < n
+        {
+            args.add(any_type)
+            set i: i + 1
+        }
+        this.create_type_reference(ct, args as ref[Array[ref[Type]?]]?, ObjectFlagsNone)
+    }
+
     function get_type_of_variable_or_parameter_or_property_worker(this, symbol: ref[Symbol]) returns ref[Type]?
     {
         ; ★★★ THE MARK, NOT THE FLAG — see unported_count's own note. The flag says
@@ -10604,13 +10672,7 @@ define Checker
         let mark this.unported_mark()
         let f Symbol.flags_of(symbol)
         if (f & SymbolFlagsPrototype) <> 0
-        {
-            ; getTypeOfPrototypeProperty — the declared type of the symbol's PARENT,
-            ; instantiated with `any` per type parameter. The parent walk is
-            ; getParentOfSymbol, which this port does not have.
-            this.record_unported("get-type-of-prototype-property", 0)
-            return null
-        }
+            return this.get_type_of_prototype_property(symbol)
         ; `symbol == c.requireSymbol` — see the header.
         let vd Symbol.value_declaration_of(symbol)
         if vd = null
@@ -12513,6 +12575,24 @@ define Checker
         (Checker.tuple_combined_flags_of(target as ref[Type]) & ElementFlagsVariadic) <> 0
     }
 
+    ; isSingleElementGenericTupleType, slice 139 — a generic tuple whose element
+    ; list holds exactly ONE entry, i.e. `[...T]`. ★It asks the GENERIC predicate
+    ; above and not the flags directly: a one-element tuple is single-element
+    ; without being generic (`[string]`), and the two relation arms this feeds are
+    ; about the variadic spread alone.
+    function is_single_element_generic_tuple_type(t: ref[Type]) returns bool
+    {
+        if Checker.is_generic_tuple_type(t) = false
+            return false
+        let target Checker.target_of(t)
+        if target = null
+            return false
+        let infos Checker.tuple_element_infos_of(target as ref[Type])
+        if infos = null
+            return false
+        ((infos as ref[Array[ref[TupleElementInfo]?]]).get_length() as int) = 1
+    }
+
     ; getGenericObjectFlags. ★The union MEMO is the reference's own and it WRITES
     ; into object_flags, which is why the two predicates below cannot ask the flags
     ; themselves.
@@ -12523,9 +12603,18 @@ define Checker
         {
             if (t.object_flags & ObjectFlagsIsGenericTypeComputed) = 0
             {
-                if (t.flags & TypeFlagsUnion) <> 0
+                ; ★★★ THE FORK IS UnionOrIntersection AGAINST Substitution, AND IT
+                ; USED TO BE Union AGAINST A STOP whose note read *neither type is
+                ; minted anywhere in this port — there is no new_intersection_type
+                ; and TypeFlagsSubstitution has no producer*. Both premises expired:
+                ; slice 121 brought the intersection and `new_substitution_type` has
+                ; been a writer since the substitution chapter (§3.5eo). The
+                ; ACCESSOR is what the fork is for — upstream reads `t.Types()` for
+                ; either composite and `AsSubstitutionType()` for the third, so this
+                ; asks union_or_intersection_types_of and not union_types_of.
+                if (t.flags & TypeFlagsUnionOrIntersection) <> 0
                 {
-                    let types Checker.union_types_of(t)
+                    let types Checker.union_or_intersection_types_of(t)
                     if types <> null
                     {
                         let list types as ref[Array[ref[Type]?]]
@@ -12542,13 +12631,12 @@ define Checker
                 }
                 else
                 {
-                    ; The INTERSECTION and SUBSTITUTION arms. Neither type is minted
-                    ; anywhere in this port — there is no new_intersection_type and
-                    ; TypeFlagsSubstitution has no producer — so the two share one
-                    ; stop rather than an invented zero, which would answer *not
-                    ; generic* for a type the reference may call generic.
-                    this.record_unported("generic-object-flags-composite", 0)
-                    return 0
+                    let base Checker.substitution_base_type_of(t)
+                    if base <> null
+                        set combined: combined | this.get_generic_object_flags(base as ref[Type])
+                    let constraint Checker.substitution_constraint_of(t)
+                    if constraint <> null
+                        set combined: combined | this.get_generic_object_flags(constraint as ref[Type])
                 }
                 set t.object_flags: t.object_flags | ObjectFlagsIsGenericTypeComputed | combined
             }
@@ -14235,6 +14323,20 @@ define Checker
     ; the asked kind and NONE of the other. An overloaded function has two call
     ; signatures and answers nil; a class has one construct signature and no call
     ; signature, which is why `new C()` reaches this at all.
+    ; getSingleCallOrConstructSignature — the call signature if there is exactly
+    ; one, else the construct one. ★`allowMembers` is FALSE at this call site, so a
+    ; type carrying properties beside its one signature answers nothing.
+    function get_single_call_or_construct_signature(this, t: ref[Type]) returns ref[Signature]?
+    {
+        let mark this.unported_mark()
+        let call_sig this.get_single_signature(t, SignatureKindCall, false)
+        if this.unported_mark() <> mark
+            return null
+        if call_sig <> null
+            return call_sig
+        this.get_single_signature(t, SignatureKindConstruct, false)
+    }
+
     function get_single_signature(this, t: ref[Type], kind: int, allow_members: bool) returns ref[Signature]?
     {
         if (t.flags & TypeFlagsObject) = 0
@@ -14406,10 +14508,12 @@ define Checker
     ; reader for it, and all three report"* — named its own expiry date, and the
     ; union chapter is it. All three readers answer now.
     ;
-    ; ★★ THE ENUM-LIKE AND UNION ARMS ARE INERT FOR THE SAME REASON THEIR FLAGS
-    ; ARE: nothing here sets TypeFlagsEnum, TypeFlagsEnumLiteral or TypeFlagsUnion
-    ; on a type. They are gates with reports rather than comments, so the slice that
-    ; makes an enum member type or a union meets one.
+    ; ★★ THE ENUM-LIKE ARM IS STILL INERT FOR THE REASON ITS FLAGS ARE: nothing
+    ; here sets TypeFlagsEnum or TypeFlagsEnumLiteral on a type. ★★★THE UNION ARM
+    ; IS LIVE SINCE SLICE 139 — the sentence that stood here counted it among the
+    ; inert ones and named `TypeFlagsUnion` with them, which stopped being true the
+    ; slice the union chapter landed; it is now the ordinary map over the
+    ; constituents (§3.5eo).
     ;
     ; ★ THE ORDER IS THE REFERENCE'S SWITCH ORDER AND IT MATTERS ONCE: EnumLike is
     ; tested before the four literal kinds, and an enum LITERAL type carries both
@@ -14432,11 +14536,7 @@ define Checker
                 return boolean_type
         }
         if (t.flags & TypeFlagsUnion) <> 0
-        {
-            ; mapType over getWidenedLiteralType, i.e. getUnionType again.
-            this.record_unported("map-type", t.flags)
-            return null
-        }
+            return this.map_type(t, MapTypeKindWidenedLiteral, null)
         t
     }
 
@@ -14524,14 +14624,13 @@ define Checker
                 if (last as ref[AstNode]) = parameter
                     set is_last: true
             }
+            ; ★The rest parameter's contextual type is the tuple of everything
+            ; from `index` on. The stop that stood here named *the TUPLE chapter,
+            ; which this port has no producer for at all* — createTupleTypeEx has
+            ; been a producer since slice 115 and get_rest_type_at_position itself
+            ; since the signature chapter (§3.5eo).
             if is_last
-            {
-                ; getRestTypeAtPosition — createTupleTypeEx and getMinArgumentCount
-                ; behind it, i.e. the TUPLE chapter, which this port has no
-                ; producer for at all.
-                this.record_unported("get-rest-type-at-position", KindParameter)
-                return null
-            }
+                return this.get_rest_type_at_position(sig, index)
         }
         this.try_get_type_at_position(sig, index)
     }
@@ -14569,9 +14668,15 @@ define Checker
 
     }
 
-    ; tryGetTypeAtPosition, with its rest half reporting for the reason
-    ; get_parameter_count's does: a tuple rest type has no producer in this port,
-    ; and getIndexedAccessType behind it is a chapter of its own.
+    ; tryGetTypeAtPosition, whole.
+    ;
+    ; ★★★ ITS REST HALF WAS A STOP WHOSE NOTE READ *a tuple rest type has no
+    ; producer in this port, and getIndexedAccessType behind it is a chapter of its
+    ; own* — and getIndexedAccessType has BEEN that chapter since slice 117
+    ; (§3.5eo). The reference's own comment is the whole content of the guard: the
+    ; bounds test comes FIRST, because getIndexedAccessType would answer
+    ; `undefined` for an out-of-range index where this function must answer
+    ; NOTHING, and the caller reads those two apart.
     function try_get_type_at_position(this, signature: ref[Signature], pos: int) returns ref[Type]?
     {
         var length 0
@@ -14589,8 +14694,34 @@ define Checker
         }
         if Checker.signature_has_rest_parameter(signature) = false
             return null
-        this.record_unported("get-indexed-access-type", pos)
-        null
+        let rest_param (signature.parameters as ref[Array[ref[Symbol]?]])[param_count]
+        if rest_param = null
+            return null
+        let mark this.unported_mark()
+        let rest_type this.get_type_of_symbol(rest_param as ref[Symbol])
+        if this.unported_mark() <> mark
+            return null
+        if rest_type = null
+            return null
+        let rt rest_type as ref[Type]
+        let index pos - param_count
+        var reachable true
+        if Checker.is_tuple_type(rt)
+        {
+            let target Checker.target_of(rt)
+            if target <> null
+            {
+                let tt target as ref[Type]
+                if (Checker.tuple_combined_flags_of(tt) & ElementFlagsVariable) = 0
+                {
+                    if index >= Checker.tuple_fixed_length_of(tt)
+                        set reachable: false
+                }
+            }
+        }
+        if reachable = false
+            return null
+        this.get_indexed_access_type(rt, this.get_number_literal_type(Checker.number_bits_from_int(index)))
     }
 
     ; getTypeOfParameter, whole.
@@ -16244,24 +16375,42 @@ define Checker
         links.resolved_type
     }
 
-    ; createDeferredTypeReference, for the ARRAY and TUPLE nodes this chapter sends
-    ; it. ★★The reference's `mapper` and `alias` parameters are both nil at this call
-    ; site, so the alias is taken from the NODE and the mapper stays null; the
-    ; `alias.typeArguments = instantiateTypes(...)` line inside the nil-alias branch
-    ; is therefore unreachable from here and is not written.
+    ; createDeferredTypeReference. ★★The two callers of the ARRAY/TUPLE chapter pass
+    ; nil for both `mapper` and `alias`, which is what the short form below spells;
+    ; ★★★the INSTANTIATION caller passes both, and the note that stood here — *the
+    ; deferred half of the reference chapter, which has no producer* — was written
+    ; at that call site while this producer sat four thousand lines above it
+    ; (§3.5eo). The `alias.typeArguments = instantiateTypes(...)` line the old note
+    ; called unreachable is now written, because that caller is the one it is for.
     function create_deferred_type_reference(this, target: ref[Type], node: ref[AstNode]) returns ref[Type]?
+        this.create_deferred_type_reference_ex(target, node, null, null)
+
+    function create_deferred_type_reference_ex(this, target: ref[Type], node: ref[AstNode], m: ref[TypeMapper]?, alias_in: ref[TypeAlias]?) returns ref[Type]?
     {
-        let alias_symbol this.get_alias_symbol_for_type_node(node)
+        var alias alias_in
+        if alias = null
+        {
+            set alias: this.get_alias_for_type_node(node)
+            if alias <> null
+            {
+                if m <> null
+                {
+                    let a alias as ref[TypeAlias]
+                    set a.type_arguments: this.instantiate_types(a.type_arguments, m as ref[TypeMapper])
+                }
+            }
+        }
         let made this.new_object_type(ObjectFlagsReference, target.symbol)
         if made = null
             return null
         let t made as ref[Type]
-        if alias_symbol <> null
+        if alias <> null
         {
-            set t.alias_symbol: alias_symbol
-            set t.alias_type_arguments: this.append_local_type_parameters_of_class_or_interface_or_type_alias(null, alias_symbol as ref[Symbol])
+            let a alias as ref[TypeAlias]
+            set t.alias_symbol: a.symbol
+            set t.alias_type_arguments: a.type_arguments
         }
-        Checker.fill_deferred_reference_data(t, target, node, null)
+        Checker.fill_deferred_reference_data(t, target, node, m)
         t
     }
 
@@ -43640,19 +43789,48 @@ define Checker
             {
                 if AstNode.kind_of(c) <> KindSuperKeyword
                 {
+                    ; ★The optional-chain arm, slice 139: the CHAIN's own
+                    ; nullability is removed before the non-null check, where the
+                    ; ordinary arm hands the expression straight to it.
                     if Binder.is_optional_chain(node)
                     {
-                        ; getOptionalExpressionType — the optional-chain marker
-                        ; removal, which this port has no producer for.
-                        set links.effects_computed: false
-                        this.record_unported("get-optional-expression-type", AstNode.kind_of(node))
-                        return null
+                        let raw this.check_expression(c)
+                        if this.unported_mark() <> mark
+                        {
+                            set links.effects_computed: false
+                            return null
+                        }
+                        if raw = null
+                        {
+                            set links.effects_computed: false
+                            return null
+                        }
+                        let non_optional this.get_optional_expression_type(raw as ref[Type], c)
+                        if this.unported_mark() <> mark
+                        {
+                            set links.effects_computed: false
+                            return null
+                        }
+                        if non_optional = null
+                        {
+                            set links.effects_computed: false
+                            return null
+                        }
+                        set func_type: this.check_non_null_type(non_optional as ref[Type], c)
+                        if this.unported_mark() <> mark
+                        {
+                            set links.effects_computed: false
+                            return null
+                        }
                     }
-                    set func_type: this.check_non_null_expression(c)
-                    if this.unported_mark() <> mark
+                    if Binder.is_optional_chain(node) = false
                     {
-                        set links.effects_computed: false
-                        return null
+                        set func_type: this.check_non_null_expression(c)
+                        if this.unported_mark() <> mark
+                        {
+                            set links.effects_computed: false
+                            return null
+                        }
                     }
                 }
             }
@@ -44913,6 +45091,33 @@ define Checker
     ; the port unions, and slice 116 gave it one that reaches THIS function, since
     ; an enum's declared type is the union of its members'. The INTERSECTION half
     ; is unchanged and still stops, because nothing mints one.
+    ; someType with the type-PARAMETER predicate, slice 139 — the relation's
+    ; comparability carve-out is its one caller. ★The someType family is spelled
+    ; one function per predicate in this port (§3.18) and this is the cheapest
+    ; member of it: a union asks its constituents, anything else asks itself.
+    function some_type_is_type_parameter(t: ref[Type]) returns bool
+    {
+        if (t.flags & TypeFlagsUnion) = 0
+            return (t.flags & TypeFlagsTypeParameter) <> 0
+        let types Checker.union_types_of(t)
+        if types = null
+            return false
+        let list types as ref[Array[ref[Type]?]]
+        let n list.get_length() as int
+        var i 0
+        while i < n
+        {
+            let e list[i]
+            if e <> null
+            {
+                if ((e as ref[Type]).flags & TypeFlagsTypeParameter) <> 0
+                    return true
+            }
+            set i: i + 1
+        }
+        false
+    }
+
     function some_type_is_generic_with_union_constraint(this, t: ref[Type]) returns bool
     {
         if (t.flags & TypeFlagsUnion) <> 0
@@ -48900,6 +49105,41 @@ define Checker
         this.check_non_null_type(t as ref[Type], node)
     }
 
+    ; ── the optional CALL chain (slice 139) ─────────────────────────────────
+    ;
+    ; ★★★ THE TWO STOPS THIS SLICE RETIRED HERE NAMED A FUNCTION THAT WAS ALREADY
+    ; IN THE FILE, AND THAT IS §3.5eo'S SHARPEST FORM YET. One read *GetNonNullableType
+    ; at an optional-chain ROOT and removeOptionalTypeMarker inside one … machinery
+    ; this port does not have*, the other *the optional-chain marker removal, which
+    ; this port has no producer for* — and `get_optional_expression_type` sits four
+    ; thousand lines below, beside check_non_null_chain, which has been calling it
+    ; since the chain arrived. Nothing had to be WRITTEN for either site; the notes
+    ; were the whole obstacle. ★★★A first draft of this slice re-ported it here as a
+    ; DUPLICATE definition, which the compiler accepts in silence: when a stop names
+    ; a callee as absent, grep for the callee before writing it.
+    ;
+    ; getOptionalCallSignature — cloneSignature under the call-chain bits, memoised
+    ; per (signature, inner/outer). ★The cache is the file's own association list
+    ; over `cached_signatures` with two kinds of its own, so an optional-call clone
+    ; cannot collide with a base or an erased signature; the reference keys the same
+    ; two by its SignatureKeyInner/Outer sentinels.
+    function get_optional_call_signature(this, signature: ref[Signature], call_chain_flags: int) returns ref[Signature]?
+    {
+        if (signature.flags & SignatureFlagsCallChainFlags) = call_chain_flags
+            return signature
+        var kind SignatureCacheKindOptionalOuter
+        if call_chain_flags = SignatureFlagsIsInnerCallChain
+            set kind: SignatureCacheKindOptionalInner
+        let cached this.signature_cache_lookup(signature, kind)
+        if cached <> null
+            return cached
+        let result this.clone_signature(signature)
+        set result.flags: result.flags | call_chain_flags
+        let row &CachedSignature^host(signature, kind, null, result)
+        cached_signatures.add(row as ref[CachedSignature]?)
+        result
+    }
+
     function check_non_null_type(this, t: ref[Type], node: ref[AstNode]) returns ref[Type]?
         this.check_non_null_type_with_reporter(t, node, false)
 
@@ -49082,20 +49322,37 @@ define Checker
             return null
         if ft = null
             return null
+        ; ★★★ THE CALL-CHAIN ARM, SLICE 139, AND ITS THREE-WAY FORK IS WHAT THE
+        ; SIGNATURE'S FLAGS ARE FOR: a chain whose callee's type did not change is
+        ; no chain for this purpose (SignatureFlagsNone), the OUTERMOST link is an
+        ; outer call chain, and everything between is an inner one — which is the
+        ; difference between propagating the optional marker outwards and merely
+        ; carrying it.
+        var func_type ft as ref[Type]
+        var call_chain_flags SignatureFlagsNone
         if Checker.is_call_chain(node)
         {
-            ; getOptionalExpressionType — GetNonNullableType at an optional-chain
-            ; ROOT and removeOptionalTypeMarker inside one, and both filter a UNION's
-            ; constituents, which is machinery this port does not have.
-            this.record_unported("get-optional-expression-type", KindCallExpression)
-            return null
+            let non_optional this.get_optional_expression_type(func_type, expr)
+            if this.unported_mark() <> mark
+                return null
+            if non_optional = null
+                return null
+            let no non_optional as ref[Type]
+            if no <> func_type
+            {
+                if Binder.is_outermost_optional_chain(node)
+                    set call_chain_flags: SignatureFlagsIsOuterCallChain
+                else
+                    set call_chain_flags: SignatureFlagsIsInnerCallChain
+            }
+            set func_type: no
         }
         ; checkNonNullTypeWithReporter, with the CANNOT-INVOKE reporter — the half
         ; of the flag that can report (see check_non_null_type_with_reporter's
         ; header). The note that stood here said the flag *would have no reader*
         ; and that it *arrives WITH getTypeFacts*; getTypeFacts is slice 90, and it
         ; does.
-        let ft2 this.check_non_null_type_with_reporter(ft as ref[Type], expr, true)
+        let ft2 this.check_non_null_type_with_reporter(func_type, expr, true)
         if ft2 = null
             return null
         let fnt ft2 as ref[Type]
@@ -49173,7 +49430,7 @@ define Checker
                 return null
             }
         }
-        this.resolve_call(node, call_sigs, check_mode, SignatureFlagsNone, 0)
+        this.resolve_call(node, call_sigs, check_mode, call_chain_flags, 0)
     }
 
     ; resolveNewExpression, to the same depth as its sibling above.
@@ -49713,11 +49970,10 @@ define Checker
                 set splice_index: index
             if call_chain_flags <> 0
             {
-                ; getOptionalCallSignature — cloneSignature into a keyed cache.
-                ; Unreachable from here for resolve_call's own recorded reason: a
-                ; call chain stops at get-optional-expression-type two functions up.
-                this.record_unported("get-optional-call-signature", call_chain_flags)
-                return null
+                let opt this.get_optional_call_signature(signature, call_chain_flags)
+                if opt = null
+                    return null
+                set signature: opt as ref[Signature]
             }
             ; `slices.Insert(result, spliceIndex, signature)`. Scaly's Array has no
             ; insert, so the tail is shifted up by one after an append — which is
@@ -51203,14 +51459,94 @@ define Checker
             return null
         }
         let args AstNode.call_arguments_of(node)
-        if Checker.get_spread_argument_index(args) >= 0
+        let spread_index Checker.get_spread_argument_index(args)
+        if spread_index >= 0
         {
-            ; "Create synthetic arguments from spreads of tuple types" — and both
-            ; halves are missing here: isTupleType has no writer in this port (see
-            ; get_parameter_count's header) and there is no synthetic expression to
-            ; put an element type on. So a spread argument stops the whole call.
-            this.record_unported("get-effective-call-arguments-spread", k)
-            return null
+            ; ★★★ "Create synthetic arguments from spreads of tuple types." THE STOP
+            ; THAT STOOD HERE CALLED BOTH HALVES MISSING — *isTupleType has no
+            ; writer in this port* and *there is no synthetic expression to put an
+            ; element type on* — and by this slice the tuple has been minted since
+            ; 115 and new_synthetic_expression is called TWENTY LINES ABOVE, in this
+            ; same function's tagged-template arm (§3.5eo).
+            ;
+            ; ★ A REST element's synthetic type is the ARRAY of the element type,
+            ; because `...args: T[]` in the middle of a tuple stands for however
+            ; many arguments are left; a variadic or rest element is also marked as
+            ; a spread on the synthetic node, which is what tells the arity check
+            ; that the count is not fixed.
+            ;
+            ; ★ `len(c.flowLoopStack) != 0` picks checkExpression over the CACHED
+            ; form upstream. This port has no flow-loop stack — get_type_at_flow_
+            ; loop_label is a stop — so the cached arm is the whole reading, and the
+            ; line moves when that stop does.
+            let list args as ref[Array[ref[AstNode]?]]
+            let n AstNode.list_count(args)
+            let effective AstNode.new_node_list(host)
+            var i 0
+            while i < spread_index
+            {
+                effective.add(AstNode.child_in_list(args, i))
+                set i: i + 1
+            }
+            set i: spread_index
+            while i < n
+            {
+                let arg AstNode.child_in_list(args, i)
+                set i: i + 1
+                if arg = null
+                    return null
+                let a arg as ref[AstNode]
+                var spread_type: ref[Type]? null
+                if AstNode.kind_of(a) = KindSpreadElement
+                {
+                    let inner AstNode.expression_of(a)
+                    if inner = null
+                        return null
+                    set spread_type: this.check_expression_cached(inner as ref[AstNode])
+                    if this.unported_mark() <> mark_of_effective_arguments
+                        return null
+                }
+                var expanded false
+                if spread_type <> null
+                {
+                    let st spread_type as ref[Type]
+                    if Checker.is_tuple_type(st)
+                    {
+                        let target Checker.target_of(st)
+                        if target = null
+                            return null
+                        let tt target as ref[Type]
+                        let elements this.get_element_types(st)
+                        if this.unported_mark() <> mark_of_effective_arguments
+                            return null
+                        if elements <> null
+                        {
+                            set expanded: true
+                            let el elements as ref[Array[ref[Type]?]]
+                            let en el.get_length() as int
+                            var j 0
+                            while j < en
+                            {
+                                let flags Checker.tuple_element_flags_at(tt, j)
+                                var synthetic el[j]
+                                if (flags & ElementFlagsRest) <> 0
+                                {
+                                    set synthetic: this.create_array_type(el[j])
+                                    if this.unported_mark() <> mark_of_effective_arguments
+                                        return null
+                                    if synthetic = null
+                                        return null
+                                }
+                                effective.add(this.new_synthetic_expression(a, synthetic, (flags & ElementFlagsVariable) <> 0, Checker.tuple_labeled_declaration_at(tt, j)))
+                                set j: j + 1
+                            }
+                        }
+                    }
+                }
+                if expanded = false
+                    effective.add(arg)
+            }
+            return effective
         }
         args
     }
@@ -51516,14 +51852,48 @@ define Checker
             }
             set i: i + 1
         }
+        ; ★★★ THE REST HALF, SLICE 139: the trailing arguments become a tuple and
+        ; THAT is what the rest parameter's type is related to.
+        ;
+        ; ★ The error NODE forks on how many arguments are left: none puts the
+        ; report on the call, one on that argument's effective check node, and
+        ; several on a SYNTHETIC expression spanning the first to the last — the one
+        ; place in this file where a synthesized node exists to carry a RANGE.
         if rest_type <> null
         {
-            ; getSpreadArgumentType, which builds a TUPLE out of the trailing
-            ; arguments — and the tuple is the same missing writer
-            ; get_effective_call_arguments' spread row names. ★It is unreachable in
-            ; fact as well: get_non_array_rest_type stops before answering non-nil.
-            this.record_unported("get-spread-argument-type", AstNode.kind_of(node))
-            return false
+            let spread_type this.get_spread_argument_type(args, arg_count, AstNode.list_count(args), rest_type as ref[Type], null, check_mode)
+            if this.unported_mark() <> mark
+                return false
+            if spread_type = null
+                return false
+            let rest_arg_count AstNode.list_count(args) - arg_count
+            var error_node: ref[AstNode]? null
+            if report_errors
+            {
+                if rest_arg_count = 0
+                    set error_node: node
+                if rest_arg_count = 1
+                {
+                    let only AstNode.child_in_list(args, arg_count)
+                    if only = null
+                        return false
+                    set error_node: this.get_effective_check_node(only as ref[AstNode])
+                }
+                if rest_arg_count > 1
+                {
+                    let first AstNode.child_in_list(args, arg_count)
+                    let last AstNode.child_in_list(args, AstNode.list_count(args) - 1)
+                    if first = null
+                        return false
+                    if last = null
+                        return false
+                    let synth this.new_synthetic_expression(node, spread_type, false, null)
+                    set synth.pos: AstNode.pos_of(first as ref[AstNode])
+                    set synth.end: AstNode.end_of(last as ref[AstNode])
+                    set error_node: synth
+                }
+            }
+            return this.check_type_related_to_ex(spread_type as ref[Type], rest_type as ref[Type], relation, error_node, DiagArgument_of_type_0_is_not_assignable_to_parameter_of_type_1)
         }
         true
     }
@@ -80065,6 +80435,23 @@ define Checker
                     return null
                 return this.type_mapper_map(mg.m2 as ref[TypeMapper], first)
             }
+            when cp: Composite
+            {
+                ; CompositeTypeMapper.Map. ★The recursion is INSTANTIATION and not
+                ; mapping — see the record's header — so this arm is the only one
+                ; that can answer a type m2 never saw.
+                if cp.m1 = null
+                    return t
+                if cp.m2 = null
+                    return t
+                let mark this.unported_mark()
+                let t1 this.type_mapper_map(cp.m1 as ref[TypeMapper], t)
+                if this.unported_mark() <> mark
+                    return null
+                if t1 <> t
+                    return this.instantiate_type(t1, cp.m2)
+                return this.type_mapper_map(cp.m2 as ref[TypeMapper], t)
+            }
             when inf: Inference
             {
                 if inf.context = null
@@ -80183,14 +80570,51 @@ define Checker
         false
     }
 
-    ; isNonGenericTopLevelType. `Type.alias` is not carried here (see the Type
-    ; record), and its absence is not a gap in THIS function: every arm of the
-    ; reference's body is inside `if t.alias != nil`, so the whole predicate is
-    ; constant FALSE for a port with no aliases and the three callers below read it
-    ; that way. It is written as a function rather than folded into them for §3.5v's
-    ; reason — the day the alias slot arrives, one body changes and no caller does.
+    ; isNonGenericTopLevelType, WRITTEN OUT SINCE SLICE 139.
+    ;
+    ; ★★★ THE NOTE THAT STOOD HERE NAMED ITS OWN EXPIRY CONDITION — *the day the
+    ; alias slot arrives, one body changes and no caller does* — AND THE SLOT
+    ; ARRIVED IN SLICE 111, WHICH MADE THE CONSTANT `false` A STACK OVERFLOW. It is
+    ; the RECURSION GUARD of could_contain_type_variables, on both its arms: a
+    ; top-level non-generic type ALIAS is where the walk must stop, and a RECURSIVE
+    ; alias is exactly where it otherwise cannot. `type Expression =
+    ; BooleanLogicExpression | 'true' | 'false'` with `type BooleanLogicExpression =
+    ; ['and', ...Expression[]] | ['not', Expression]` recursed until the stack ran
+    ; out — SIGSEGV, all six artifacts of one unit at once, which reads as a harness
+    ; failure and not as a checker one. It only became reachable when this slice
+    ; removed the walls in front of it (§3.5fq: a wall hides wrong answers).
+    ;
+    ; ★ The ancestor walk is the reference's `FindAncestorOrQuit`: a SourceFile is
+    ; the match, a ModuleDeclaration keeps walking, and ANY other parent quits — so
+    ; an alias inside a namespace body is not top-level, because its parent is the
+    ; ModuleBlock and that is the quit case.
     function is_non_generic_top_level_type(t: ref[Type]) returns bool
+    {
+        if t.alias_symbol = null
+            return false
+        if t.alias_type_arguments <> null
+        {
+            if ((t.alias_type_arguments as ref[Array[ref[Type]?]]).get_length() as int) <> 0
+                return false
+        }
+        var declaration Checker.get_declaration_of_kind(t.alias_symbol as ref[Symbol], KindTypeAliasDeclaration)
+        if declaration = null
+            set declaration: Checker.get_declaration_of_kind(t.alias_symbol as ref[Symbol], KindJSTypeAliasDeclaration)
+        if declaration = null
+            return false
+        var up AstNode.parent_node_of(declaration as ref[AstNode])
+        while up <> null
+        {
+            let node up as ref[AstNode]
+            let k AstNode.kind_of(node)
+            if k = KindSourceFile
+                return true
+            if k <> KindModuleDeclaration
+                return false
+            set up: AstNode.parent_node_of(node)
+        }
         false
+    }
 
     ; couldContainTypeVariablesWorker, whole, memo included.
     ;
@@ -80329,8 +80753,15 @@ define Checker
     ; is nil at every call site this port has — the reference's own instantiateType
     ; passes nil, and the three callers that do not are all behind stops.
     ;
-    ; ★★ THE ALIAS HALF OF THE GUARD IS CONSTANT FALSE for the reason
-    ; is_non_generic_top_level_type is: `Type.alias` is not carried.
+    ; ★★★ THE ALIAS HALF OF THE GUARD IS LIVE SINCE SLICE 139, and the sentence
+    ; that stood here — *constant FALSE … `Type.alias` is not carried* — expired with
+    ; slice 111's alias slots, the same expiry that turned
+    ; is_non_generic_top_level_type into a stack overflow. Upstream's own comment
+    ; says what it buys: *"Check for type variables in the alias, so things like
+    ; `type Brand<T> = number & {}` can potentially be copied with new alias type
+    ; args, despite them being unreferenced"* — without it an alias whose arguments
+    ; are type variables the BODY never mentions is not instantiated at all, and the
+    ; cache then leaks type parameters out of their scope.
     ;
     ; ★ THE ACTIVE-MAPPER CACHE IS NOT PORTED and its reader is named:
     ; `activeTypeMappersCaches` memoises one (mapper, type) pair for the duration of
@@ -80356,9 +80787,30 @@ define Checker
             return t
         let ty t as ref[Type]
         let mark this.unported_mark()
-        let could this.could_contain_type_variables(ty)
+        var could this.could_contain_type_variables(ty)
         if this.unported_mark() <> mark
             return null
+        if could = false
+        {
+            if ty.alias_type_arguments <> null
+            {
+                let aliases ty.alias_type_arguments as ref[Array[ref[Type]?]]
+                let an aliases.get_length() as int
+                var i 0
+                while i < an
+                {
+                    let a aliases[i]
+                    if a <> null
+                    {
+                        if this.could_contain_type_variables(a as ref[Type])
+                            set could: true
+                        if this.unported_mark() <> mark
+                            return null
+                    }
+                    set i: i + 1
+                }
+            }
+        }
         if could = false
             return t
         if instantiation_depth = 100
@@ -80762,19 +81214,30 @@ define Checker
         let found Checker.find_object_instantiation(tgt, type_arguments, alias, single_signature)
         if found <> null
             return found
+        ; ★ combineTypeMappers and NOT mergeTypeMappers, which is what stood here
+        ; while the COMPOSITE arm had no writer: a single-signature type's outer
+        ; mapper has to be applied to the whole result of the inner one, not merely
+        ; asked about the type it answers. Slice 139 gives the arm its writer and
+        ; the line its reference spelling.
         var new_mapper this.new_type_mapper(type_parameters, type_arguments) as ref[TypeMapper]?
         if (tgt.object_flags & ObjectFlagsSingleSignatureType) <> 0
         {
             if m <> null
-                set new_mapper: this.merge_type_mappers(new_mapper, m)
+                set new_mapper: this.combine_type_mappers(new_mapper, m)
         }
         var result: ref[Type]? null
+        ; ★ The REFERENCE arm reads the node off `t` and the target off `t.Target()`
+        ; — not off `tgt`, which is `t`'s own target already; the deferred reference
+        ; is re-made against the DEFERRED node with the new mapper.
         if (tgt.object_flags & ObjectFlagsReference) <> 0
         {
-            ; createDeferredTypeReference — the deferred half of the reference
-            ; chapter, which has no producer here (slice 115 wrote the reader).
-            this.record_unported("object-type-instantiation-deferred-reference", tgt.object_flags)
-            return null
+            let node Checker.reference_node_of(t)
+            if node = null
+                return null
+            let inner Checker.target_of(t)
+            if inner = null
+                return null
+            set result: this.create_deferred_type_reference_ex(inner as ref[Type], node as ref[AstNode], new_mapper, alias)
         }
         if (tgt.object_flags & ObjectFlagsReference) = 0
         {
@@ -81142,6 +81605,10 @@ define Checker
             return this.get_base_type_of_literal_type(t)
         if mk = MapTypeKindDefinitelyFalsyPart
             return this.get_definitely_falsy_part_of_type(t)
+        if mk = MapTypeKindWidenedLiteral
+            return this.get_widened_literal_type(t)
+        if mk = MapTypeKindMutableArrayOrTuple
+            return this.get_mutable_array_or_tuple_type(t)
         if mk = MapTypeKindContextualElement
         {
             if a = null
@@ -83302,27 +83769,36 @@ define Checker
                 return null
             }
         }
+        ; The already-instantiated branch, slice 139: re-instantiating walks to the
+        ; ORIGINAL and composes the two mappers, so the result's target is never a
+        ; transient symbol and the mapper chain never grows a link per round.
+        var sym_out: ref[Symbol]? symbol
+        var m_out: ref[TypeMapper]? m
         if (Symbol.check_flags_of(sym) & CheckFlagsInstantiated) <> 0
         {
-            ; `symbol = links.target; m = combineTypeMappers(links.mapper, m)` — the
-            ; COMPOSITE mapper arm TypeMapperData's header names as having no
-            ; writer. Instantiating an already-instantiated symbol needs it, and
-            ; nothing that reaches this chapter does: the members table
-            ; instantiate_symbol_table walks is the DECLARED one.
-            this.record_unported("instantiate-instantiated-symbol", Symbol.check_flags_of(sym))
-            return null
+            set sym_out: links.target
+            if sym_out = null
+                return null
+            set m_out: this.combine_type_mappers(links.mapper, m)
         }
-        ; `result.CheckFlags = Instantiated | symbol.CheckFlags&(Readonly|Late|
-        ; OptionalParameter|RestParameter)`. The masked half is empty here for a
-        ; structural reason rather than by omission: those four are written by
-        ; getLateBoundSymbol and by createSymbolWithType, neither of which exists,
-        ; so a binder symbol's check_flags is zero and the mask contributes nothing.
-        let result this.new_symbol(Symbol.flags_of(sym), Symbol.name_data_of(sym), Symbol.name_len_of(sym))
-        Symbol.set_check_flags(result, CheckFlagsInstantiated)
-        Symbol.copy_declarations_from(result, sym)
+        ; ★★★ `result.CheckFlags = Instantiated | symbol.CheckFlags&(Readonly|Late|
+        ; OptionalParameter|RestParameter)`, and TWO OF THE FOUR ARE LIVE SINCE
+        ; SLICE 139. The sentence that stood here called the masked half empty
+        ; because *getLateBoundSymbol and createSymbolWithType, neither of which
+        ; exists* — both exist, `create_symbol_with_type` writes Readonly and
+        ; `get_late_bound_symbol` writes Late, so an instantiated readonly property
+        ; was silently losing its readonly bit (§3.5eo). ★The other two stay out and
+        ; the reason is a PRODUCER rather than a name: RestParameter and
+        ; OptionalParameter are written only by getExpandedParameters' tuple
+        ; expansion, which cannot run here — write_parameter_declaration's header
+        ; carries the same reading.
+        let src sym_out as ref[Symbol]
+        let result this.new_symbol(Symbol.flags_of(src), Symbol.name_data_of(src), Symbol.name_len_of(src))
+        Symbol.set_check_flags(result, CheckFlagsInstantiated | (Symbol.check_flags_of(src) & (CheckFlagsReadonly | CheckFlagsLate)))
+        Symbol.copy_declarations_from(result, src)
         let result_links this.value_symbol_link_of(result)
-        set result_links.target: symbol
-        set result_links.mapper: m
+        set result_links.target: sym_out
+        set result_links.mapper: m_out
         result
     }
 
@@ -83396,23 +83872,57 @@ define Checker
     function instantiate_signature(this, sig: ref[Signature]?, m: ref[TypeMapper]) returns ref[Signature]?
         this.instantiate_signature_ex(sig, m, false)
 
-    function instantiate_signature_ex(this, sig: ref[Signature]?, m: ref[TypeMapper], erase_type_parameters: bool) returns ref[Signature]?
+    ; ★★★ THE FRESH-TYPE-PARAMETER BRANCH IS SLICE 139'S AND IT IS THE STOP THAT
+    ; STOOD HERE. The note said *cloneTypeParameter over the fresh set, then
+    ; combineTypeMappers — the COMPOSITE mapper arm TypeMapperData's header names as
+    ; having no writer. It lands with the arm* — and it does: the arm is written,
+    ; the clone existed since slice 125 and `mapper` is the slot its own header
+    ; named a caller for.
+    ;
+    ; ★★★ THE ORDER INSIDE THE BRANCH IS LOAD-BEARING AND UPSTREAM SAYS SO IN A
+    ; COMMENT: the clones are minted FIRST, the combined mapper is built over
+    ; {original -> clone} SECOND, and the mapper is written back onto every clone
+    ; THIRD — so a clone's constraint is instantiated through a mapper that already
+    ; knows about all of its siblings. Built in any other order, `<T, U extends T>`
+    ; loses the sibling mention.
+    function instantiate_signature_ex(this, sig: ref[Signature]?, m_in: ref[TypeMapper], erase_type_parameters: bool) returns ref[Signature]?
     {
         if sig = null
             return null
         let s sig as ref[Signature]
+        var m: ref[TypeMapper] m_in
         var tpn 0
         if s.type_parameters <> null
             set tpn: (s.type_parameters as ref[Array[ref[Type]?]]).get_length() as int
         if erase_type_parameters
             set tpn: 0
+        var fresh_type_parameters: ref[Array[ref[Type]?]]? null
         if tpn <> 0
         {
-            ; cloneTypeParameter over the fresh set, then combineTypeMappers — the
-            ; COMPOSITE mapper arm TypeMapperData's header names as having no
-            ; writer. It lands with the arm.
-            this.record_unported("instantiate-signature-type-parameters", tpn)
-            return null
+            let originals s.type_parameters as ref[Array[ref[Type]?]]
+            let fresh &Array[ref[Type]?]^host()
+            var i 0
+            while i < tpn
+            {
+                let tp originals[i]
+                if tp = null
+                    return null
+                fresh.add(this.clone_type_parameter(tp as ref[Type]) as ref[Type]?)
+                set i: i + 1
+            }
+            set fresh_type_parameters: fresh as ref[Array[ref[Type]?]]?
+            let combined this.combine_type_mappers(this.new_type_mapper(s.type_parameters, fresh_type_parameters) as ref[TypeMapper]?, m_in as ref[TypeMapper]?)
+            if combined = null
+                return null
+            set m: combined as ref[TypeMapper]
+            set i: 0
+            while i < tpn
+            {
+                let cl fresh[i]
+                if cl <> null
+                    Checker.set_type_parameter_mapper(cl as ref[Type], m as ref[TypeMapper]?)
+                set i: i + 1
+            }
         }
         let mark this.unported_mark()
         let this_param this.instantiate_symbol(s.this_parameter, m)
@@ -83421,7 +83931,7 @@ define Checker
         let params this.instantiate_symbols(s.parameters, m)
         if this.unported_mark() <> mark
             return null
-        let made this.new_signature(s.flags & SignatureFlagsPropagatingFlags, s.declaration, null, this_param, params, null, s.min_argument_count)
+        let made this.new_signature(s.flags & SignatureFlagsPropagatingFlags, s.declaration, fresh_type_parameters, this_param, params, null, s.min_argument_count)
         set made.target: sig
         set made.mapper: m
         made
@@ -94054,17 +94564,83 @@ define Checker
                 }
             }
         }
-        ; isSingleElementGenericTupleType on either side — a tuple whose ONE
-        ; element is variadic, which needs the tuple target's element infos.
-        if Checker.is_tuple_type(src)
+        ; ★★★ THE TWO SINGLE-ELEMENT GENERIC TUPLE ARMS, SLICE 139. The stop that
+        ; stood here asked `is_tuple_type` — EVERY tuple — for a pair of arms that
+        ; apply to `[...T]` alone, so the whole tuple population of the corpus
+        ; arrived at a report about a shape almost none of it had; the element infos
+        ; its note named have been on the interface arm since slice 115 (§3.5eo).
+        ;
+        ; ★ The reference's comment is the rule: for a generic T and a U assignable
+        ; to T, `[...U]` is assignable to T, U is assignable to `readonly [...T]`,
+        ; and U is assignable to `[...T]` when U is constrained to a MUTABLE array
+        ; or tuple. Both arms fall THROUGH on a false rather than answering it —
+        ; the reference tests `result != TernaryFalse` and keeps going — which is
+        ; why neither writes the negative.
+        if Checker.is_single_element_generic_tuple_type(src)
         {
-            this.record_unported("single-element-generic-tuple", src.flags)
-            return false
+            let s_target Checker.target_of(src)
+            var s_readonly false
+            if s_target <> null
+                set s_readonly: Checker.tuple_readonly_of(s_target as ref[Type])
+            if s_readonly = false
+            {
+                let mark this.unported_mark()
+                let args this.get_type_arguments(src)
+                if this.unported_mark() <> mark
+                    return false
+                if args <> null
+                {
+                    let list args as ref[Array[ref[Type]?]]
+                    if (list.get_length() as int) > 0
+                    {
+                        let a0 list[0]
+                        if a0 <> null
+                        {
+                            if this.is_related_to_ex(a0 as ref[Type], target, relation, null, intersection_state, RecursionFlagsSource)
+                                return true
+                        }
+                    }
+                }
+            }
         }
-        if Checker.is_tuple_type(target)
+        if Checker.is_single_element_generic_tuple_type(target)
         {
-            this.record_unported("single-element-generic-tuple", target.flags)
-            return false
+            let t_target Checker.target_of(target)
+            var admit false
+            if t_target <> null
+            {
+                if Checker.tuple_readonly_of(t_target as ref[Type])
+                    set admit: true
+            }
+            if admit = false
+            {
+                let mark this.unported_mark()
+                let base this.get_base_constraint_or_type(src)
+                if this.unported_mark() <> mark
+                    return false
+                if base <> null
+                    set admit: this.is_mutable_array_or_tuple(base as ref[Type])
+            }
+            if admit
+            {
+                let mark2 this.unported_mark()
+                let args this.get_type_arguments(target)
+                if this.unported_mark() <> mark2
+                    return false
+                if args <> null
+                {
+                    let list args as ref[Array[ref[Type]?]]
+                    if (list.get_length() as int) > 0
+                    {
+                        let a0 list[0]
+                        if a0 <> null
+                        {
+                            if this.is_related_to_ex(src, a0 as ref[Type], relation, null, intersection_state, RecursionFlagsTarget)
+                                return true
+                        }
+                    }
+                }
+            }
         }
         ; The thirteen-arm switch in front of `default`. ★★THE GUARD BELOW WAS ONE
         ; SENTENCE FOR SIX ARMS — *an IndexedAccess, an Index, a Conditional, a
@@ -94074,10 +94650,88 @@ define Checker
         ; the first of them finds the fork here*. ★★★SLICE 126 IS THAT ARM: the
         ; TEMPLATE LITERAL is minted now, so its own arm is written and the guard
         ; keeps the four that still have no producer.
+        ; ★★★ THE TARGET-TYPE-PARAMETER ARM, SLICE 139, AND WHAT IT MOSTLY DOES IS
+        ; NOTHING. Both of its halves are conditional — a MAPPED source against the
+        ; parameter's own `keyof`, and a comparability carve-out between two type
+        ; parameters — so for the 330 units that arrived at the stop standing here
+        ; the reference simply falls through to the object tail. The guard was a
+        ; report about a shape it never examined.
         if (target.flags & TypeFlagsTypeParameter) <> 0
         {
-            this.record_unported("structured-target-type-parameter", src.flags)
-            return false
+            ; A source `{ [P in Q]: X }` is related to a target T if `keyof T` is
+            ; related to Q and X is related to `T[Q]`. ★The NameType test is the
+            ; reference's own: a mapped type with an `as` clause renames its keys,
+            ; so its template no longer answers for `T[P]`.
+            if (src.object_flags & ObjectFlagsMapped) <> 0
+            {
+                let decl Checker.mapped_declaration_of(src)
+                var plain false
+                if decl <> null
+                {
+                    if AstNode.mapped_type_name_type_of(decl as ref[AstNode]) = null
+                        set plain: true
+                }
+                if plain
+                {
+                    let mark this.unported_mark()
+                    let keyof this.get_index_type(target)
+                    let constraint_type this.get_constraint_type_from_mapped_type(src)
+                    if this.unported_mark() <> mark
+                        return false
+                    if keyof <> null
+                    {
+                        if constraint_type <> null
+                        {
+                            if this.is_related_to_ex(keyof as ref[Type], constraint_type as ref[Type], relation, null, intersection_state, RecursionFlagsBoth)
+                            {
+                                if (Checker.get_mapped_type_modifiers(src) & MappedTypeModifiersIncludeOptional) = 0
+                                {
+                                    let template this.get_template_type_from_mapped_type(src)
+                                    let tp this.get_type_parameter_from_mapped_type(src)
+                                    if this.unported_mark() <> mark
+                                        return false
+                                    if template <> null
+                                    {
+                                        if tp <> null
+                                        {
+                                            let indexed this.get_indexed_access_type(target, tp as ref[Type])
+                                            if this.unported_mark() <> mark
+                                                return false
+                                            if indexed <> null
+                                            {
+                                                if this.is_related_to_ex(template as ref[Type], indexed as ref[Type], relation, error_node, intersection_state, RecursionFlagsBoth)
+                                                    return true
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ; ★★★ THE CARVE-OUT IS THE ONE HALF THAT ANSWERS FALSE, and it is a
+            ; deliberate restriction rather than a fallback: comparability is mostly
+            ; bidirectional, so two unrelated type parameters would otherwise be
+            ; comparable in both directions. One extending the other is the only
+            ; way through, and the RETURN here — either the constraint's verdict or
+            ; false — is what keeps the object tail from re-admitting the pair.
+            if relation = RelationComparable
+            {
+                if (src.flags & TypeFlagsTypeParameter) <> 0
+                {
+                    let mark this.unported_mark()
+                    let constraint this.get_constraint_of_type_parameter(src)
+                    if this.unported_mark() <> mark
+                        return false
+                    if constraint <> null
+                    {
+                        if Checker.some_type_is_type_parameter(constraint as ref[Type])
+                            return this.is_related_to_ex(constraint as ref[Type], target, relation, null, intersection_state, RecursionFlagsSource)
+                    }
+                    return false
+                }
+            }
         }
         if (target.flags & TypeFlagsTemplateLiteral) <> 0
         {
@@ -100017,12 +100671,18 @@ define Checker
             return false
         if attributes_type = null
             return false
+        ; ★The freshness strip under SkipContextSensitive. The stop that stood here
+        ; said getRegularTypeOfObjectLiteral *has no writer here* — it is at
+        ; get_regular_type_of_object_literal and has been since the object-literal
+        ; chapter (§3.5eo).
         if (check_mode & CheckModeSkipContextSensitive) <> 0
         {
-            ; getRegularTypeOfObjectLiteral — the FRESHNESS strip, which belongs to
-            ; the object-literal chapter and has no writer here.
-            this.record_unported("get-regular-type-of-object-literal", check_mode)
-            return false
+            let regular this.get_regular_type_of_object_literal(attributes_type as ref[Type])
+            if this.unported_mark() <> mark
+                return false
+            if regular = null
+                return false
+            set attributes_type: regular
         }
         var error_node: ref[AstNode]? null
         if report_errors
@@ -100343,6 +101003,23 @@ define Checker
         if m1 = null
             return m2
         this.new_merged_type_mapper(m1, m2) as ref[TypeMapper]?
+    }
+
+    function new_composite_type_mapper(this, m1: ref[TypeMapper]?, m2: ref[TypeMapper]?) returns ref[TypeMapper]
+    {
+        let p &TypeMapper^host(TypeMapperData.Composite(CompositeTypeMapperData(m1, m2)))
+        p
+    }
+
+    ; combineTypeMappers — mergeTypeMappers' twin, one arm apart. The guard is the
+    ; same one and the answer for a nil first mapper is the same m2; what differs
+    ; is the arm it mints, and the difference is the whole content of the two
+    ; records' headers.
+    function combine_type_mappers(this, m1: ref[TypeMapper]?, m2: ref[TypeMapper]?) returns ref[TypeMapper]?
+    {
+        if m1 = null
+            return m2
+        this.new_composite_type_mapper(m1, m2) as ref[TypeMapper]?
     }
 
     ; ── the three mapping factories the mapped type needs (slice 125) ───────
@@ -101590,12 +102267,37 @@ define Checker
                         if ((target.alias_type_arguments as ref[Array[ref[Type]?]]).get_length() as int) <> 0
                             set have_args: true
                     }
+                    ; ★★★ "Source and target are types originating in the same
+                    ; generic type alias declaration. Simply infer from source type
+                    ; arguments to target type arguments, with defaults applied."
+                    ; The stop that stood here said the variance measurement was
+                    ; one *this port has none of* — slice 130 measured it, and
+                    ; get_alias_variances is its entry point (§3.5eo).
                     if have_args
                     {
-                        ; getAliasVariances over the alias symbol, which is the
-                        ; variance measurement this port has none of. The row is
-                        ; the one slice 111 named at its own line.
-                        this.record_unported("get-alias-variances", source.flags)
+                        let alias_sym source.alias_symbol as ref[Symbol]
+                        let params this.type_alias_link_of(alias_sym).type_parameters
+                        if params = null
+                            return
+                        let ps params as ref[Array[ref[Type]?]]
+                        let min_params this.get_min_type_argument_count(ps)
+                        var is_js false
+                        let vd Symbol.value_declaration_of(alias_sym)
+                        if vd <> null
+                        {
+                            if Parser.is_in_js_file(vd as ref[AstNode])
+                                set is_js: true
+                        }
+                        if source.alias_type_arguments = null
+                            return
+                        if target.alias_type_arguments = null
+                            return
+                        let source_types this.fill_missing_type_arguments(source.alias_type_arguments as ref[Array[ref[Type]?]], ps, min_params, is_js)
+                        let target_types this.fill_missing_type_arguments(target.alias_type_arguments as ref[Array[ref[Type]?]], ps, min_params, is_js)
+                        let variances this.get_alias_variances(alias_sym)
+                        if this.unported_mark() <> mark
+                            return
+                        this.infer_from_type_arguments(n, source_types, target_types, variances)
                     }
                     return
                 }
@@ -104838,18 +105540,57 @@ define Checker
         let instantiated this.get_signature_instantiation_without_filling_in_type_arguments(sig, filled)
         if this.unported_mark() <> mark
             return null
+        ; ★★★ THE INFERRED-PARAMETER TAIL, SLICE 139. Its stop called
+        ; getOrCreateTypeFromSignature *the anonymous-signature-type factory this
+        ; port does not have* — the factory is `get_or_create_type_from_signature`
+        ; and it has had a reader for slices (§3.5eo).
+        ;
+        ; ★★★ AND IT BOUGHT NOTHING, WHICH IS THE HONEST MEASUREMENT: the arm has NO
+        ; INPUT. `InferenceContext.inferred_type_parameters` is read at the one call
+        ; site that fills this parameter and WRITTEN NOWHERE — the writer is
+        ; inferTypeArguments' outer-type-parameter path — so the guard below is
+        ; constantly false and the stop it replaced had never fired. **An expired
+        ; note on an arm with no input is still expired and still worth removing,
+        ; but it is not a unit**; `expiredstops.py`'s hits have to be read for
+        ; reachability as well as for the premise. The body is the reference's, so
+        ; the day the writer lands nothing here moves. What the tail does: the
+        ; instantiated signature RETURNS a function type, and the inferred type
+        ; parameters are moved onto THAT signature, so `<A>(a: A[]) => …` inferred
+        ; through a generic wrapper stays generic in the wrapper's result.
+        ;
+        ; ★ The new return type carries the instantiated signature's own mapper, so
+        ; the inner signature's constraints still instantiate — and the setter
+        ; writes the target slot too, which is null on a freshly minted isolated
+        ; type and stays that way.
         if inferred_type_parameters <> null
         {
             if ((inferred_type_parameters as ref[Array[ref[Type]?]]).get_length() as int) <> 0
             {
-                ; getSingleCallOrConstructSignature of the instantiated RETURN
-                ; type, then a clone carrying the inferred parameters and
-                ; getOrCreateTypeFromSignature — the anonymous-signature-type
-                ; factory this port does not have. It is the generic-function
-                ; return of a generic call, `<A>(a: A[]) => …` inferred through
-                ; `arrayMap`.
-                this.record_unported("signature-instantiation-inferred-type-parameters", (inferred_type_parameters as ref[Array[ref[Type]?]]).get_length() as int)
-                return null
+                if instantiated = null
+                    return null
+                let inst instantiated as ref[Signature]
+                let ret this.get_return_type_of_signature(inst)
+                if this.unported_mark() <> mark
+                    return null
+                if ret = null
+                    return null
+                let return_signature this.get_single_call_or_construct_signature(ret as ref[Type])
+                if this.unported_mark() <> mark
+                    return null
+                if return_signature <> null
+                {
+                    let new_return_signature this.clone_signature(return_signature as ref[Signature])
+                    set new_return_signature.type_parameters: inferred_type_parameters
+                    let new_return_type this.get_or_create_type_from_signature(new_return_signature)
+                    if this.unported_mark() <> mark
+                        return null
+                    if new_return_type = null
+                        return null
+                    Checker.set_object_target_and_mapper(new_return_type as ref[Type], null, inst.mapper)
+                    let new_instantiated this.clone_signature(inst)
+                    set new_instantiated.resolved_return_type: new_return_type
+                    return new_instantiated
+                }
             }
         }
         instantiated
@@ -104922,7 +105663,7 @@ define Checker
                         let a (args as ref[Array[ref[AstNode]?]])[i]
                         if a <> null
                         {
-                            if Checker.is_spread_argument(a as ref[AstNode])
+                            if this.is_spread_argument(a as ref[AstNode])
                                 set spread: true
                         }
                         set i: i + 1
@@ -104988,10 +105729,14 @@ define Checker
                 return null
             if could
             {
-                ; getSpreadArgumentType — the tuple the remaining arguments make,
-                ; which needs the tuple writer and a SyntheticExpression.
-                this.record_unported("get-spread-argument-type", all_args - arg_count)
-                return null
+                let spread_type this.get_spread_argument_type(args, arg_count, all_args, rest_type as ref[Type], context, check_mode)
+                if this.unported_mark() <> mark
+                    return null
+                if spread_type = null
+                    return null
+                this.infer_types(context.inferences, spread_type as ref[Type], rest_type as ref[Type], InferencePriorityNone, false)
+                if this.unported_mark() <> mark
+                    return null
             }
         }
         this.get_inferred_types(context)
@@ -105149,10 +105894,244 @@ define Checker
         null
     }
 
-    ; isSpreadArgument. The SyntheticExpression half has no producer here — its
-    ; writer is getSpreadArgumentType, which is a stop one function up.
-    function is_spread_argument(arg: ref[AstNode]) returns bool
-        AstNode.kind_of(arg) = KindSpreadElement
+    ; isSpreadArgument, BOTH halves since slice 139. ★★★The note that stood here
+    ; said the SyntheticExpression half *has no producer* and named
+    ; getSpreadArgumentType as its writer; the actual writer is
+    ; get_effective_call_arguments' spread synthesis, which landed in this same
+    ; slice — so the predicate is completed in the SAME edit that gives it input,
+    ; because a half-answering predicate would silently treat a synthesized spread
+    ; as an ordinary argument.
+    ; ★It is a METHOD now: the synthetic node's `is_spread` lives on the side link,
+    ; which only the Checker can look up.
+    function is_spread_argument(this, arg: ref[AstNode]) returns bool
+    {
+        if AstNode.kind_of(arg) = KindSpreadElement
+            return true
+        if AstNode.kind_of(arg) <> KindSyntheticExpression
+            return false
+        let link this.synthetic_expression_link_of(arg)
+        if link = null
+            return false
+        (link as ref[SyntheticExpressionLink]).is_spread
+    }
+
+    ; getMutableArrayOrTupleType — the spread of a READONLY tuple into a rest
+    ; parameter has to lose the readonly, and a non-tuple becomes a one-element
+    ; VARIADIC tuple so the arity machinery sees an open end.
+    function get_mutable_array_or_tuple_type(this, t: ref[Type]) returns ref[Type]?
+    {
+        if (t.flags & TypeFlagsUnion) <> 0
+            return this.map_type(t, MapTypeKindMutableArrayOrTuple, null)
+        if (t.flags & TypeFlagsAny) <> 0
+            return t
+        let mark this.unported_mark()
+        let base this.get_base_constraint_or_type(t)
+        if this.unported_mark() <> mark
+            return null
+        if base <> null
+        {
+            if this.is_mutable_array_or_tuple(base as ref[Type])
+                return t
+        }
+        if Checker.is_tuple_type(t)
+        {
+            let target Checker.target_of(t)
+            if target = null
+                return null
+            let infos Checker.tuple_element_infos_of(target as ref[Type])
+            if infos = null
+                return null
+            let elements this.get_element_types(t)
+            if this.unported_mark() <> mark
+                return null
+            return this.create_tuple_type_ex(elements, infos as ref[Array[ref[TupleElementInfo]?]], false)
+        }
+        let types this.new_type_list(null)
+        types.add(t)
+        let infos &Array[ref[TupleElementInfo]?]^host()
+        infos.add(&TupleElementInfo^host(ElementFlagsVariadic, null) as ref[TupleElementInfo]?)
+        this.create_tuple_type_ex(types as ref[Array[ref[Type]?]]?, infos as ref[Array[ref[TupleElementInfo]?]], false)
+    }
+
+    ; ★★★ getSpreadArgumentType — the TUPLE the trailing arguments make, which is
+    ; what a rest parameter is related to and inferred from. Its two stops each
+    ; blamed a missing tuple writer and a missing SyntheticExpression; slice 115
+    ; wrote the first and this file has had the second since the tagged-template
+    ; arm (§3.5eo).
+    ;
+    ; ★★★ THE FIRST BLOCK IS THE ...x-AGAINST-...y CASE and it is not a special
+    ; case of the loop: when the LAST argument is itself a spread and the rest
+    ; parameter starts at or before it, the spread's own type IS the answer — as a
+    ; mutable array or tuple when it is array-like, and as an array of the iterated
+    ; element type otherwise. Folding it into the loop would wrap `...args` in a
+    ; second tuple.
+    ;
+    ; ★ The per-argument contextual type differs by what the REST type is: for a
+    ; tuple it is the element's contextual type at that position, for anything else
+    ; the indexed access at the numeric literal — the same fork
+    ; get_contextual_type_for_element_expression serves for an array literal.
+    function get_spread_argument_type(this, args: ref[Array[ref[AstNode]?]]?, index: int, arg_count: int, rest_type: ref[Type], context: ref[InferenceContext]?, check_mode: int) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let in_const_context this.is_const_type_variable(rest_type, 0)
+        if arg_count > 0
+        {
+            if index >= (arg_count - 1)
+            {
+                let last AstNode.child_in_list(args, arg_count - 1)
+                if last = null
+                    return null
+                let arg last as ref[AstNode]
+                if this.is_spread_argument(arg)
+                {
+                    var spread_type: ref[Type]? null
+                    if AstNode.kind_of(arg) = KindSyntheticExpression
+                    {
+                        let link this.synthetic_expression_link_of(arg)
+                        if link = null
+                            return null
+                        set spread_type: (link as ref[SyntheticExpressionLink]).resolved_type
+                    }
+                    if AstNode.kind_of(arg) <> KindSyntheticExpression
+                    {
+                        let inner AstNode.expression_of(arg)
+                        if inner = null
+                            return null
+                        set spread_type: this.check_expression_with_contextual_type_ex(inner as ref[AstNode], rest_type, context, check_mode)
+                        if this.unported_mark() <> mark
+                            return null
+                    }
+                    if spread_type = null
+                        return null
+                    let st spread_type as ref[Type]
+                    if this.is_array_like_type(st)
+                        return this.get_mutable_array_or_tuple_type(st)
+                    var error_node arg
+                    if AstNode.kind_of(arg) = KindSpreadElement
+                    {
+                        let inner AstNode.expression_of(arg)
+                        if inner = null
+                            return null
+                        set error_node: inner as ref[AstNode]
+                    }
+                    let element this.check_iterated_type_or_element_type(IterationUseSpread, st, undefined_type, error_node)
+                    if this.unported_mark() <> mark
+                        return null
+                    return this.create_array_type_ex(element, in_const_context)
+                }
+            }
+        }
+        let types this.new_type_list(null)
+        let infos &Array[ref[TupleElementInfo]?]^host()
+        var i index
+        while i < arg_count
+        {
+            let a AstNode.child_in_list(args, i)
+            if a = null
+                return null
+            let arg a as ref[AstNode]
+            var t: ref[Type]? null
+            var flags ElementFlagsRequired
+            if this.is_spread_argument(arg)
+            {
+                var spread_type: ref[Type]? null
+                if AstNode.kind_of(arg) = KindSyntheticExpression
+                {
+                    let link this.synthetic_expression_link_of(arg)
+                    if link = null
+                        return null
+                    set spread_type: (link as ref[SyntheticExpressionLink]).resolved_type
+                }
+                if AstNode.kind_of(arg) <> KindSyntheticExpression
+                {
+                    let inner AstNode.expression_of(arg)
+                    if inner = null
+                        return null
+                    set spread_type: this.check_expression(inner as ref[AstNode])
+                    if this.unported_mark() <> mark
+                        return null
+                }
+                if spread_type = null
+                    return null
+                let st spread_type as ref[Type]
+                if this.is_array_like_type(st)
+                {
+                    set t: st
+                    set flags: ElementFlagsVariadic
+                }
+                if this.is_array_like_type(st) = false
+                {
+                    var error_node arg
+                    if AstNode.kind_of(arg) = KindSpreadElement
+                    {
+                        let inner AstNode.expression_of(arg)
+                        if inner = null
+                            return null
+                        set error_node: inner as ref[AstNode]
+                    }
+                    set t: this.check_iterated_type_or_element_type(IterationUseSpread, st, undefined_type, error_node)
+                    if this.unported_mark() <> mark
+                        return null
+                    set flags: ElementFlagsRest
+                }
+            }
+            if this.is_spread_argument(arg) = false
+            {
+                var contextual_type: ref[Type]? null
+                if Checker.is_tuple_type(rest_type)
+                {
+                    set contextual_type: this.get_contextual_type_for_element_expression(rest_type, i - index, arg_count - index, 0 - 1, 0 - 1)
+                    if this.unported_mark() <> mark
+                        return null
+                    if contextual_type = null
+                        set contextual_type: unknown_type
+                }
+                if Checker.is_tuple_type(rest_type) = false
+                {
+                    set contextual_type: this.get_indexed_access_type_ex(rest_type, this.get_number_literal_type(Checker.number_bits_from_int(i - index)), AccessFlagsContextual, null, null)
+                    if this.unported_mark() <> mark
+                        return null
+                }
+                if contextual_type = null
+                    return null
+                let ct contextual_type as ref[Type]
+                let arg_type this.check_expression_with_contextual_type_ex(arg, ct, context, check_mode)
+                if this.unported_mark() <> mark
+                    return null
+                if arg_type = null
+                    return null
+                var has_primitive_contextual_type in_const_context
+                if has_primitive_contextual_type = false
+                    set has_primitive_contextual_type: Checker.maybe_type_of_kind(ct, TypeFlagsPrimitive | TypeFlagsIndex | TypeFlagsTemplateLiteral | TypeFlagsStringMapping)
+                if has_primitive_contextual_type
+                    set t: this.get_regular_type_of_literal_type(arg_type as ref[Type])
+                if has_primitive_contextual_type = false
+                    set t: this.get_widened_literal_type(arg_type as ref[Type])
+                if this.unported_mark() <> mark
+                    return null
+                set flags: ElementFlagsRequired
+            }
+            if t = null
+                return null
+            var labeled: ref[AstNode]? null
+            if AstNode.kind_of(arg) = KindSyntheticExpression
+            {
+                let link this.synthetic_expression_link_of(arg)
+                if link <> null
+                    set labeled: (link as ref[SyntheticExpressionLink]).tuple_name_source
+            }
+            types.add(t)
+            infos.add(&TupleElementInfo^host(flags, labeled) as ref[TupleElementInfo]?)
+            set i: i + 1
+        }
+        var readonly in_const_context
+        if readonly
+        {
+            if this.some_type_is_mutable_array_like(rest_type)
+                set readonly: false
+        }
+        this.create_tuple_type_ex(types as ref[Array[ref[Type]?]]?, infos as ref[Array[ref[TupleElementInfo]?]], readonly)
+    }
 
 
     ; ── slice 128: THE ITERATION AND ASYNC PROTOCOL ──────────────────────────
