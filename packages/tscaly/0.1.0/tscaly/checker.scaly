@@ -1574,6 +1574,27 @@ define AssertionLink
     }
 }
 
+; One row of c.mergedSymbols (slice 137) — the table `get_merged_symbol`'s own
+; header has been owing since slice 113, and this is the slice that fills it.
+;
+; ★★★ THE KEY IS THE **SOURCE** AND THE VALUE IS THE TARGET, which is the one thing
+; about this table that reads backwards: `recordMergedSymbol(target, source)` writes
+; `mergedSymbols[source] = target`, so the row says *whoever still holds the symbol
+; that was merged AWAY must be handed the survivor*. A row keyed the other way round
+; would be an identity map with extra steps.
+define MergedSymbolLink
+(
+    source: ref[Symbol]?
+    target: ref[Symbol]?
+)
+{
+    init(s: ref[Symbol]?, t: ref[Symbol]?)
+    {
+        set source: s
+        set target: t
+    }
+}
+
 define TypeNodeLink
 (
     node: ref[AstNode]?
@@ -5418,6 +5439,13 @@ define Checker
     ; one annotation as soon as a second reader of that annotation lands.
     type_node_links: ref[Array[ref[TypeNodeLink]?]]
 
+    ; c.mergedSymbols (slice 137) — the same idiom, keyed on the symbol that was
+    ; merged AWAY. It is the table `get_merged_symbol` has read since slice 113
+    ; while nothing could write it, which is the state that function's header calls
+    ; out by name: *a lookup that always misses and a table that is never filled are
+    ; the same code*.
+    merged_symbols: ref[Array[ref[MergedSymbolLink]?]]
+
     ; c.nodeLinks (slice 83) — the same idiom a fourth time. One row per accessor
     ; PAIR of the unit, so the scan is shorter than type_node_links'.
     node_links: ref[Array[ref[NodeLink]?]]
@@ -6004,6 +6032,9 @@ define Checker
         let tnl host.allocate(sizeof Array[ref[TypeNodeLink]?], alignof Array[ref[TypeNodeLink]?]) as pointer[Array[ref[TypeNodeLink]?]]
         set *tnl: Array[ref[TypeNodeLink]?]()
         set c.type_node_links: tnl
+        let msl host.allocate(sizeof Array[ref[MergedSymbolLink]?], alignof Array[ref[MergedSymbolLink]?]) as pointer[Array[ref[MergedSymbolLink]?]]
+        set *msl: Array[ref[MergedSymbolLink]?]()
+        set c.merged_symbols: msl
         let nll host.allocate(sizeof Array[ref[NodeLink]?], alignof Array[ref[NodeLink]?]) as pointer[Array[ref[NodeLink]?]]
         set *nll: Array[ref[NodeLink]?]()
         set c.node_links: nll
@@ -15228,8 +15259,338 @@ define Checker
         ; own until checkExpressionWithTypeArguments arrived; see that function.
         if k = KindTypeQuery
             return this.get_type_from_type_query_node(node)
-        this.record_unported("get-type-from-type-node", k)
+        ; ★★★ SLICE 137 — THE FOUR JSDoc WRAPPERS, and the note that left them out
+        ; EXPIRED for the reason the Parenthesized one's did two slices earlier. It
+        ; read *"each is a one-line forward whose value is exactly the inner arm's,
+        ; so porting them buys nothing this slice can print"*, which was true while
+        ; the inner arms were keywords. Two of the four are NOT forwards at all —
+        ; `?T` adds null and `...T` builds an array — and the two that are carry the
+        ; `get-type-from-type-node` row's largest event counts (312 and 311).
+        if k = KindJSDocNonNullableType
+            return this.try_get_type_from_type_node(node)
+        if k = KindJSDocNullableType
+        {
+            let inner this.try_get_type_from_type_node(node)
+            if inner = null
+                return null
+            if Checker.strict_null_checks() = false
+                return inner
+            return this.get_nullable_type(inner as ref[Type], TypeFlagsNull)
+        }
+        ; ★The variadic's inner type is NOT reached through `type_of`: see
+        ; AstNode.jsdoc_variadic_inner_of, where the reference does the same.
+        if k = KindJSDocVariadicType
+        {
+            let inner AstNode.jsdoc_variadic_inner_of(node)
+            if inner = null
+                return null
+            return this.create_array_type(this.get_type_from_type_node(inner as ref[AstNode]))
+        }
+        if k = KindJSDocOptionalType
+        {
+            let inner this.try_get_type_from_type_node(node)
+            if inner = null
+                return null
+            return this.add_optionality_ex(inner as ref[Type], false, true)
+        }
+        ; ★★★ SLICE 137 — `this`, AND THE TWO KINDS SHARE ONE ARM UPSTREAM (`case
+        ; ast.KindThisType, ast.KindThisKeyword`). The second is what makes the arm
+        ; reachable outside a type position at all: `getTypeOfNode` on a `this`
+        ; EXPRESSION that is not in an expression context falls through to here, which
+        ; is the fallthrough its own site spells out.
+        if k = KindThisType
+            return this.get_type_from_this_type_node(node)
+        if k = KindThisKeyword
+            return this.get_type_from_this_type_node(node)
+        ; ★★★ SLICE 137 — THE IMPORT TYPE, the largest row of this switch BY UNITS.
+        if k = KindImportType
+            return this.get_type_from_import_type_node(node)
+        ; ★★★ AND THE `default` ARM IS `c.errorType`, NOT A STOP — the switch is
+        ; COMPLETE now, so a kind that reaches this line is one the reference itself
+        ; has no arm for, and answering the error type is what it does. The tag stays
+        ; alive at the three OTHER sites that raise it, which is why it does not
+        ; disappear from the histogram.
+        error_type
+    }
+
+    ; ── the IMPORT TYPE (slice 137) ─────────────────────────────────────────
+    ;
+    ; getTypeFromImportTypeNode, whole. `import("m").A.B` and `typeof import("m").x`.
+    ;
+    ; ★★★ EVERY FAILURE ARM WRITES `unknownSymbol` INTO THE NODE'S RESOLVED SYMBOL
+    ; AND ANSWERS THE ERROR TYPE, and the pair is one act rather than two: a later
+    ; reader that finds no resolved symbol at all would ask again and report again,
+    ; where one that finds the unknown symbol stops quietly. That is why the arms are
+    ; not folded into a single `return error_type`.
+    ;
+    ; ★★ THE MEANING IS DECIDED BY `typeof` AND CARRIED TO THE LAST NAME ONLY: every
+    ; segment but the final one is looked up as a NAMESPACE, because `import("m").a.b`
+    ; walks module members and only the tail is the thing being named.
+    function get_type_from_import_type_node(this, node: ref[AstNode]) returns ref[Type]?
+    {
+        let links this.type_node_link_of(node)
+        if links.resolved_type <> null
+            return links.resolved_type
+        let argument AstNode.import_type_argument_of(node)
+        ; ast.IsLiteralImportTypeNode — the argument must be a LiteralType whose
+        ; literal is a string. Anything else is `import(SomeType)`, which parses.
+        var literal: ref[AstNode]? null
+        if argument <> null
+        {
+            let a argument as ref[AstNode]
+            if AstNode.kind_of(a) = KindLiteralType
+            {
+                let lit AstNode.literal_type_inner_of(a)
+                if lit <> null
+                {
+                    if AstNode.kind_of(lit as ref[AstNode]) = KindStringLiteral
+                        set literal: lit
+                }
+            }
+        }
+        if literal = null
+        {
+            this.error_on_node(argument, DiagString_literal_expected)
+            return this.fail_import_type(node, links)
+        }
+        var target_meaning SymbolFlagsType
+        if AstNode.import_type_is_type_of(node)
+            set target_meaning: SymbolFlagsValue
+        let mark this.unported_mark()
+        let inner this.resolve_external_module_name(node, literal, false)
+        if this.unported_mark() <> mark
+            return null
+        if inner = null
+            return this.fail_import_type(node, links)
+        let module_symbol this.resolve_external_module_symbol(inner, false)
+        if module_symbol = null
+            return this.fail_import_type(node, links)
+        let qualifier AstNode.import_type_qualifier_of(node)
+        if Parser.node_is_missing(qualifier) = false
+        {
+            if qualifier = null
+                return this.fail_import_type(node, links)
+            let chain &Array[ref[AstNode]?]^host()
+            this.append_identifier_chain(chain, qualifier as ref[AstNode])
+            let cn chain.get_length() as int
+            var current module_symbol as ref[Symbol]
+            var ci 0
+            while ci < cn
+            {
+                let seg chain[ci]
+                if seg = null
+                    return this.fail_import_type(node, links)
+                let sg seg as ref[AstNode]
+                var meaning SymbolFlagsNamespace
+                if ci = cn - 1
+                    set meaning: target_meaning
+                set ci: ci + 1
+                let merged this.get_merged_symbol(this.resolve_symbol(current))
+                if merged = null
+                    return this.fail_import_type(node, links)
+                let mg merged as ref[Symbol]
+                var next: ref[Symbol]? null
+                if AstNode.import_type_is_type_of(node)
+                {
+                    let ct this.get_type_of_symbol(mg)
+                    if this.unported_mark() <> mark
+                        return null
+                    if ct <> null
+                        set next: this.get_property_of_type_ex(ct as ref[Type], AstNode.identifier_text_of(sg), AstNode.identifier_text_length_of(sg), false, true)
+                }
+                else
+                {
+                    ; ★★ THE COMMONJS `export=`-ALONGSIDE-TYPEDEFS FALLBACK IS THE
+                    ; REFERENCE'S OWN `!!!` — an unfinished line upstream — and it is
+                    ; left out here for that reason rather than transcribed: porting a
+                    ; marked-incomplete branch would pin behaviour the reference does
+                    ; not itself stand behind.
+                    set next: this.get_symbol_in_table(this.get_exports_of_symbol(mg), AstNode.identifier_text_of(sg), AstNode.identifier_text_length_of(sg), meaning)
+                    if this.unported_mark() <> mark
+                        return null
+                }
+                if next = null
+                {
+                    this.error_on_node(sg, DiagNamespace_0_has_no_exported_member_1)
+                    set links.resolved_type: error_type
+                    return links.resolved_type
+                }
+                ; Both the segment and its PARENT get the symbol: the parent of the
+                ; last identifier of `a.b` is the QualifiedName, and a reader that
+                ; lands on either must find the same answer.
+                let sn this.symbol_node_link_of(sg)
+                set sn.resolved_symbol: next
+                let pn AstNode.parent_node_of(sg)
+                if pn <> null
+                {
+                    let pl this.symbol_node_link_of(pn as ref[AstNode])
+                    set pl.resolved_symbol: next
+                }
+                set current: next as ref[Symbol]
+            }
+            let t this.resolve_import_symbol_type(node, current, target_meaning)
+            if this.unported_mark() <> mark
+                return null
+            set links.resolved_type: t
+            return links.resolved_type
+        }
+        if (this.get_symbol_flags(module_symbol as ref[Symbol]) & target_meaning) <> 0
+        {
+            let t this.resolve_import_symbol_type(node, module_symbol as ref[Symbol], target_meaning)
+            if this.unported_mark() <> mark
+                return null
+            set links.resolved_type: t
+            return links.resolved_type
+        }
+        var code DiagModule_0_does_not_refer_to_a_type_but_is_used_as_a_type_here_Did_you_mean_typeof_import_0
+        if target_meaning = SymbolFlagsValue
+            set code: DiagModule_0_does_not_refer_to_a_value_but_is_used_as_a_value_here
+        this.error_on_node(node, code)
+        this.fail_import_type(node, links)
+    }
+
+    ; The three lines every failure arm of getTypeFromImportTypeNode ends with.
+    function fail_import_type(this, node: ref[AstNode], links: ref[TypeNodeLink]) returns ref[Type]?
+    {
+        let sn this.symbol_node_link_of(node)
+        set sn.resolved_symbol: unknown_symbol
+        set links.resolved_type: error_type
+        links.resolved_type
+    }
+
+    ; getIdentifierChain, as an APPEND rather than a return — the reference builds
+    ; the list by appending its own recursion's result, which is this in the shape
+    ; this language has.
+    procedure append_identifier_chain(this, out: ref[Array[ref[AstNode]?]], node: ref[AstNode])
+    {
+        if AstNode.kind_of(node) = KindIdentifier
+        {
+            out.add(node)
+            return
+        }
+        let left AstNode.qualified_left_of(node)
+        if left <> null
+            this.append_identifier_chain(out, left as ref[AstNode])
+        let right AstNode.qualified_right_of(node)
+        if right <> null
+            out.add(right)
+    }
+
+    ; resolveImportSymbolType, whole.
+    ;
+    ; ★ The VALUE arm deliberately asks getTypeOfSymbol of the UNRESOLVED symbol —
+    ; the reference's own comment says so (*"intentionally doesn't use resolved symbol
+    ; so type is cached as expected on the alias"*) — while getTypeReferenceType needs
+    ; the resolved one because it does not handle aliases.
+    function resolve_import_symbol_type(this, node: ref[AstNode], symbol: ref[Symbol], meaning: int) returns ref[Type]?
+    {
+        let resolved this.resolve_symbol(symbol)
+        let sn this.symbol_node_link_of(node)
+        set sn.resolved_symbol: resolved
+        if meaning = SymbolFlagsValue
+        {
+            let t this.get_type_of_symbol(symbol)
+            if t = null
+                return null
+            return this.get_instantiation_expression_type(t as ref[Type], node)
+        }
+        if resolved = null
+            return null
+        this.get_type_reference_type(node, resolved as ref[Symbol])
+    }
+
+    ; getSymbol — a table lookup that is FILTERED BY MEANING, which is what makes it
+    ; more than SymbolTable.get. ★The alias arm is the second half: an alias whose
+    ; TARGET carries the meaning answers, and `getSymbolFlags` returns SymbolFlagsAll
+    ; when the alias resolution itself failed, which the reference relies on to avoid
+    ; cascading a second report out of one broken import.
+    function get_symbol_in_table(this, symbols: ref[SymbolTable]?, d: pointer[char], n: int, meaning: int) returns ref[Symbol]?
+    {
+        if (meaning & SymbolFlagsAll) = 0
+            return null
+        let found this.get_merged_symbol(SymbolTable.get(symbols, d, n))
+        if found = null
+            return null
+        let f found as ref[Symbol]
+        if (Symbol.flags_of(f) & meaning) <> 0
+            return f
+        if (Symbol.flags_of(f) & SymbolFlagsAlias) = 0
+            return null
+        if (this.get_symbol_flags(f) & meaning) <> 0
+            return f
         null
+    }
+
+    ; ── getTypeFromThisTypeNode and getThisType (slice 137) ─────────────────
+    ;
+    ; ★★★ THE MEMO IS THE POINT OF THE OUTER FUNCTION AND NOT DECORATION: getThisType
+    ; REPORTS on failure, so a second ask of one `this` would emit TS2526 twice, and
+    ; diagcheck's relation is a SUBSEQUENCE — an extra line is the one thing it fails
+    ; on. Both call sites (the type-node switch and checkThisType) reach the same node.
+    function get_type_from_this_type_node(this, node: ref[AstNode]) returns ref[Type]?
+    {
+        let links this.type_node_link_of(node)
+        if links.resolved_type <> null
+            return links.resolved_type
+        let t this.get_this_type(node)
+        set links.resolved_type: t
+        t
+    }
+
+    ; getThisType, whole.
+    ;
+    ; ★★★ ITS THREE CONDITIONS ARE ONE SENTENCE AND EACH IS A DIFFERENT QUESTION: the
+    ; container's PARENT has to be a class or an interface (a `this` in a free
+    ; function has no home type), the container may not be STATIC (a static member's
+    ; `this` is the constructor, not the instance), and a CONSTRUCTOR is admitted only
+    ; for a node inside its BODY — a `this` in a constructor's parameter list or
+    ; return annotation is outside the instance the constructor is building.
+    ;
+    ; ★★ THE ANSWER IS THE INTERFACE TYPE'S OWN `thisType` SLOT, which
+    ; get_declared_type_of_class_or_interface fills only where the declaration needs
+    ; one; the reference's `core.Coalesce(..., c.errorType)` is what says so, and it
+    ; is the null case here.
+    function get_this_type(this, node: ref[AstNode]) returns ref[Type]?
+    {
+        let container Binder.get_this_container(node, false, false)
+        if container <> null
+        {
+            let cn container as ref[AstNode]
+            let parent AstNode.parent_node_of(cn)
+            if parent <> null
+            {
+                let pn parent as ref[AstNode]
+                var class_like_or_interface false
+                if Checker.is_class_like(pn)
+                    set class_like_or_interface: true
+                if AstNode.kind_of(pn) = KindInterfaceDeclaration
+                    set class_like_or_interface: true
+                if class_like_or_interface
+                {
+                    if b.is_static(cn) = false
+                    {
+                        var in_scope true
+                        if AstNode.kind_of(cn) = KindConstructor
+                            set in_scope: Checker.is_node_descendant_of(node, AstNode.body_of(cn))
+                        if in_scope
+                        {
+                            let sym this.get_symbol_of_declaration(pn)
+                            if sym = null
+                                return error_type
+                            let declared this.get_declared_type_of_class_or_interface(sym as ref[Symbol])
+                            if declared = null
+                                return error_type
+                            let tt Checker.this_type_of(declared as ref[Type])
+                            if tt = null
+                                return error_type
+                            return tt
+                        }
+                    }
+                }
+            }
+        }
+        this.error_on_node(node, DiagA_this_type_is_available_only_in_a_non_static_member_of_a_class_or_interface)
+        error_type
     }
 
     ; ── the tuple element wrappers ──────────────────────────────────────────
@@ -33843,9 +34204,14 @@ define Checker
             set this_type: true
         if this_type
         {
-            ; getTypeFromThisTypeNode → getThisType, neither ported.
-            this.record_unported("get-type-from-this-type-node", k)
-            return null
+            ; getTypeFromThisTypeNode → getThisType, both ported in slice 137.
+            ; ★The caller wants a SYMBOL, and the reference takes it off the type it
+            ; gets back; a `this` outside a class or interface answers the error type,
+            ; whose symbol is null — which is the same nothing the stop answered.
+            let t this.get_type_from_this_type_node(node)
+            if t = null
+                return null
+            return (t as ref[Type]).symbol
         }
 
         if k = KindSuperKeyword
@@ -57649,7 +58015,22 @@ define Checker
             this.check_variable_like_declaration(declaration)
             let type_node AstNode.type_of(declaration)
             if type_node <> null
-                this.record_unported("get-type-from-type-node", AstNode.kind_of(type_node))
+            {
+                ; ★ SLICE 137. The arm's own note said it was *"behind the type
+                ; system: an annotation has to be resolved before `must be any or
+                ; unknown` can be decided"*, and the switch that resolves it is
+                ; complete now.
+                let mark this.unported_mark()
+                let t this.get_type_from_type_node(type_node as ref[AstNode])
+                if this.unported_mark() = mark
+                {
+                    if t <> null
+                    {
+                        if ((t as ref[Type]).flags & TypeFlagsAnyOrUnknown) = 0
+                            this.grammar_error_on_first_token(type_node as ref[AstNode], DiagCatch_clause_variable_type_annotation_must_be_any_or_unknown_if_specified)
+                    }
+                }
+            }
             else
             {
                 let initializer AstNode.initializer_of(declaration)
@@ -59835,29 +60216,31 @@ define Checker
         if lib_file <> null
             this.merge_file_globals(lib_file as ref[AstNode], lib_b as ref[Binder], ambient)
         this.merge_file_globals(file as ref[AstNode], b, ambient)
-        ; ★★★ THE TWO AUGMENTATION LOOPS REPORT SINCE SLICE 114, AND THE REASON THEY
-        ; WERE ABLE TO SAY NOTHING BEFORE IS THAT THEIR UNITS ALL STOPPED FIRST.
-        ; `mergeModuleAugmentation` needs mergeSymbolTable and is still not written;
-        ; what changed is that it also REPORTS — TS2664 for an augmentation whose
-        ; module cannot be found — and the alias chapter took the wall in front of
-        ; those units away. Eight stage-2 units then read as FAIL with a diagnostic
-        ; MISSING, which is the shape §3.5v's fourth reason forbids: an omission
-        ; that can change the output is a stop, not a silence. ★It is asked of the
-        ; FILE and not written unconditionally, so a unit with no augmentation pays
-        ; nothing — and the question is the PARSER's collector, not the checker's.
+        ; ★★★ THE TWO AUGMENTATION LOOPS ARE THE REFERENCE'S SINCE SLICE 137, AND
+        ; THEIR OLD STOP NAMED THE PRODUCER: *"`mergeModuleAugmentation` needs
+        ; mergeSymbolTable and is still not written"*. That stop returned from HERE,
+        ; before the rest of the procedure, and its note said why — *"Upstream the
+        ; GLOBAL-scope pass runs before addUndefinedToGlobalsOrErrorOnRedeclaration,
+        ; deliberately, because it changes what that reports"*. So the order below is
+        ; the whole reason the stop had to be so blunt, and it is kept exactly.
         ;
-        ; ★★★ IT STOPS AT THE FIRST OF THE REFERENCE'S TWO LOOPS AND RETURNS, WHICH
-        ; IS THE SAFE DIRECTION RATHER THAN THE FAITHFUL ONE, and the reason is
-        ; diagcheck. Upstream the GLOBAL-scope pass runs HERE — before
-        ; addUndefinedToGlobalsOrErrorOnRedeclaration, deliberately, because it
-        ; changes what that reports — and the non-global pass runs last. Running the
-        ; rest of this procedure without the merge could therefore emit a diagnostic
-        ; the reference does not, and diagcheck's relation is a SUBSEQUENCE: a
-        ; missing line is legal, an extra one is not.
+        ; ★★ THE COLLECTION IS BEHIND THE PREDICATE, so a unit with no augmentation
+        ; pays one statement walk and nothing else — the shape the stop already had.
+        let augmentations &Array[ref[AstNode]?]^host()
         if this.file_has_module_augmentation()
+            this.collect_module_augmentations(augmentations, file, false)
+        ; "We do global augmentations separately from module augmentations (and
+        ; before creating global types)": pass one, the `declare global` blocks.
+        let agn augmentations.get_length() as int
+        var agi 0
+        while agi < agn
         {
-            this.record_unported("merge-module-augmentation", 0)
-            return
+            let a augmentations[agi]
+            set agi: agi + 1
+            if a = null
+                continue
+            if Binder.is_global_scope_augmentation(AstNode.parent_node_of(a as ref[AstNode]))
+                this.merge_module_augmentation(a as ref[AstNode])
         }
         ; Every `getGlobalType` line is still left out, on §3.5be's rule: a call
         ; with no reader stays out rather than in as a stub.
@@ -59884,6 +60267,20 @@ define Checker
             if sym <> null
                 this.merge_global_symbol(sym as ref[Symbol])
             set ai: ai + 1
+        }
+        ; "merge _nonglobal_ module augmentations. this needs to be done after global
+        ; symbol table is initialized to make sure that all ambient modules are
+        ; indexed" — pass two, and the ONLY thing that separates it from pass one is
+        ; everything between them.
+        var agj 0
+        while agj < agn
+        {
+            let a augmentations[agj]
+            set agj: agj + 1
+            if a = null
+                continue
+            if Binder.is_global_scope_augmentation(AstNode.parent_node_of(a as ref[AstNode])) = false
+                this.merge_module_augmentation(a as ref[AstNode])
         }
     }
 
@@ -59968,6 +60365,174 @@ define Checker
             set i: i + 1
         }
         false
+    }
+
+    ; ── mergeModuleAugmentation (slice 137) ──────────────────────────────────
+    ;
+    ; ★★★ IT IS ASKED OF THE MODULE **NAME** AND WORKS ON ITS PARENT, which is the
+    ; shape `file.ModuleAugmentations` has: the parser collects the string literal
+    ; (or the `global` identifier), not the declaration. Every read below goes
+    ; through the parent, so the argument is a HANDLE and never the subject.
+    ;
+    ; ★★★ THE FIRST GUARD IS THE ONE THAT MAKES THE PASS IDEMPOTENT AND IT IS NOT
+    ; OBVIOUS: `symbol.Declarations[0] != moduleNode` returns early, because two
+    ; `declare module "m"` blocks in ONE file share a symbol that already carries
+    ; both declarations — so the merge is performed for the FIRST declaration and
+    ; skipped for every other. Drop it and the second block merges the accumulated
+    ; symbol a second time, which appends every declaration twice.
+    procedure merge_module_augmentation(this, module_name: ref[AstNode])
+    {
+        let module_node AstNode.parent_node_of(module_name)
+        if module_node = null
+            return
+        let mn module_node as ref[AstNode]
+        let sym AstNode.symbol_of(mn)
+        if sym = null
+            return
+        let augmentation sym as ref[Symbol]
+        if Symbol.declaration_at(augmentation, 0) <> module_node
+            return
+        if Binder.is_global_scope_augmentation(mn)
+        {
+            if Symbol.exports_of(augmentation) <> null
+                this.merge_symbol_table(globals, Symbol.exports_of(augmentation) as ref[SymbolTable], false, null)
+            return
+        }
+        ; "do not validate names of augmentations that are defined in ambient
+        ; context" — the guard reads the GRANDparent's flags, i.e. the container the
+        ; augmentation sits in, and an ambient one gets no not-found message at all.
+        var not_found 0
+        let gp AstNode.parent_node_of(mn)
+        if gp <> null
+        {
+            if (AstNode.flags_of(gp as ref[AstNode]) & NodeFlagsAmbient) = 0
+                set not_found: DiagInvalid_module_name_in_augmentation_module_0_cannot_be_found
+        }
+        let mark this.unported_mark()
+        let found this.resolve_external_module_name_worker(module_name, module_name, not_found, false, true)
+        if this.unported_mark() <> mark
+            return
+        if found = null
+            return
+        ; "obtain item referenced by 'export='"
+        let main this.resolve_external_module_symbol(found, false)
+        if main = null
+            return
+        let mm main as ref[Symbol]
+        if (Symbol.flags_of(mm) & SymbolFlagsNamespace) = 0
+        {
+            this.error_on_node(module_name, DiagCannot_augment_module_0_because_it_resolves_to_a_non_module_entity)
+            return
+        }
+        ; ★★★ THE PATTERN-AMBIENT-MODULE FORK IS UNREACHABLE HERE AND IT IS NOT A
+        ; HOLE: `resolve_external_module_name_worker` reports `pattern-ambient-module`
+        ; and answers null one function up, so the line above has already returned by
+        ; the time this branch could be asked. It is written down rather than left
+        ; out because the fork's OTHER half is what this port takes, and a reader who
+        ; finds only one half has to re-derive why.
+        ;
+        ; "We may need to merge the module augmentation's exports into the target
+        ; symbols of the resolved exports" — the `export *` case, and its condition
+        ; is asked on the MAIN module's own exports table rather than on the resolved
+        ; one: a name the star brought in gets the augmentation's declarations, a
+        ; name the module declares itself is left to the plain merge below.
+        var sd: pointer[char] null
+        let sl Binder.internal_name(host, "export", &sd)
+        if SymbolTable.get(Symbol.exports_of(mm), sd, sl) <> null
+        {
+            if SymbolTable.length(Symbol.exports_of(augmentation)) <> 0
+            {
+                let resolved this.get_resolved_members_or_exports_of_symbol(mm, true)
+                let ae Symbol.exports_of(augmentation) as ref[SymbolTable]
+                let an SymbolTable.length(ae)
+                var ai 0
+                while ai < an
+                {
+                    let nd SymbolTable.entry_name_data_at(ae, ai)
+                    let nl SymbolTable.entry_name_len_at(ae, ai)
+                    let v SymbolTable.entry_symbol_at(ae, ai)
+                    if v <> null
+                    {
+                        let target SymbolTable.get(resolved, nd, nl)
+                        if target <> null
+                        {
+                            if SymbolTable.get(Symbol.exports_of(mm), nd, nl) = null
+                                this.merge_symbol(target as ref[Symbol], v as ref[Symbol], false)
+                        }
+                    }
+                    set ai: ai + 1
+                }
+            }
+        }
+        this.merge_symbol(mm, augmentation, false)
+    }
+
+    ; `file.ModuleAugmentations` — the parser's collector (`collectModuleReferences`),
+    ; written out as the walk it is.
+    ;
+    ; ★★★ IT IS **NOT** `statement_is_module_augmentation` READ AS A COLLECTOR, AND
+    ; THE FIRST VERSION OF THIS SLICE MADE EXACTLY THAT MISTAKE. That predicate
+    ; answers *does this statement CONTAIN an augmentation* — it recurses into an
+    ; ambient module's body and reports its own container as true — so collecting on
+    ; it handed `merge_module_augmentation` the name of `declare module "Map"` rather
+    ; than of the `module "Observable"` nested inside it. The augmentation then
+    ; resolved its own module name TO ITSELF, `mergeSymbol(x, x)` returned at its
+    ; `source == target` guard, and five stage-2 units printed `any` where the
+    ; reference prints `typeof import("Observable")` — with no diagnostic anywhere,
+    ; because every step had done exactly what it was asked.
+    ; ★★A PREDICATE THAT RECURSES ANSWERS ABOUT A SUBTREE; A COLLECTOR HAS TO ANSWER
+    ; ABOUT A NODE. The two questions read alike and the shared helper is the trap.
+    ;
+    ; ★ The reference's three-way fork is kept whole: an ambient module in an
+    ; EXTERNAL file is an augmentation outright; one nested in a top-level ambient
+    ; module is an augmentation when its name is non-relative; and one at the top
+    ; level of a SCRIPT is an ambient module DECLARATION whose body is then walked
+    ; with `inAmbientModule` true. Only the third recurses.
+    procedure collect_module_augmentations(this, out: ref[Array[ref[AstNode]?]], node: ref[AstNode]?, in_ambient_module: bool)
+    {
+        let stmts AstNode.statements_of(node)
+        if stmts = null
+            return
+        let list stmts as ref[Array[ref[AstNode]?]]
+        let n list.get_length() as int
+        var i 0
+        while i < n
+        {
+            let st list[i]
+            set i: i + 1
+            if st = null
+                continue
+            let s st as ref[AstNode]
+            if AstNode.kind_of(s) <> KindModuleDeclaration
+                continue
+            if Binder.is_ambient_module(s) = false
+                continue
+            var declared in_ambient_module
+            if b.has_syntactic_modifier(s, ModifierFlagsAmbient)
+                set declared: true
+            if b.is_declaration_file_of()
+                set declared: true
+            if declared = false
+                continue
+            let name AstNode.name_of(s)
+            if name = null
+                continue
+            let nm name as ref[AstNode]
+            var is_augmentation b.is_external_module_of()
+            if in_ambient_module
+            {
+                if is_external_module_name_relative(Slice[char](AstNode.identifier_text_length_of(nm), AstNode.identifier_text_of(nm))) = false
+                    set is_augmentation: true
+            }
+            if is_augmentation
+            {
+                out.add(nm)
+                continue
+            }
+            if in_ambient_module
+                continue
+            this.collect_module_augmentations(out, AstNode.body_of(s), true)
+        }
     }
 
     ; initializeChecker's LOOP BODY, one file of the program. It was inline until
@@ -60076,30 +60641,28 @@ define Checker
         false
     }
 
-    ; mergeGlobalSymbol.
+    ; mergeGlobalSymbol, WHOLE since slice 137.
     ;
-    ; ★★★ THE COLLISION ARM IS A STOP, AND THE ALTERNATIVE WOULD BE THE SILENT
-    ; WRONG ANSWER §3.5bk NAMES. `globalSymbol != nil` means the name is already in
-    ; the table, and the reference then calls `mergeSymbol(globalSymbol, symbol,
-    ; false)` — which unions two symbols' declarations, members and exports and
-    ; RECORDS the result in c.mergedSymbols, the table get_merged_symbol's own
-    ; header says it owes to the slice that fills it. Storing the incoming symbol
-    ; unmerged would answer a name with HALF its declarations, at rc 0, and no
-    ; instrument in this suite compares a symbol reached through globals.
+    ; ★★★ THE COLLISION ARM WAS A STOP AND ITS NOTE NAMED WHAT IT WAS WAITING FOR:
+    ; *"the reference then calls `mergeSymbol(globalSymbol, symbol, false)` — which
+    ; unions two symbols' declarations, members and exports and RECORDS the result in
+    ; c.mergedSymbols ... Storing the incoming symbol unmerged would answer a name
+    ; with HALF its declarations, at rc 0, and no instrument in this suite compares a
+    ; symbol reached through globals."* Both halves are here now, so the arm is the
+    ; reference's one line.
     ;
-    ; ★★ WITH ONE FILE AND NO LIB THE ARM HAS EXACTLY ONE SHAPE, and it is the one
-    ; the caller has just reported on: a script file declaring `globalThis`, whose
-    ; name collides with the seeded symbol. Every other name of a single file's
-    ; locals table is distinct by construction — the binder's locals table is keyed
-    ; on the name, so a second declaration of `x` is already merged INTO one symbol
-    ; there.
+    ; ★★ THE ARM IS LIVE BECAUSE OF THE LIB, which is what makes it the frontier row
+    ; it is: with the lib loaded (slice 118) every global name the unit re-declares —
+    ; `Array`, `String`, an interface the unit augments — arrives here with the lib's
+    ; symbol already in the table, and that is the merge the reference performs.
     procedure merge_global_symbol(this, symbol: ref[Symbol])
     {
         let nd Symbol.name_data_of(symbol)
         let nl Symbol.name_len_of(symbol)
-        if SymbolTable.get(globals, nd, nl) <> null
+        let existing SymbolTable.get(globals, nd, nl)
+        if existing <> null
         {
-            this.record_unported("merge-global-symbol", Symbol.flags_of(symbol))
+            SymbolTable.set_entry(host, globals, nd, nl, this.merge_symbol(existing as ref[Symbol], symbol, false))
             return
         }
         SymbolTable.set_entry(host, globals, nd, nl, this.get_merged_symbol(symbol))
@@ -65326,6 +65889,31 @@ define Checker
             set i: i + 1
         }
         null
+    }
+
+    ; ★★★ A NODE OF THE **LIB** MAY NOT BE REPORTED ON (slice 137), AND NOTHING BEFORE
+    ; THIS SLICE COULD REACH ONE. Upstream a diagnostic is filed against the SOURCE
+    ; FILE of the node it names, and the harness asks for `GetDiagnostics(unit)` — so
+    ; a report the reference makes on a lib declaration is simply not in the list this
+    ; suite compares. Every check this port had run walked the unit's own tree, so the
+    ; question never came up; the SYMBOL MERGE is the first chapter that reports on a
+    ; symbol it did not walk to, and `class Object {}` in the unit made
+    ; reportMergeSymbolError name lib.es5.d.ts's `Object` twice.
+    ;
+    ; ★★★ IT IS ALSO THE SPAN BUG binder_of_node's header WARNED ABOUT, from the other
+    ; side: all three reporters compute their range with `b`, the UNIT's binder, so a
+    ; lib node would have been reported at the unit's text under the lib's offsets —
+    ; *silently*, exactly as that note says. Suppressing the report closes both.
+    ;
+    ; ★The test is asked in the SUPPRESSING direction (is this provably the lib?)
+    ; rather than as *is this the unit*: a synthesized node with no parent chain
+    ; answers null for its file, and dropping its report on that ground would delete
+    ; diagnostics this port makes today.
+    function node_is_in_lib(this, n: ref[AstNode]?) returns bool
+    {
+        if lib_file = null
+            return false
+        Checker.source_file_of_node(n) = lib_file
     }
 
     ; ast.GetSourceFileOfNode — the walk up to the SourceFile.
@@ -71303,9 +71891,9 @@ define Checker
         this.get_type_from_type_node(node)
     }
 
-    ; checkThisType, whole: one call, and the whole of it is the stop.
+    ; checkThisType, whole: one call, and since slice 137 it is that call.
     procedure check_this_type(this, node: ref[AstNode])
-        this.record_unported("get-type-from-this-type-node", KindThisType)
+        this.get_type_from_this_type_node(node)
 
     ; checkTypeQuery, whole, and likewise entirely its stop. ★getTypeFromTypeQueryNode
     ; resolves the entity name to a symbol and asks for its type, so this row is the
@@ -71798,13 +72386,13 @@ define Checker
     procedure check_import_type(this, node: ref[AstNode])
     {
         this.check_source_element(AstNode.import_type_argument_of(node))
+        ; ★★★ THE STOP HERE WAS AN EXPIRED NOTE (slice 137). It read *"getResolutionMode
+        ; Override with reportErrors ... checkImportAttributes reports the same
+        ; dimension from the declaration side"* — and that second sentence was the
+        ; whole answer: the function it named has been ported since, called by
+        ; check_import_attributes, so this arm was one line away the whole time.
         if AstNode.import_type_attributes_of(node) <> null
-        {
-            ; getResolutionModeOverride with reportErrors — the `with { "resolution-mode":
-            ; "import" }` clause validated against the module kind. checkImportAttributes
-            ; reports the same dimension from the declaration side.
-            this.record_unported("get-resolution-mode-override", KindImportType)
-        }
+            this.get_resolution_mode_override(AstNode.import_type_attributes_of(node) as ref[AstNode], true)
         this.check_type_reference_or_import(node)
     }
 
@@ -71915,11 +72503,52 @@ define Checker
         while i < count
         {
             let e AstNode.child_in_list(elements, i)
-            let flags Checker.get_tuple_element_flags(e)
+            var flags Checker.get_tuple_element_flags(e)
             if (flags & ElementFlagsVariadic) <> 0
             {
-                this.record_unported("get-type-from-type-node", AstNode.kind_of(e))
-                break
+                ; ★ SLICE 137 — the variadic element's own type, which is what the
+                ; stop here was waiting for. ★★The `break` on a non-array-like type is
+                ; the reference's and it is load-bearing for the report ORDER: the
+                ; loop's later grammar checks are suppressed once this one has fired,
+                ; and this port's diagnostics are a SUBSEQUENCE of the reference's.
+                if e = null
+                    break
+                let mark this.unported_mark()
+                let vt this.try_get_type_from_type_node(e as ref[AstNode])
+                if this.unported_mark() <> mark
+                    break
+                if vt = null
+                    break
+                let vtt vt as ref[Type]
+                ; ★★★ THE MARK IS ASKED AROUND `isArrayLikeType` AND NOT ONLY AROUND
+                ; THE TYPE, AND WITHOUT THAT THE ARM REPORTS A DIAGNOSTIC THE
+                ; REFERENCE DOES NOT. The test's second term is
+                ; `isTypeAssignableTo(t, readonly any[])`, and for a type parameter
+                ; whose constraint is a TUPLE the relation stops here
+                ; (`single-element-generic-tuple`) and answers FALSE — which reads
+                ; exactly like *not array-like*. `[...string[], ...T]` with `T extends
+                ; [string]` drew a TS2574 on four stage-1 units; with `T extends
+                ; string[]`, where the relation is complete, it draws none.
+                ; ★★A PREDICATE THAT STOPS ANSWERS ITS OWN FALSE, and every report
+                ; behind one owes this check.
+                let arraylike this.is_array_like_type(vtt)
+                if this.unported_mark() <> mark
+                    break
+                if arraylike = false
+                {
+                    this.error_on_node(e, DiagA_rest_element_type_must_be_an_array_type)
+                    break
+                }
+                var rest_like this.is_array_type(vtt)
+                if Checker.is_tuple_type(vtt)
+                {
+                    if (Checker.tuple_combined_flags_of(vtt) & ElementFlagsRest) <> 0
+                        set rest_like: true
+                }
+                if this.unported_mark() <> mark
+                    break
+                if rest_like
+                    set flags: flags | ElementFlagsRest
             }
             if (flags & ElementFlagsRest) <> 0
             {
@@ -72281,14 +72910,34 @@ define Checker
         if Parser.is_in_js_file(node)
             return
         let k AstNode.kind_of(node)
+        var jsdoc_wrapper false
         if k = KindJSDocNonNullableType
-        {
-            this.record_unported("get-type-from-type-node", k)
-            return
-        }
+            set jsdoc_wrapper: true
         if k = KindJSDocNullableType
+            set jsdoc_wrapper: true
+        if jsdoc_wrapper
         {
-            this.record_unported("get-type-from-type-node", k)
+            ; ★★★ SLICE 137, AND THE OLD NOTE OVER-STATED WHAT THIS ARM NEEDS. It read
+            ; *"gets a message that QUOTES the type it would have meant ... so it needs
+            ; getTypeFromTypeNode and TypeToString and stops here"*. The two message
+            ; ARGUMENTS — the token and the printed type — are exactly what §3.20 drops
+            ; here: a diagnostic is (pos, end, code). Which of the two CODES is chosen
+            ; depends on `postfix` alone, a comparison of two POSITIONS, so the report
+            ; never needed either half.
+            ;
+            ; ★★ The type is still computed and thrown away, because computing it is
+            ; not free of REPORTS: getTypeFromTypeNode walks the annotation and
+            ; whatever it says there, the reference says too.
+            let inner AstNode.type_of(node)
+            if inner <> null
+                this.get_type_from_type_node(inner as ref[AstNode])
+            var code DiagX_0_at_the_start_of_a_type_is_not_valid_TypeScript_syntax_Did_you_mean_to_write_1
+            if inner <> null
+            {
+                if AstNode.pos_of(node) = AstNode.pos_of(inner as ref[AstNode])
+                    set code: DiagX_0_at_the_end_of_a_type_is_not_valid_TypeScript_syntax_Did_you_mean_to_write_1
+            }
+            this.grammar_error_on_node(node, code)
             return
         }
         this.grammar_error_on_node(node, DiagJSDoc_types_can_only_be_used_inside_documentation_comments)
@@ -76251,6 +76900,8 @@ define Checker
     ; diagnostic the reference does not have.
     procedure lookup_or_issue_error(this, node: ref[AstNode], code: int)
     {
+        if this.node_is_in_lib(node)
+            return
         var start 0
         var stop 0
         if b.error_range_for_node(node, &start, &stop) = false
@@ -76338,16 +76989,184 @@ define Checker
         (AstNode.flags_of(d as ref[AstNode]) & NodeFlagsJavaScriptFile) <> 0
     }
 
-    ; combineSymbolTables — the two empty fast paths, and a stop for the merge.
+    ; ── mergeSymbol and mergeSymbolTable (slice 137) ────────────────────────
     ;
-    ; ★★★ THE MERGE IS A STOP AND NOT A FOLD, and what it is waiting for is
-    ; mergeSymbol: a name that is in BOTH the early and the late table is a genuine
-    ; merge (two declarations of one member), and answering either table alone would
-    ; drop the other's declarations. The shape needs `class C { x: T; ["x"]: U }` —
-    ; where lateBindMember has ALREADY reported the duplicate identifier — or an
-    ; accessor pair split across the two, so the report is made and only the TABLE
-    ; is unfinished. ★mergeSymbol is also what module augmentation needs, which is
-    ; why it is named as this chapter's remainder rather than half-written here.
+    ; ★★★ THIS IS THE PRODUCER FOUR READERS OF THIS FILE HAVE NAMED IN THEIR OWN
+    ; HEADERS, and each of them named it as the reason it was stopping rather than
+    ; guessing: `combine_symbol_tables` (*"the merge is a stop and not a fold, and
+    ; what it is waiting for is mergeSymbol"*), `merge_global_symbol` (*"storing the
+    ; incoming symbol unmerged would answer a name with HALF its declarations, at rc
+    ; 0"*), `clone_symbol` (*"the slice that ports mergeSymbol owes both"*) and
+    ; `get_merged_symbol`, whose table had no writer at all. So the four are ONE
+    ; chapter and never were four, which is why they retire together.
+    ;
+    ; ★★★ THE FUNCTION MUTATES ITS TARGET AND RETURNS IT, AND THE TARGET IS NOT
+    ; ALWAYS THE ONE IT WAS GIVEN — the reference's own header says it: *if target is
+    ; transient it is mutable, and mergeSymbol will both mutate and return it; if it
+    ; is not transient, mergeSymbol will produce a transient CLONE, mutate that and
+    ; return it*. Every caller must therefore use the RETURN and never assume the
+    ; symbol it handed in was the one that changed; mergeSymbolTable's `target[id] =
+    ; merged` is that rule written down at the only place it is easy to get wrong.
+    procedure merge_symbol(this, target_in: ref[Symbol], source: ref[Symbol], unidirectional: bool) returns ref[Symbol]
+    {
+        var target target_in
+        var mergeable false
+        if (Symbol.flags_of(target) & Checker.get_excluded_symbol_flags(Symbol.flags_of(source))) = 0
+            set mergeable: true
+        if ((Symbol.flags_of(source) | Symbol.flags_of(target)) & SymbolFlagsAssignment) <> 0
+            set mergeable: true
+        if mergeable
+        {
+            ; `source == target` — an export-assigned namespace exporting something
+            ; that is also exported at the top level reaches this with one symbol on
+            ; both sides, and the reference returns rather than merging it into
+            ; itself (its own comment names the fixture).
+            if source = target
+                return target
+            if (Symbol.flags_of(target) & SymbolFlagsTransient) = 0
+            {
+                let resolved this.resolve_symbol(target)
+                if resolved = null
+                    return source
+                let rt resolved as ref[Symbol]
+                if rt = unknown_symbol
+                    return source
+                var ok false
+                if (Symbol.flags_of(rt) & Checker.get_excluded_symbol_flags(Symbol.flags_of(source))) = 0
+                    set ok: true
+                if ((Symbol.flags_of(source) | Symbol.flags_of(rt)) & SymbolFlagsAssignment) <> 0
+                    set ok: true
+                if ok = false
+                {
+                    this.report_merge_symbol_error(target, source)
+                    return source
+                }
+                set target: this.clone_symbol(rt)
+            }
+            ; The const-enum-only reset, and it is asked in BOTH directions: the
+            ; flag comes OFF the target when an instantiated module merges into one
+            ; that had only const enums, and it is masked OUT of the source's flags
+            ; when the target does not carry it.
+            var reset false
+            if (Symbol.flags_of(source) & SymbolFlagsValueModule) <> 0
+            {
+                if (Symbol.flags_of(target) & SymbolFlagsValueModule) <> 0
+                {
+                    if (Symbol.flags_of(target) & SymbolFlagsConstEnumOnlyModule) <> 0
+                    {
+                        if (Symbol.flags_of(source) & SymbolFlagsConstEnumOnlyModule) = 0
+                            set reset: true
+                    }
+                }
+            }
+            if reset
+                Symbol.set_flags(target, Symbol.flags_of(target) & ~SymbolFlagsConstEnumOnlyModule)
+            var source_flags Symbol.flags_of(source)
+            if (Symbol.flags_of(target) & SymbolFlagsConstEnumOnlyModule) = 0
+                set source_flags: source_flags & ~SymbolFlagsConstEnumOnlyModule
+            Symbol.set_flags(target, Symbol.flags_of(target) | source_flags)
+            if Symbol.value_declaration_of(source) <> null
+                Binder.set_value_declaration(target, Symbol.value_declaration_of(source) as ref[AstNode])
+            let dn Symbol.declaration_count(source)
+            var di 0
+            while di < dn
+            {
+                let d Symbol.declaration_at(source, di)
+                if d <> null
+                    Symbol.append_declaration(host, target, d as ref[AstNode])
+                set di: di + 1
+            }
+            ; ★★ THE TWO TABLE MERGES DIFFER IN THEIR LAST ARGUMENT AND THAT IS THE
+            ; WHOLE OF THE `mergedParent` MECHANISM: members get `nil`, exports get
+            ; the merged TARGET, so a symbol that was itself merged while merging the
+            ; exports is re-parented onto the survivor. See merge_symbol_table.
+            if Symbol.members_of(source) <> null
+                this.merge_symbol_table(Symbol.get_members(host, target), Symbol.members_of(source) as ref[SymbolTable], unidirectional, null)
+            if Symbol.exports_of(source) <> null
+                this.merge_symbol_table(Symbol.get_exports(host, target), Symbol.exports_of(source) as ref[SymbolTable], unidirectional, target)
+            if unidirectional = false
+                this.record_merged_symbol(target, source)
+            return target
+        }
+        if (Symbol.flags_of(target) & SymbolFlagsNamespaceModule) <> 0
+        {
+            ; ★ The globalThis exemption is a report question and not a merge one:
+            ; `var globalThis` has already drawn a *Declaration name conflicts* line,
+            ; and the reference suppresses this one so the pair does not read as two
+            ; unrelated complaints.
+            if target <> global_this_symbol
+                this.error_on_node_or_null(this.first_declaration_name(source), DiagCannot_augment_module_0_with_value_exports_because_it_resolves_to_a_non_module_entity)
+            return target
+        }
+        this.report_merge_symbol_error(target, source)
+        target
+    }
+
+    ; ast.GetNameOfDeclaration(getFirstDeclaration(symbol)) — the one operand the
+    ; merge's TS2649 needs. ★A symbol with no declaration answers null and
+    ; error_on_node_or_null drops the report, which is the reference's own behaviour
+    ; through a nil node.
+    function first_declaration_name(this, symbol: ref[Symbol]) returns ref[AstNode]?
+    {
+        let d Symbol.declaration_at(symbol, 0)
+        if d = null
+            return null
+        b.get_name_of_declaration(d as ref[AstNode])
+    }
+
+    ; mergeSymbolTable, whole.
+    ;
+    ; ★★★ THE `mergedParent` ARM IS ASKED OF THE **TARGET**, NOT OF THE MERGE'S
+    ; RESULT, and the distinction is the reference's own worked example: merging a
+    ; module augmentation into `a.ts`, the symbol for an interface the augmentation
+    ; RE-declares is itself merged, so its parent must become the merged module;
+    ; the symbol for one the augmentation declares ALONE has a single declaration,
+    ; came only from the source, and keeps the augmentation as its parent. So the
+    ; guard is `targetSymbol != nil` — was there something here to merge with —
+    ; and the re-parenting is restricted to a TRANSIENT symbol, i.e. one this merge
+    ; is entitled to mutate.
+    procedure merge_symbol_table(this, target: ref[SymbolTable], source: ref[SymbolTable], unidirectional: bool, merged_parent: ref[Symbol]?)
+    {
+        let n SymbolTable.length(source)
+        var i 0
+        while i < n
+        {
+            let nd SymbolTable.entry_name_data_at(source, i)
+            let nl SymbolTable.entry_name_len_at(source, i)
+            let src SymbolTable.entry_symbol_at(source, i)
+            if src <> null
+            {
+                let ss src as ref[Symbol]
+                let existing SymbolTable.get(target, nd, nl)
+                var merged: ref[Symbol]? null
+                if existing <> null
+                    set merged: this.merge_symbol(existing as ref[Symbol], ss, unidirectional)
+                else
+                    set merged: this.get_merged_symbol(ss)
+                if merged_parent <> null
+                {
+                    if existing <> null
+                    {
+                        let m merged as ref[Symbol]
+                        if (Symbol.flags_of(m) & SymbolFlagsTransient) <> 0
+                            Symbol.set_parent(m, merged_parent)
+                    }
+                }
+                SymbolTable.set_entry(host, target, nd, nl, merged)
+            }
+            set i: i + 1
+        }
+    }
+
+    ; combineSymbolTables, WHOLE since slice 137 — two calls to merge_symbol_table
+    ; where the reference has two, and the two empty fast paths in front of them.
+    ;
+    ; ★★★ ITS OLD NOTE NAMED THE PRODUCER AND THE SHAPE: *"a name that is in BOTH the
+    ; early and the late table is a genuine merge (two declarations of one member),
+    ; and answering either table alone would drop the other's declarations ... `class
+    ; C { x: T; ["x"]: U }` — where lateBindMember has ALREADY reported the duplicate
+    ; identifier"*. So the report was already made and only the TABLE was unfinished,
+    ; which is why this arm changes what a member ANSWERS and not what it reports.
     function combine_symbol_tables(this, first: ref[SymbolTable]?, second: ref[SymbolTable]?) returns ref[SymbolTable]?
     {
         if SymbolTable.length(first) = 0
@@ -76355,34 +77174,8 @@ define Checker
         if SymbolTable.length(second) = 0
             return first
         let combined SymbolTable.create(host)
-        let f first as ref[SymbolTable]
-        let fn SymbolTable.length(f)
-        var i 0
-        while i < fn
-        {
-            let sym SymbolTable.entry_symbol_at(f, i)
-            if sym <> null
-                SymbolTable.set_entry(host, combined, SymbolTable.entry_name_data_at(f, i), SymbolTable.entry_name_len_at(f, i), sym)
-            set i: i + 1
-        }
-        let sc second as ref[SymbolTable]
-        let sn SymbolTable.length(sc)
-        var j 0
-        while j < sn
-        {
-            let nd SymbolTable.entry_name_data_at(sc, j)
-            let nl SymbolTable.entry_name_len_at(sc, j)
-            let sym SymbolTable.entry_symbol_at(sc, j)
-            set j: j + 1
-            if sym = null
-                continue
-            if SymbolTable.get(combined, nd, nl) <> null
-            {
-                this.record_unported("combine-symbol-tables-merge", Symbol.flags_of(sym as ref[Symbol]))
-                continue
-            }
-            SymbolTable.set_entry(host, combined, nd, nl, sym)
-        }
+        this.merge_symbol_table(combined, first as ref[SymbolTable], false, null)
+        this.merge_symbol_table(combined, second as ref[SymbolTable], false, null)
         combined
     }
 
@@ -76617,15 +77410,48 @@ define Checker
             Symbol.append_declaration(host, isym, decl)
     }
 
-    ; cloneSymbol, minus recordMergedSymbol — see get_merged_symbol's header for the
-    ; table that call would write. ★It is left out rather than stubbed because the
-    ; ONE caller here is lateBindIndexSignature, whose clone is a fresh index symbol
-    ; nothing looks up through the merged map; the slice that ports mergeSymbol owes
-    ; both.
+    ; cloneSymbol, WHOLE since slice 137 — the recordMergedSymbol its old header
+    ; deferred (*"the slice that ports mergeSymbol owes both"*) is the last line
+    ; here now, and the table it writes exists.
+    ;
+    ; ★★ IT IS LOAD-BEARING FOR THE CLONE THE MERGE MAKES AND NOT FOR THE OTHER ONE.
+    ; The pre-existing caller is lateBindIndexSignature, whose clone is a fresh index
+    ; symbol nothing looks up through the merged map; merge_symbol's clone is the
+    ; opposite — the ORIGINAL is still in whatever table the caller read it from, so
+    ; without this row every later lookup of it would answer the symbol the merge
+    ; abandoned.
     function clone_symbol(this, symbol: ref[Symbol]) returns ref[Symbol]
     {
         let result this.new_symbol(Symbol.flags_of(symbol), Symbol.name_data_of(symbol), Symbol.name_len_of(symbol))
-        Symbol.copy_declarations_from(result, symbol)
+        ; ★★★ THE DECLARATION LIST IS COPIED ELEMENT BY ELEMENT AND **NOT** SHARED,
+        ; AND THAT IS THE REFERENCE'S OWN LINE WITH ITS OWN COMMENT ON IT:
+        ; `result.Declarations = symbol.Declarations[0:len(…):len(…)]` — *"Force
+        ; reallocation if anything is ever appended to declarations"*. A Go slice
+        ; whose capacity is clamped to its length reallocates on the first append;
+        ; `copy_declarations_from` here ASSIGNS THE ARRAY, so an append to the clone
+        ; would land in the ORIGINAL's list.
+        ; ★★★ Nothing before this slice could see that, because the only caller was
+        ; lateBindIndexSignature, which clones and never appends. merge_symbol appends
+        ; on its very next lines, and the original is a symbol of the **LIB** — shared
+        ; across every unit of a `--batch` process — so the shared array would have
+        ; written the unit's own declarations into lib.es5.d.ts's symbols and left
+        ; them there for the next unit.
+        let dn Symbol.declaration_count(symbol)
+        var di 0
+        while di < dn
+        {
+            let d Symbol.declaration_at(symbol, di)
+            if d <> null
+                Symbol.append_declaration(host, result, d as ref[AstNode])
+            set di: di + 1
+        }
+        ; ★★ The parent and the value declaration are the clone's other two lines, and
+        ; they were missing while `copy_declarations_from` carried them by accident —
+        ; it sets all three. merge_symbol reads the value declaration back immediately:
+        ; its next act is `SetValueDeclaration(target, …)`, whose whole decision is
+        ; *what does the target already have*.
+        Symbol.set_parent(result, Symbol.parent_of(symbol))
+        Symbol.set_value_declaration(result, Symbol.value_declaration_of(symbol))
         ; ★ The two tables are cloned ONLY where the original has one: a symbol with
         ; no members table and a symbol with an EMPTY one are different objects here
         ; (the symbols dump prints `-` for the first), and this file's own
@@ -76634,6 +77460,7 @@ define Checker
             Symbol.set_members(result, this.clone_symbol_table(Symbol.members_of(symbol)))
         if Symbol.exports_of(symbol) <> null
             Symbol.set_exports(result, this.clone_symbol_table(Symbol.exports_of(symbol)))
+        this.record_merged_symbol(result, symbol)
         result
     }
 
@@ -84112,20 +84939,26 @@ define Checker
 
     ; checkFlagAgreementBetweenOverloads, the second closure.
     ;
-    ; ★★★ THE PER-SOURCE-FILE GROUPING IS ONE GROUP HERE, AND THAT IS A PROOF RATHER
-    ; THAN A SIMPLIFICATION. The reference groups the overloads by
-    ; GetSourceFileOfNode and computes a canonical flag set per group, so that
-    ; overloads split between lib.d.ts and a user file need not agree on `export` or
-    ; `declare`. This port binds ONE file — there is no program, no lib and no second
-    ; SourceFile — so every declaration of a symbol walks up to the same file node,
-    ; the single group IS the whole list, `canonicalFlagsForFile` equals
-    ; `canonicalFlags` and `deviationInFile` equals `deviation`. The two variables are
-    ; therefore one variable, and the day this port loads a lib is the day the
-    ; grouping has to be written; it is named here so that day finds it.
+    ; ★★★ THE PER-SOURCE-FILE GROUPING IS WRITTEN SINCE SLICE 137, AND THE NOTE THAT
+    ; STOOD HERE NAMED THE DAY: *"the day this port loads a lib is the day the
+    ; grouping has to be written; it is named here so that day finds it."* The lib
+    ; arrived in slice 118, but a lib declaration and a unit declaration only reach
+    ; ONE symbol once merge_symbol exists — so the trigger is this slice, not that one.
+    ;
+    ; ★★★ WHAT THE GROUPING BUYS IS EXACTLY THE TWO FLAGS THE REFERENCE'S COMMENTS
+    ; NAME: `export` and `declare` may differ ACROSS files (lib.d.ts declares
+    ; `function eval(...)` ambient, the unit writes `function eval() {}` non-ambient)
+    ; and a module augmentation is *"allowed to add overloads to a non-ambient
+    ; function in an implementation file"*. Private/protected and abstract are asked
+    ; against the GLOBAL canonical, unchanged — the reference uses `deviation` there
+    ; and `deviationInFile` only for the first two, and that asymmetry is the whole
+    ; mechanism. Without it `"use strict"; function eval() {}` drew a TS2384 the
+    ; reference does not report.
     ;
     ; ★ The reference iterates a Go MAP over the groups, whose order is
     ; nondeterministic — invisible only because the diagnostics are sorted by position
-    ; afterwards. With one group there is nothing to order.
+    ; afterwards. This walks the declarations in order and processes each file's group
+    ; at its FIRST member, which is one fixed order out of that set.
     procedure check_flag_agreement_between_overloads(this, symbol: ref[Symbol], implementation: ref[AstNode]?, flags_to_check: int, some_overload_flags: int, all_overload_flags: int)
     {
         ; Error if some overloads have a flag that is not shared by all overloads. To
@@ -84138,34 +84971,87 @@ define Checker
             return
         let canonical_flags this.effective_declaration_flags(canonical as ref[AstNode], flags_to_check)
         let count Symbol.declaration_count(symbol)
-        var i 0
-        while i < count
+        var g 0
+        while g < count
         {
-            let overload Symbol.declaration_at(symbol, i)
-            set i: i + 1
-            if overload = null
+            let head Symbol.declaration_at(symbol, g)
+            set g: g + 1
+            if head = null
                 continue
-            let o overload as ref[AstNode]
-            let deviation this.effective_declaration_flags(o, flags_to_check) xor canonical_flags
-            if (deviation & ModifierFlagsExport) <> 0
-                this.error_on_node_or_null(this.name_of_declaration(o), DiagOverload_signatures_must_all_be_exported_or_non_exported)
-            else
+            let hf Checker.source_file_of_node(head as ref[AstNode])
+            ; Process each group at its FIRST member: a declaration whose file has
+            ; already been seen belongs to a group that has been walked.
+            var seen false
+            var p 0
+            while p < g - 1
             {
-                if (deviation & ModifierFlagsAmbient) <> 0
-                    this.error_on_node_or_null(this.name_of_declaration(o), DiagOverload_signatures_must_all_be_ambient_or_non_ambient)
+                let earlier Symbol.declaration_at(symbol, p)
+                if earlier <> null
+                {
+                    if Checker.source_file_of_node(earlier as ref[AstNode]) = hf
+                        set seen: true
+                }
+                set p: p + 1
+            }
+            if seen
+                continue
+            ; The group's own canonical: the implementation when it shares a container
+            ; with the group's FIRST overload, else that first overload.
+            var group_first: ref[AstNode]? null
+            var j 0
+            while j < count
+            {
+                let d Symbol.declaration_at(symbol, j)
+                set j: j + 1
+                if d = null
+                    continue
+                if Checker.source_file_of_node(d as ref[AstNode]) <> hf
+                    continue
+                if group_first = null
+                    set group_first: d
+            }
+            if group_first = null
+                continue
+            var group_canonical group_first
+            if implementation <> null
+            {
+                if AstNode.parent_node_of(implementation) = AstNode.parent_node_of(group_first)
+                    set group_canonical: implementation
+            }
+            let canonical_flags_for_file this.effective_declaration_flags(group_canonical as ref[AstNode], flags_to_check)
+            var i 0
+            while i < count
+            {
+                let overload Symbol.declaration_at(symbol, i)
+                set i: i + 1
+                if overload = null
+                    continue
+                let o overload as ref[AstNode]
+                if Checker.source_file_of_node(o) <> hf
+                    continue
+                let own this.effective_declaration_flags(o, flags_to_check)
+                let deviation own xor canonical_flags
+                let deviation_in_file own xor canonical_flags_for_file
+                if (deviation_in_file & ModifierFlagsExport) <> 0
+                    this.error_on_node_or_null(this.name_of_declaration(o), DiagOverload_signatures_must_all_be_exported_or_non_exported)
                 else
                 {
-                    if (deviation & (ModifierFlagsPrivate | ModifierFlagsProtected)) <> 0
-                    {
-                        var target this.name_of_declaration(o)
-                        if target = null
-                            set target: o
-                        this.error_on_node_or_null(target, DiagOverload_signatures_must_all_be_public_private_or_protected)
-                    }
+                    if (deviation_in_file & ModifierFlagsAmbient) <> 0
+                        this.error_on_node_or_null(this.name_of_declaration(o), DiagOverload_signatures_must_all_be_ambient_or_non_ambient)
                     else
                     {
-                        if (deviation & ModifierFlagsAbstract) <> 0
-                            this.error_on_node_or_null(this.name_of_declaration(o), DiagOverload_signatures_must_all_be_abstract_or_non_abstract)
+                        if (deviation & (ModifierFlagsPrivate | ModifierFlagsProtected)) <> 0
+                        {
+                            var target this.name_of_declaration(o)
+                            if target = null
+                                set target: o
+                            this.error_on_node_or_null(target, DiagOverload_signatures_must_all_be_public_private_or_protected)
+                        }
+                        else
+                        {
+                            if (deviation & ModifierFlagsAbstract) <> 0
+                                this.error_on_node_or_null(this.name_of_declaration(o), DiagOverload_signatures_must_all_be_abstract_or_non_abstract)
+                        }
                     }
                 }
             }
@@ -85340,25 +86226,67 @@ define Checker
         null
     }
 
-    ; getMergedSymbol, whole — and it is the IDENTITY under this harness.
+    ; getMergedSymbol, whole — AND IT HAS ITS TABLE SINCE SLICE 137.
     ;
-    ; ★★★ THE ARGUMENT IS THAT THE TABLE HAS NO WRITER, AND IT IS A CLAIM WITH A
-    ; DATE ON IT (§3.5bg). `c.mergedSymbols` is written at exactly two sites in all
-    ; of internal/checker — mergeSymbol's `recordMergedSymbol(target, source)` and
+    ; ★★★ THE NOTE THAT STOOD HERE WAS A CLAIM WITH A DATE ON IT AND THE DATE HAS
+    ; PASSED. It read *"`c.mergedSymbols` is written at exactly two sites in all of
+    ; internal/checker — mergeSymbol's `recordMergedSymbol(target, source)` and
     ; cloneSymbol's `recordMergedSymbol(result, symbol)` — and both are reached only
-    ; from the GLOBAL merge: initializeChecker's mergeSymbolTable over the lib and
-    ; the other source files, and the module-augmentation pass. This port has one
-    ; file, no lib, and neither pass, so the map is empty and every lookup misses.
-    ; ★★The slice that ports either one owes this function its table, and the
-    ; failure mode if it does not is silent: a lookup that always misses and a table
-    ; that is never filled are the same code.
-    ;
-    ; ★ Written as a function rather than folded into its caller for that reason —
-    ; the place where the table WOULD be consulted has to exist before it can be
-    ; given one, and a caller that reads `symbol` directly is a caller that will not
-    ; be found by grepping for the function name.
+    ; from the GLOBAL merge ... so the map is empty and every lookup misses"*, and it
+    ; closed with the sentence this slice is the answer to: *the slice that ports
+    ; either one owes this function its table, and the failure mode if it does not is
+    ; silent — a lookup that always misses and a table that is never filled are the
+    ; same code*. Both writers are here now (merge_symbol and clone_symbol), and the
+    ; reason the function was written out rather than folded into its callers is
+    ; exactly that it could be given one without moving a single caller.
     function get_merged_symbol(this, symbol: ref[Symbol]?) returns ref[Symbol]?
+    {
+        if symbol = null
+            return symbol
+        let len merged_symbols.get_length() as int
+        var i 0
+        while i < len
+        {
+            let row merged_symbols[i]
+            if row <> null
+            {
+                let r row as ref[MergedSymbolLink]
+                if r.source = symbol
+                    return r.target
+            }
+            set i: i + 1
+        }
         symbol
+    }
+
+    ; recordMergedSymbol, whole — one line upstream (`c.mergedSymbols[source] =
+    ; target`) and a set-or-append here, because the store is a list.
+    ;
+    ; ★★ THE OVERWRITE IS NOT DECORATION. A symbol can be merged twice — a name
+    ; declared in the lib, in the unit and again inside a module augmentation walks
+    ; through this table once per merge — and a Go map assignment REPLACES, so an
+    ; append-only list would leave the FIRST survivor in front of the scan and hand
+    ; back a symbol that has itself since been merged away.
+    procedure record_merged_symbol(this, target: ref[Symbol], source: ref[Symbol])
+    {
+        let len merged_symbols.get_length() as int
+        var i 0
+        while i < len
+        {
+            let row merged_symbols[i]
+            if row <> null
+            {
+                let r row as ref[MergedSymbolLink]
+                if r.source = source
+                {
+                    set r.target: target
+                    return
+                }
+            }
+            set i: i + 1
+        }
+        merged_symbols.add(&MergedSymbolLink^host(source, target))
+    }
 
     ; getLateBoundSymbol, whole since slice 129 — the forcing branch included.
     ;
@@ -85921,6 +86849,8 @@ define Checker
     {
         if n = null
             return false
+        if this.node_is_in_lib(n)
+            return false
         if this.has_parse_diagnostics()
             return false
         var start 0
@@ -85961,6 +86891,8 @@ define Checker
     procedure error_on_node(this, n: ref[AstNode]?, code: int)
     {
         if n = null
+            return
+        if this.node_is_in_lib(n)
             return
         var start 0
         var stop 0
