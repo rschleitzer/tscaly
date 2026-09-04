@@ -3640,9 +3640,10 @@ define ForkEvent
 ; resolved call its TYPE and leaves this pin UNMOVED to the checksum. The STOP LOG is
 ; what gates that half, and a pin written at the resolution is not a substitute for
 ; it.
-; resolveCall's own state, slice 131 — the reference's CallState minus its five
-; failure slots (see choose_overload's header for why those are the failure pass's
-; and not this record's). `arg_check_mode` is the one MUTABLE slot: chooseOverload
+; resolveCall's own state, slice 131, completed by slice 138 — the reference's
+; CallState minus only `signatureHelpTrailingComma`, which needs a CheckMode the
+; language service alone sets. `arg_check_mode` is not the only MUTABLE slot any
+; more (the three failure slots below move too), but it is the oldest: chooseOverload
 ; clears SkipContextSensitive on the first candidate that gets that far, and the
 ; reference's comment says it must stay cleared *"for any subsequent candidates"* —
 ; which is why it lives in the state and not in a parameter.
@@ -3654,6 +3655,23 @@ define CallState
     type_arguments: ref[Array[ref[AstNode]?]]?
     arg_check_mode: int
     is_single_non_generic_candidate: bool
+
+    ; ── the three FAILURE slots, slice 138 ──────────────────────────────────
+    ;
+    ; ★★★ THEY ARE WRITTEN BY chooseOverload AND READ ONLY AFTER IT HAS FAILED,
+    ; which is why they are state and not a return value: the reference's comment
+    ; over them says what they are for — *"if overload resolution or type argument
+    ; inference fails, we want to report the best error possible. The best error is
+    ; one which says that an argument was not assignable to a parameter"* — so a
+    ; candidate that got as far as the argument comparison outranks one that failed
+    ; on type-argument arity, which outranks one that failed on plain arity.
+    ;
+    ; ★★ `candidates_for_argument_error` is a LIST because the report needs the
+    ; LAST one and the COUNT: more than one is what turns each of that candidate's
+    ; own diagnostics into TS2769 (`No overload matches this call`).
+    candidates_for_argument_error: ref[Array[ref[Signature]?]]?
+    candidate_for_argument_arity_error: ref[Signature]?
+    candidate_for_type_argument_error: ref[Signature]?
 )
 
 define CallEvent
@@ -4976,6 +4994,13 @@ define Checker
     global_iterator_return_result_type: ref[Type]?
     global_promise_type: ref[Type]?
     global_promise_like_type: ref[Type]?
+
+    ; getGlobalTemplateStringsArrayType's memo, slice 138 — the type of a tagged
+    ; template's FIRST argument, which is synthesized rather than written.
+    global_template_strings_array_type: ref[Type]?
+
+    ; getGlobalImportCallOptionsTypeChecked's memo, slice 138.
+    global_import_call_options_type: ref[Type]?
     ; getGlobalBuiltinIteratorTypes — a LIST per direction, four names for sync
     ; (`ArrayIterator`, `MapIterator`, `SetIterator`, `StringIterator`) and one for
     ; async (`ReadableStreamAsyncIterator`), each at arity ONE. ★They are memoised
@@ -6320,6 +6345,8 @@ define Checker
         set c.global_iterator_return_result_type: null
         set c.global_promise_type: null
         set c.global_promise_like_type: null
+        set c.global_template_strings_array_type: null
+        set c.global_import_call_options_type: null
         set c.global_builtin_iterator_types: null
         set c.global_async_builtin_iterator_types: null
         set c.global_awaited_symbol: null
@@ -20949,15 +20976,29 @@ define Checker
             this.check_no_type_arguments(node, null)
             return null_type
         }
+        ; ★★★ THE ROW `global-function-type` WAS AN EXPIRED NOTE at all three of
+        ; its sites (§3.5eo, third harvest). Its own comment named §3.11 — the LIB
+        ; — and the LIB landed; `get_global_function_type` has been in this file
+        ; since the strict-function pair, which uses it as their fallback, and
+        ; nothing re-read the note. ★A null answer is the lib WITHOUT a `Function`
+        ; interface, where the reference's `getGlobalType` hands out
+        ; `emptyObjectType` and reports; that is the one thing this port cannot
+        ; say here, so it keeps a row of its own rather than the old one's name.
+        var is_function_name false
         if Checker.name_bytes_are(d, "Function")
-        {
-            this.record_unported("global-function-type", 0)
-            return null
-        }
+            set is_function_name: true
         if Checker.name_bytes_are(d, "function")
+            set is_function_name: true
+        if is_function_name
         {
-            this.record_unported("global-function-type", 0)
-            return null
+            this.check_no_type_arguments(node, null)
+            let ft this.get_global_function_type()
+            if ft = null
+            {
+                this.record_unported("global-function-type-absent", 0)
+                return null
+            }
+            return ft
         }
         ; `array` and `promise` are both `len(typeArgs) == 0 && !noImplicitAny`,
         ; and noImplicitAny is TRUE here — so both conditions are false and the
@@ -37517,12 +37558,35 @@ define Checker
         {
             if this.is_reachable_flow_node(flow) = false
                 return unreachable_never_type
+            ; ★★★ THE ROW `get-base-type-of-literal-type` WAS AN EXPIRED NOTE at
+            ; all four of its sites (§3.5eo, third harvest): the function it named
+            ; — with its enum arm, its union arm and the comparison twin — has been
+            ; in this file since the literal-type slice, and nothing re-read the
+            ; note. `x += 1` narrows to the ANTECEDENT's type widened out of its
+            ; literal, which is why the antecedent is asked here and nowhere else
+            ; in the arm.
             if Checker.get_assignment_target_kind(node) = AssignmentKindCompound
             {
-                ; getBaseTypeOfLiteralType — the row the equality operators and
-                ; checkIdentifier's own compound arm already stand at.
-                this.record_unported("get-base-type-of-literal-type", AstNode.kind_of(node))
-                return null
+                let antecedent flow.antecedent
+                if antecedent = null
+                    return null
+                var ante_incomplete false
+                let flow_type this.get_type_at_flow_node(f, antecedent as ref[FlowNode], &ante_incomplete)
+                if flow_type = null
+                    return null
+                set out_incomplete: ante_incomplete
+                let based this.get_base_type_of_literal_type(flow_type as ref[Type])
+                if based = null
+                    return null
+                ; `newFlowType`, whose whole body is this substitution: an
+                ; INCOMPLETE `never` becomes `silentNever`, so a circular flow does
+                ; not publish a narrowed type it has not finished computing.
+                if ante_incomplete
+                {
+                    if ((based as ref[Type]).flags & TypeFlagsNever) <> 0
+                        return silent_never_type
+                }
+                return based
             }
             if declared = auto_type
             {
@@ -37532,12 +37596,19 @@ define Checker
                 this.record_unported("get-evolving-array-type", AstNode.kind_of(node))
                 return null
             }
+            var t declared
             if Checker.is_in_compound_like_assignment(node)
             {
-                this.record_unported("get-base-type-of-literal-type", AstNode.kind_of(node))
-                return null
+                let based this.get_base_type_of_literal_type(declared)
+                if based = null
+                    return null
+                set t: based as ref[Type]
             }
-            if (declared.flags & TypeFlagsUnion) <> 0
+            ; ★Both readings below are the reference's `t` and not its
+            ; `f.declaredType`: a compound assignment has already widened it out
+            ; of its literal, and asking the DECLARED type again here would undo
+            ; exactly the line above.
+            if (t.flags & TypeFlagsUnion) <> 0
             {
                 ; getAssignmentReducedType (slice 123) — the fourth door, and the
                 ; one the reference's own comment points at: an assignment narrows
@@ -37548,9 +37619,9 @@ define Checker
                     return null
                 if assigned = null
                     return null
-                return this.get_assignment_reduced_type(declared, assigned as ref[Type])
+                return this.get_assignment_reduced_type(t, assigned as ref[Type])
             }
-            return declared
+            return t
         }
         if this.contains_matching_reference(reference, node)
         {
@@ -45081,11 +45152,9 @@ define Checker
             {
                 if Checker.is_in_compound_like_assignment(node)
                 {
-                    ; getBaseTypeOfLiteralType — the same row the equality operators
-                    ; stand at, and for the same reason: its enum arm wants
-                    ; getBaseTypeOfEnumLikeType and its union arm the union machinery.
-                    this.record_unported("get-base-type-of-literal-type", KindIdentifier)
-                    return null
+                    if t = null
+                        return null
+                    return this.get_base_type_of_literal_type(t as ref[Type])
                 }
                 return t
             }
@@ -45421,11 +45490,9 @@ define Checker
                 }
             }
         }
+        ; "Identifier is target of a compound assignment"
         if assignment_kind <> AssignmentKindNone
-        {
-            this.record_unported("get-base-type-of-literal-type", KindIdentifier)
-            return null
-        }
+            return this.get_base_type_of_literal_type(ft)
         ft
     }
 
@@ -45502,19 +45569,13 @@ define Checker
         if k = KindCallExpression
         {
             if Parser.is_import_call(node)
-            {
-                this.record_unported("check-import-call-expression", k)
-                return null
-            }
+                return this.check_import_call_expression(node)
             return this.check_call_expression(node, check_mode)
         }
         if k = KindNewExpression
             return this.check_call_expression(node, check_mode)
         if k = KindTaggedTemplateExpression
-        {
-            this.record_unported("check-tagged-template-expression", k)
-            return null
-        }
+            return this.check_tagged_template_expression(node)
         ; checkParenthesizedExpression, whole:
         ;   `return c.checkExpressionEx(node.Expression(), checkMode)`
         ;
@@ -47090,7 +47151,7 @@ define Checker
             return
         if target_type = null
             return
-        this.check_type_assignable_to_and_optionally_elaborate(right_type as ref[Type], target_type as ref[Type], left, right)
+        this.check_type_assignable_to_and_optionally_elaborate(right_type as ref[Type], target_type as ref[Type], left, right, 0)
     }
 
     ; checkReferenceExpression, whole. Both of its reports are node-driven, which
@@ -47627,6 +47688,242 @@ define Checker
     ; near wall, so minting their values now would be three fields nothing reads.
     ; ★Nothing compares a signature ID (Type's own note says the same for type ids),
     ; so the counter running three lower than the reference's costs nothing.
+    ; ── THE DYNAMIC IMPORT, slice 138 ───────────────────────────────────────
+    ;
+    ; checkImportCallExpression. ★★★It is not a call in the resolution sense at
+    ; all — no signature, no overload set: the result is `Promise<T>` where T is
+    ; the imported module's type, and the whole body is the grammar, the specifier's
+    ; type and the options argument.
+    ;
+    ; ★★ THE EXTRA ARGUMENTS ARE CHECKED ON PURPOSE though the grammar has already
+    ; reported them: *"Even though multiple arguments is grammatically incorrect,
+    ; type-check extra arguments for completion"*.
+    function check_import_call_expression(this, node: ref[AstNode]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let ignored_grammar this.check_grammar_import_call_expression(node)
+        let args AstNode.call_arguments_of(node)
+        let arg_count AstNode.list_count(args)
+        if arg_count = 0
+            return this.create_promise_return_type(node, any_type)
+        let specifier_row AstNode.child_in_list(args, 0)
+        if specifier_row = null
+            return null
+        let specifier specifier_row as ref[AstNode]
+        let specifier_type this.check_expression_cached(specifier)
+        if this.unported_mark() <> mark
+            return null
+        if specifier_type = null
+            return null
+        var options_type: ref[Type]? null
+        if arg_count > 1
+        {
+            let options_row AstNode.child_in_list(args, 1)
+            if options_row = null
+                return null
+            set options_type: this.check_expression_cached(options_row as ref[AstNode])
+            if this.unported_mark() <> mark
+                return null
+        }
+        var i 2
+        while i < arg_count
+        {
+            let extra AstNode.child_in_list(args, i)
+            set i: i + 1
+            if extra = null
+                return null
+            let ignored_extra this.check_expression_cached(extra as ref[AstNode])
+            if this.unported_mark() <> mark
+                return null
+        }
+        var specifier_bad false
+        if ((specifier_type as ref[Type]).flags & TypeFlagsNullable) <> 0
+            set specifier_bad: true
+        if specifier_bad = false
+        {
+            if this.is_type_assignable_to(specifier_type as ref[Type], string_type) = false
+                set specifier_bad: true
+            if this.unported_mark() <> mark
+                return null
+        }
+        if specifier_bad
+            this.error_on_node(specifier, DiagDynamic_import_s_specifier_must_be_of_type_string_but_here_has_type_0)
+        if options_type <> null
+        {
+            let options_target this.get_global_import_call_options_type_checked()
+            if this.unported_mark() <> mark
+                return null
+            if options_target <> null
+            {
+                if (options_target as ref[Type]) <> empty_object_type
+                {
+                    let nullable this.get_nullable_type(options_target as ref[Type], TypeFlagsUndefined)
+                    if this.unported_mark() <> mark
+                        return null
+                    if nullable = null
+                        return null
+                    let ignored_assign this.check_type_assignable_to(options_type as ref[Type], nullable as ref[Type], AstNode.child_in_list(args, 1), 0)
+                    if this.unported_mark() <> mark
+                        return null
+                }
+            }
+            ; `assert` was renamed to `with`, and the report lands on the property
+            ; NAME. ★It breaks out of the loop at the first one.
+            let options_node AstNode.child_in_list(args, 1)
+            if options_node = null
+                return null
+            if AstNode.kind_of(options_node as ref[AstNode]) = KindObjectLiteralExpression
+            {
+                let properties AstNode.properties_of(options_node as ref[AstNode])
+                var pi 0
+                while pi < AstNode.list_count(properties)
+                {
+                    let prop AstNode.child_in_list(properties, pi)
+                    set pi: pi + 1
+                    if prop = null
+                        return null
+                    let p prop as ref[AstNode]
+                    if AstNode.kind_of(p) <> KindPropertyAssignment
+                        continue
+                    let nm AstNode.name_of(p)
+                    if nm = null
+                        continue
+                    let name nm as ref[AstNode]
+                    if AstNode.kind_of(name) <> KindIdentifier
+                        continue
+                    if Checker.identifier_text_is(name, "assert") = false
+                        continue
+                    this.error_on_node(name, DiagImport_assertions_have_been_replaced_by_import_attributes_Use_with_instead_of_assert)
+                    set pi: AstNode.list_count(properties)
+                }
+            }
+        }
+        ; "resolveExternalModuleName will return undefined if the
+        ; moduleReferenceExpression is not a string literal"
+        let module_symbol this.resolve_external_module_name(node, specifier, false)
+        if this.unported_mark() <> mark
+            return null
+        if module_symbol <> null
+        {
+            let es_module_symbol this.resolve_external_module_symbol(module_symbol, true)
+            if this.unported_mark() <> mark
+                return null
+            if es_module_symbol <> null
+            {
+                ; ★★★ THE SYNTHETIC DEFAULT IS THE ONE WALL LEFT IN THIS ARM, and
+                ; it is a chapter rather than a helper: `getTypeWithSyntheticDefault
+                ; Only` and `getTypeWithSyntheticDefaultImportType` both go through
+                ; `createDefaultPropertyWrapperForModule` and `canHaveSyntheticDefault`,
+                ; whose own body asks the PROGRAM for a file's implied module format
+                ; and for project-reference redirects — three readings this port has
+                ; no source for. The row therefore stands at the moment a specifier
+                ; RESOLVES; an unresolved one answers `Promise<any>` below, which is
+                ; the reference's own answer.
+                this.record_unported("type-with-synthetic-default", AstNode.kind_of(node))
+                return null
+            }
+        }
+        this.create_promise_return_type(node, any_type)
+    }
+
+    ; getGlobalImportCallOptionsTypeChecked — the CHECKED resolver of the pair, so
+    ; a missing `ImportCallOptions` reports. ★The unchecked twin's only reader is
+    ; the contextual type of the second argument, which is unported.
+    function get_global_import_call_options_type_checked(this) returns ref[Type]?
+    {
+        if global_import_call_options_type <> null
+            return global_import_call_options_type
+        let t this.get_global_type_of_arity("ImportCallOptions", 17, 0)
+        set global_import_call_options_type: t
+        t
+    }
+
+    ; checkGrammarImportCallExpression, whole — and every option it reads is
+    ; DECIDED under this harness rather than guessed: `module` is unset, so
+    ; `moduleKind` is the DERIVED **ES2022** (see the field's own note), and
+    ; VerbatimModuleSyntax is unset.
+    ;
+    ; ★★ TWO OF ITS SEVEN REPORTS ARE THEREFORE DEAD and are written as the
+    ; constant they are, each with the option that would wake it: the
+    ; verbatim-module-syntax report needs ModuleKindCommonJS, and TS1323 needs
+    ; ModuleKindES2015 exactly.
+    function check_grammar_import_call_expression(this, node: ref[AstNode]) returns bool
+    {
+        ; `import.defer("m")` — the callee is a MetaProperty, and a deferred import
+        ; needs esnext or preserve.
+        let callee AstNode.expression_of(node)
+        if Checker.kind_or_unknown(callee) = KindMetaProperty
+            return this.grammar_error_on_node(node, DiagDeferred_imports_are_only_supported_when_the_module_flag_is_set_to_esnext_or_preserve)
+        ; ★★★ THE TEST IS `nodeAsCall.TypeArguments != nil` AND NOT A COUNT.
+        ; `import<>("m")` parses with a type-argument LIST that EXISTS and is
+        ; EMPTY, and the reference reports on it — the pinned corpus writes both
+        ; forms on two lines of one unit for exactly that reason
+        ; (importCallExpressionWithTypeArgument). A `list_count(...) <> 0` here
+        ; reported the first and not the second.
+        if AstNode.type_arguments_of(node) <> null
+            return this.grammar_error_on_node(node, DiagThis_use_of_import_is_invalid_import_calls_can_be_written_but_they_must_have_parentheses_and_cannot_have_type_arguments)
+        let args AstNode.call_arguments_of(node)
+        let arg_count AstNode.list_count(args)
+        ; "We are allowed trailing comma after proposal-import-assertions" — under
+        ; ES2022 we are not, so both halves of this block run.
+        let ignored_comma this.check_grammar_for_disallowed_trailing_comma(args, DiagTrailing_comma_not_allowed)
+        if arg_count > 1
+            return this.grammar_error_on_node_or_null(AstNode.child_in_list(args, 1), DiagDynamic_imports_only_support_a_second_argument_when_the_module_option_is_set_to_esnext_node16_node18_node20_nodenext_or_preserve)
+        if arg_count = 0
+            return this.grammar_error_on_node(node, DiagDynamic_imports_can_only_accept_a_module_specifier_and_an_optional_set_of_attributes_as_arguments)
+        ; "parseArgumentOrArrayLiteralElement allows spread element to be in an
+        ; argument list which is not allowed as specifier in dynamic import."
+        var si 0
+        while si < arg_count
+        {
+            let arg AstNode.child_in_list(args, si)
+            set si: si + 1
+            if arg = null
+                continue
+            if AstNode.kind_of(arg as ref[AstNode]) = KindSpreadElement
+                return this.grammar_error_on_node(arg as ref[AstNode], DiagArgument_of_dynamic_import_cannot_be_spread_element)
+        }
+        false
+    }
+
+    ; checkTaggedTemplateExpression, whole — and the `!!! JSX` comment upstream
+    ; stands over a line the reference does not have either.
+    ;
+    ; ★ THE GRAMMAR PAIR IS AN `else`: the chain error and the type-argument check
+    ; are mutually exclusive, because a tagged template in an optional chain has
+    ; already reported and its type arguments are not the author's next problem.
+    function check_tagged_template_expression(this, node: ref[AstNode]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        if this.check_grammar_tagged_template_chain(node) = false
+            this.check_grammar_type_arguments(AstNode.type_arguments_of(node))
+        let sig this.get_resolved_signature(node, CheckModeNormal)
+        if this.unported_mark() <> mark
+            return null
+        if sig = null
+            return null
+        let signature sig as ref[Signature]
+        this.check_deprecated_signature(signature, node)
+        if this.unported_mark() <> mark
+            return null
+        this.get_return_type_of_signature(signature)
+    }
+
+    ; checkGrammarTaggedTemplateChain, whole. ★The report lands on the TEMPLATE and
+    ; not on the tag, which is the reference's choice: `a?.b`` `` `'s problem is the
+    ; template that follows the chain.
+    function check_grammar_tagged_template_chain(this, node: ref[AstNode]) returns bool
+    {
+        var in_chain false
+        if AstNode.question_dot_token_of(node) <> null
+            set in_chain: true
+        if (AstNode.flags_of(node) & NodeFlagsOptionalChain) <> 0
+            set in_chain: true
+        if in_chain = false
+            return false
+        this.grammar_error_on_node_or_null(AstNode.tagged_template_template_of(node), DiagTagged_template_expressions_are_not_permitted_in_an_optional_chain)
+    }
+
     function check_call_expression(this, node: ref[AstNode], check_mode: int) returns ref[Type]?
     {
         this.check_grammar_type_arguments(AstNode.type_arguments_of(node))
@@ -47873,10 +48170,7 @@ define Checker
         if k = KindNewExpression
             return this.record_call(node, k, this.resolve_new_expression(node, check_mode))
         if k = KindTaggedTemplateExpression
-        {
-            this.record_unported("resolve-tagged-template-expression", k)
-            return null
-        }
+            return this.record_call(node, k, this.resolve_tagged_template_expression(node, check_mode))
         if k = KindDecorator
             return this.record_call(node, k, this.resolve_decorator(node, check_mode))
         var jsx false
@@ -48879,7 +49173,7 @@ define Checker
                 return null
             }
         }
-        this.resolve_call(node, call_sigs, check_mode, SignatureFlagsNone)
+        this.resolve_call(node, call_sigs, check_mode, SignatureFlagsNone, 0)
     }
 
     ; resolveNewExpression, to the same depth as its sibling above.
@@ -48966,7 +49260,7 @@ define Checker
                     }
                 }
             }
-            return this.resolve_call(node, construct_sigs, check_mode, SignatureFlagsNone)
+            return this.resolve_call(node, construct_sigs, check_mode, SignatureFlagsNone, 0)
         }
 
         ; "If expressionType's apparent type is an object type with no construct
@@ -49112,13 +49406,18 @@ define Checker
             return false
         if ((reduced as ref[Type]).flags & TypeFlagsNever) <> 0
             return false
-        ; isTypeAssignableTo(funcType, c.globalFunctionType) — the relation exists
-        ; since slice 101; the TARGET does not. `globalFunctionType` is the `Function`
-        ; interface of the lib, which is §3.11 — the same wall get_type_from_type_node's
-        ; `Function` arm reports as `global-function-type`, and this is that row's
-        ; second call site.
-        this.record_unported("global-function-type", apparent_func_type.flags)
-        false
+        ; `isTypeAssignableTo(funcType, c.globalFunctionType)` — the last term of
+        ; the untyped-call test, and the one that makes an object with no call
+        ; signature but a `Function` base still count as callable.
+        let ft this.get_global_function_type()
+        if this.unported_mark() <> mark
+            return false
+        if ft = null
+        {
+            this.record_unported("global-function-type-absent", apparent_func_type.flags)
+            return false
+        }
+        this.is_type_assignable_to(func_type, ft as ref[Type])
     }
 
     ; callLikeExpressionMayHaveTypeArguments, whole.
@@ -49188,8 +49487,16 @@ define Checker
         ; DEFAULT does not, because the reference's default is to walk nothing.
         if k = KindTaggedTemplateExpression
         {
-            this.record_unported("resolve-untyped-call-tagged-template", k)
-            return null
+            ; `c.checkExpression(node.AsTaggedTemplateExpression().Template)` — the
+            ; template, not the arguments: its spans' expressions are reached
+            ; through it.
+            let template AstNode.tagged_template_template_of(node)
+            if template = null
+                return null
+            let ignored_template this.check_expression(template as ref[AstNode])
+            if this.unported_mark() <> mark
+                return null
+            return any_signature
         }
         if k = KindBinaryExpression
         {
@@ -49431,7 +49738,7 @@ define Checker
     function signature_has_literal_types(s: ref[Signature]) returns bool
         (s.flags & SignatureFlagsHasLiteralTypes) <> 0
 
-    ; chooseOverload, whole but for the three failure slots.
+    ; chooseOverload, WHOLE — the three failure slots landed with slice 138.
     ;
     ; ★★★ A CANDIDATE THAT DOES NOT MATCH IS A `continue`, AND A STOP IS NOT. The
     ; two are told apart by the unported mark: `is_signature_applicable` answering
@@ -49443,6 +49750,12 @@ define Checker
         let mark this.unported_mark()
         let node s.node
         let args s.args
+        ; The reference's three `= nil` lines. They matter because resolve_call runs
+        ; this twice — the subtype pass and then the assignable pass — and the
+        ; report reads what the LAST pass left.
+        set s.candidates_for_argument_error: null
+        set s.candidate_for_argument_arity_error: null
+        set s.candidate_for_type_argument_error: null
         if s.is_single_non_generic_candidate
         {
             let row s.candidates[0]
@@ -49460,7 +49773,13 @@ define Checker
             if this.unported_mark() <> mark
                 return null
             if applicable = false
+            {
+                ; `s.candidatesForArgumentError = []*Signature{candidate}` — the
+                ; ONE candidate, so the report re-runs the comparison on it with
+                ; reportErrors true and keeps its own code.
+                this.add_argument_error_candidate(s, candidate)
                 return null
+            }
             return candidate
         }
         let count s.candidates.get_length() as int
@@ -49496,9 +49815,11 @@ define Checker
                     set type_argument_types: this.check_type_arguments(candidate, s.type_arguments, false, 0)
                     if this.unported_mark() <> mark
                         return null
-                    ; `s.candidateForTypeArgumentError = candidate; continue`
                     if type_argument_types = null
+                    {
+                        set s.candidate_for_type_argument_error: candidate
                         continue
+                    }
                 }
                 else
                 {
@@ -49538,7 +49859,10 @@ define Checker
                     if this.unported_mark() <> mark
                         return null
                     if ok = false
+                    {
+                        set s.candidate_for_argument_arity_error: check_candidate
                         continue
+                    }
                 }
             }
             else
@@ -49547,7 +49871,14 @@ define Checker
             if this.unported_mark() <> mark
                 return null
             if applicable = false
+            {
+                ; "Give preference to error candidates that have no rest
+                ; parameters (as they are more specific)" — the preference is the
+                ; APPEND ORDER plus the report's reading of the LAST entry, not a
+                ; sort: reorder_candidates has already put the specific ones first.
+                this.add_argument_error_candidate(s, check_candidate as ref[Signature])
                 continue
+            }
             if s.arg_check_mode <> CheckModeNormal
             {
                 ; "If one or more context sensitive arguments were excluded, we
@@ -49580,14 +49911,20 @@ define Checker
                         if this.unported_mark() <> mark
                             return null
                         if ok2 = false
+                        {
+                            set s.candidate_for_argument_arity_error: check_candidate
                             continue
+                        }
                     }
                 }
                 set applicable: this.is_signature_applicable(node, args, check_candidate as ref[Signature], relation, s.arg_check_mode, false)
                 if this.unported_mark() <> mark
                     return null
                 if applicable = false
+                {
+                    this.add_argument_error_candidate(s, check_candidate as ref[Signature])
                     continue
+                }
             }
             ; `s.candidates[candidateIndex] = checkCandidate` — the INSTANTIATED
             ; signature replaces the declared one in the candidate list, which is
@@ -49598,7 +49935,60 @@ define Checker
         null
     }
 
-    function resolve_call(this, node: ref[AstNode], signatures: ref[Array[ref[Signature]?]]?, check_mode: int, call_chain_flags: int) returns ref[Signature]?
+    ; ── THE TAGGED TEMPLATE, slice 138 ──────────────────────────────────────
+    ;
+    ; resolveTaggedTemplateExpression. ★★★It is an ordinary CALL whose argument
+    ; list is built rather than written — see get_effective_call_arguments' arm —
+    ; so everything below the tag's own type is resolve_call's work.
+    ;
+    ; ★★ THE ARRAY-LITERAL ARM IS A SUGGESTION AND NOT A TYPE ERROR: `[f`` ``g`` ``]`
+    ; parses as ONE tagged template whose tag is another one, and the reference
+    ; guesses the author meant a comma (TS2796) rather than reporting that the
+    ; first template is not callable.
+    function resolve_tagged_template_expression(this, node: ref[AstNode], check_mode: int) returns ref[Signature]?
+    {
+        let mark this.unported_mark()
+        let tag_row AstNode.tagged_template_tag_of(node)
+        if tag_row = null
+            return null
+        let tag tag_row as ref[AstNode]
+        let tag_type this.check_expression(tag)
+        if this.unported_mark() <> mark
+            return null
+        if tag_type = null
+            return null
+        let apparent_type this.get_apparent_type(tag_type as ref[Type])
+        if this.unported_mark() <> mark
+            return null
+        if apparent_type = null
+            return null
+        if this.is_error_type(apparent_type as ref[Type])
+            return this.resolve_error_call(node)
+        let call_signatures this.get_signatures_of_type(apparent_type as ref[Type], SignatureKindCall)
+        if this.unported_mark() <> mark
+            return null
+        let construct_signatures this.get_signatures_of_type(apparent_type as ref[Type], SignatureKindConstruct)
+        if this.unported_mark() <> mark
+            return null
+        let num_call Checker.sig_count(call_signatures)
+        if this.is_untyped_function_call(tag_type as ref[Type], apparent_type as ref[Type], num_call, Checker.sig_count(construct_signatures))
+            return this.resolve_untyped_call(node)
+        if this.unported_mark() <> mark
+            return null
+        if num_call = 0
+        {
+            if Checker.kind_or_unknown(AstNode.parent_node_of(node)) = KindArrayLiteralExpression
+            {
+                this.error_on_node(tag, DiagIt_is_likely_that_you_are_missing_a_comma_to_separate_these_two_template_expressions_They_form_a_tagged_template_expression_which_cannot_be_invoked)
+                return this.resolve_error_call(node)
+            }
+            this.invocation_error(tag, apparent_type as ref[Type], SignatureKindCall)
+            return this.resolve_error_call(node)
+        }
+        this.resolve_call(node, call_signatures, check_mode, SignatureFlagsNone, 0)
+    }
+
+    function resolve_call(this, node: ref[AstNode], signatures: ref[Array[ref[Signature]?]]?, check_mode: int, call_chain_flags: int, head_code: int) returns ref[Signature]?
     {
         let mark this.unported_mark()
         ; "We already perform checking on the type arguments on the class
@@ -49671,7 +50061,7 @@ define Checker
         ; `signatureHelpTrailingComma` needs CheckModeIsForSignatureHelp, which only
         ; the language service sets, so has_correct_arity takes it as the constant
         ; false it is here.
-        let state &CallState^host(node, args, cands, type_arguments, arg_check_mode, single_non_generic)
+        let state &CallState^host(node, args, cands, type_arguments, arg_check_mode, single_non_generic, null, null, null)
         ; "the subtype pass is just important for choosing the best signature. So in
         ; the case where there is only one signature, the subtype pass is useless."
         var result: ref[Signature]? null
@@ -49689,16 +50079,902 @@ define Checker
         }
         if result <> null
             return result
-        ; getCandidateForOverloadFailure caches the candidate and
-        ; reportCallResolutionErrors then re-runs the applicability check with
-        ; reportErrors TRUE — which is the only place a TS2345, a TS2554 or a
-        ; TS2558 comes from, and the reason no head message is threaded through the
-        ; relation. ★It is ONE row and not three: with the candidate list in hand
-        ; the reference picks between the three messages itself, so a port that
-        ; cannot report any of them cannot tell them apart either.
-        this.record_unported("report-call-resolution-errors", count)
-        null
+        ; ── the FAILURE PASS, slice 138 ──────────────────────────────────────
+        ;
+        ; ★★★ THE CANDIDATE IS CACHED BEFORE THE REPORT AND THAT ORDER IS THE
+        ; REFERENCE'S, with its own six-line reason: *"we need to ensure that the
+        ; result is present for the error checks below so that if this signature is
+        ; encountered again, we handle the circularity (rather than producing a
+        ; different result which may produce no errors and assert)"*. The report
+        ; below re-runs the argument comparison, which can ask for this very
+        ; signature again through a contextual type.
+        let fallback this.get_candidate_for_overload_failure(node, cands, args, check_mode)
+        if this.unported_mark() <> mark
+            return null
+        if fallback = null
+            return null
+        let links this.signature_link_of(node)
+        set links.resolved_signature: fallback
+        ; `reportErrors` upstream is `!c.isInferencePartiallyBlocked &&
+        ; candidatesOutArray == nil`, and BOTH halves are constants here: the flag
+        ; is written only by services.go, and no caller in this port passes an out
+        ; array. ★The `isInstanceof` head is constant too — the BinaryExpression
+        ; route into resolve_call is resolveInstanceof, which is a row of its own in
+        ; resolve_signature.
+        this.report_call_resolution_errors(node, state, signatures as ref[Array[ref[Signature]?]], head_code)
+        if this.unported_mark() <> mark
+            return null
+        fallback
     }
+    ; ── THE FAILURE PASS, slice 138 ──────────────────────────────────────────
+    ;
+    ; ★★★ THE ROW `report-call-resolution-errors` WAS ONE STOP FOR TWO DIFFERENT
+    ; JOBS, and only one of them is a report. `getCandidateForOverloadFailure`
+    ; answers a SIGNATURE — the call's type after a failed resolution, which every
+    ; caller of get_resolved_signature then reads — while
+    ; `reportCallResolutionErrors` produces the diagnostics. A port that had
+    ; neither answered `null` for the whole resolution, so a wrong call lost its
+    ; TYPE as well as its message: that is why the row was worth twelve units and
+    ; not just twelve diagnostics.
+    ;
+    ; ★★★ AND THE PORT NEEDS NO DIAGNOSTIC-CHAIN OBJECT FOR IT. Upstream re-heads
+    ; a diagnostic with `ast.NewDiagnosticChain`, which keeps the file and the LOC
+    ; and replaces the outermost MESSAGE — so for a dump of (pos, end, code) the
+    ; chain is a change of CODE and nothing else. Where the code is known before
+    ; the report, the head is chosen at the report (`var code msg; if head_code <>
+    ; 0 set code: head_code`); where the relation is what reports, the codes are
+    ; rewritten afterwards through `DiagnosticList.recode_from`.
+    ;
+    ; ★★ WHAT IS DROPPED IS RELATED INFORMATION, under §3.24's standing rule, and
+    ; with it TWO functions: `addImplementationSuccessElaboration` (its whole body
+    ; builds `The call would have succeeded against this implementation…` as
+    ; related info, and its `chooseOverload` re-run reports nothing because it
+    ; passes reportErrors false) and `invocationErrorRecovery`, which was already
+    ; recorded as a drop at invocation_error. The three `An argument for 0 was not
+    ; provided` forms under the too-few-arguments arm are related information too.
+    procedure add_argument_error_candidate(this, s: ref[CallState], candidate: ref[Signature])
+    {
+        if s.candidates_for_argument_error = null
+            set s.candidates_for_argument_error: this.new_signature_list()
+        let list s.candidates_for_argument_error as ref[Array[ref[Signature]?]]
+        list.add(candidate)
+    }
+
+    ; getCandidateForOverloadFailure. ★`hasCandidatesOutArray` is the constant
+    ; FALSE here for resolve_call's own recorded reason, so the fork is decided by
+    ; the candidate count and by whether any candidate is generic — "normally we
+    ; will combine overloads. Skip this if they have type parameters since that's
+    ; hard to combine."
+    function get_candidate_for_overload_failure(this, node: ref[AstNode], candidates: ref[Array[ref[Signature]?]], args: ref[Array[ref[AstNode]?]]?, check_mode: int) returns ref[Signature]?
+    {
+        let mark this.unported_mark()
+        ; "Else should not have called this."
+        this.check_node_deferred(node)
+        let n candidates.get_length() as int
+        var any_generic false
+        var i 0
+        while i < n
+        {
+            let row candidates[i]
+            set i: i + 1
+            if row = null
+                return null
+            let sig row as ref[Signature]
+            if sig.type_parameters <> null
+            {
+                if (sig.type_parameters as ref[Array[ref[Type]?]]).get_length() <> 0
+                    set any_generic: true
+            }
+        }
+        if n = 1
+            return this.pick_longest_candidate_signature(node, candidates, args, check_mode)
+        if any_generic
+            return this.pick_longest_candidate_signature(node, candidates, args, check_mode)
+        this.create_union_of_signatures_for_overload_failure(candidates)
+    }
+
+    ; pickLongestCandidateSignature, whole. ★`c.apparentArgumentCount` is the
+    ; language service's own override of the argument count and is nil here.
+    ;
+    ; ★★ IT WRITES BACK INTO THE CANDIDATE LIST — `candidates[bestIndex] =
+    ; instantiated` — and that is not bookkeeping: the report pass reads the same
+    ; list, so the arity error is measured against the INSTANTIATED signature.
+    function pick_longest_candidate_signature(this, node: ref[AstNode], candidates: ref[Array[ref[Signature]?]], args: ref[Array[ref[AstNode]?]]?, check_mode: int) returns ref[Signature]?
+    {
+        let mark this.unported_mark()
+        let arg_count AstNode.list_count(args)
+        let best_index this.get_longest_candidate_index(candidates, arg_count)
+        if this.unported_mark() <> mark
+            return null
+        ; The index cannot be negative on a non-empty list: `maxParams` starts at
+        ; -1, so the first candidate's parameter count always beats it.
+        if best_index < 0
+            return null
+        let row candidates[best_index]
+        if row = null
+            return null
+        let candidate row as ref[Signature]
+        var tp_count 0
+        if candidate.type_parameters <> null
+            set tp_count: (candidate.type_parameters as ref[Array[ref[Type]?]]).get_length() as int
+        if tp_count = 0
+            return candidate
+        let type_parameters candidate.type_parameters as ref[Array[ref[Type]?]]
+        var type_argument_nodes: ref[Array[ref[AstNode]?]]? null
+        if Checker.call_like_expression_may_have_type_arguments(node)
+            set type_argument_nodes: AstNode.type_arguments_of(node)
+        var instantiated: ref[Signature]? null
+        if AstNode.list_count(type_argument_nodes) <> 0
+        {
+            let type_arguments this.get_type_arguments_from_nodes(type_argument_nodes, type_parameters)
+            if this.unported_mark() <> mark
+                return null
+            if type_arguments = null
+                return null
+            set instantiated: this.create_signature_instantiation(candidate, type_arguments)
+        }
+        else
+            set instantiated: this.infer_signature_instantiation_for_overload_failure(node, type_parameters, candidate, args, check_mode)
+        if this.unported_mark() <> mark
+            return null
+        if instantiated = null
+            return null
+        candidates.put(best_index as size_t, instantiated)
+        instantiated
+    }
+
+    ; getLongestCandidateIndex — the first candidate that could take this many
+    ; arguments, else the widest one. ★A negative answer means the list was empty,
+    ; which get_candidate_for_overload_failure's caller has already excluded.
+    function get_longest_candidate_index(this, candidates: ref[Array[ref[Signature]?]], args_count: int) returns int
+    {
+        let mark this.unported_mark()
+        let n candidates.get_length() as int
+        var max_params_index 0 - 1
+        var max_params 0 - 1
+        var i 0
+        while i < n
+        {
+            let row candidates[i]
+            if row = null
+                return 0 - 1
+            let candidate row as ref[Signature]
+            let param_count this.get_parameter_count(candidate)
+            if this.unported_mark() <> mark
+                return 0 - 1
+            let has_rest this.has_effective_rest_parameter(candidate)
+            if this.unported_mark() <> mark
+                return 0 - 1
+            if has_rest
+                return i
+            if param_count >= args_count
+                return i
+            if param_count > max_params
+            {
+                set max_params: param_count
+                set max_params_index: i
+            }
+            set i: i + 1
+        }
+        max_params_index
+    }
+
+    ; getTypeArgumentsFromNodes — the written type arguments, TRUNCATED to the
+    ; declared count and then FILLED from each remaining parameter's default, its
+    ; constraint, or `unknown`.
+    function get_type_arguments_from_nodes(this, type_argument_nodes: ref[Array[ref[AstNode]?]]?, type_parameters: ref[Array[ref[Type]?]]) returns ref[Array[ref[Type]?]]?
+    {
+        let mark this.unported_mark()
+        let np type_parameters.get_length() as int
+        var given AstNode.list_count(type_argument_nodes)
+        if given > np
+            set given: np
+        let result this.new_type_list(null)
+        var i 0
+        while i < given
+        {
+            let n AstNode.child_in_list(type_argument_nodes, i)
+            set i: i + 1
+            if n = null
+                return null
+            let t this.get_type_from_type_node(n as ref[AstNode])
+            if this.unported_mark() <> mark
+                return null
+            if t = null
+                return null
+            result.add(t)
+        }
+        while (result.get_length() as int) < np
+        {
+            let row type_parameters[result.get_length() as int]
+            if row = null
+                return null
+            let tp row as ref[Type]
+            var t this.get_default_from_type_parameter(tp)
+            if this.unported_mark() <> mark
+                return null
+            if t = null
+            {
+                set t: this.get_constraint_of_type_parameter(tp)
+                if this.unported_mark() <> mark
+                    return null
+                if t = null
+                    set t: unknown_type
+            }
+            result.add(t)
+        }
+        result
+    }
+
+    ; inferSignatureInstantiationForOverloadFailure. ★The two extra check-mode bits
+    ; are the reference's and they are what keeps this pass cheap: no
+    ; context-sensitive argument is checked and no generic function is instantiated
+    ; just to produce an error signature.
+    function infer_signature_instantiation_for_overload_failure(this, node: ref[AstNode], type_parameters: ref[Array[ref[Type]?]], candidate: ref[Signature], args: ref[Array[ref[AstNode]?]]?, check_mode: int) returns ref[Signature]?
+    {
+        let mark this.unported_mark()
+        var flags InferenceFlagsNone
+        if Parser.is_in_js_file(node)
+            set flags: InferenceFlagsAnyDefault
+        let ctx this.new_inference_context(type_parameters, candidate, flags, CompareKindAssignable)
+        let type_arguments this.infer_type_arguments(node, candidate, args, check_mode | CheckModeSkipContextSensitive | CheckModeSkipGenericFunctions, ctx)
+        if this.unported_mark() <> mark
+            return null
+        if type_arguments = null
+            return null
+        this.create_signature_instantiation(candidate, type_arguments)
+    }
+
+    ; getNonRestParameterCount.
+    function get_non_rest_parameter_count(sig: ref[Signature]) returns int
+    {
+        var n 0
+        if sig.parameters <> null
+            set n: (sig.parameters as ref[Array[ref[Symbol]?]]).get_length() as int
+        if Checker.signature_has_rest_parameter(sig)
+            return n - 1
+        n
+    }
+
+    ; The last of a signature's parameters, `core.LastOrNil(s.parameters)`.
+    function last_parameter_of(sig: ref[Signature]) returns ref[Symbol]?
+    {
+        if sig.parameters = null
+            return null
+        let ps sig.parameters as ref[Array[ref[Symbol]?]]
+        let n ps.get_length() as int
+        if n = 0
+            return null
+        ps[n - 1]
+    }
+
+    ; The i-th parameter of a signature, `s.parameters[i]` guarded.
+    function parameter_at(sig: ref[Signature], i: int) returns ref[Symbol]?
+    {
+        if sig.parameters = null
+            return null
+        let ps sig.parameters as ref[Array[ref[Symbol]?]]
+        if i < 0
+            return null
+        if (ps.get_length() as int) <= i
+            return null
+        ps[i]
+    }
+
+    ; getRestTypeOfTupleType.
+    function get_rest_type_of_tuple_type(this, t: ref[Type]) returns ref[Type]?
+        this.get_element_type_of_slice_of_tuple_type(t, Checker.tuple_fixed_length_of(t), 0, false, false)
+
+    ; tryGetRestTypeOfSignature — the ELEMENT type behind a rest parameter, which
+    ; is what a combined overload-failure signature needs for its own rest slot.
+    function try_get_rest_type_of_signature(this, signature: ref[Signature]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        if Checker.signature_has_rest_parameter(signature) = false
+            return null
+        let last Checker.last_parameter_of(signature)
+        if last = null
+            return null
+        var rest_type this.get_type_of_symbol(last as ref[Symbol])
+        if this.unported_mark() <> mark
+            return null
+        if rest_type = null
+            return null
+        if Checker.is_tuple_type(rest_type as ref[Type])
+        {
+            set rest_type: this.get_rest_type_of_tuple_type(rest_type as ref[Type])
+            if this.unported_mark() <> mark
+                return null
+            if rest_type = null
+                return null
+        }
+        this.get_index_type_of_type(rest_type as ref[Type], number_type)
+    }
+
+    ; createCombinedSymbolForOverloadFailure + createCombinedSymbolFromTypes.
+    ; ★"This function is currently only used for erroneous overloads, so it's good
+    ; enough to just use the first source."
+    function create_combined_symbol_for_overload_failure(this, sources: ref[Array[ref[Symbol]?]], t: ref[Type]?) returns ref[Symbol]?
+    {
+        let n sources.get_length() as int
+        if n = 0
+            return null
+        let first sources[0]
+        if first = null
+            return null
+        this.create_symbol_with_type(first as ref[Symbol], t)
+    }
+
+    function create_combined_symbol_from_types(this, sources: ref[Array[ref[Symbol]?]], types: ref[Array[ref[Type]?]]) returns ref[Symbol]?
+    {
+        let mark this.unported_mark()
+        let u this.get_union_type_ex(types, UnionReductionSubtype, null, null)
+        if this.unported_mark() <> mark
+            return null
+        this.create_combined_symbol_for_overload_failure(sources, u)
+    }
+
+    ; createUnionOfSignaturesForOverloadFailure — ONE signature standing for a whole
+    ; non-generic overload set, so that a failed call still has a type.
+    ;
+    ; ★★ EVERY PARAMETER SLOT IS A UNION AND THE RETURN IS AN INTERSECTION, which is
+    ; the direction that makes the result useless for anything but error recovery:
+    ; it accepts each overload's argument at each position and promises the least
+    ; each overload returns.
+    function create_union_of_signatures_for_overload_failure(this, candidates: ref[Array[ref[Signature]?]]) returns ref[Signature]?
+    {
+        let mark this.unported_mark()
+        let n candidates.get_length() as int
+        if n = 0
+            return null
+        ; `core.MapNonNil(candidates, thisParameter)` and its types.
+        let this_parameters this.new_symbol_list()
+        let this_types this.new_type_list(null)
+        var i 0
+        while i < n
+        {
+            let row candidates[i]
+            set i: i + 1
+            if row = null
+                return null
+            let sig row as ref[Signature]
+            if sig.this_parameter <> null
+            {
+                let tp sig.this_parameter as ref[Symbol]
+                this_parameters.add(tp)
+                let t this.get_type_of_parameter(tp)
+                if this.unported_mark() <> mark
+                    return null
+                this_types.add(t)
+            }
+        }
+        var this_parameter: ref[Symbol]? null
+        if (this_parameters.get_length() as int) <> 0
+        {
+            set this_parameter: this.create_combined_symbol_from_types(this_parameters, this_types)
+            if this.unported_mark() <> mark
+                return null
+        }
+        ; `minAndMax(candidates, getNonRestParameterCount)`, inlined: the generic
+        ; pair over a closure is one loop here.
+        var min_argument_count 0
+        var max_non_rest_param 0
+        set i: 0
+        while i < n
+        {
+            let row candidates[i]
+            if row = null
+                return null
+            let value Checker.get_non_rest_parameter_count(row as ref[Signature])
+            if i = 0
+            {
+                set min_argument_count: value
+                set max_non_rest_param: value
+            }
+            else
+            {
+                if value < min_argument_count
+                    set min_argument_count: value
+                if value > max_non_rest_param
+                    set max_non_rest_param: value
+            }
+            set i: i + 1
+        }
+        let parameters this.new_symbol_list()
+        var slot 0
+        while slot < max_non_rest_param
+        {
+            let symbols this.new_symbol_list()
+            let types this.new_type_list(null)
+            set i: 0
+            while i < n
+            {
+                let row candidates[i]
+                set i: i + 1
+                if row = null
+                    return null
+                let sig row as ref[Signature]
+                var pn 0
+                if sig.parameters <> null
+                    set pn: (sig.parameters as ref[Array[ref[Symbol]?]]).get_length() as int
+                var picked: ref[Symbol]? null
+                if Checker.signature_has_rest_parameter(sig)
+                {
+                    if slot < (pn - 1)
+                        set picked: Checker.parameter_at(sig, slot)
+                    else
+                        set picked: Checker.last_parameter_of(sig)
+                }
+                else
+                {
+                    if slot < pn
+                        set picked: Checker.parameter_at(sig, slot)
+                }
+                if picked <> null
+                    symbols.add(picked as ref[Symbol])
+                let t this.try_get_type_at_position(sig, slot)
+                if this.unported_mark() <> mark
+                    return null
+                if t <> null
+                    types.add(t)
+            }
+            let combined this.create_combined_symbol_from_types(symbols, types)
+            if this.unported_mark() <> mark
+                return null
+            if combined <> null
+                parameters.add(combined as ref[Symbol])
+            set slot: slot + 1
+        }
+        ; The REST slot, `core.MapNonNil(candidates, lastParameterIfRest)`.
+        let rest_parameter_symbols this.new_symbol_list()
+        let rest_types this.new_type_list(null)
+        set i: 0
+        while i < n
+        {
+            let row candidates[i]
+            set i: i + 1
+            if row = null
+                return null
+            let sig row as ref[Signature]
+            if Checker.signature_has_rest_parameter(sig)
+            {
+                let last Checker.last_parameter_of(sig)
+                if last <> null
+                    rest_parameter_symbols.add(last as ref[Symbol])
+            }
+            let rt this.try_get_rest_type_of_signature(sig)
+            if this.unported_mark() <> mark
+                return null
+            if rt <> null
+                rest_types.add(rt)
+        }
+        var flags SignatureFlagsIsSignatureCandidateForOverloadFailure
+        if (rest_parameter_symbols.get_length() as int) <> 0
+        {
+            let element this.get_union_type_ex(rest_types, UnionReductionSubtype, null, null)
+            if this.unported_mark() <> mark
+                return null
+            let array_type this.create_array_type(element)
+            if this.unported_mark() <> mark
+                return null
+            let combined this.create_combined_symbol_for_overload_failure(rest_parameter_symbols, array_type)
+            if this.unported_mark() <> mark
+                return null
+            if combined <> null
+                parameters.add(combined as ref[Symbol])
+            set flags: flags | SignatureFlagsHasRestParameter
+        }
+        set i: 0
+        while i < n
+        {
+            let row candidates[i]
+            set i: i + 1
+            if row = null
+                return null
+            if Checker.signature_has_literal_types(row as ref[Signature])
+                set flags: flags | SignatureFlagsHasLiteralTypes
+        }
+        let return_types this.new_type_list(null)
+        set i: 0
+        while i < n
+        {
+            let row candidates[i]
+            set i: i + 1
+            if row = null
+                return null
+            let rt this.get_return_type_of_signature(row as ref[Signature])
+            if this.unported_mark() <> mark
+                return null
+            return_types.add(rt)
+        }
+        let return_type this.get_intersection_type(return_types)
+        if this.unported_mark() <> mark
+            return null
+        let first candidates[0]
+        if first = null
+            return null
+        this.new_signature(flags, (first as ref[Signature]).declaration, null, this_parameter, parameters, return_type, min_argument_count)
+    }
+
+    ; reportCallResolutionErrors — the four-arm switch, in the reference's order,
+    ; which IS the priority: an argument that did not fit outranks a type-argument
+    ; failure, which outranks bare arity.
+    procedure report_call_resolution_errors(this, node: ref[AstNode], s: ref[CallState], signatures: ref[Array[ref[Signature]?]], head_code: int)
+    {
+        let mark this.unported_mark()
+        let arg_error_count Checker.sig_count(s.candidates_for_argument_error)
+        if arg_error_count <> 0
+        {
+            let list s.candidates_for_argument_error as ref[Array[ref[Signature]?]]
+            let row list[arg_error_count - 1]
+            if row = null
+                return
+            let last row as ref[Signature]
+            ; ★★★ THE RE-RUN IS THE REPORT. Every TS2345 of a failed call comes out
+            ; of this one comparison — the resolution itself always runs with
+            ; reportErrors false, which is why no head message is threaded through
+            ; the relation and why the codes are re-headed afterwards instead.
+            let before diagnostics.length()
+            let ignored this.is_signature_applicable(s.node, s.args, last, RelationAssignable, CheckModeNormal, true)
+            if this.unported_mark() <> mark
+                return
+            if arg_error_count > 1
+                diagnostics.recode_from(before, DiagNo_overload_matches_this_call)
+            if head_code <> 0
+                diagnostics.recode_from(before, head_code)
+            return
+        }
+        if s.candidate_for_argument_arity_error <> null
+        {
+            let one this.new_signature_list()
+            one.add(s.candidate_for_argument_arity_error as ref[Signature])
+            this.report_argument_arity_error(s.node, one, s.args, head_code)
+            return
+        }
+        if s.candidate_for_type_argument_error <> null
+        {
+            let ignored2 this.check_type_arguments(s.candidate_for_type_argument_error as ref[Signature], AstNode.type_arguments_of(s.node), true, head_code)
+            return
+        }
+        if AstNode.kind_of(node) = KindJsxOpeningFragment
+            return
+        let with_correct_arity this.new_signature_list()
+        let n signatures.get_length() as int
+        var i 0
+        while i < n
+        {
+            let row signatures[i]
+            set i: i + 1
+            if row = null
+                return
+            let sig row as ref[Signature]
+            let ok this.has_correct_type_argument_arity(sig, s.type_arguments)
+            if this.unported_mark() <> mark
+                return
+            if ok
+                with_correct_arity.add(sig)
+        }
+        if (with_correct_arity.get_length() as int) = 0
+            this.report_type_argument_arity_error(s.node, signatures, s.type_arguments, head_code)
+        else
+            this.report_argument_arity_error(s.node, with_correct_arity, s.args, head_code)
+    }
+
+    ; getErrorNodeForCallNode — a call reports on its CALLEE, and on a member
+    ; call's NAME rather than on the whole access.
+    function get_error_node_for_call_node(node: ref[AstNode]) returns ref[AstNode]
+    {
+        if AstNode.kind_of(node) <> KindCallExpression
+            return node
+        let e AstNode.expression_of(node)
+        if e = null
+            return node
+        let expr e as ref[AstNode]
+        if AstNode.kind_of(expr) <> KindPropertyAccessExpression
+            return expr
+        let nm AstNode.name_of(expr)
+        if nm = null
+            return expr
+        nm as ref[AstNode]
+    }
+
+    ; isPromiseResolveArityError — whether the callee is the `resolve` PARAMETER of
+    ; a `new Promise(...)` executor. ★It buys exactly one message: `Expected 0
+    ; arguments, but got 1. Did you forget to include 'void' in your type argument
+    ; to 'Promise'?` in place of the plain arity error, because `resolve()` with no
+    ; argument is the shape a missing `<void>` produces.
+    function is_promise_resolve_arity_error(this, node: ref[AstNode]) returns bool
+    {
+        let mark this.unported_mark()
+        if AstNode.kind_of(node) <> KindCallExpression
+            return false
+        let e AstNode.expression_of(node)
+        if e = null
+            return false
+        let callee e as ref[AstNode]
+        if AstNode.kind_of(callee) <> KindIdentifier
+            return false
+        let symbol this.resolve_name(callee, AstNode.identifier_text_of(callee), AstNode.identifier_text_length_of(callee), SymbolFlagsValue, 0, false, false)
+        if this.unported_mark() <> mark
+            return false
+        if symbol = null
+            return false
+        let decl Symbol.value_declaration_of(symbol as ref[Symbol])
+        if decl = null
+            return false
+        let param decl as ref[AstNode]
+        if AstNode.kind_of(param) <> KindParameter
+            return false
+        let fn AstNode.parent_node_of(param)
+        if fn = null
+            return false
+        if Checker.is_function_expression_or_arrow_function(fn as ref[AstNode]) = false
+            return false
+        let outer AstNode.parent_node_of(fn as ref[AstNode])
+        if outer = null
+            return false
+        if AstNode.kind_of(outer as ref[AstNode]) <> KindNewExpression
+            return false
+        let ctor_expr AstNode.expression_of(outer as ref[AstNode])
+        if ctor_expr = null
+            return false
+        if AstNode.kind_of(ctor_expr as ref[AstNode]) <> KindIdentifier
+            return false
+        let global_promise this.lookup_globals("Promise", 7, SymbolFlagsValue)
+        if this.unported_mark() <> mark
+            return false
+        if global_promise = null
+            return false
+        let ctor_symbol this.get_resolved_symbol(ctor_expr as ref[AstNode])
+        if this.unported_mark() <> mark
+            return false
+        ctor_symbol = (global_promise as ref[Symbol])
+    }
+
+    ; getArgumentArityError, as a REPORT rather than as a diagnostic value.
+    ;
+    ; ★★★ `parameterRange` IS A STRING UPSTREAM AND ONE TEST READS IT — the
+    ; void-promise arm asks `parameterRange == "1"`. Under `!hasRestParameter`,
+    ; which that arm already requires, the range prints "1" exactly when
+    ; `min_count` and `max_count` are both 1, and both come from the same candidate
+    ; set so `min_count <= max_count` always holds. That is why the string is not
+    ; built here: the only thing it decides is asked directly.
+    procedure report_argument_arity_error(this, node: ref[AstNode], signatures: ref[Array[ref[Signature]?]], args: ref[Array[ref[AstNode]?]]?, head_code: int)
+    {
+        let mark this.unported_mark()
+        let arg_count AstNode.list_count(args)
+        let spread_index Checker.get_spread_argument_index(args)
+        if spread_index >= 0
+        {
+            ; ★The spread arm returns BEFORE the head is chained upstream, so the
+            ; head does not apply to it.
+            this.error_on_node_or_null(AstNode.child_in_list(args, spread_index), DiagA_spread_argument_must_either_have_a_tuple_type_or_be_passed_to_a_rest_parameter)
+            return
+        }
+        let n signatures.get_length() as int
+        if n = 0
+            return
+        var min_count 0
+        var max_count 0
+        ; "longest parameter count *shorter than the call*" / "shortest parameter
+        ; count *longer than the call*" — both stay UNSET when no candidate is on
+        ; that side, and both are read only by the arm that guarantees one is.
+        var max_below 0 - 1
+        var min_above 0 - 1
+        var has_rest_parameter false
+        var i 0
+        while i < n
+        {
+            let row signatures[i]
+            if row = null
+                return
+            let sig row as ref[Signature]
+            let min_parameter this.get_min_argument_count(sig)
+            if this.unported_mark() <> mark
+                return
+            let max_parameter this.get_parameter_count(sig)
+            if this.unported_mark() <> mark
+                return
+            if i = 0
+            {
+                set min_count: min_parameter
+                set max_count: max_parameter
+            }
+            else
+            {
+                if min_parameter < min_count
+                    set min_count: min_parameter
+                if max_parameter > max_count
+                    set max_count: max_parameter
+            }
+            if min_parameter < arg_count
+            {
+                if min_parameter > max_below
+                    set max_below: min_parameter
+            }
+            if arg_count < max_parameter
+            {
+                if min_above < 0
+                    set min_above: max_parameter
+                else
+                {
+                    if max_parameter < min_above
+                        set min_above: max_parameter
+                }
+            }
+            let rest this.has_effective_rest_parameter(sig)
+            if this.unported_mark() <> mark
+                return
+            if rest
+                set has_rest_parameter: true
+            set i: i + 1
+        }
+        var is_void_promise_error false
+        if has_rest_parameter = false
+        {
+            if min_count = 1
+            {
+                if max_count = 1
+                {
+                    if arg_count = 0
+                    {
+                        set is_void_promise_error: this.is_promise_resolve_arity_error(node)
+                        if this.unported_mark() <> mark
+                            return
+                    }
+                }
+            }
+        }
+        let error_node Checker.get_error_node_for_call_node(node)
+        if is_void_promise_error
+        {
+            if Parser.is_in_js_file(node)
+            {
+                this.error_on_node(error_node, DiagExpected_1_argument_but_got_0_new_Promise_needs_a_JSDoc_hint_to_produce_a_resolve_that_can_be_called_without_arguments)
+                return
+            }
+        }
+        var message DiagExpected_0_arguments_but_got_1
+        if AstNode.kind_of(node) = KindDecorator
+        {
+            set message: DiagThe_runtime_will_invoke_the_decorator_with_1_arguments_but_the_decorator_expects_0
+            if has_rest_parameter
+                set message: DiagThe_runtime_will_invoke_the_decorator_with_1_arguments_but_the_decorator_expects_at_least_0
+        }
+        else
+        {
+            if has_rest_parameter
+                set message: DiagExpected_at_least_0_arguments_but_got_1
+            else
+            {
+                if is_void_promise_error
+                    set message: DiagExpected_0_arguments_but_got_1_Did_you_forget_to_include_void_in_your_type_argument_to_Promise
+            }
+        }
+        ; "between min and max, but with no matching overload"
+        if min_count < arg_count
+        {
+            if arg_count < max_count
+            {
+                var code DiagNo_overload_expects_0_arguments_but_overloads_do_exist_that_expect_either_1_or_2_arguments
+                if head_code <> 0
+                    set code: head_code
+                this.error_on_node(error_node, code)
+                return
+            }
+        }
+        var code2 message
+        if head_code <> 0
+            set code2: head_code
+        ; "too short: put the error span on the call expression, not any of the
+        ; args". ★The `An argument for 0 was not provided` forms under it are
+        ; related information and are dropped.
+        if arg_count < min_count
+        {
+            this.error_on_node(error_node, code2)
+            return
+        }
+        ; "Guard against out-of-bounds access when maxCount >= len(args)."
+        if max_count >= arg_count
+        {
+            this.error_on_node(error_node, code2)
+            return
+        }
+        ; The span over the SURPLUS arguments — from the first one the widest
+        ; signature cannot take to the last one written. It is not any node's own
+        ; range, so it goes in directly.
+        let first_extra AstNode.child_in_list(args, max_count)
+        let last_arg AstNode.child_in_list(args, arg_count - 1)
+        if first_extra = null
+            return
+        if last_arg = null
+            return
+        var pos AstNode.pos_of(first_extra as ref[AstNode])
+        var stop AstNode.end_of(last_arg as ref[AstNode])
+        if stop = pos
+            set stop: stop + 1
+        set pos: b.skip_trivia_at(pos)
+        if stop < pos
+            set stop: pos
+        if this.node_is_in_lib(node)
+            return
+        diagnostics.add_direct(pos, stop, code2)
+    }
+
+    ; getTypeArgumentArityError, as a report. ★The span is the type-argument LIST
+    ; with its leading trivia skipped — the same shape the JSX intrinsic arm uses,
+    ; and not a node range.
+    procedure report_type_argument_arity_error(this, node: ref[AstNode], signatures: ref[Array[ref[Signature]?]], type_arguments: ref[Array[ref[AstNode]?]]?, head_code: int)
+    {
+        let mark this.unported_mark()
+        let arg_count AstNode.list_count(type_arguments)
+        var pos 0
+        var stop 0
+        if this.list_range_of(type_arguments, &pos, &stop) = false
+        {
+            this.record_unported("type-argument-list-range", AstNode.kind_of(node))
+            return
+        }
+        let n signatures.get_length() as int
+        if n = 0
+            return
+        var code DiagExpected_0_type_arguments_but_got_1
+        if n > 1
+        {
+            ; "Overloads exist" — a count strictly between two overloads' arities
+            ; gets its own message.
+            var below 0 - 1
+            var above 0 - 1
+            var i 0
+            while i < n
+            {
+                let row signatures[i]
+                set i: i + 1
+                if row = null
+                    return
+                let sig row as ref[Signature]
+                var max_count 0
+                if sig.type_parameters <> null
+                    set max_count: (sig.type_parameters as ref[Array[ref[Type]?]]).get_length() as int
+                var min_count 0
+                if sig.type_parameters <> null
+                {
+                    set min_count: this.get_min_type_argument_count(sig.type_parameters as ref[Array[ref[Type]?]])
+                    if this.unported_mark() <> mark
+                        return
+                }
+                if min_count > arg_count
+                {
+                    if above < 0
+                        set above: min_count
+                    else
+                    {
+                        if min_count < above
+                            set above: min_count
+                    }
+                }
+                else
+                {
+                    if max_count < arg_count
+                    {
+                        if max_count > below
+                            set below: max_count
+                    }
+                }
+            }
+            if below >= 0
+            {
+                if above >= 0
+                    set code: DiagNo_overload_expects_0_type_arguments_but_overloads_do_exist_that_expect_either_1_or_2_type_arguments
+            }
+        }
+        if head_code <> 0
+            set code: head_code
+        if this.node_is_in_lib(node)
+            return
+        diagnostics.add_direct(b.skip_trivia_at(pos), stop, code)
+    }
+
     ; hasCorrectTypeArgumentArity — no type arguments at all is always correct
     ; (they are inferred); otherwise the written count must sit between the
     ; minimum and the declared number.
@@ -49843,6 +51119,7 @@ define Checker
     ; parser does not have, so each is its caller's row and not this function's.
     function get_effective_call_arguments(this, node: ref[AstNode]) returns ref[Array[ref[AstNode]?]]?
     {
+        let mark_of_effective_arguments this.unported_mark()
         let k AstNode.kind_of(node)
         ; ★ A JSX opening-like element's ONE argument is its attributes list — and
         ; it has none at all when the list is empty AND the element has no
@@ -49876,6 +51153,40 @@ define Checker
             ; untyped and never gets here.
             this.record_unported("check-synthetic-expression", k)
             return null
+        }
+        ; ── the TAGGED TEMPLATE's arguments, slice 138 ──────────────────────
+        ;
+        ; ★★★ THE FIRST ARGUMENT IS NOT WRITTEN ANYWHERE — it is a SYNTHETIC
+        ; expression standing for the whole template and typed
+        ; `TemplateStringsArray`, which is why the tag of `` f`a${x}b` `` sees the
+        ; arity 2 and not 1. The remaining arguments are the SPANS' expressions,
+        ; and a no-substitution template has none at all.
+        if k = KindTaggedTemplateExpression
+        {
+            let template AstNode.tagged_template_template_of(node)
+            if template = null
+                return null
+            let strings_type this.get_global_template_strings_array_type()
+            if this.unported_mark() <> mark_of_effective_arguments
+                return null
+            let args AstNode.new_node_list(host)
+            args.add(this.new_synthetic_expression(template as ref[AstNode], strings_type, false, null))
+            if AstNode.kind_of(template as ref[AstNode]) <> KindTemplateExpression
+                return args
+            let spans AstNode.template_expression_spans_of(template as ref[AstNode])
+            var si 0
+            while si < AstNode.list_count(spans)
+            {
+                let span AstNode.child_in_list(spans, si)
+                set si: si + 1
+                if span = null
+                    return null
+                let e AstNode.expression_of(span as ref[AstNode])
+                if e = null
+                    return null
+                args.add(e)
+            }
+            return args
         }
         ; slice 134 — a decorator's arguments are SYNTHESIZED from its own call
         ; signature; see get_effective_decorator_arguments.
@@ -50191,7 +51502,7 @@ define Checker
                 var en: ref[AstNode]? null
                 if report_errors
                     set en: effective_check_node
-                let ok this.check_type_related_to_and_optionally_elaborate(check_arg_type, param_type, relation, en, effective_check_node)
+                let ok this.check_type_related_to_and_optionally_elaborate(check_arg_type, param_type, relation, en, effective_check_node, DiagArgument_of_type_0_is_not_assignable_to_parameter_of_type_1)
                 if this.unported_mark() <> mark
                     return false
                 if ok = false
@@ -52618,7 +53929,7 @@ define Checker
             return target_type
         if expr_type = null
             return null
-        this.check_type_assignable_to_and_optionally_elaborate(expr_type as ref[Type], target_type, node, expr)
+        this.check_type_assignable_to_and_optionally_elaborate(expr_type as ref[Type], target_type, node, expr, DiagType_0_does_not_satisfy_the_expected_type_1)
         if this.unported_mark() <> mark
             return null
         expr_type
@@ -52861,6 +54172,21 @@ define Checker
     ; isTypeComparableTo.
     function is_type_comparable_to(this, source: ref[Type], target: ref[Type]) returns bool
         this.is_type_related_to(source, target, RelationComparable)
+
+    ; checkTypeComparableTo — the REPORTING twin, slice 138.
+    function check_type_comparable_to(this, source: ref[Type], target: ref[Type], error_node: ref[AstNode]?, head_code: int) returns bool
+        this.check_type_related_to_ex(source, target, RelationComparable, error_node, head_code)
+
+    ; isTypeEqualityComparableTo, whole. ★★The NULLABLE target is the whole point:
+    ; `x == null` and `case null:` are comparable to ANYTHING, which is why the
+    ; relation alone would answer wrongly for the one shape the corpus reaches
+    ; most.
+    function is_type_equality_comparable_to(this, source: ref[Type], target: ref[Type]) returns bool
+    {
+        if (target.flags & TypeFlagsNullable) <> 0
+            return true
+        this.is_type_comparable_to(source, target)
+    }
 
     ; getRegularTypeOfObjectLiteral. ★ Its guard is the whole function on this
     ; corpus: only a FRESH object-literal type has a regular twin, and building one
@@ -56304,7 +57630,7 @@ define Checker
         ; has no type node), which is why the row was small where the declaration's
         ; was the largest on the list.
         if t <> null
-            this.check_type_assignable_to_and_optionally_elaborate(initializer_type as ref[Type], t as ref[Type], node, initializer)
+            this.check_type_assignable_to_and_optionally_elaborate(initializer_type as ref[Type], t as ref[Type], node, initializer, 0)
         t
     }
 
@@ -56337,7 +57663,7 @@ define Checker
         ; `checkTypeAssignableToAndOptionallyElaborate(expressionType, t, node,
         ; expr, nil, nil)` — the elaborating pair, which this port has had since
         ; the relation landed; what was missing was nothing but a reader.
-        this.check_type_assignable_to_and_optionally_elaborate(expression_type as ref[Type], t as ref[Type], node, expr)
+        this.check_type_assignable_to_and_optionally_elaborate(expression_type as ref[Type], t as ref[Type], node, expr, 0)
         t
     }
 
@@ -58763,7 +60089,7 @@ define Checker
                 {
                     if left_type <> null
                     {
-                        this.check_type_assignable_to_and_optionally_elaborate(iterated_type as ref[Type], left_type as ref[Type], ve, AstNode.expression_of(node))
+                        this.check_type_assignable_to_and_optionally_elaborate(iterated_type as ref[Type], left_type as ref[Type], ve, AstNode.expression_of(node), 0)
                         if this.unported_mark() <> mark
                             return
                     }
@@ -58882,7 +60208,7 @@ define Checker
                     if expr_type = null
                         return
                     let cmark this.unported_mark()
-                    let ok this.check_type_assignable_to_and_optionally_elaborate(expr_type as ref[Type], return_type as ref[Type], node, expr_node)
+                    let ok this.check_type_assignable_to_and_optionally_elaborate(expr_type as ref[Type], return_type as ref[Type], node, expr_node, 0)
                     if this.unported_mark() <> cmark
                         return
                     if ok = false
@@ -58950,6 +60276,7 @@ define Checker
     ; dimension.
     procedure check_switch_statement(this, node: ref[AstNode])
     {
+        let mark this.unported_mark()
         this.check_grammar_statement_in_ambient_context(node)
         var first_default_clause: ref[AstNode]? null
         var has_duplicate_default_clause false
@@ -58982,14 +60309,27 @@ define Checker
                 if case_expression <> null
                 {
                     let case_type this.check_expression(case_expression as ref[AstNode])
-                    ; isTypeEqualityComparableTo / checkTypeComparableTo. BOTH types
-                    ; are needed, so the row is reached only when the switch subject
-                    ; and this clause's expression are both typed — `switch (null) {
-                    ; case null: }` is the shape that gets there today.
+                    if this.unported_mark() <> mark
+                        return
+                    ; ★★★ THE SECOND CHECK IS THE REPORT AND IT RUNS IN THE OTHER
+                    ; DIRECTION: *"expressionType is not comparable to caseType,
+                    ; try the reversed check and report errors if it fails"*. So a
+                    ; clause that fails one way round is silent, and only a clause
+                    ; that fails BOTH ways reports — at the clause's own
+                    ; expression.
                     if case_type <> null
                     {
                         if expression_type <> null
-                            this.record_unported("is-type-equality-comparable-to", AstNode.kind_of(case_expression as ref[AstNode]))
+                        {
+                            if this.is_type_equality_comparable_to(expression_type as ref[Type], case_type as ref[Type]) = false
+                            {
+                                if this.unported_mark() <> mark
+                                    return
+                                let ignored_cmp this.check_type_comparable_to(case_type as ref[Type], expression_type as ref[Type], case_expression, 0)
+                            }
+                            if this.unported_mark() <> mark
+                                return
+                        }
                     }
                 }
             }
@@ -59440,14 +60780,14 @@ define Checker
                             else
                             {
                                 if widened_type <> null
-                                    this.check_type_assignable_to_and_optionally_elaborate(init_type as ref[Type], widened_type as ref[Type], node, initializer)
+                                    this.check_type_assignable_to_and_optionally_elaborate(init_type as ref[Type], widened_type as ref[Type], node, initializer, 0)
                             }
                         }
                         else
                         {
                             let wt2 this.get_widened_type_for_variable_like_declaration(node, false)
                             if wt2 <> null
-                                this.check_type_assignable_to_and_optionally_elaborate(init_type as ref[Type], wt2 as ref[Type], node, initializer)
+                                this.check_type_assignable_to_and_optionally_elaborate(init_type as ref[Type], wt2 as ref[Type], node, initializer, 0)
                         }
                     }
                 }
@@ -59574,7 +60914,7 @@ define Checker
                         ; thirty-one slices and the head of the work list on both
                         ; stages, ANSWERED by slice 101 wherever neither side is
                         ; structured.
-                        this.check_type_assignable_to_and_optionally_elaborate(initializer_type as ref[Type], symbol_type as ref[Type], node, initializer)
+                        this.check_type_assignable_to_and_optionally_elaborate(initializer_type as ref[Type], symbol_type as ref[Type], node, initializer, 0)
                         ; ★★★ THE `using` ARMS ARE BESIDE THIS CALL AND NOT BEHIND
                         ; IT, WHICH IS WHAT THE NOTE THAT STOOD HERE GOT WRONG. The
                         ; reference runs them AFTER the assignability check, in the
@@ -59695,7 +61035,7 @@ define Checker
                     {
                         let it this.check_expression_cached(initializer as ref[AstNode])
                         if it <> null
-                            this.check_type_assignable_to_and_optionally_elaborate(it as ref[Type], declaration_type, node, initializer)
+                            this.check_type_assignable_to_and_optionally_elaborate(it as ref[Type], declaration_type, node, initializer, 0)
                     }
                     let vd Symbol.value_declaration_of(symbol as ref[Symbol])
                     if vd <> null
@@ -66438,7 +67778,7 @@ define Checker
                 if t <> null
                 {
                     if initializer_type <> null
-                        this.check_type_assignable_to_and_optionally_elaborate(initializer_type as ref[Type], t as ref[Type], expr, expr)
+                        this.check_type_assignable_to_and_optionally_elaborate(initializer_type as ref[Type], t as ref[Type], expr, expr, 0)
                 }
             }
         }
@@ -67849,7 +69189,7 @@ define Checker
             return null
         if decorator_signature = null
             return this.resolve_error_call(node)
-        this.resolve_call(node, call_signatures, check_mode, SignatureFlagsNone)
+        this.resolve_call(node, call_signatures, check_mode, SignatureFlagsNone, head)
     }
 
     ; checkDecorator.
@@ -75383,7 +76723,7 @@ define Checker
         }
         if error_node = null
             return
-        this.check_type_assignable_to_and_optionally_elaborate(unwrapped_expr_type as ref[Type], unwrapped_return_type, error_node as ref[AstNode], effective_expr)
+        this.check_type_assignable_to_and_optionally_elaborate(unwrapped_expr_type as ref[Type], unwrapped_return_type, error_node as ref[AstNode], effective_expr, 0)
     }
 
     ; getEffectiveCheckNode — ast.SkipOuterExpressions at the two kinds it passes
@@ -75691,27 +77031,30 @@ define Checker
         this.append_type_parameters(null, AstNode.type_parameters_of(declaration))
     }
 
-    ; getSignatureFromDeclaration, whole but for one conjunct.
+    ; getSignatureFromDeclaration, WHOLE since slice 138.
     ;
-    ; ★★★ THE CONJUNCT IS `isUntypedSignatureInJSFile` AND IT IS NOT PORTED, NOT
-    ; STOPPED — which is the opposite of what this file usually does with a term it
-    ; cannot compute, so the argument is written out. The flag's five terms are
-    ; `iife == nil`, a JS file, one of five function-like kinds, every parameter
-    ; untyped, and `getContextualType(declaration, ContextFlagsSignature) == nil`.
-    ; The last is the contextual-typing chapter. **A stop there would fire on every
-    ; untyped function in every .js unit of the corpus** — and it would fire for a
-    ; bit that has NO READER anywhere in this port: SignatureFlagsIsUntypedSignature
-    ; InJSFile is read by getSignatureApplicability and by assignability's
-    ; source-signature comparison, both of them in the relation. §3.5be's rule read
-    ; forwards is exactly this case: **a flag with no reader is not ported — it is
-    ; only DECLARED**, and a work-list row bought by a flag nothing asks about is a
-    ; row that measures the instrument rather than the port.
+    ; ★★★ `isUntypedSignatureInJSFile` WAS THE ONE DROPPED CONJUNCT, AND THE
+    ; ARGUMENT FOR DROPPING IT WAS ALREADY FALSE WHEN IT WAS WRITTEN. It read: *a
+    ; flag with no reader is not ported — it is only DECLARED*, and named the
+    ; relation as the only reader. But `get_min_argument_count` reads it TWO SCREENS
+    ; UP in this same file (*"if IsUntypedSignatureInJSFile return 0"*), and in a JS
+    ; file an unannotated parameter is therefore OPTIONAL — so with the flag never
+    ; set, every `function f(x) {}` in a `.js` unit had a minimum of ONE.
     ;
-    ; ★★ THE IIFE IS PORTED THOUGH, and it is the same expression's first term —
-    ; because `iife` has a SECOND reader that does change an answer this slice
-    ; stores: the min-argument-count test's fourth disjunct. The two halves of one
-    ; upstream local get different treatment for a reason that is about the readers
-    ; and not about the cost.
+    ; ★★★ NOTHING COULD SEE IT UNTIL THERE WAS AN ARITY REPORT. `has_correct_arity`
+    ; answered false and the resolution simply failed, which was one more UNPORTED
+    ; unit; the moment slice 138's `report_argument_arity_error` landed, the same
+    ; wrong minimum became **six spurious TS2554 on one unit** (salsa/
+    ; unannotatedParametersAreOptional) and one more on jsdocReadonlyDeclarations.
+    ; §3.5fp's class: **a dropped line in a ported function produces no row on any
+    ; frontier**, and a note that justifies the drop by naming the readers ages
+    ; exactly as fast as the reader list.
+    ;
+    ; ★★ ITS LAST TERM IS `getContextualType(declaration, ContextFlagsSignature)`,
+    ; which was the real reason for the drop and is ported since the contextual
+    ; chapter. The other four are the IIFE (already here, for the min-argument
+    ; count's fourth disjunct), a JS file, one of five function-like kinds, and
+    ; every parameter unannotated.
     ;
     ; ★★★ THE PARAMETER-PROPERTY DETOUR IS THE ONE PLACE A SIGNATURE ASKS THE
     ; RESOLVER. `constructor(private x: number)` binds its parameter TWICE — once as
@@ -75742,6 +77085,50 @@ define Checker
         let iife AstNode.get_immediately_invoked_function_expression(declaration)
         let parameters host.allocate(sizeof Array[ref[Symbol]?], alignof Array[ref[Symbol]?]) as pointer[Array[ref[Symbol]?]]
         set *parameters: Array[ref[Symbol]?]()
+
+        ; isUntypedSignatureInJSFile — the five conjuncts, in the reference's own
+        ; order, and the contextual type LAST because it is the expensive one.
+        if iife = null
+        {
+            if Parser.is_in_js_file(declaration)
+            {
+                let dk AstNode.kind_of(declaration)
+                var function_like false
+                if dk = KindFunctionExpression
+                    set function_like: true
+                if dk = KindArrowFunction
+                    set function_like: true
+                if dk = KindFunctionDeclaration
+                    set function_like: true
+                if dk = KindConstructor
+                    set function_like: true
+                if AstNode.is_method_or_accessor(declaration)
+                    set function_like: true
+                if function_like
+                {
+                    var all_untyped true
+                    let plist AstNode.parameters_of(declaration)
+                    var pi 0
+                    while pi < AstNode.list_count(plist)
+                    {
+                        let p AstNode.child_in_list(plist, pi)
+                        set pi: pi + 1
+                        if p = null
+                            continue
+                        if AstNode.type_of(p as ref[AstNode]) <> null
+                            set all_untyped: false
+                    }
+                    if all_untyped
+                    {
+                        let ctx this.get_contextual_type(declaration, ContextFlagsSignature)
+                        if this.unported_mark() <> mark
+                            return null
+                        if ctx = null
+                            set flags: flags | SignatureFlagsIsUntypedSignatureInJSFile
+                    }
+                }
+            }
+        }
 
         var this_data: pointer[char] null
         let this_len Binder.internal_name_unprefixed(host, "this", &this_data)
@@ -86107,7 +87494,37 @@ define Checker
             return
         }
         if k = KindJsxSelfClosingElement
+        {
             this.check_jsx_self_closing_element_deferred(node as ref[AstNode])
+            return
+        }
+        ; ── slice 138's five kinds, and the rule above is why they are here ─────
+        ;
+        ; ★★★ `get_candidate_for_overload_failure` CALLS check_node_deferred, so
+        ; these arms and that one line are ONE edit — and the first draft of the
+        ; slice made exactly the mistake this header predicts: the writer landed
+        ; without the arm, and stage 1 lost the TS2304 the reference files for
+        ; `(() => {})(arguments = 6)` on three units. *"These node kinds are
+        ; deferred checked when overload resolution fails. To save on work, we
+        ; ensure the arguments are checked just once in a deferred way."*
+        var failed_call false
+        if k = KindCallExpression
+            set failed_call: true
+        if k = KindNewExpression
+            set failed_call: true
+        if k = KindTaggedTemplateExpression
+            set failed_call: true
+        if k = KindDecorator
+            set failed_call: true
+        if k = KindJsxOpeningElement
+            set failed_call: true
+        if failed_call
+        {
+            let ignored this.resolve_untyped_call(node as ref[AstNode])
+            return
+        }
+        ; The BinaryExpression arm is `instanceof` only, and resolve_untyped_call
+        ; keeps a row for it — no writer in this port reaches it.
     }
 
     ; checkUnusedRenamedBindingElements, over the list checkVariableLikeDeclaration
@@ -95514,8 +96931,8 @@ define Checker
     ; error node is consulted, so an assignment that HOLDS costs one flag test and
     ; leaves no trace. The stop that used to stand at these three call sites is
     ; replaced by an answer, not by a smaller stop.
-    function check_type_assignable_to_and_optionally_elaborate(this, source: ref[Type], target: ref[Type], error_node: ref[AstNode]?, expr: ref[AstNode]?) returns bool
-        this.check_type_related_to_and_optionally_elaborate(source, target, RelationAssignable, error_node, expr)
+    function check_type_assignable_to_and_optionally_elaborate(this, source: ref[Type], target: ref[Type], error_node: ref[AstNode]?, expr: ref[AstNode]?, head_code: int) returns bool
+        this.check_type_related_to_and_optionally_elaborate(source, target, RelationAssignable, error_node, expr, head_code)
 
     ; checkTypeAssignableTo — the plain entry, no elaboration, with a head message.
     ; ★It is NOT the `AndOptionallyElaborate` pair above: the elaborators walk an
@@ -95524,7 +96941,15 @@ define Checker
     function check_type_assignable_to(this, source: ref[Type], target: ref[Type], error_node: ref[AstNode]?, head_code: int) returns bool
         this.check_type_related_to_ex(source, target, RelationAssignable, error_node, head_code)
 
-    function check_type_related_to_and_optionally_elaborate(this, source: ref[Type], target: ref[Type], relation: int, error_node: ref[AstNode]?, expr: ref[AstNode]?) returns bool
+    ; ★★★ THE HEAD REACHED THIS PAIR IN SLICE 138, and it is not decoration: the
+    ; ARGUMENT comparison hands down `Argument of type 0 is not assignable to
+    ; parameter of type 1` (TS2345), which is the code every failed call reports.
+    ; Without it the same comparison answers the RELATION's own TS2322 — the right
+    ; span with the wrong code, which is exactly what the pre-slice tree did on
+    ; `fixtures_callres_argument_relation`. ★It also repaired a site that had been
+    ; wrong since slice 133: `satisfies` passes TS1360 upstream and the port passed
+    ; nothing, because at the time nothing could carry it.
+    function check_type_related_to_and_optionally_elaborate(this, source: ref[Type], target: ref[Type], relation: int, error_node: ref[AstNode]?, expr: ref[AstNode]?, head_code: int) returns bool
     {
         let mark this.unported_mark()
         let related this.is_type_related_to(source, target, relation)
@@ -95546,7 +96971,7 @@ define Checker
             this.record_relation(error_node, source, target, 0)
             return false
         }
-        if this.elaborate_error(expr, source, target, relation)
+        if this.elaborate_error(expr, source, target, relation, head_code)
         {
             this.record_relation(error_node, source, target, 0)
             return false
@@ -95561,7 +96986,7 @@ define Checker
             this.record_relation(error_node, source, target, 2)
             return false
         }
-        let answered this.check_type_related_to(source, target, relation, error_node)
+        let answered this.check_type_related_to_ex(source, target, relation, error_node, head_code)
         var verdict 0
         if this.unported_mark() <> mark
             set verdict: 2
@@ -95830,7 +97255,7 @@ define Checker
     ; ★★ THE NOTE ITSELF IS RELATED INFORMATION and therefore outside what a dump
     ; carries — see the family header. What is observable is the diagnostic it
     ; decorates, and that is this function's own `check_type_related_to`.
-    function elaborate_did_you_mean_to_call_or_construct(this, node: ref[AstNode], source: ref[Type], target: ref[Type], relation: int, kind: int) returns bool
+    function elaborate_did_you_mean_to_call_or_construct(this, node: ref[AstNode], source: ref[Type], target: ref[Type], relation: int, kind: int, head_code: int) returns bool
     {
         let mark this.unported_mark()
         let sigs this.get_signatures_of_type(source, kind)
@@ -95864,8 +97289,11 @@ define Checker
         if some = false
             return false
         ; The relation is re-asked at the NODE, which is what emits the line the
-        ; note would decorate. `false` here means it reported.
-        if this.check_type_related_to(source, target, relation, node) = false
+        ; note would decorate — and it is asked WITH THE HEAD (slice 138), because
+        ; the reference passes `headMessage` here too and then keeps the resulting
+        ; diagnostic: `reportDiagnostic(diags[0].AddRelatedInfo(…))`. Only the
+        ; related info is dropped. `false` here means it reported.
+        if this.check_type_related_to_ex(source, target, relation, node, head_code) = false
             return true
         false
     }
@@ -96104,7 +97532,7 @@ define Checker
             return false
         if next <> null
         {
-            if this.elaborate_error(next, spt, tpt, relation)
+            if this.elaborate_error(next, spt, tpt, relation, 0)
                 return true
             if this.unported_mark() <> mark
                 return false
@@ -96305,7 +97733,7 @@ define Checker
             return false
         if this.unported_mark() <> mark
             return false
-        if this.elaborate_error(body, sr, tr, relation)
+        if this.elaborate_error(body, sr, tr, relation, 0)
             return true
         if this.unported_mark() <> mark
             return false
@@ -96337,7 +97765,7 @@ define Checker
     ; ★ `isOrHasGenericConditional(target)` needs Conditional or an Intersection
     ; holding one, both structured; and `compilerOptions.NoCheck` is unset, which
     ; is the plain-equality reading of an unset option (§3.5cw).
-    function elaborate_error(this, node: ref[AstNode]?, source: ref[Type], target: ref[Type], relation: int) returns bool
+    function elaborate_error(this, node: ref[AstNode]?, source: ref[Type], target: ref[Type], relation: int, head_code: int) returns bool
     {
         if node = null
             return false
@@ -96356,9 +97784,9 @@ define Checker
         ; arm the moment a signature exists.
         if (source.flags & TypeFlagsObject) <> 0
         {
-            if this.elaborate_did_you_mean_to_call_or_construct(n, source, target, relation, SignatureKindConstruct)
+            if this.elaborate_did_you_mean_to_call_or_construct(n, source, target, relation, SignatureKindConstruct, head_code)
                 return true
-            if this.elaborate_did_you_mean_to_call_or_construct(n, source, target, relation, SignatureKindCall)
+            if this.elaborate_did_you_mean_to_call_or_construct(n, source, target, relation, SignatureKindCall, head_code)
                 return true
         }
         let k AstNode.kind_of(n)
@@ -96368,19 +97796,19 @@ define Checker
             ; assertion and breaks out of the switch otherwise.
             if Checker.is_const_assertion(n) = false
                 return false
-            return this.elaborate_error(AstNode.expression_of(n), source, target, relation)
+            return this.elaborate_error(AstNode.expression_of(n), source, target, relation, head_code)
         }
         if k = KindJsxExpression
-            return this.elaborate_error(AstNode.expression_of(n), source, target, relation)
+            return this.elaborate_error(AstNode.expression_of(n), source, target, relation, head_code)
         if k = KindParenthesizedExpression
-            return this.elaborate_error(AstNode.expression_of(n), source, target, relation)
+            return this.elaborate_error(AstNode.expression_of(n), source, target, relation, head_code)
         if k = KindBinaryExpression
         {
             let op AstNode.binary_operator_kind(n)
             if op = KindEqualsToken
-                return this.elaborate_error(AstNode.binary_right_of(n), source, target, relation)
+                return this.elaborate_error(AstNode.binary_right_of(n), source, target, relation, head_code)
             if op = KindCommaToken
-                return this.elaborate_error(AstNode.binary_right_of(n), source, target, relation)
+                return this.elaborate_error(AstNode.binary_right_of(n), source, target, relation, head_code)
             return false
         }
         if k = KindObjectLiteralExpression
@@ -98125,7 +99553,7 @@ define Checker
                     return null
                 if result <> null
                 {
-                    let ignored this.check_type_assignable_to_and_optionally_elaborate(attrs_type as ref[Type], result as ref[Type], tag_name, attributes)
+                    let ignored this.check_type_assignable_to_and_optionally_elaborate(attrs_type as ref[Type], result as ref[Type], tag_name, attributes, 0)
                     if this.unported_mark() <> mark
                         return null
                 }
@@ -98187,7 +99615,7 @@ define Checker
                 this.error_on_node(AstNode.jsx_tag_name_of(node), DiagJSX_element_type_0_does_not_have_any_construct_or_call_signatures)
             return this.resolve_error_call(node)
         }
-        this.resolve_call(node, signatures, check_mode, SignatureFlagsNone)
+        this.resolve_call(node, signatures, check_mode, SignatureFlagsNone, 0)
     }
 
     ; getJSXFragmentType.
@@ -98604,7 +100032,7 @@ define Checker
             else
                 set error_node: AstNode.jsx_tag_name_of(node)
         }
-        this.check_type_related_to_and_optionally_elaborate(attributes_type as ref[Type], param_type as ref[Type], relation, error_node, attributes)
+        this.check_type_related_to_and_optionally_elaborate(attributes_type as ref[Type], param_type as ref[Type], relation, error_node, attributes, 0)
     }
 
     ; ast.IsJsxCallLike — an opening-like element or an opening FRAGMENT, which is
@@ -103920,6 +105348,15 @@ define Checker
         t
     }
 
+    function get_global_template_strings_array_type(this) returns ref[Type]?
+    {
+        if global_template_strings_array_type <> null
+            return global_template_strings_array_type
+        let t this.get_global_type_of_arity("TemplateStringsArray", 20, 0)
+        set global_template_strings_array_type: t
+        t
+    }
+
     ; getGlobalBuiltinIteratorTypes, both directions. ★The list is memoised as a
     ; LIST because isReferenceToSomeType asks all of it at once; see the field.
     function get_global_builtin_iterator_types(this) returns ref[Array[ref[Type]?]]?
@@ -106618,7 +108055,7 @@ define Checker
                 var error_node: ref[AstNode]? operand
                 if error_node = null
                     set error_node: node
-                this.check_type_assignable_to_and_optionally_elaborate(yielded_type as ref[Type], signature_yield_type as ref[Type], error_node, operand)
+                this.check_type_assignable_to_and_optionally_elaborate(yielded_type as ref[Type], signature_yield_type as ref[Type], error_node, operand, 0)
                 if this.unported_mark() <> mark
                     return null
             }
