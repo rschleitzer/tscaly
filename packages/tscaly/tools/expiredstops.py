@@ -26,8 +26,25 @@
 # reachability claim; those still need the reading. Of the seven premises slice 139
 # expired, this scan named five.
 #
-# Usage:  packages/tscaly/tools/expiredstops.py [file.scaly]
-#         (default: 0.1.0/tscaly/checker.scaly, relative to the package)
+# ★★★ THE `tags` MODE IS THE OTHER HALF OF THAT BLIND SPOT, AND SLICE 142 PAID FOR IT.
+# `mark-node-assignments` sat at +77 units on frontier.sh with a note calling the walk
+# behind it *"a slice of its own"* — and the whole family (markNodeAssignments,
+# ensureAssignmentsMarked, extendAssignmentPosition, the per-symbol link) had been in
+# the file since slice 100, four thousand lines above. The mode above cannot see it:
+# the note names no absent CALLEE, it names an amount of WORK, and there is no camel
+# case in it to test. What IS testable is the stop's own TAG — a tag is written as the
+# name of the thing that is missing, so `<tag>` snake-cased is a function name, and a
+# tag naming a function DEFINED SOMEWHERE ELSE IN THE FILE is a claim to re-read.
+#
+# ★★ IT IS NOISIER THAN THE FIRST MODE BY CONSTRUCTION and that is not a defect: the
+# ordinary shape is a stop INSIDE a partly-ported function tagged with that function's
+# own name, so only stops whose enclosing function DIFFERS from the tag are printed —
+# and even then the callee named is usually present but incomplete. 75 rows on
+# 2026-09-04, of which `mark-node-assignments` was one. A hit is a note to re-read.
+#
+# Usage:  packages/tscaly/tools/expiredstops.py [file.scaly] [tags]
+#         (default: 0.1.0/tscaly/checker.scaly, relative to the package;
+#          the second argument selects the TAG mode instead of the claim mode)
 
 import io
 import os
@@ -50,12 +67,53 @@ def snake(name):
     return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s).lower()
 
 
+def tag_mode(root, path, src, lines):
+    """The stop's TAG, read as the name of the thing that is missing."""
+    at, cur = {}, None
+    enclosing = []
+    for line in lines:
+        m = re.match(r"^\s*(?:function|procedure)\s+([a-z_][a-z0-9_]*)", line)
+        if m:
+            cur = m.group(1)
+            at.setdefault(cur, len(enclosing) + 1)
+        enclosing.append(cur)
+    hits = []
+    for i, line in enumerate(lines):
+        m = STOP.search(line)
+        if not m:
+            continue
+        name = m.group(1).replace("-", "_")
+        if name in at and enclosing[i] != name:
+            hits.append((i + 1, m.group(1), enclosing[i] or "?", at[name]))
+    rel = os.path.relpath(path, root)
+    print("expiredstops (tags) — stops whose TAG names a function defined ELSEWHERE")
+    print("  file            %s" % rel)
+    print("  stops           %d" % len(STOP.findall(src)))
+    print("  TO RE-READ      %d" % len(hits))
+    print()
+    for ln, tag, enc, d in hits:
+        print("  %s:%d  %-44s in %-44s (defined at %d)" % (rel, ln, tag, enc, d))
+    print()
+    print("  ★ A hit is a note to RE-READ, never a work item — the named function is")
+    print("    usually present but INCOMPLETE, which is a legitimate stop. What the")
+    print("    mode exists for is the other case: the callee is whole and the note")
+    print("    aged (slice 142's `mark-node-assignments`, ported forty slices earlier).")
+
+
 def main():
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-    path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, "0.1.0/tscaly/checker.scaly")
+    args = [a for a in sys.argv[1:]]
+    mode = "claims"
+    if args and args[-1] in ("tags", "claims"):
+        mode = args.pop()
+    path = args[0] if args else os.path.join(root, "0.1.0/tscaly/checker.scaly")
     src = io.open(path, encoding="utf-8").read()
     lines = src.split("\n")
     defined = set(DEFN.findall(src))
+
+    if mode == "tags":
+        tag_mode(root, path, src, lines)
+        return
 
     hits = []
     for i, line in enumerate(lines):
