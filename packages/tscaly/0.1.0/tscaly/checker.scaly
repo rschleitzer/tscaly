@@ -2801,6 +2801,25 @@ define ArrayToSingleTypeMapperData
     target: ref[Type]?
 )
 
+; DeferredTypeMapper (slice 136) — sources plus a THUNK per source, where the
+; reference holds `targets []func() *Type`.
+;
+; ★★★ THE THUNK IS SPELLED AS ITS ONE SHAPE, AND THAT IS A DIVERGENCE WORTH
+; NAMING. `newDeferredTypeMapper` has exactly ONE caller in the whole reference —
+; getInferredTypeParameterConstraint's type-reference arm — and every one of its
+; thunks is the same expression with a different index:
+; `getEffectiveTypeArgumentAtIndex(parent, typeParameters, i)`. So this arm carries
+; the NODE instead of a list of closures and computes the i-th argument on demand,
+; which preserves the laziness exactly (that is what the deferral BUYS: a
+; constraint mentioning one type parameter must not force the type of every
+; argument). ★The day a second caller with a different thunk appears, this arm has
+; to grow a discriminator rather than a second node slot.
+define DeferredTypeMapperData
+(
+    sources: ref[Array[ref[Type]?]]?
+    node: ref[AstNode]?
+)
+
 ; MergedTypeMapper (slice 122) — `m2.Map(m1.Map(t))`, a PLAIN composition of the
 ; two maps. Its sibling CompositeTypeMapper instantiates through m2 instead of
 ; mapping through it, and that one still has no writer here: both its callers
@@ -2856,6 +2875,7 @@ define TypeMapperData union
     Simple: SimpleTypeMapperData
     Array: ArrayTypeMapperData
     ArrayToSingle: ArrayToSingleTypeMapperData
+    Deferred: DeferredTypeMapperData
     Merged: MergedTypeMapperData
     Inference: InferenceTypeMapperData
     Reliability: ReliabilityTypeMapperData
@@ -4007,6 +4027,23 @@ define SubstitutionTypeData
 ; reason and one more besides: the key holds the FULL access flags while the
 ; minted type keeps only the PERSISTENT ones, so the key cannot be read back off
 ; the answer even in principle.
+; ── SubstitutionEntry (slice 136) ───────────────────────────────────────────
+;
+; One row of `c.substitutionTypes`, whose key upstream is the pair of TYPE IDS
+; (`SubstitutionTypeKey{baseId, constraintId}`).
+;
+; ★ It is an ENTRY rather than a memo on the type for the reason IndexedAccessEntry
+; is: the key is a PAIR and neither half is recoverable from the answer alone —
+; getSubstitutionType folds three cases into `baseType` before the table is ever
+; asked, so a minted substitution and a base type handed straight back are
+; indistinguishable afterwards.
+define SubstitutionEntry
+(
+    base_type: ref[Type]?
+    constraint: ref[Type]?
+    t: ref[Type]?
+)
+
 define IndexedAccessEntry
 (
     key_flags: int
@@ -4066,6 +4103,16 @@ define ConditionalTypeData
     extends_type: ref[Type]?
     resolved_true_type: ref[Type]?
     resolved_false_type: ref[Type]?
+
+    ; ★ The three CONSTRAINT memos, slice 136. They are separate slots upstream for
+    ; the reason the two above are: each is the answer of a different question about
+    ; the same conditional, and `resolved_constraint_of_distributive` additionally
+    ; uses `noConstraintType` as a THIRD state — *asked, and the answer is nothing* —
+    ; which a bare null cannot express.
+    resolved_default_constraint: ref[Type]?
+    resolved_constraint_of_distributive: ref[Type]?
+    resolved_inferred_true_type: ref[Type]?
+
     mapper: ref[TypeMapper]?
     combined_mapper: ref[TypeMapper]?
 )
@@ -5156,6 +5203,13 @@ define Checker
     string_or_number_type: ref[Type]?
     string_number_symbol_type: ref[Type]?
 
+    ; c.numericStringType — the template literal `${number}`, slice 136. It arrives
+    ; under §3.5be's rule and not before: its two readers are
+    ; `is_applicable_index_type` (a `number` index signature applies to it) and the
+    ; mapped-type append of `get_conditional_flow_type_of_type`, and both land in
+    ; this slice.
+    numeric_string_type: ref[Type]?
+
     ; ── c.typeofType (slice 133) ────────────────────────────────────────────
     ;
     ; The union of the eight names `typeof x` can answer, and the same rule as its
@@ -5191,6 +5245,9 @@ define Checker
 
     ; c.indexedAccessTypes — the deferred `T[K]` intern table.
     indexed_access_types: ref[Array[ref[IndexedAccessEntry]?]]
+
+    ; c.substitutionTypes — slice 136.
+    substitution_types: ref[Array[ref[SubstitutionEntry]?]]
 
     ; ── the union intern table, slice 94 ────────────────────────────────────
     ;
@@ -6160,12 +6217,16 @@ define Checker
         set c.number_or_bigint_type: null
         set c.string_or_number_type: null
         set c.string_number_symbol_type: null
+        set c.numeric_string_type: null
         let ixt host.allocate(sizeof Array[ref[Type]?], alignof Array[ref[Type]?]) as pointer[Array[ref[Type]?]]
         set *ixt: Array[ref[Type]?]()
         set c.index_types: ixt
         let iat host.allocate(sizeof Array[ref[IndexedAccessEntry]?], alignof Array[ref[IndexedAccessEntry]?]) as pointer[Array[ref[IndexedAccessEntry]?]]
         set *iat: Array[ref[IndexedAccessEntry]?]()
         set c.indexed_access_types: iat
+        let sut host.allocate(sizeof Array[ref[SubstitutionEntry]?], alignof Array[ref[SubstitutionEntry]?]) as pointer[Array[ref[SubstitutionEntry]?]]
+        set *sut: Array[ref[SubstitutionEntry]?]()
+        set c.substitution_types: sut
         ; c.tupleTypes, and the two global-type memos (slice 115). The memos start
         ; null and mean *not asked yet*; get_global_array_type answers
         ; empty_generic_type where the table has no Array, so the memo can never
@@ -20331,6 +20392,76 @@ define Checker
     ; eight capitalised names to intrinsics; it is written rather than stopped,
     ; because every one of its answers is a type this port already mints and its
     ; guard is a flag — see below.
+    ; Does an enclosing JSDoc DECLARE this type reference's name with a `@template`
+    ; tag? See the stop inside get_type_from_type_reference for why the question is
+    ; asked at all. It walks UP to the JSDoc nodes in the parent chain — the same
+    ; chain get_conditional_flow_type_of_type stops at — and reads their tag lists.
+    function jsdoc_template_would_declare(this, node: ref[AstNode]) returns bool
+    {
+        let name_node AstNode.type_reference_name_of(node)
+        if name_node = null
+            return false
+        let nm name_node as ref[AstNode]
+        if AstNode.kind_of(nm) <> KindIdentifier
+            return false
+        let want AstNode.identifier_text_of(nm)
+        let want_len AstNode.identifier_text_length_of(nm)
+        var cur: ref[AstNode]? AstNode.parent_node_of(node)
+        while cur <> null
+        {
+            let n cur as ref[AstNode]
+            if AstNode.kind_of(n) = KindJSDoc
+            {
+                if Checker.jsdoc_tags_declare_template(n, want, want_len)
+                    return true
+            }
+            set cur: AstNode.parent_node_of(n)
+        }
+        false
+    }
+
+    function jsdoc_tags_declare_template(doc: ref[AstNode], want: pointer[char], want_len: int) returns bool
+    {
+        let tags AstNode.jsdoc_tag_list_of(doc)
+        if tags = null
+            return false
+        let tl tags as ref[Array[ref[AstNode]?]]
+        let n tl.get_length() as int
+        var i 0
+        while i < n
+        {
+            let tag tl[i]
+            set i: i + 1
+            if tag = null
+                continue
+            let t tag as ref[AstNode]
+            if AstNode.kind_of(t) <> KindJSDocTemplateTag
+                continue
+            let tps AstNode.type_parameters_of(t)
+            if tps = null
+                continue
+            let list tps as ref[Array[ref[AstNode]?]]
+            let m list.get_length() as int
+            var k 0
+            while k < m
+            {
+                let tp list[k]
+                set k: k + 1
+                if tp = null
+                    continue
+                let tpn AstNode.name_of(tp as ref[AstNode])
+                if tpn = null
+                    continue
+                let id tpn as ref[AstNode]
+                if AstNode.kind_of(id) <> KindIdentifier
+                    continue
+                if SymbolTable.names_equal(AstNode.identifier_text_of(id), AstNode.identifier_text_length_of(id), want, want_len)
+                    return true
+            }
+        }
+        false
+    }
+
     function get_type_from_type_reference(this, node: ref[AstNode]) returns ref[Type]?
     {
         let links this.type_node_link_of(node)
@@ -20347,6 +20478,31 @@ define Checker
                     return null
                 }
             }
+        }
+        ; ★★★ THE JSDoc `@template` STOP, SLICE 136, AND IT IS A STOP RATHER THAN A
+        ; DIAGNOSTIC BECAUSE THE ANSWER WOULD BE WRONG AND NOT MERELY MISSING.
+        ; This port does not declare the type parameters of a `@template` tag —
+        ; measured, and the plain form is as unbound as the one under `@overload` —
+        ; so a name an enclosing `@template` declares resolves past it to whatever
+        ; the GLOBALS hold. In the corpus that is not hypothetical: `@template
+        ; {Array<unknown>} [Parameters=[]]` resolves to the LIB's `Parameters<T>`,
+        ; whose arity check then reports a TS2314 the reference does not have, at a
+        ; span the reference calls a type parameter.
+        ;
+        ; ★★★ IT WAS INVISIBLE UNTIL THIS SLICE AND THE WALL THAT HID IT WAS
+        ; `conditional-type-infer-context` — the lib's own `Parameters<T>` is a
+        ; conditional with an `infer`, so resolving the WRONG symbol used to stop
+        ; inside it. Porting the inference context removed the stop and the wrong
+        ; answer came out the other side; the resolution defect is older than the
+        ; slice that made it speak.
+        ;
+        ; ★ It is asked on the enclosing JSDoc's OWN tags and nothing wider: the
+        ; question is whether the name would have been DECLARED here, so a walk that
+        ; searched further would refuse references the port answers correctly today.
+        if this.jsdoc_template_would_declare(node)
+        {
+            this.record_unported("jsdoc-template-type-parameter", KindJSDocTemplateTag)
+            return null
         }
         let mark this.unported_mark()
         let jd this.get_intended_type_from_jsdoc_type_reference(node)
@@ -21506,18 +21662,20 @@ define Checker
     ; list is one flip.
     function get_conditional_flow_type_of_type(this, t: ref[Type], node: ref[AstNode]) returns ref[Type]?
     {
+        let mark this.unported_mark()
+        var constraints: ref[Array[ref[Type]?]]? null
         var n: ref[AstNode]? node
         var covariant true
         while n <> null
         {
             let cur n as ref[AstNode]
             if Checker.is_statement(cur)
-                return t
+                break
             if AstNode.kind_of(cur) = KindJSDoc
-                return t
+                break
             let p AstNode.parent_node_of(cur)
             if p = null
-                return t
+                break
             let parent p as ref[AstNode]
             let pk AstNode.kind_of(parent)
             if pk = KindParameter
@@ -21546,28 +21704,37 @@ define Checker
             }
             if substitutes
             {
-                this.record_unported("get-implied-constraint", pk)
-                return null
+                ; ★★★ SLICE 136 — THE FIRST APPEND. The stop that stood here
+                ; (`get-implied-constraint`) was the largest row of the whole
+                ; frontier by EVENTS at stage 1, and what it was waiting for was a
+                ; producer for the substitution type rather than a chapter of its
+                ; own: getImpliedConstraint is eight lines.
+                let implied this.get_implied_constraint(t, AstNode.conditional_type_check_of(parent), AstNode.conditional_type_extends_of(parent))
+                if this.unported_mark() <> mark
+                    return null
+                if implied <> null
+                {
+                    if constraints = null
+                        set constraints: this.new_type_list(null) as ref[Array[ref[Type]?]]?
+                    (constraints as ref[Array[ref[Type]?]]).add(implied)
+                }
             }
-            if conditional_true = false
+            else
             {
                 if (t.flags & TypeFlagsTypeParameter) <> 0
                 {
                     if pk = KindMappedType
                     {
-                        ; ★★★ THE ARM IS TRANSCRIBED SINCE SLICE 125 AND ONLY THE
-                        ; APPEND STOPS, which is the header's own discipline
-                        ; applied one level deeper: the stop that stood here fired
-                        ; for EVERY mapped-type ancestor of a type parameter
-                        ; (118 events at stage 1), where the reference appends only
-                        ; for a homomorphic mapped type whose own variable is
-                        ; array-or-tuple constrained. What is left is
-                        ; getSubstitutionType, which has no producer here.
+                        ; ★★★ THE SECOND APPEND, AND IT IS `${number}`. The arm has
+                        ; been transcribed since slice 125 with only the append
+                        ; reporting; what it appends is the union of `number` and
+                        ; numericStringType, which is why that intrinsic is minted in
+                        ; this slice — a homomorphic mapped type over an array or
+                        ; tuple constrains its key to the two spellings of an index.
                         if AstNode.mapped_type_name_type_of(parent) = null
                         {
                             if AstNode.type_of(parent) = cur
                             {
-                                let mark this.unported_mark()
                                 let mapped_type this.get_type_from_type_node(parent)
                                 if this.unported_mark() <> mark
                                     return null
@@ -21589,8 +21756,17 @@ define Checker
                                         {
                                             if this.has_array_or_tuple_type_constraint(tv)
                                             {
-                                                this.record_unported("get-substitution-type", pk)
-                                                return null
+                                                if numeric_string_type = null
+                                                    return null
+                                                let index_union this.get_union_type_pair(number_type, numeric_string_type as ref[Type])
+                                                if this.unported_mark() <> mark
+                                                    return null
+                                                if index_union <> null
+                                                {
+                                                    if constraints = null
+                                                        set constraints: this.new_type_list(null) as ref[Array[ref[Type]?]]?
+                                                    (constraints as ref[Array[ref[Type]?]]).add(index_union)
+                                                }
                                             }
                                         }
                                     }
@@ -21602,7 +21778,65 @@ define Checker
             }
             set n: parent
         }
-        t
+        if constraints = null
+            return t
+        let list constraints as ref[Array[ref[Type]?]]
+        if (list.get_length() as int) = 0
+            return t
+        let inter this.get_intersection_type(list)
+        if this.unported_mark() <> mark
+            return null
+        if inter = null
+            return null
+        this.get_substitution_type(t, inter as ref[Type])
+    }
+
+    ; getImpliedConstraint and isUnaryTupleTypeNode (slice 136).
+    ;
+    ; ★★★ IT IS A TWO-ARM SWITCH AND THE FIRST ARM IS A RECURSION THROUGH A
+    ; ONE-ELEMENT TUPLE ON BOTH SIDES. `[T] extends [U] ? …` is how a conditional
+    ; is written when the author wants to defeat DISTRIBUTION, and the reference
+    ; unwraps both wrappers rather than treating the tuple as the checked type —
+    ; so the implied constraint of `T` inside such a conditional is `U`, exactly as
+    ; it is in the unwrapped spelling.
+    ;
+    ; ★ The second arm compares through get_actual_type_variable on BOTH sides,
+    ; which is what lets an already-substituted `T` still match its own check node.
+    function get_implied_constraint(this, t: ref[Type], check_node: ref[AstNode]?, extends_node: ref[AstNode]?) returns ref[Type]?
+    {
+        if check_node = null
+            return null
+        if extends_node = null
+            return null
+        let cn check_node as ref[AstNode]
+        let en extends_node as ref[AstNode]
+        if Checker.is_unary_tuple_type_node(cn)
+        {
+            if Checker.is_unary_tuple_type_node(en)
+                return this.get_implied_constraint(t, AstNode.child_in_list(AstNode.elements_of(cn), 0), AstNode.child_in_list(AstNode.elements_of(en), 0))
+        }
+        let mark this.unported_mark()
+        let checked this.get_type_from_type_node(cn)
+        if this.unported_mark() <> mark
+            return null
+        if checked = null
+            return null
+        let actual_checked this.get_actual_type_variable(checked as ref[Type])
+        if this.unported_mark() <> mark
+            return null
+        let actual_t this.get_actual_type_variable(t)
+        if this.unported_mark() <> mark
+            return null
+        if actual_checked <> actual_t
+            return null
+        this.get_type_from_type_node(en)
+    }
+
+    function is_unary_tuple_type_node(node: ref[AstNode]) returns bool
+    {
+        if AstNode.kind_of(node) <> KindTupleType
+            return false
+        AstNode.list_count(AstNode.elements_of(node)) = 1
     }
 
     ; ── the predicates this chapter needed ───────────────────────────────────
@@ -23234,6 +23468,312 @@ define Checker
         (c as ref[Type]) <> circular_constraint_type
     }
 
+    ; ── slice 136: getConstraintOfType and the CONDITIONAL's two constraints ──
+    ;
+    ; ★★★ THE DISPATCHER WAS MISSING WHILE ONE OF ITS FOUR ARMS HAD BEEN PORTED
+    ; SINCE SLICE 92. Every caller in the tree reached `getConstraintOfTypeParameter`
+    ; directly, which is right for a type parameter and silently wrong for the other
+    ; three inputs — an indexed access, a conditional and everything else answer
+    ; through arms nothing here could ask for.
+    function get_constraint_of_type(this, t: ref[Type]) returns ref[Type]?
+    {
+        if (t.flags & TypeFlagsTypeParameter) <> 0
+            return this.get_constraint_of_type_parameter(t)
+        if (t.flags & TypeFlagsIndexedAccess) <> 0
+            return this.get_constraint_of_indexed_access(t)
+        if (t.flags & TypeFlagsConditional) <> 0
+            return this.get_constraint_of_conditional_type(t)
+        this.get_base_constraint_of_type(t)
+    }
+
+    ; getConstraintOfIndexedAccess and getConstraintFromIndexedAccess.
+    ;
+    ; ★ The MAPPED-GENERIC arm reports rather than being written: it is
+    ; substituteIndexedMappedType, a chapter with a reverse mapper behind it, and
+    ; the guard in front of it (isMappedTypeGenericIndexedAccess) is written whole
+    ; so the report names the shape it is standing in for rather than the whole
+    ; function.
+    function get_constraint_of_indexed_access(this, t: ref[Type]) returns ref[Type]?
+    {
+        if this.has_non_circular_base_constraint(t) = false
+            return null
+        this.get_constraint_from_indexed_access(t)
+    }
+
+    function get_constraint_from_indexed_access(this, t: ref[Type]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let object_type Checker.indexed_access_object_type_of(t)
+        let index_type Checker.indexed_access_index_type_of(t)
+        if object_type = null
+            return null
+        if index_type = null
+            return null
+        let ot object_type as ref[Type]
+        let it index_type as ref[Type]
+        if this.is_mapped_type_generic_indexed_access(t)
+        {
+            this.record_unported("substitute-indexed-mapped-type", t.flags)
+            return null
+        }
+        let access_flags Checker.indexed_access_flags_of(t)
+        let index_constraint this.get_simplified_type_or_constraint(it)
+        if this.unported_mark() <> mark
+            return null
+        if index_constraint <> null
+        {
+            if (index_constraint as ref[Type]) <> it
+            {
+                let indexed_access this.get_indexed_access_type_or_undefined(ot, index_constraint as ref[Type], access_flags, null, null)
+                if this.unported_mark() <> mark
+                    return null
+                if indexed_access <> null
+                    return indexed_access
+            }
+        }
+        let object_constraint this.get_simplified_type_or_constraint(ot)
+        if this.unported_mark() <> mark
+            return null
+        if object_constraint <> null
+        {
+            if (object_constraint as ref[Type]) <> ot
+                return this.get_indexed_access_type_or_undefined(object_constraint as ref[Type], it, access_flags, null, null)
+        }
+        null
+    }
+
+    ; getSimplifiedTypeOrConstraint. ★It is the one caller of getSimplifiedType
+    ; whose fall-through is the constraint rather than the type, which is what makes
+    ; the pair mutually recursive: an indexed access's constraint asks its index's
+    ; simplification, and a failure to simplify asks that index's constraint.
+    function get_simplified_type_or_constraint(this, t: ref[Type]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let simplified this.get_simplified_type(t, false)
+        if this.unported_mark() <> mark
+            return null
+        if simplified <> null
+        {
+            if (simplified as ref[Type]) <> t
+                return simplified
+        }
+        this.get_constraint_of_type(t)
+    }
+
+    ; isMappedTypeGenericIndexedAccess — the guard in front of the arm above,
+    ; written whole so the report names a shape and not a function.
+    function is_mapped_type_generic_indexed_access(this, t: ref[Type]) returns bool
+    {
+        if (t.flags & TypeFlagsIndexedAccess) = 0
+            return false
+        let object_type Checker.indexed_access_object_type_of(t)
+        let index_type Checker.indexed_access_index_type_of(t)
+        if object_type = null
+            return false
+        if index_type = null
+            return false
+        let ot object_type as ref[Type]
+        if (ot.object_flags & ObjectFlagsMapped) = 0
+            return false
+        if Checker.is_generic_mapped_type(ot)
+            return false
+        if this.is_generic_index_type(index_type as ref[Type]) = false
+            return false
+        if (Checker.get_mapped_type_modifiers(ot) & MappedTypeModifiersExcludeOptional) <> 0
+            return false
+        let decl Checker.mapped_declaration_of(ot)
+        if decl = null
+            return false
+        AstNode.mapped_type_name_type_of(decl as ref[AstNode]) = null
+    }
+
+    ; getConstraintOfConditionalType, getConstraintFromConditionalType and the two
+    ; constraints a conditional has.
+    ;
+    ; ★★★ THE PAIR IS AN ORDER, NOT A CHOICE: the DISTRIBUTIVE constraint is asked
+    ; first and the DEFAULT one is the fallback, so `T extends undefined ? never : T`
+    ; answers the union with `undefined` removed rather than the union of the two
+    ; branches — which is the whole point of the distributive kludge the reference's
+    ; own comment apologises for.
+    function get_constraint_of_conditional_type(this, t: ref[Type]) returns ref[Type]?
+    {
+        if this.has_non_circular_base_constraint(t) = false
+            return null
+        this.get_constraint_from_conditional_type(t)
+    }
+
+    function get_constraint_from_conditional_type(this, t: ref[Type]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let distributive this.get_constraint_of_distributive_conditional_type(t)
+        if this.unported_mark() <> mark
+            return null
+        if distributive <> null
+            return distributive
+        this.get_default_constraint_of_conditional_type(t)
+    }
+
+    ; getDefaultConstraintOfConditionalType. ★★The `any` ELISION is the reference's
+    ; own comment and it is not a tidy-up: without it *"a conditional type with a
+    ; single branch of type `any` would be assignable to anything"*, so an `any`
+    ; branch is treated like `never` here and not like `unknown`.
+    function get_default_constraint_of_conditional_type(this, t: ref[Type]) returns ref[Type]?
+    {
+        let existing Checker.conditional_default_constraint_of(t)
+        if existing <> null
+            return existing
+        let mark this.unported_mark()
+        let true_constraint this.get_inferred_true_type_from_conditional_type(t)
+        if this.unported_mark() <> mark
+            return null
+        if true_constraint = null
+            return null
+        let false_constraint this.get_false_type_from_conditional_type(t)
+        if this.unported_mark() <> mark
+            return null
+        if false_constraint = null
+            return null
+        let tc true_constraint as ref[Type]
+        let fc false_constraint as ref[Type]
+        var answer: ref[Type]? null
+        if Checker.is_type_any(tc)
+            set answer: false_constraint
+        else
+        {
+            if Checker.is_type_any(fc)
+                set answer: true_constraint
+            else
+            {
+                set answer: this.get_union_type_pair(tc, fc)
+                if this.unported_mark() <> mark
+                    return null
+            }
+        }
+        if answer = null
+            return null
+        Checker.set_conditional_default_constraint(t, answer)
+        answer
+    }
+
+    ; getInferredTrueTypeFromConditionalType — the true branch instantiated with the
+    ; COMBINED mapper where there is one, which is the inference context's answer for
+    ; an `infer T` in the extends position.
+    function get_inferred_true_type_from_conditional_type(this, t: ref[Type]) returns ref[Type]?
+    {
+        let existing Checker.conditional_inferred_true_type_of(t)
+        if existing <> null
+            return existing
+        let combined Checker.conditional_combined_mapper_of(t)
+        if combined = null
+        {
+            let plain this.get_true_type_from_conditional_type(t)
+            if plain = null
+                return null
+            Checker.set_conditional_inferred_true_type(t, plain)
+            return plain
+        }
+        let mark this.unported_mark()
+        let root Checker.conditional_root_of(t)
+        if root = null
+            return null
+        let tn AstNode.conditional_type_true_of((root as ref[ConditionalRoot]).node)
+        if tn = null
+            return null
+        let written this.get_type_from_type_node(tn as ref[AstNode])
+        if this.unported_mark() <> mark
+            return null
+        if written = null
+            return null
+        let inst this.instantiate_type(written as ref[Type], combined)
+        if this.unported_mark() <> mark
+            return null
+        if inst = null
+            return null
+        Checker.set_conditional_inferred_true_type(t, inst)
+        inst
+    }
+
+    ; getConstraintOfDistributiveConditionalType.
+    ;
+    ; ★★★ `noConstraintType` IS THE THIRD STATE AND IT IS LOAD-BEARING. The memo
+    ; means three things — *not asked* (null), *asked, no constraint*
+    ; (noConstraintType) and *asked, here it is* — and collapsing the middle one
+    ; into null would recompute a distributive constraint on every ask, which is a
+    ; conditional-type instantiation each time.
+    ;
+    ; ★ The RESTRICTIVE-INSTANTIATION guard is the reference's own and its comment
+    ; says why: for such an instantiation every type parameter has been replaced with
+    ; `unknown`, so a distributive constraint there *"is going to produce even more
+    ; false positive/negative results than the distribute constraint already does"*.
+    function get_constraint_of_distributive_conditional_type(this, t: ref[Type]) returns ref[Type]?
+    {
+        let existing Checker.conditional_distributive_constraint_of(t)
+        if existing <> null
+        {
+            if (existing as ref[Type]) = no_constraint_type
+                return null
+            return existing
+        }
+        let mark this.unported_mark()
+        let root Checker.conditional_root_of(t)
+        if root = null
+            return null
+        let r root as ref[ConditionalRoot]
+        let check_type Checker.conditional_check_type_of(t)
+        if check_type = null
+            return null
+        let ct check_type as ref[Type]
+        var answer: ref[Type]? null
+        ; ★★★ THE SECOND HALF OF THE REFERENCE'S GUARD IS CONSTANT HERE AND IS
+        ; SPELLED AS ONE. Upstream it reads
+        ; `c.cachedTypes[{RestrictiveInstantiation, t.id}] != t`, which asks whether
+        ; THIS type is its own restrictive instantiation; `getRestrictiveInstantiation`
+        ; has no port, so nothing ever writes that row, the lookup is nil for every
+        ; type and the disjunct is TRUE. It is written as a comment rather than as a
+        ; branch on a table that does not exist, on the same rule create_widening_type
+        ; follows for an option spelled as a constant — and the day the restrictive
+        ; instantiation lands, this is the line that has to move with it.
+        if r.is_distributive
+        {
+            {
+                let simplified this.get_simplified_type(ct, false)
+                if this.unported_mark() <> mark
+                    return null
+                if simplified = null
+                    return null
+                var constraint simplified
+                if (simplified as ref[Type]) = ct
+                {
+                    set constraint: this.get_constraint_of_type(ct)
+                    if this.unported_mark() <> mark
+                        return null
+                }
+                if constraint <> null
+                {
+                    if (constraint as ref[Type]) <> ct
+                    {
+                        let mapper this.prepend_type_mapping(r.check_type, constraint as ref[Type], Checker.conditional_mapper_of(t))
+                        let instantiated this.get_conditional_type_instantiation(t, mapper, true, null)
+                        if this.unported_mark() <> mark
+                            return null
+                        if instantiated <> null
+                        {
+                            if ((instantiated as ref[Type]).flags & TypeFlagsNever) = 0
+                                set answer: instantiated
+                        }
+                    }
+                }
+            }
+        }
+        if answer = null
+        {
+            Checker.set_conditional_distributive_constraint(t, no_constraint_type)
+            return null
+        }
+        Checker.set_conditional_distributive_constraint(t, answer)
+        answer
+    }
+
     ; getConstraintFromTypeParameter, whole but for the `tp.target` path, which is
     ; the INSTANTIATED type parameter's: it needs instantiateType and a `target`
     ; slot TypeParameterTypeData does not carry, and nothing here instantiates
@@ -23397,45 +23937,275 @@ define Checker
         null
     }
 
-    ; getInferredTypeParameterConstraint, as its GUARD. The whole body sits inside
-    ; `if ast.IsInferTypeNode(declaration.Parent)`, so a type parameter that is not
-    ; an `infer T` collects no inferences and the function answers nil — which is
-    ; the answer for every type parameter that has no constraint declaration, i.e.
-    ; for the overwhelming majority of the calls that reach here.
+    ; getInferredTypeParameterConstraint, WHOLE (slice 136).
     ;
-    ; ★ The five inference arms behind the guard need getIntersectionType,
+    ; ★★★ THE NOTE THAT STOOD HERE WAS A LIST OF DIMENSIONS THAT HAD ALL LANDED.
+    ; It read: *"the five inference arms behind the guard need getIntersectionType,
     ; stringNumberSymbolType, createArrayType, getTypeParametersForTypeReferenceOr
     ; Import and instantiateType — four dimensions between them — so the guard is
-    ; where the stop goes and the arms are not written at all.
+    ; where the stop goes and the arms are not written at all."* The intersection
+    ; arrived in slice 121, stringNumberSymbolType with it, the instantiation in 125,
+    ; and getTypeParametersForTypeReferenceOrImport has been beside this function all
+    ; along. Nothing re-read the sentence and the stop was 20 units at stage 1.
     ;
-    ; ★ `omitTypeReferences` is the reference's second parameter and its only
-    ; caller here passes false; it is not written, because a parameter no branch
-    ; reads is a claim about a body this port does not have (§3.5ar).
+    ; ★★★ WHAT `infer T` MEANS IS THE WHOLE FUNCTION: an `infer` type parameter has
+    ; no constraint of its own, so its constraint is INFERRED from the POSITION it
+    ; stands in. `Foo<infer T>` takes it from Foo's own parameter; a rest position
+    ; makes it `unknown[]`; a template-literal span makes it `string`; a mapped
+    ; type's key makes it `string | number | symbol`. Several declarations of one
+    ; `infer T` intersect.
+    ;
+    ; ★ `omitTypeReferences` is the reference's second parameter and its only caller
+    ; passes false; it stays unwritten under §3.5ar, and the arm it guards is written
+    ; as if it were false — which is what that caller asks for.
     function get_inferred_type_parameter_constraint(this, t: ref[Type]) returns ref[Type]?
     {
         if t.symbol = null
             return null
+        let mark this.unported_mark()
         let sym t.symbol as ref[Symbol]
+        var inferences: ref[Array[ref[Type]?]]? null
         let n Symbol.declaration_count(sym)
         var i 0
         while i < n
         {
             let d Symbol.declaration_at(sym, i)
-            if d <> null
+            set i: i + 1
+            if d = null
+                continue
+            let decl d as ref[AstNode]
+            let dp AstNode.parent_node_of(decl)
+            if dp = null
+                continue
+            if AstNode.kind_of(dp as ref[AstNode]) <> KindInferType
+                continue
+            ; "When an 'infer T' declaration is immediately contained in a type
+            ; reference node (such as 'Foo<infer T>'), T's constraint is inferred
+            ; from the constraint of the corresponding type parameter in 'Foo'. When
+            ; multiple 'infer T' declarations are present, we form an intersection of
+            ; the inferred constraint types."
+            var child dp as ref[AstNode]
+            var parent_opt AstNode.parent_node_of(child)
+            while parent_opt <> null
             {
-                let p AstNode.parent_node_of(d as ref[AstNode])
-                if p <> null
+                if AstNode.kind_of(parent_opt as ref[AstNode]) <> KindParenthesizedType
+                    break
+                set child: parent_opt as ref[AstNode]
+                set parent_opt: AstNode.parent_node_of(child)
+            }
+            if parent_opt = null
+                continue
+            let parent parent_opt as ref[AstNode]
+            let pk AstNode.kind_of(parent)
+            var inferred: ref[Type]? null
+            if pk = KindTypeReference
+            {
+                let type_parameters this.get_type_parameters_for_type_reference_or_import(parent)
+                if this.unported_mark() <> mark
+                    return null
+                if type_parameters <> null
                 {
-                    if AstNode.kind_of(p as ref[AstNode]) = KindInferType
+                    let tps type_parameters as ref[Array[ref[Type]?]]
+                    let index Checker.index_in_list(AstNode.type_arguments_of(parent), child)
+                    if index >= 0
                     {
-                        this.record_unported("get-inferred-type-parameter-constraint", KindInferType)
-                        return null
+                        if index < (tps.get_length() as int)
+                        {
+                            let slot tps[index]
+                            if slot <> null
+                            {
+                                let declared_constraint this.get_constraint_of_type_parameter(slot as ref[Type])
+                                if this.unported_mark() <> mark
+                                    return null
+                                if declared_constraint <> null
+                                {
+                                    ; "Type parameter constraints can reference other
+                                    ; type parameters so constraints need to be
+                                    ; instantiated. If instantiation produces the type
+                                    ; parameter itself, we discard that inference. For
+                                    ; example, in
+                                    ;   type Foo<T extends string, U extends T> = [T, U];
+                                    ;   type Bar<T> = T extends Foo<infer X, infer X> ? Foo<X, X> : T;
+                                    ; the instantiated constraint for U is X, so we
+                                    ; discard that inference."
+                                    let mapper this.new_deferred_type_mapper(tps, parent)
+                                    let instantiated this.instantiate_type(declared_constraint as ref[Type], mapper as ref[TypeMapper]?)
+                                    if this.unported_mark() <> mark
+                                        return null
+                                    if instantiated <> null
+                                    {
+                                        if (instantiated as ref[Type]) <> t
+                                            set inferred: instantiated
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
-            set i: i + 1
+            else
+            {
+                ; The REST arm — three spellings of the same position, and each
+                ; denotes `unknown[]`.
+                var is_rest false
+                if pk = KindParameter
+                {
+                    if AstNode.dot_dot_dot_token_of(parent) <> null
+                        set is_rest: true
+                }
+                if pk = KindRestType
+                    set is_rest: true
+                if pk = KindNamedTupleMember
+                {
+                    if AstNode.dot_dot_dot_token_of(parent) <> null
+                        set is_rest: true
+                }
+                if is_rest
+                {
+                    set inferred: this.create_array_type(unknown_type)
+                    if this.unported_mark() <> mark
+                        return null
+                }
+                else
+                {
+                    if pk = KindTemplateLiteralTypeSpan
+                        set inferred: string_type
+                    else
+                    {
+                        ; A type parameter DECLARATION whose own parent is a mapped
+                        ; type — the `[P in K]` position — is constrained to the three
+                        ; key types.
+                        var is_mapped_key false
+                        if pk = KindTypeParameter
+                        {
+                            let gp AstNode.parent_node_of(parent)
+                            if gp <> null
+                            {
+                                if AstNode.kind_of(gp as ref[AstNode]) = KindMappedType
+                                    set is_mapped_key: true
+                            }
+                        }
+                        if is_mapped_key
+                            set inferred: string_number_symbol_type
+                        else
+                        {
+                            ; ★★★ THE FIFTH ARM IS THE HOMOMORPHIC-MAPPED-TYPE ONE and
+                            ; its guard is seven conjuncts deep: an `infer` inside a
+                            ; mapped type that is itself the EXTENDS side of a
+                            ; conditional whose CHECK side is another mapped type. What
+                            ; it denotes is the check side's own template, instantiated
+                            ; so that the check mapped type's key stands for this one's.
+                            if pk = KindMappedType
+                            {
+                                let mapped_body AstNode.type_of(parent)
+                                if mapped_body <> null
+                                {
+                                    if Checker.skip_type_parentheses(mapped_body) = dp
+                                    {
+                                        let gp AstNode.parent_node_of(parent)
+                                        if gp <> null
+                                        {
+                                            let grand gp as ref[AstNode]
+                                            if AstNode.kind_of(grand) = KindConditionalType
+                                            {
+                                                if AstNode.conditional_type_extends_of(grand) = parent
+                                                {
+                                                    let check_node AstNode.conditional_type_check_of(grand)
+                                                    if check_node <> null
+                                                    {
+                                                        let cn check_node as ref[AstNode]
+                                                        if AstNode.kind_of(cn) = KindMappedType
+                                                        {
+                                                            let check_body AstNode.type_of(cn)
+                                                            if check_body <> null
+                                                            {
+                                                                set inferred: this.infer_constraint_from_check_mapped_type(cn, check_body as ref[AstNode])
+                                                                if this.unported_mark() <> mark
+                                                                    return null
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if inferred <> null
+            {
+                if inferences = null
+                    set inferences: this.new_type_list(null) as ref[Array[ref[Type]?]]?
+                (inferences as ref[Array[ref[Type]?]]).add(inferred)
+            }
         }
-        null
+        if inferences = null
+            return null
+        let list inferences as ref[Array[ref[Type]?]]
+        if (list.get_length() as int) = 0
+            return null
+        this.get_intersection_type(list)
+    }
+
+    ; The body of the fifth arm above, lifted out for the s178 alloca-pool rule —
+    ; a new check inside a function this large must be ONE statement calling a
+    ; helper, and the arm needs four locals of its own.
+    function infer_constraint_from_check_mapped_type(this, check_mapped_type: ref[AstNode], check_body: ref[AstNode]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let node_type this.get_type_from_type_node(check_body)
+        if this.unported_mark() <> mark
+            return null
+        if node_type = null
+            return null
+        let tp_node AstNode.mapped_type_parameter_of(check_mapped_type)
+        if tp_node = null
+            return null
+        let tpn tp_node as ref[AstNode]
+        let sym this.get_symbol_of_declaration(tpn)
+        if this.unported_mark() <> mark
+            return null
+        if sym = null
+            return null
+        let source this.get_declared_type_of_type_parameter(sym as ref[Symbol])
+        if this.unported_mark() <> mark
+            return null
+        if source = null
+            return null
+        ; `core.IfElse(constraint != nil, getTypeFromTypeNode(constraint), stringNumberSymbolType)`
+        var target: ref[Type]? string_number_symbol_type
+        let constraint_node AstNode.type_parameter_constraint_of(tpn)
+        if constraint_node <> null
+        {
+            set target: this.get_type_from_type_node(constraint_node as ref[AstNode])
+            if this.unported_mark() <> mark
+                return null
+        }
+        if target = null
+            return null
+        let mapper this.new_simple_type_mapper(source, target)
+        this.instantiate_type(node_type as ref[Type], mapper as ref[TypeMapper]?)
+    }
+
+    ; getEffectiveTypeArgumentAtIndex — the i-th WRITTEN type argument, or the i-th
+    ; of the effective list once the defaults have been filled in.
+    function get_effective_type_argument_at_index(this, node: ref[AstNode], type_parameters: ref[Array[ref[Type]?]], index: int) returns ref[Type]?
+    {
+        let written AstNode.type_arguments_of(node)
+        if index < AstNode.list_count(written)
+            return this.get_type_from_type_node(AstNode.child_in_list(written, index) as ref[AstNode])
+        let effective this.get_effective_type_arguments(node, type_parameters)
+        if effective = null
+            return null
+        let list effective as ref[Array[ref[Type]?]]
+        if index < 0
+            return null
+        if index >= (list.get_length() as int)
+            return null
+        list[index]
     }
 
     ; isErrorType. ★★★ THE SECOND DISJUNCT IS WRITTEN IN SLICE 114 AND THE NOTE
@@ -26296,6 +27066,16 @@ define Checker
         null
     }
 
+    ; d.combinedMapper — the inference context's mapper merged with the caller's,
+    ; which a conditional carries only when its extends clause has an `infer`.
+    function conditional_combined_mapper_of(t: ref[Type]) returns ref[TypeMapper]?
+    {
+        choose t.data
+            when d: Conditional
+                return d.combined_mapper
+        null
+    }
+
     function conditional_mapper_of(t: ref[Type]) returns ref[TypeMapper]?
     {
         choose t.data
@@ -26313,6 +27093,64 @@ define Checker
             {
                 var d c
                 set d.resolved_true_type: v
+                set t.data: TypeData.Conditional(d)
+            }
+    }
+
+    ; The three constraint memos of slice 136, in the shape the two above use.
+    function conditional_default_constraint_of(t: ref[Type]) returns ref[Type]?
+    {
+        choose t.data
+            when d: Conditional
+                return d.resolved_default_constraint
+        null
+    }
+
+    procedure set_conditional_default_constraint(t: ref[Type], v: ref[Type]?)
+    {
+        choose t.data
+            when c: Conditional
+            {
+                var d c
+                set d.resolved_default_constraint: v
+                set t.data: TypeData.Conditional(d)
+            }
+    }
+
+    function conditional_distributive_constraint_of(t: ref[Type]) returns ref[Type]?
+    {
+        choose t.data
+            when d: Conditional
+                return d.resolved_constraint_of_distributive
+        null
+    }
+
+    procedure set_conditional_distributive_constraint(t: ref[Type], v: ref[Type]?)
+    {
+        choose t.data
+            when c: Conditional
+            {
+                var d c
+                set d.resolved_constraint_of_distributive: v
+                set t.data: TypeData.Conditional(d)
+            }
+    }
+
+    function conditional_inferred_true_type_of(t: ref[Type]) returns ref[Type]?
+    {
+        choose t.data
+            when d: Conditional
+                return d.resolved_inferred_true_type
+        null
+    }
+
+    procedure set_conditional_inferred_true_type(t: ref[Type], v: ref[Type]?)
+    {
+        choose t.data
+            when c: Conditional
+            {
+                var d c
+                set d.resolved_inferred_true_type: v
                 set t.data: TypeData.Conditional(d)
             }
     }
@@ -26369,14 +27207,24 @@ define Checker
             return null
         if reduced <> null
             set t: reduced as ref[Type]
-        ; ★ isNoInferType needs a SUBSTITUTION type, whose only producers are the
-        ; conditional's true branch and `NoInfer<T>` itself — neither reachable
-        ; before those land — so this arm is a gate with a report rather than a
-        ; branch, on this file's rule for an inert arm.
-        if (t.flags & TypeFlagsSubstitution) <> 0
+        ; ★★★ THE NO-INFER ARM IS LIVE SINCE SLICE 136, AND THE NOTE THAT STOOD
+        ; HERE NAMED THE DAY: it read *"isNoInferType needs a SUBSTITUTION type,
+        ; whose only producers are the conditional's true branch and `NoInfer<T>`
+        ; itself — neither reachable before those land"*. The conditional's true
+        ; branch is get_conditional_flow_type_of_type and it mints one now.
+        ;
+        ; ★ It is asked on `is_no_infer_type` and not on the SUBSTITUTION FLAG: a
+        ; substitution type whose constraint is not `unknown` is not a NoInfer and
+        ; falls through to should_defer_index_type like any other instantiable.
+        if Checker.is_no_infer_type(t)
         {
-            this.record_unported("get-index-type-no-infer", t.flags)
-            return null
+            let base Checker.substitution_base_type_of(t)
+            if base = null
+                return null
+            let inner this.get_index_type_ex(base as ref[Type], index_flags)
+            if inner = null
+                return null
+            return this.get_no_infer_type(inner as ref[Type])
         }
         if this.should_defer_index_type(t, index_flags)
             return this.get_index_type_for_generic_type(t, index_flags)
@@ -28001,20 +28849,61 @@ define Checker
             let check_type_deferred this.is_deferred_type(ct, check_tuples)
             if this.unported_mark() <> mark
                 return null
-            ; ★ THE INFERENCE CONTEXT. `infer T` in the extends position makes the
-            ; conditional carry a COMBINED mapper, built out of a fresh inference
-            ; context and the caller's mapper — which is newInferenceContext,
-            ; inferTypes and combineTypeMappers, i.e. the inference dimension.
+            ; ★★★ THE INFERENCE CONTEXT, SLICE 136, AND ITS NOTE NAMED THE
+            ; DIMENSION IT WAS WAITING FOR: *"newInferenceContext, inferTypes and
+            ; combineTypeMappers, i.e. the inference dimension"*. `inference.go`
+            ; landed WHOLE in slice 122 — the context lifecycle and its four mappers
+            ; included — and the stop stood for thirteen slices after it.
+            ;
+            ; ★★★ THE ORDER OF THE COMBINED MAPPER IS THE REFERENCE'S OWN AND IT IS
+            ; LOAD-BEARING: `combineTypeMappers(context.mapper, mapper)`, the
+            ; INFERENCE mapper first. Its comment says why — *"it's possible for
+            ; 'infer T' type parameters to be given uninstantiated constraints when
+            ; those type parameters are used in type references (see
+            ; getInferredTypeParameterConstraint)"* — which is exactly the arm this
+            ; same slice writes, so the two are one mechanism read from two ends.
+            ;
+            ; ★ The nonFixingMapper is combined the OTHER way round
+            ; (`context.nonFixingMapper` then `mapper`), because a constraint asked
+            ; through it must be instantiated in the CALLER's context and not only in
+            ; the inference's.
+            var combined_mapper: ref[TypeMapper]? null
             if root.infer_type_parameters <> null
             {
-                if ((root.infer_type_parameters as ref[Array[ref[Type]?]]).get_length() as int) <> 0
+                let infer_tps root.infer_type_parameters as ref[Array[ref[Type]?]]
+                if (infer_tps.get_length() as int) <> 0
                 {
-                    this.record_unported("conditional-type-infer-context", 0)
-                    return null
+                    let context this.new_inference_context(infer_tps, null, InferenceFlagsNone, CompareKindAssignable)
+                    if mapper <> null
+                        set context.non_fixing_mapper: this.merge_type_mappers(context.non_fixing_mapper, mapper)
+                    if check_type_deferred = false
+                    {
+                        ; "We don't want inferences from constraints as they may
+                        ; cause us to eagerly resolve the conditional type instead of
+                        ; deferring resolution. Also, we always want strict function
+                        ; types rules (i.e. proper contravariance) for inferences."
+                        this.infer_types(context.inferences, ct, et, InferencePriorityNoConstraints | InferencePriorityAlwaysStrict, false)
+                        if this.unported_mark() <> mark
+                            return null
+                    }
+                    if mapper <> null
+                        set combined_mapper: this.merge_type_mappers(context.mapper, mapper)
+                    else
+                        set combined_mapper: context.mapper
                 }
             }
-            ; combinedMapper is null here, so inferredExtendsType is extendsType.
-            let inferred_extends_type et
+            ; "Instantiate the extends type including inferences for 'infer T' type
+            ; parameters."
+            var inferred_extends_type et
+            if combined_mapper <> null
+            {
+                let inst this.instantiate_type(root.extends_type, combined_mapper)
+                if this.unported_mark() <> mark
+                    return null
+                if inst = null
+                    return null
+                set inferred_extends_type: inst as ref[Type]
+            }
             if check_type_deferred = false
             {
                 if this.is_deferred_type(inferred_extends_type, check_tuples) = false
@@ -28026,8 +28915,11 @@ define Checker
                     return null
                 }
             }
-            ; The deferred answer.
-            let made this.new_conditional_type(root, mapper, null)
+            ; The deferred answer. ★It carries the COMBINED mapper now, which is
+            ; what get_inferred_true_type_from_conditional_type reads: the true branch
+            ; of a deferred `T extends Foo<infer U> ? U : never` must be instantiated
+            ; with the inference, not with the caller's mapper alone.
+            let made this.new_conditional_type(root, mapper, combined_mapper)
             if made = null
                 return null
             let result made as ref[Type]
@@ -28101,7 +28993,7 @@ define Checker
         let et this.instantiate_type(root.extends_type, mapper)
         if this.unported_mark() <> mark
             return null
-        this.new_type(TypeFlagsConditional, ObjectFlagsNone, null, TypeData.Conditional(ConditionalTypeData(root, ct, et, null, null, mapper, combined_mapper)))
+        this.new_type(TypeFlagsConditional, ObjectFlagsNone, null, TypeData.Conditional(ConditionalTypeData(root, ct, et, null, null, null, null, null, mapper, combined_mapper)))
     }
 
     ; instantiateTypeAlias — `alias` mapped through the mapper, which for a null
@@ -28599,6 +29491,20 @@ define Checker
         sns.add(number_type)
         sns.add(es_symbol_type)
         set string_number_symbol_type: this.get_union_type(sns)
+        ; ★★★ c.numericStringType, SLICE 136, AND THE NOTE ABOVE NAMED ITS OWN
+        ; EXPIRY TWICE: this line was *"a second reason the same line is not
+        ; written"* because it *"needs getTemplateLiteralType"*, and
+        ; is_applicable_index_type's own note said *"no template-literal type is
+        ; minted anywhere in this port … the day one is, this line and that one move
+        ; together"*. get_template_literal_type has been here since slice 126. Both
+        ; readers land with it, so the field arrives under the same rule the three
+        ; unminted intrinsic unions are still held by, not as an exception to it.
+        let nst_texts this.new_string_list()
+        nst_texts.add(this.empty_string())
+        nst_texts.add(this.empty_string())
+        let nst_types this.new_type_list(null)
+        nst_types.add(number_type)
+        set numeric_string_type: this.get_template_literal_type(nst_texts, nst_types)
         ;
         ; ★ The remaining absence shifts the type IDS of everything below by four
         ; against the reference's numbering and nothing observes that — the dump
@@ -54423,12 +55329,22 @@ define Checker
         (Symbol.flags_of(symbol as ref[Symbol]) & SymbolFlagsEnum) <> 0
     }
 
-    ; isConstTypeVariable. ★★ Its FIRST arm is the whole function on this corpus —
-    ; a `const` type parameter — and the five behind it are reached only through a
-    ; contextual type that is a union, an indexed access, a conditional, a
+    ; isConstTypeVariable.
+    ;
+    ; ★★★ ITS FIVE REMAINING ARMS ARE ONE LINE EACH AND THE NOTE THAT STOOD HERE
+    ; CALLED THEM FIVE CHAPTERS. It read *"the five behind it are reached only
+    ; through a contextual type that is a union, an indexed access, a conditional, a
     ; substitution or a mapped type. Each of those five is a chapter and each
-    ; reports; the DEPTH guard is written above them because it is what makes the
-    ; recursion terminate and it must not become a property of which arms exist.
+    ; reports"* — which described where the ARRIVALS come from, not what the arms
+    ; need: every one of them is a recursion into this same function through an
+    ; accessor that has been here for slices, and the union arm alone was 15 units
+    ; on the stage-1 frontier.
+    ;
+    ; ★ The DEPTH argument is not uniform and that is the reference's own: the
+    ; union/intersection, substitution and mapped arms recurse at the SAME depth
+    ; (they are re-spellings of one type variable), while the indexed access and the
+    ; conditional recurse one level DEEPER, because each is a step through a real
+    ; type constructor.
     function is_const_type_variable(this, t: ref[Type]?, depth: int) returns bool
     {
         if depth >= 5
@@ -54457,31 +55373,69 @@ define Checker
         }
         if (ty.flags & TypeFlagsUnionOrIntersection) <> 0
         {
-            this.record_unported("is-const-type-variable-union", 0)
+            let types Checker.union_or_intersection_types_of(ty)
+            if types = null
+                return false
+            let list types as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            var i 0
+            while i < n
+            {
+                let e list[i]
+                set i: i + 1
+                if this.is_const_type_variable(e, depth)
+                    return true
+            }
             return false
         }
         if (ty.flags & TypeFlagsIndexedAccess) <> 0
-        {
-            this.record_unported("is-const-type-variable-indexed-access", 0)
-            return false
-        }
+            return this.is_const_type_variable(Checker.indexed_access_object_type_of(ty), depth + 1)
         if (ty.flags & TypeFlagsConditional) <> 0
         {
-            this.record_unported("is-const-type-variable-conditional", 0)
-            return false
+            let mark this.unported_mark()
+            let constraint this.get_constraint_of_conditional_type(ty)
+            if this.unported_mark() <> mark
+                return false
+            return this.is_const_type_variable(constraint, depth + 1)
         }
         if (ty.flags & TypeFlagsSubstitution) <> 0
-        {
-            this.record_unported("is-const-type-variable-substitution", 0)
-            return false
-        }
+            return this.is_const_type_variable(Checker.substitution_base_type_of(ty), depth)
         if (ty.object_flags & ObjectFlagsMapped) <> 0
         {
-            this.record_unported("is-const-type-variable-mapped", 0)
-            return false
+            let mark this.unported_mark()
+            let type_variable this.get_homomorphic_type_variable(ty)
+            if this.unported_mark() <> mark
+                return false
+            return this.is_const_type_variable(type_variable, depth)
         }
-        ; isGenericTupleType — the tuple chapter, whose constructor this port does
-        ; not have at all (new_object_type's tuple arm reports).
+        ; `case c.isGenericTupleType(t)` — the variadic elements of a generic tuple,
+        ; each asked at the SAME depth. It reads the target tuple's elementInfos,
+        ; which this port carries on the TupleTarget, so it is written whole.
+        if Checker.is_generic_tuple_type(ty)
+        {
+            ; ★ The element flags come off the TARGET (`t.TargetTupleType()`), not
+            ; off `t`: the tuple type in hand is a REFERENCE, and only its target
+            ; carries the elementInfos.
+            let target Checker.target_of(ty)
+            if target = null
+                return false
+            let elements this.get_element_types(ty)
+            if elements = null
+                return false
+            let list elements as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            var i 0
+            while i < n
+            {
+                let e list[i]
+                let flags Checker.tuple_element_flags_at(target as ref[Type], i)
+                set i: i + 1
+                if (flags & ElementFlagsVariadic) = 0
+                    continue
+                if this.is_const_type_variable(e, depth)
+                    return true
+            }
+        }
         false
     }
 
@@ -70540,20 +71494,22 @@ define Checker
             {
                 if (type_parameters as ref[Array[ref[Type]?]]).get_length() <> 0
                 {
-                    ; checkTypeArgumentConstraints — getEffectiveTypeArguments, a
-                    ; mapper per parameter and checkTypeAssignableTo, which is the
-                    ; work list's own largest row. The constraint is asked FIRST
-                    ; upstream and the whole body is behind it, so a generic with
-                    ; no constrained parameter passes through here silently; the
-                    ; stop is written where the reference's loop first needs an
-                    ; answer it cannot get.
-                    if this.type_parameters_have_a_constraint(type_parameters as ref[Array[ref[Type]?]])
-                    {
-                        if this.unported_mark() <> mark
-                            return
-                        this.record_unported("check-type-argument-constraints", 0)
-                        return
-                    }
+                    ; ★★★ checkTypeArgumentConstraints IS CALLED HERE SINCE SLICE
+                    ; 136, AND THE CALLEE HAD BEEN PORTED SINCE SLICE 124 — it sits
+                    ; 1 700 lines up this file and the CLASS chapter's heritage arm
+                    ; has been calling it all along. The note that stood here named
+                    ; the three things it *"needs"* — getEffectiveTypeArguments, a
+                    ; mapper per parameter and checkTypeAssignableTo — and all three
+                    ; came with the callee; nobody re-read the stop after writing it.
+                    ; §3.5dk's shape exactly, and it is the second time this slice
+                    ; family has found one.
+                    ;
+                    ; ★ The `type_parameters_have_a_constraint` pre-pass GOES, rather
+                    ; than being kept as a fast path: it was the STOP's guard, asked
+                    ; once for the whole list to keep the report off an unconstrained
+                    ; generic, and the reference's own loop already skips a parameter
+                    ; with no constraint.
+                    this.check_type_argument_constraints(node, type_parameters as ref[Array[ref[Type]?]])
                     if this.unported_mark() <> mark
                         return
                 }
@@ -70704,10 +71660,27 @@ define Checker
         if symbol = null
             return null
         let s symbol as ref[Symbol]
+        ; ★★★ THE ALIAS ARM IS TWO LINES AND ITS STOP WAS THE LARGEST ROW OF THE
+        ; STAGE-1 FRONTIER BY UNITS (23). The note that stood here predicted its own
+        ; expiry in as many words: *"typeAliasLinks.typeParameters … this port does
+        ; not carry — and it cannot be reached from here anyway, because a type alias
+        ; reference stops one chapter earlier … the day the alias chapter lands, this
+        ; arm has input"*. The alias chapter landed in slice 105 and the slot has been
+        ; on TypeAliasLink since; nothing re-read the line.
+        ;
+        ; ★ `len(typeParameters) != 0` and not merely non-nil: an alias with no type
+        ; parameters falls THROUGH to the ObjectFlagsReference arm below rather than
+        ; answering an empty list, which is the reference's own `if` and not a
+        ; tidy-up.
         if (Symbol.flags_of(s) & SymbolFlagsTypeAlias) <> 0
         {
-            this.record_unported("type-alias-type-parameters", 0)
-            return null
+            let link this.type_alias_link_of(s)
+            let tps link.type_parameters
+            if tps <> null
+            {
+                if ((tps as ref[Array[ref[Type]?]]).get_length() as int) <> 0
+                    return tps
+            }
         }
         if (ty.object_flags & ObjectFlagsReference) <> 0
         {
@@ -76774,6 +77747,23 @@ define Checker
                 }
                 return t
             }
+            when df: Deferred
+            {
+                if df.sources = null
+                    return t
+                if df.node = null
+                    return t
+                let src df.sources as ref[Array[ref[Type]?]]
+                let n src.get_length() as int
+                var i 0
+                while i < n
+                {
+                    if src[i] = t
+                        return this.get_effective_type_argument_at_index(df.node as ref[AstNode], src, i)
+                    set i: i + 1
+                }
+                return t
+            }
             when mg: Merged
             {
                 if mg.m1 = null
@@ -77261,9 +78251,56 @@ define Checker
             let combined this.merge_type_mappers(Checker.conditional_mapper_of(t), m)
             return this.get_conditional_type_instantiation(t, combined, false, alias)
         }
+        ; ★★★ THE SUBSTITUTION ARM, SLICE 136, AND THE HEADER ABOVE NAMED ITS
+        ; EXPIRY: it called this *"a genuine unreachable rather than a wall"*
+        ; because *"nothing in this port mints a substitution type —
+        ; getSubstitutionType has no caller here"*. Both halves fell in one slice:
+        ; get_conditional_flow_type_of_type now calls get_substitution_type, and a
+        ; substitution reaching instantiation is the ORDINARY consequence, since the
+        ; type originates in a conditional's true branch and every use of that branch
+        ; instantiates it.
+        ;
+        ; ★★★ ONE DISJUNCT OF THE THIRD TEST IS STILL A WALL AND IT IS REPORTED
+        ; RATHER THAN ANSWERED FALSE. `isTypeAssignableTo(restrictive(base),
+        ; restrictive(constraint))` needs getRestrictiveInstantiation, whose mapper is
+        ; a FUNCTION type mapper this port has no arm for; reading it as false would
+        ; not stop the walk, it would take the two branches BELOW it — a substitution
+        ; type or an intersection where the reference answers the base type — which is
+        ; a wrong answer at rc 0 rather than a missing one.
         if (t.flags & TypeFlagsSubstitution) <> 0
         {
-            this.record_unported("instantiate-substitution-type", t.flags)
+            let base Checker.substitution_base_type_of(t)
+            if base = null
+                return null
+            let new_base this.instantiate_type(base as ref[Type], m)
+            if this.unported_mark() <> mark
+                return null
+            if new_base = null
+                return null
+            let nb new_base as ref[Type]
+            if Checker.is_no_infer_type(t)
+                return this.get_no_infer_type(nb)
+            let constraint Checker.substitution_constraint_of(t)
+            if constraint = null
+                return null
+            let new_constraint this.instantiate_type(constraint as ref[Type], m)
+            if this.unported_mark() <> mark
+                return null
+            if new_constraint = null
+                return null
+            let nc new_constraint as ref[Type]
+            ; "A substitution type originates in the true branch of a conditional
+            ; type and can be resolved to just the base type in the same cases as the
+            ; conditional type resolves to its true branch (because the base type is
+            ; then known to satisfy the constraint)."
+            if (nb.flags & TypeFlagsTypeVariable) <> 0
+            {
+                if this.is_generic_type(nc)
+                    return this.get_substitution_type(nb, nc)
+            }
+            if (nc.flags & TypeFlagsAnyOrUnknown) <> 0
+                return nb
+            this.record_unported("restrictive-instantiation", t.flags)
             return null
         }
         t
@@ -88391,6 +89428,43 @@ define Checker
             if tr <> null
                 set target: tr as ref[Type]
         }
+        ; ★★★ getNormalizedType's SUBSTITUTION ARM, SLICE 136, AND IT IS ASYMMETRIC
+        ; BY DESIGN. The reference's comment over these two lines names all of it:
+        ; *"resolve substitution types to either the substitution (on the source
+        ; side) or the type variable (on the target side)"* — reading a substitution
+        ; is knowing MORE about the value (its base intersected with its constraint),
+        ; writing to one is knowing only that it is the type variable, and `writing`
+        ; is exactly what distinguishes the two call sites.
+        ;
+        ; ★★★ WITHOUT IT, THE TYPE THIS SLICE MINTS IS INERT IN THE RELATION, and
+        ; the corpus said so the same afternoon: in `TRec extends MyRecord ?
+        ; MySet<TRec> : TRec[]` the true branch's `TRec` IS the substitution, so
+        ; `MySet<TRec>`'s constraint check must see `TRec & MyRecord` — and seeing
+        ; the bare type parameter instead reported a TS2344 the reference does not
+        ; have. It was invisible until check_type_argument_constraints was CALLED in
+        ; this same slice, which is the second time in one afternoon that removing a
+        ; wall turned a dormant gap into a wrong answer.
+        ;
+        ; ★ The other four arms of getNormalizedType — the generic tuple, the
+        ; deferred reference, the union/intersection normalization and
+        ; getSimplifiedType — are NOT here, and neither is its fixpoint LOOP; each
+        ; is its own chapter and the fresh-literal arm above was already inlined
+        ; alone. What this adds is the arm whose input this slice created.
+        let mark_norm this.unported_mark()
+        if (source.flags & TypeFlagsSubstitution) <> 0
+        {
+            let si this.get_substitution_intersection(source)
+            if this.unported_mark() <> mark_norm
+                return false
+            if si <> null
+                set source: si as ref[Type]
+        }
+        if (target.flags & TypeFlagsSubstitution) <> 0
+        {
+            let tb Checker.substitution_base_type_of(target)
+            if tb <> null
+                set target: tb as ref[Type]
+        }
         if source = target
             return true
         ; ★★★ THE IDENTITY RELATION GOES STRAIGHT INTO THE RECURSION, and this is
@@ -90574,9 +91648,94 @@ define Checker
             this.record_unported("structured-target-mapped", target.object_flags)
             return false
         }
+        ; ★★★ THE SOURCE TYPE-VARIABLE ARM, SLICE 136. Its three steps are the
+        ; reference's own and each needed a piece this slice writes:
+        ; `get_constraint_of_type` (the dispatcher, which did not exist), and
+        ; `is_mapped_type_generic_indexed_access` (written with the constraint
+        ; family). What it says is the whole idea of a constrained type parameter in
+        ; the relation — a `T` is assignable wherever its CONSTRAINT is.
+        ;
+        ; ★ The two-step order is the reference's optimisation and its comment says
+        ; so: *"hi-speed no-this-instantiation check (less accurate, but avoids
+        ; costly `this`-instantiation when the constraint will suffice)"*. The bare
+        ; constraint is tried first WITHOUT reports, and only the this-instantiated
+        ; one may report.
+        ;
+        ; ★★ The reportErrors term of the second step is three conjuncts, and this
+        ; port spells reportErrors as an error NODE: the reference suppresses the
+        ; report when the constraint fell back to `unknown` (there is nothing to say)
+        ; and when BOTH sides are type parameters (the relation between two of those
+        ; is the caller's message to make), so the node is nulled in exactly those
+        ; two cases.
         if (src.flags & TypeFlagsTypeVariable) <> 0
         {
-            this.record_unported("structured-source-type-variable", src.flags)
+            ; "IndexedAccess comparisons are handled above in the
+            ; `target.flags&TypeFlagsIndexedAccess` branch."
+            var both_indexed_access false
+            if (src.flags & TypeFlagsIndexedAccess) <> 0
+            {
+                if (target.flags & TypeFlagsIndexedAccess) <> 0
+                    set both_indexed_access: true
+            }
+            if both_indexed_access = false
+            {
+                let mark this.unported_mark()
+                var constraint this.get_constraint_of_type(src)
+                if this.unported_mark() <> mark
+                    return false
+                if constraint = null
+                    set constraint: unknown_type
+                let c constraint as ref[Type]
+                if this.is_related_to_ex(c, target, relation, null, intersection_state, RecursionFlagsSource)
+                    return true
+                if this.unported_mark() <> mark
+                    return false
+                let with_this this.get_type_with_this_argument(c, src, false)
+                if this.unported_mark() <> mark
+                    return false
+                if with_this = null
+                    return false
+                var en error_node
+                if c = unknown_type
+                    set en: null
+                if (target.flags & src.flags & TypeFlagsTypeParameter) <> 0
+                    set en: null
+                if this.is_related_to_ex(with_this as ref[Type], target, relation, en, intersection_state, RecursionFlagsSource)
+                    return true
+                if this.unported_mark() <> mark
+                    return false
+                ; "For an indexed access type { [P in K]: E}[X], above we have
+                ; already explored an instantiation of E with X substituted for P. We
+                ; also want to explore type { [P in K]: E }[C], where C is the
+                ; constraint of X."
+                if this.is_mapped_type_generic_indexed_access(src)
+                {
+                    let index_type Checker.indexed_access_index_type_of(src)
+                    let object_type Checker.indexed_access_object_type_of(src)
+                    if index_type <> null
+                    {
+                        if object_type <> null
+                        {
+                            let index_constraint this.get_constraint_of_type(index_type as ref[Type])
+                            if this.unported_mark() <> mark
+                                return false
+                            if index_constraint <> null
+                            {
+                                let access this.get_indexed_access_type(object_type as ref[Type], index_constraint as ref[Type])
+                                if this.unported_mark() <> mark
+                                    return false
+                                if access <> null
+                                {
+                                    if this.is_related_to_ex(access as ref[Type], target, relation, error_node, intersection_state, RecursionFlagsSource)
+                                        return true
+                                    if this.unported_mark() <> mark
+                                        return false
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             return false
         }
         if (src.flags & (TypeFlagsIndex | TypeFlagsConditional | TypeFlagsStringMapping)) <> 0
@@ -96715,6 +97874,12 @@ define Checker
     ; prepended it runs FIRST. resolveMappedTypeMembers uses the appended form for
     ; the key type and instantiateMappedType the prepended one for the homomorphic
     ; variable, and swapping them is a wrong answer rather than a slower one.
+    function new_deferred_type_mapper(this, sources: ref[Array[ref[Type]?]], node: ref[AstNode]) returns ref[TypeMapper]
+    {
+        let p &TypeMapper^host(TypeMapperData.Deferred(DeferredTypeMapperData(sources, node)))
+        p
+    }
+
     function new_simple_type_mapper(this, source: ref[Type]?, target: ref[Type]?) returns ref[TypeMapper]
     {
         let p &TypeMapper^host(TypeMapperData.Simple(SimpleTypeMapperData(source, target)))
@@ -96927,6 +98092,130 @@ define Checker
         pair.add(Checker.substitution_constraint_of(t))
         pair.add(Checker.substitution_base_type_of(t))
         this.get_intersection_type(pair)
+    }
+
+    ; ── slice 136: THE SUBSTITUTION TYPE GETS A PRODUCER ─────────────────────
+    ;
+    ; newSubstitutionType, getOrCreateSubstitutionType, getSubstitutionType,
+    ; getNoInferType and isNoInferTargetType.
+    ;
+    ; ★★★ EVERY READER OF A SUBSTITUTION TYPE WAS ALREADY HERE AND NOTHING COULD
+    ; MAKE ONE. `is_no_infer_type`, `get_substitution_intersection`,
+    ; `get_actual_type_variable`, the relation's Substitution arm, the inference's
+    ; two, `compute_base_constraint`'s and `get_generic_object_flags`' — eleven
+    ; sites reading a payload arm with no producer, and three of them carried a
+    ; note saying so in as many words (`TypeFlagsSubstitution has no producer`,
+    ; get_index_type's *"whose only producers are the conditional's true branch and
+    ; NoInfer<T> itself"*, instantiate_type's stop). This is the producer, and it is
+    ; what turns those eleven from inert transcription into live arms.
+    function new_substitution_type(this, base_type: ref[Type], constraint: ref[Type]) returns ref[Type]
+        this.new_type(TypeFlagsSubstitution, ObjectFlagsNone, null, TypeData.Substitution(SubstitutionTypeData(base_type, constraint)))
+
+    ; getOrCreateSubstitutionType. The key is the reference's own pair of type ids,
+    ; held as an entry and compared on IDENTITY of the two types — which is what
+    ; the id pair stands for, since a Type is interned by every producer that makes
+    ; one.
+    function get_or_create_substitution_type(this, base_type: ref[Type], constraint: ref[Type]) returns ref[Type]
+    {
+        let n substitution_types.get_length() as int
+        var i 0
+        while i < n
+        {
+            let row substitution_types[i]
+            set i: i + 1
+            if row = null
+                continue
+            let e row as ref[SubstitutionEntry]
+            if e.base_type = base_type
+            {
+                if e.constraint = constraint
+                {
+                    if e.t <> null
+                        return e.t as ref[Type]
+                }
+            }
+        }
+        let made this.new_substitution_type(base_type, constraint)
+        substitution_types.add(&SubstitutionEntry^host(base_type, constraint, made))
+        made
+    }
+
+    ; getSubstitutionType. ★★★ THE THREE FOLDS ARE WHAT MAKE THE TYPE RARE, and
+    ; they are why the intern table cannot be keyed on the answer: a constraint
+    ; that is `any`/`unknown`, a constraint EQUAL to the base, or an `any` base all
+    ; answer the BASE TYPE, so most calls mint nothing at all.
+    function get_substitution_type(this, base_type: ref[Type], constraint: ref[Type]) returns ref[Type]
+    {
+        if (constraint.flags & TypeFlagsAnyOrUnknown) <> 0
+            return base_type
+        if constraint = base_type
+            return base_type
+        if (base_type.flags & TypeFlagsAny) <> 0
+            return base_type
+        this.get_or_create_substitution_type(base_type, constraint)
+    }
+
+    ; getNoInferType — `NoInfer<T>`. It goes through getOrCreateSubstitutionType
+    ; DIRECTLY rather than through getSubstitutionType, and that is the whole
+    ; representation: the constraint IS `unknown`, which the folding entry point
+    ; would answer the base type for.
+    function get_no_infer_type(this, t: ref[Type]) returns ref[Type]
+    {
+        if this.is_no_infer_target_type(t) = false
+            return t
+        this.get_or_create_substitution_type(t, unknown_type)
+    }
+
+    ; isNoInferTargetType. The reference's own comment names the design: *"a more
+    ; conservative and predictable form of couldContainTypeVariables … we don't
+    ; want to exhaustively examine all object type members"*.
+    ;
+    ; ★ The last disjunct masks Substitution OUT of Instantiable, so a substitution
+    ; type is judged by the disjunct above it and never by this one.
+    function is_no_infer_target_type(this, t: ref[Type]) returns bool
+    {
+        if (t.flags & TypeFlagsUnionOrIntersection) <> 0
+        {
+            let types Checker.union_or_intersection_types_of(t)
+            if types <> null
+            {
+                let l types as ref[Array[ref[Type]?]]
+                let n l.get_length() as int
+                var i 0
+                while i < n
+                {
+                    let e l[i]
+                    set i: i + 1
+                    if e = null
+                        continue
+                    if this.is_no_infer_target_type(e as ref[Type])
+                        return true
+                }
+            }
+        }
+        if (t.flags & TypeFlagsSubstitution) <> 0
+        {
+            if Checker.is_no_infer_type(t) = false
+            {
+                let base Checker.substitution_base_type_of(t)
+                if base <> null
+                {
+                    if this.is_no_infer_target_type(base as ref[Type])
+                        return true
+                }
+            }
+        }
+        if (t.flags & TypeFlagsObject) <> 0
+        {
+            if this.is_empty_anonymous_object_type(t) = false
+                return true
+        }
+        if (t.flags & (TypeFlagsInstantiable & ~TypeFlagsSubstitution)) <> 0
+        {
+            if this.is_pattern_literal_type(t) = false
+                return true
+        }
+        false
     }
 
     function is_non_generic_object_type(t: ref[Type]) returns bool
