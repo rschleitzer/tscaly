@@ -96,15 +96,23 @@ def emit(entries):
     out.append("")
 
     # byte-comparison helper
-    out.append("; True when the len bytes at buf equal the ASCII literal `word`.")
-    out.append("; Callers have already established that len equals the word's length, so")
-    out.append("; this compares bytes only.")
-    out.append("function kw_eq(buf: pointer[char], word: pointer[const_char], len: int) returns bool")
+    #
+    # ★★★THE SLICE FORM BELONGS IN THE GENERATOR, NOT ONLY IN THE FILE.
+    # `word` was `(pointer[const_char], int)` and was converted to a Slice
+    # on 2026-08-29 -- but only in the GENERATED file.  Regenerating would
+    # have silently undone the conversion at 88 places (85 keyword calls
+    # plus kw_eq itself); measured 2026-09-04 by running the generator
+    # against the checked-in state.
+    # The Slice carries its length, so the `len` parameter is gone.
+    out.append("; True when the bytes at buf equal the ASCII literal `word`.")
+    out.append("; Callers have already established that the scanned length equals")
+    out.append("; the word's length, so this compares bytes only.")
+    out.append("function kw_eq(buf: pointer[char], word: Slice[char]) returns bool")
     out.append("{")
     out.append("    var i: int 0")
-    out.append("    while i < len")
+    out.append("    while i < word.length")
     out.append("    {")
-    out.append("        if (*(buf + i) as int) <> (*(word + i) as int)")
+    out.append("        if (*(buf + i) as int) <> (word[i] as int)")
     out.append("            return false")
     out.append("        set i: i + 1")
     out.append("    }")
@@ -131,7 +139,9 @@ def emit(entries):
         out.append("    if len = %d" % n)
         out.append("    {")
         for text, kind in sorted(by_len[n]):
-            out.append('        if kw_eq(buf, "%s", %d)' % (text, n))
+            # Slice[T] ist {length, data} seit dem Feld-Flip 2026-08-30:
+            # die LAENGE steht vorn.
+            out.append('        if kw_eq(buf, Slice[char](%d, "%s"))' % (n, text))
             out.append("            return %s" % kind)
         out.append("    }")
         out.append("")
