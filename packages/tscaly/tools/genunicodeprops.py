@@ -93,7 +93,10 @@ def dispatch(out, fn, doc, words, result):
             # count -- for these property names that is n, and the assertion
             # holds that down in case one ever carries an escape.
             assert len(w) == n and w.isascii() and "\\" not in w, w
-            out.append('        if kw_eq(s.data, "%s")' % w)
+            # ★kw_eq takes the VIEW since 2026-09-05, so `s` goes in whole.
+            # `s.data` was a Slice taken apart at the call site purely to fit a
+            # pointer parameter -- the shape tools/lenfix/scan.py chases.
+            out.append('        if kw_eq(s, "%s")' % w)
             out.append('            return %s' % (result[w] if result else 'true'))
         out.append('    }')
     out.append('    %s' % ('0' if result else 'false'))
