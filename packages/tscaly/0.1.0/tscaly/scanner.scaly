@@ -53,6 +53,8 @@
 ; The BigInt literal is now the only kind still holding a stand-in — see
 ; set_bigint_token_value, which names the reader that would earn the port.
 
+use scaly.memory.Page
+use scaly.containers.Array
 use scaly.containers.String
 use tscaly.Diagnostics.DiagnosticList
 
@@ -60,6 +62,79 @@ use tscaly.Diagnostics.DiagnosticList
 ; inline 7s with a comment until slice 13b needed it as a diagnostic's LENGTH as
 ; well as a scan bound, at which point naming it stopped being tidiness.
 define MERGE_CONFLICT_MARKER_LENGTH: int 7
+
+; ── EscapeSequenceScanningFlags, back as a flag WORD ────────────────────────
+;
+; The reference's `EscapeSequenceScanningFlags`. Slice 13b carried the one bit
+; that selected anything under the two callers it had — ReportErrors — as a
+; plain bool, and said in as many words that *the day the regex scanner lands it
+; becomes the flags again*. Slice 140 is that day: the regular expression
+; grammar passes RegularExpression, AnnexB, AnyUnicodeMode and AtomEscape, and
+; each of the four selects a branch that was unreachable before.
+;
+; ★ The two COMPOSITES are the reference's own and neither is a plain
+; conjunction, which is why they are named rather than spelled out at the six
+; sites that test them. ReportInvalidEscapeErrors is an OR-mask — the test is
+; `flags & mask <> 0`, so a regular expression reports an invalid escape
+; WHETHER OR NOT ReportErrors is set. AllowExtendedUnicodeEscape is the same
+; shape read the other way: `\u{...}` is allowed when the value is a string
+; literal OR when the pattern is in a Unicode mode, and it is exactly the
+; string-literal half that made this branch dead for twenty slices.
+define EscapeSequenceScanningFlagsNone: int 0
+define EscapeSequenceScanningFlagsString: int 1
+define EscapeSequenceScanningFlagsReportErrors: int 2
+define EscapeSequenceScanningFlagsRegularExpression: int 4
+define EscapeSequenceScanningFlagsAnnexB: int 8
+define EscapeSequenceScanningFlagsAnyUnicodeMode: int 16
+define EscapeSequenceScanningFlagsAtomEscape: int 32
+define EscapeSequenceScanningFlagsReportInvalidEscapeErrors: int 6
+define EscapeSequenceScanningFlagsAllowExtendedUnicodeEscape: int 17
+
+; ── the regular expression flags ────────────────────────────────────────────
+;
+; The reference's `regularExpressionFlags`, one bit per letter of `dgimsuvy`,
+; plus the two composites it derives. AnyUnicodeMode is `u|v` and Modifiers is
+; the three a `(?ims-ims:...)` subpattern may toggle.
+define RegExpFlagsNone: int 0
+define RegExpFlagsHasIndices: int 1
+define RegExpFlagsGlobal: int 2
+define RegExpFlagsIgnoreCase: int 4
+define RegExpFlagsMultiline: int 8
+define RegExpFlagsDotAll: int 16
+define RegExpFlagsUnicode: int 32
+define RegExpFlagsUnicodeSets: int 64
+define RegExpFlagsSticky: int 128
+define RegExpFlagsAnyUnicodeMode: int 96
+define RegExpFlagsModifiers: int 28
+
+; The reference's `charCodeToRegExpFlag` map, as the lookup it is: the flag bit
+; for a flag LETTER, or None for a byte that is not one.
+function reg_exp_flag_of_char(ch: int) returns int
+{
+    if ch = ("d" as char) as int
+        return RegExpFlagsHasIndices
+    if ch = ("g" as char) as int
+        return RegExpFlagsGlobal
+    if ch = ("i" as char) as int
+        return RegExpFlagsIgnoreCase
+    if ch = ("m" as char) as int
+        return RegExpFlagsMultiline
+    if ch = ("s" as char) as int
+        return RegExpFlagsDotAll
+    if ch = ("u" as char) as int
+        return RegExpFlagsUnicode
+    if ch = ("v" as char) as int
+        return RegExpFlagsUnicodeSets
+    if ch = ("y" as char) as int
+        return RegExpFlagsSticky
+    RegExpFlagsNone
+}
+
+; ── the three classSetExpressionType values ─────────────────────────────────
+define ClassSetExpressionTypeUnknown: int 0
+define ClassSetExpressionTypeClassUnion: int 1
+define ClassSetExpressionTypeClassIntersection: int 2
+define ClassSetExpressionTypeClassSubtraction: int 3
 
 ; The reference embeds this in Scanner so Mark()/Rewind() can save and restore
 ; the whole mutable block as one value (the parser speculates in JSDoc). Go's
@@ -194,6 +269,32 @@ define Scanner
     value_capacity: int
     value_length: int
 
+    ; ── the VALUE of the escape scan_escape_sequence just read ──────────────
+    ;
+    ; ★★★ THE REFERENCE'S scanEscapeSequence RETURNS A STRING AND THIS PORT'S
+    ; WRITES A SINK, and until slice 140 nobody needed the difference: a string
+    ; literal wants the bytes appended and never looks at them again. The
+    ; REGULAR EXPRESSION grammar does look — `scan_class_atom` hands its answer
+    ; to a range comparison — so the value has to come back.
+    ;
+    ; ★ It comes back as THREE INTS rather than as bytes, because three is
+    ; everything the grammar asks. Upstream's uses are exactly `== ""`,
+    ; `stringutil.DecodeJSStringRune(s)` and `len(s) == size` — is it empty, what
+    ; is its first code point, and is that code point the whole of it. So the
+    ; summary is (length in bytes, first code point, that code point's length),
+    ; and no string is built anywhere in this grammar.
+    ;
+    ; ★ `esc_len` 0 IS the empty string, which is what the line-continuation arms
+    ; and the end-of-text arm answer. esc_clear leaves the code point at 0xFFFD,
+    ; because that is what Go's utf8.DecodeRuneInString answers for an empty
+    ; input and the reference compares that value rather than guarding it.
+    ;
+    ; TRANSIENT, like the sink above and for the same reason: it is written and
+    ; read inside one escape, so a mark carries nothing of it.
+    esc_len: int
+    esc_cp: int
+    esc_size: int
+
     ; ★★★ The reference's `languageVariant core.LanguageVariant`, set by the
     ; parser from the SCRIPT KIND (`getLanguageVariant`) and read at exactly one
     ; place in Scan(): a `<` followed by `/` is ONE token under the JSX variant.
@@ -223,9 +324,50 @@ define Scanner
     ; carry the comment saying so through twenty slices.
     skip_jsdoc_leading_asterisks: int
 
+    ; The reference's `scriptTarget core.ScriptTarget`; see language_version for
+    ; why it arrives with the regular expression grammar and with nothing else.
+    script_target: int
+
+    ; ★★★ THE REGULAR EXPRESSION ERROR SINK IS NOT THE PARSER'S. The checker
+    ; installs a DIFFERENT SetOnError for its regExpScanner — one that reports
+    ; into the CHECKER's diagnostics and that drops a report landing at the same
+    ; position as the one it last emitted. `DiagnosticList.add`'s own dedup is
+    ; against the list's LAST ENTRY, which is not the same question once the
+    ; checker has already reported elsewhere in the file, so the rule lives here
+    ; with its own memory. -1 is the reference's `lastError == nil`, and it is
+    ; reset at every literal because upstream's is a fresh local per call.
+    regexp_error_mode: bool
+    regexp_last_error_pos: int
+
     state: ScannerState
 )
 {
+    ; ★ A SECOND, EMPTY init — the reference's `NewScanner()`, whose one caller
+    ; is checkGrammarRegularExpressionLiteral. It is a separate init and not a
+    ; default because Scaly resolves an init by ARGUMENT COUNT; every field is
+    ; set, so nothing here reaches the positional-tuple path. The text arrives
+    ; later, through begin_regexp_scan.
+    init()
+    {
+        set buffer: Slice[char]()
+        set end: 0
+        set skip_trivia: true
+        set unported_pos: 0 - 1
+        set diagnostics: null
+        set value_buffer: Slice[char]()
+        set value_capacity: 0
+        set value_length: 0
+        set esc_len: 0
+        set esc_cp: 0xFFFD
+        set esc_size: 0
+        set jsx_variant: false
+        set skip_jsdoc_leading_asterisks: 0
+        set script_target: ScriptTargetNone
+        set regexp_error_mode: false
+        set regexp_last_error_pos: 0 - 1
+        set state: ScannerState(0, 0, 0, KindUnknown, TokenFlagsNone, null, 0)
+    }
+
     init(source: String)
     {
         set buffer: Slice[char](source.length(), source.get_buffer())
@@ -236,8 +378,14 @@ define Scanner
         set value_buffer: Slice[char]()
         set value_capacity: 0
         set value_length: 0
+        set esc_len: 0
+        set esc_cp: 0xFFFD
+        set esc_size: 0
         set jsx_variant: false
         set skip_jsdoc_leading_asterisks: 0
+        set script_target: ScriptTargetNone
+        set regexp_error_mode: false
+        set regexp_last_error_pos: 0 - 1
         set state: ScannerState(0, 0, 0, KindUnknown, TokenFlagsNone, null, 0)
     }
 
@@ -309,6 +457,116 @@ define Scanner
 
     function token_flags(this) returns int
         state.token_flags
+
+    ; ── what the regular expression grammar asks of the scanner ─────────────
+    ;
+    ; The reference reaches straight into `p.scanner.pos`, `.end`, `.tokenStart`
+    ; and `.text` from regexp.go, because the two live in one Go package and Go
+    ; has no privacy below that. Here they are named questions, for the reason
+    ; the accessor block above gives: a by-value struct nested in a struct is not
+    ; laid out in a root that never declared it, so `scanner.state.pos` from
+    ; another concept is exit 16 waiting to happen.
+
+    function pos(this) returns int
+        state.pos
+
+    procedure set_pos(this, v: int)
+        set state.pos: v
+
+    procedure set_token_start(this, v: int)
+        set state.token_start: v
+
+    ; A single BYTE at an absolute position — the reference's `s.text[p]`.
+    function byte_at(this, p: int) returns int
+    {
+        if p < end
+            return buffer[p] as int
+        0 - 1
+    }
+
+    ; `s.text[from:to]`, which is a slice and not a copy on either side.
+    function source_range(this, from: int, to: int) returns Slice[char]
+        Slice[char](to - from, buffer.data + from)
+
+    ; The whole of `s.text` — the reference's `sourceFile.Text()`, which the
+    ; checker hands to its own scanner. It is the FILE's text and not the body's,
+    ; so it is read off `buffer` and not off `end`, which the regular expression
+    ; grammar moves.
+    function text_slice(this) returns Slice[char]
+        buffer
+
+    function language_variant_jsx(this) returns bool
+        jsx_variant
+
+    ; The three facts about the escape scan_escape_sequence last read; see the
+    ; esc_* fields for why the value comes back as three ints.
+    function escape_len(this) returns int
+        esc_len
+
+    function escape_cp(this) returns int
+        esc_cp
+
+    function escape_size(this) returns int
+        esc_size
+
+    ; The reference's stringutil.IsASCIILetter and its isWordCharacter, both of
+    ; which only the regular expression grammar asks for.
+    function is_ascii_letter(c: int) returns bool
+    {
+        if (c >= ("a" as char) as int) and (c <= ("z" as char) as int)
+            return true
+        (c >= ("A" as char) as int) and (c <= ("Z" as char) as int)
+    }
+
+    function is_word_character(c: int) returns bool
+    {
+        if is_ascii_letter(c)
+            return true
+        if is_digit(c)
+            return true
+        c = ("_" as char) as int
+    }
+
+    ; ── the SCRIPT TARGET ───────────────────────────────────────────────────
+    ;
+    ; The reference's `scriptTarget` plus its `languageVersion()`, which reads
+    ; ScriptTargetLatest when nothing was set. ★ Its ONE reader is the regular
+    ; expression grammar — the flag-availability check and the named-capturing-
+    ; group report — which is why the field arrives with slice 140 and not with
+    ; the scanner: SetScriptTarget has exactly one caller upstream, and that
+    ; caller is checkGrammarRegularExpressionLiteral.
+    function language_version(this) returns int
+    {
+        if script_target = ScriptTargetNone
+            return ScriptTargetLatest
+        script_target
+    }
+
+    procedure set_script_target(this, v: int)
+        set script_target: v
+
+    ; checkRegularExpressionFlagAvailability, whole — the reference's
+    ; regExpFlagToFirstAvailableLanguageVersion read as the three-arm lookup it
+    ; is. ★ All three arms are UNREACHABLE under this harness and that is stated
+    ; rather than dropped: language_version is ES2025 = 12 (see
+    ; Checker.language_version), and 12 is at or above every one of the three
+    ; bounds, so the report is never emitted. The fork decides nothing else, so
+    ; its presence and its absence are the same walk — and the reference's shape
+    ; is the cheaper record.
+    procedure check_regular_expression_flag_availability(this, flag: int, p: int, size: int)
+    {
+        var available_from 0
+        if flag = RegExpFlagsHasIndices
+            set available_from: ScriptTargetES2022
+        if flag = RegExpFlagsDotAll
+            set available_from: ScriptTargetES2018
+        if flag = RegExpFlagsUnicodeSets
+            set available_from: ScriptTargetES2024
+        if available_from = 0
+            return
+        if this.language_version() < available_from
+            this.error_at(DiagThis_regular_expression_flag_is_only_available_when_targeting_0_or_later, p, size)
+    }
 
     ; ── the current token's VALUE ───────────────────────────────────────────
     ;
@@ -812,8 +1070,38 @@ define Scanner
 
     procedure error_at(this, code: int, pos: int, length: int)
     {
+        ; The checker's own SetOnError, whole. Its CategoryMessage branch —
+        ; which attaches related info instead of reporting — cannot be reached
+        ; from here, because the one CategoryMessage message the regular
+        ; expression grammar emits is the spelling suggestion this port does not
+        ; build; RegExpParser's header carries that argument.
+        if regexp_error_mode
+        {
+            if regexp_last_error_pos = pos
+                return
+            if diagnostics <> null
+                diagnostics.add_direct(pos, pos + length, code)
+            set regexp_last_error_pos: pos
+            return
+        }
         if diagnostics <> null
             diagnostics.add(pos, pos + length, code)
+    }
+
+    ; The checker's `regExpScanner.SetText` / `SetOnError` / `ResetTokenState`,
+    ; as the one entry point they are here: point a scanner at a file's text with
+    ; the regular expression error rule armed, ready to scan at `p`.
+    procedure begin_regexp_scan(this, text: Slice[char], d: ref[DiagnosticList]?, p: int)
+    {
+        set buffer: text
+        set end: text.length
+        set diagnostics: d
+        set regexp_error_mode: true
+        set regexp_last_error_pos: 0 - 1
+        set value_buffer: Slice[char]()
+        set value_capacity: 0
+        set value_length: 0
+        set state: ScannerState(p, p, p, KindUnknown, TokenFlagsNone, null, 0)
     }
 
     ; True once scan() has answered end-of-file.
@@ -1648,8 +1936,42 @@ define Scanner
     ; the reports were unreachable, so nothing ever looked wrong. Retired in
     ; slice 25 with the last reachable `unported` of this file. The proof is a
     ; grep — no `return false` occurs between this line and the routine's end.
-    procedure scan_escape_sequence(this, report_errors: bool)
+    ; The three writers of the summary above. Each sits beside the value_put_*
+    ; call of the same arm, so an arm that produces a value and an arm that
+    ; produces the empty string are told apart by which one is missing.
+    procedure esc_clear(this)
     {
+        set esc_len: 0
+        set esc_cp: 0xFFFD
+        set esc_size: 0
+    }
+
+    ; A value that is exactly one code point — every decoded arm. Its byte
+    ; length is what value_put_codepoint writes, INCLUDING the three bytes a
+    ; lone surrogate takes; utf8_encoded_size says so, and its header explains
+    ; why that agrees with the reference on the one input where the bytes differ.
+    procedure esc_codepoint(this, cp: int)
+    {
+        set esc_len: utf8_encoded_size(cp)
+        set esc_cp: cp
+        set esc_size: esc_len
+    }
+
+    ; A value that is a RUN OF SOURCE — the arms that answer the escape's own
+    ; text because they could not decode it. Its first code point is whatever
+    ; stands at `from`, which is a backslash at every one of these sites, so
+    ; `esc_len <> esc_size` and the caller's range comparison drops out exactly
+    ; as the reference's `len(s) == size` test does.
+    procedure esc_range(this, from: int, to: int)
+    {
+        set esc_len: to - from
+        set esc_cp: this.utf8_decode_at(from)
+        set esc_size: this.utf8_size_at(from)
+    }
+
+    procedure scan_escape_sequence(this, flags: int)
+    {
+        this.esc_clear()
         let start state.pos
         set state.pos: state.pos + 1
         let ch this.char()
@@ -1663,12 +1985,24 @@ define Scanner
         }
         set state.pos: state.pos + 1
 
+        ; The reference's `flags & ReportInvalidEscapeErrors != 0`, which is an
+        ; OR over TWO bits: a regular expression reports an invalid escape even
+        ; with ReportErrors clear. See the constants at the top of this file.
+        let report_errors (flags & EscapeSequenceScanningFlagsReportInvalidEscapeErrors) <> 0
+        let in_regexp (flags & EscapeSequenceScanningFlagsRegularExpression) <> 0
+        ; `\1` inside a CHARACTER CLASS is not a backreference, so the octal and
+        ; decimal arms name the class in their message there; an ATOM escape gets
+        ; the ordinary wording. The reference spells the condition as
+        ; `RegularExpression != 0 && AtomEscape == 0`.
+        let in_class in_regexp and ((flags & EscapeSequenceScanningFlagsAtomEscape) = 0)
+
         ; \0 not followed by a digit is the NUL escape and nothing more.
         if ch = ("0" as char) as int
         {
             if not is_digit(this.char())
             {
                 this.value_put_byte(0)
+                this.esc_codepoint(0)
                 return
             }
         }
@@ -1690,11 +2024,23 @@ define Scanner
             set state.token_flags: state.token_flags | TokenFlagsContainsInvalidEscape
             if report_errors
             {
-                this.error_at(DiagOctal_escape_sequences_are_not_allowed_Use_the_syntax_0, start, state.pos - start)
-                this.value_put_codepoint(this.octal_value(start + 1, state.pos))
+                ; ★ `ch <> '0'` is the reference's, and it is the one place the
+                ; class wording is NOT simply "in a character class": `\0` is the
+                ; NUL escape wherever it stands, so only `\1`-`\3` can be read as
+                ; a backreference.
+                if in_class and (ch <> ("0" as char) as int)
+                    this.error_at(DiagOctal_escape_sequences_and_backreferences_are_not_allowed_in_a_character_class_If_this_was_intended_as_an_escape_sequence_use_the_syntax_0_instead, start, state.pos - start)
+                else
+                    this.error_at(DiagOctal_escape_sequences_are_not_allowed_Use_the_syntax_0, start, state.pos - start)
+                let v this.octal_value(start + 1, state.pos)
+                this.value_put_codepoint(v)
+                this.esc_codepoint(v)
             }
             else
+            {
                 this.value_put_range(start, state.pos)
+                this.esc_range(start, state.pos)
+            }
             return
         }
         if (ch >= ("4" as char) as int) and (ch <= ("7" as char) as int)
@@ -1704,11 +2050,19 @@ define Scanner
             set state.token_flags: state.token_flags | TokenFlagsContainsInvalidEscape
             if report_errors
             {
-                this.error_at(DiagOctal_escape_sequences_are_not_allowed_Use_the_syntax_0, start, state.pos - start)
-                this.value_put_codepoint(this.octal_value(start + 1, state.pos))
+                if in_class
+                    this.error_at(DiagOctal_escape_sequences_and_backreferences_are_not_allowed_in_a_character_class_If_this_was_intended_as_an_escape_sequence_use_the_syntax_0_instead, start, state.pos - start)
+                else
+                    this.error_at(DiagOctal_escape_sequences_are_not_allowed_Use_the_syntax_0, start, state.pos - start)
+                let v this.octal_value(start + 1, state.pos)
+                this.value_put_codepoint(v)
+                this.esc_codepoint(v)
             }
             else
+            {
                 this.value_put_range(start, state.pos)
+                this.esc_range(start, state.pos)
+            }
             return
         }
         if (ch = ("8" as char) as int) or (ch = ("9" as char) as int)
@@ -1716,11 +2070,18 @@ define Scanner
             set state.token_flags: state.token_flags | TokenFlagsContainsInvalidEscape
             if report_errors
             {
-                this.error_at(DiagEscape_sequence_0_is_not_allowed, start, state.pos - start)
+                if in_class
+                    this.error_at(DiagDecimal_escape_sequences_and_backreferences_are_not_allowed_in_a_character_class, start, state.pos - start)
+                else
+                    this.error_at(DiagEscape_sequence_0_is_not_allowed, start, state.pos - start)
                 this.value_put_byte(ch)
+                this.esc_codepoint(ch)
             }
             else
+            {
                 this.value_put_range(start, state.pos)
+                this.esc_range(start, state.pos)
+            }
             return
         }
 
@@ -1735,40 +2096,105 @@ define Scanner
                     if report_errors
                         this.error(DiagHexadecimal_digit_expected)
                     this.value_put_range(start, state.pos)
+                    this.esc_range(start, state.pos)
                     return
                 }
                 set state.pos: state.pos + 1
             }
             set state.token_flags: state.token_flags | TokenFlagsHexEscape
-            this.value_put_codepoint(this.hex_value(start + 2, state.pos))
+            let hv this.hex_value(start + 2, state.pos)
+            this.value_put_codepoint(hv)
+            this.esc_codepoint(hv)
             return
         }
 
         if ch = ("u" as char) as int
         {
+            ; `extended` is read BEFORE the rewind, exactly as the reference
+            ; reads it: pos is one past the `u` here, so the byte it looks at is
+            ; the one that decides between `\uDDDD` and `\u{DDDDDD}`.
+            let extended this.char() = ("{" as char) as int
             ; scan_unicode_escape re-reads the `\u`, so back up over both bytes.
             set state.pos: state.pos - 2
             let cp this.scan_unicode_escape(report_errors)
+
+            ; ★★★ THE BRACED FORM'S GATE WAS DEAD UNTIL THIS SLICE. The
+            ; reference's AllowExtendedUnicodeEscape is `String | AnyUnicodeMode`
+            ; and every caller before the regular expression set String, so
+            ; `\u{...}` was always allowed. In a pattern without `u` or `v` it is
+            ; not, and this is the report.
+            if extended
+            {
+                if (flags & EscapeSequenceScanningFlagsAllowExtendedUnicodeEscape) = 0
+                {
+                    set state.token_flags: state.token_flags | TokenFlagsContainsInvalidEscape
+                    if report_errors
+                        this.error_at(DiagUnicode_escape_sequences_are_only_available_when_the_Unicode_u_flag_or_the_Unicode_Sets_v_flag_is_set, start, state.pos - start)
+                }
+            }
+
             if cp < 0
             {
                 this.value_put_range(start, state.pos)
+                this.esc_range(start, state.pos)
                 return
             }
+
             ; ★ A high surrogate escape followed by a low one is ONE code point
             ; in a string literal, exactly as the adjacent UTF-16 code units
             ; would be in a JavaScript string. A lone surrogate survives as its
             ; own three UTF-8 bytes — see value_put_codepoint for why that needs
             ; no arm of its own.
+            ;
+            ; ★★★ A PATTERN PAIRS THEM UNDER NARROWER CONDITIONS, and the
+            ; reference gives the reason: in a Unicode-mode pattern `\uHigh\uLow`
+            ; is one code point so that scanClassRanges can compare the pair
+            ; numerically, but a BRACED escape never pairs and a non-Unicode
+            ; pattern keeps the two as separate atoms.
             if is_high_surrogate(cp)
             {
-                let low this.scan_low_surrogate_escape(cp)
-                if low >= 0
+                if not in_regexp
                 {
-                    this.value_put_codepoint(0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00))
-                    return
+                    let low this.scan_low_surrogate_escape(cp)
+                    if low >= 0
+                    {
+                        let combined 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
+                        this.value_put_codepoint(combined)
+                        this.esc_codepoint(combined)
+                        return
+                    }
+                }
+                else
+                {
+                    if extended = false
+                    {
+                        if (flags & EscapeSequenceScanningFlagsAnyUnicodeMode) <> 0
+                        {
+                            if this.char() = ("\\" as char) as int
+                            {
+                                if this.char_at(1) = ("u" as char) as int
+                                {
+                                    if this.char_at(2) <> ("{" as char) as int
+                                    {
+                                        let saved_pos state.pos
+                                        let next this.scan_unicode_escape(report_errors)
+                                        if is_low_surrogate(next)
+                                        {
+                                            let combined 0x10000 + ((cp - 0xD800) << 10) + (next - 0xDC00)
+                                            this.value_put_codepoint(combined)
+                                            this.esc_codepoint(combined)
+                                            return
+                                        }
+                                        set state.pos: saved_pos
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             this.value_put_codepoint(cp)
+            this.esc_codepoint(cp)
             return
         }
 
@@ -1778,31 +2204,37 @@ define Scanner
         if ch = ("b" as char) as int
         {
             this.value_put_byte(8)
+            this.esc_codepoint(8)
             return
         }
         if ch = ("t" as char) as int
         {
             this.value_put_byte(9)
+            this.esc_codepoint(9)
             return
         }
         if ch = ("n" as char) as int
         {
             this.value_put_byte(10)
+            this.esc_codepoint(10)
             return
         }
         if ch = ("v" as char) as int
         {
             this.value_put_byte(11)
+            this.esc_codepoint(11)
             return
         }
         if ch = ("f" as char) as int
         {
             this.value_put_byte(12)
+            this.esc_codepoint(12)
             return
         }
         if ch = ("r" as char) as int
         {
             this.value_put_byte(13)
+            this.esc_codepoint(13)
             return
         }
 
@@ -1830,13 +2262,42 @@ define Scanner
             ; continuation like the two above and decodes to nothing.
             if (cp = 0x2028) or (cp = 0x2029)
                 return
+            this.report_unescapable_in_regexp(flags, cp, start)
             this.value_put_codepoint(cp)
+            this.esc_codepoint(cp)
             return
         }
 
         ; Any other escaped ASCII character stands for itself — `\'`, `\"`,
         ; `\\`, `\``, and everything unlisted.
+        this.report_unescapable_in_regexp(flags, ch, start)
         this.value_put_byte(ch)
+        this.esc_codepoint(ch)
+    }
+
+    ; The reference's last two lines of scanEscapeSequence, which the port's two
+    ; older callers could never reach:
+    ;
+    ;     if flags&AnyUnicodeMode != 0 || flags&RegularExpression != 0 &&
+    ;        flags&AnnexB == 0 && IsIdentifierPart(ch) {
+    ;         s.errorAt(This_character_cannot_be_escaped_in_a_regular_expression, ...)
+    ;     }
+    ;
+    ; ★ It reports UNCONDITIONALLY — there is no ReportErrors in the condition —
+    ; which is the same asymmetry the end-of-text report at the top has.
+    procedure report_unescapable_in_regexp(this, flags: int, cp: int, start: int)
+    {
+        if (flags & EscapeSequenceScanningFlagsAnyUnicodeMode) <> 0
+        {
+            this.error_at(DiagThis_character_cannot_be_escaped_in_a_regular_expression, start, state.pos - start)
+            return
+        }
+        if (flags & EscapeSequenceScanningFlagsRegularExpression) = 0
+            return
+        if (flags & EscapeSequenceScanningFlagsAnnexB) <> 0
+            return
+        if is_identifier_part(cp)
+            this.error_at(DiagThis_character_cannot_be_escaped_in_a_regular_expression, start, state.pos - start)
     }
 
     ; ── identifiers ─────────────────────────────────────────────────────────
@@ -2451,7 +2912,10 @@ define Scanner
                 ; reference's own arrangement and the reason its cooked text can
                 ; be nonsense while the raw text is what the tag function reads.
                 this.value_arm(chunk_start)
-                this.scan_escape_sequence(report_errors)
+                var tflags EscapeSequenceScanningFlagsString
+                if report_errors
+                    set tflags: tflags | EscapeSequenceScanningFlagsReportErrors
+                this.scan_escape_sequence(tflags)
                 set chunk_start: state.pos
                 continue
             }
@@ -2535,7 +2999,7 @@ define Scanner
                 ; pass with errors suppressed would build the tagged-template
                 ; value for a string.
                 this.value_arm(chunk_start)
-                this.scan_escape_sequence(true)
+                this.scan_escape_sequence(EscapeSequenceScanningFlagsString | EscapeSequenceScanningFlagsReportErrors)
                 set chunk_start: state.pos
                 continue
             }
@@ -3367,15 +3831,16 @@ define Scanner
     ; and the parser asks for the re-read at the one place a regular expression
     ; may begin — parsePrimaryExpression.
     ;
-    ; ★★★ THE REFERENCE'S `reportErrors` PARAMETER IS NOT PORTED, AND WHICH
-    ; CALLER SETS IT IS THE REASON. Upstream it is variadic and false by default:
-    ; the parser calls `ReScanSlashToken()`, the CHECKER calls it with `true`.
-    ; Under the flag the body additionally runs `regExpParser` — a second grammar
-    ; of about a thousand lines that validates the pattern and its flags — and
-    ; those diagnostics belong to the checking pass, not to the parse. This port
-    ; has a parser, so the parameter would carry one value at its one call site;
-    ; it is left out rather than carried false, and this note is what stands in
-    ; for it. What comes back with the checker is the branch AND its parameter.
+    ; ★★★ THE `reportErrors` PARAMETER IS BACK, WITH THE BRANCH THAT READS IT
+    ; (slice 140). Upstream it is variadic and false by default: the parser calls
+    ; `ReScanSlashToken()`, the CHECKER calls it with `true`, and under the flag
+    ; the body additionally validates the FLAGS and runs `regExpParser` — the
+    ; second grammar in this file. Slice 16 left the parameter out rather than
+    ; carrying it false, on the argument that an absent parameter is a claim
+    ; about which caller is missing and a false one is a claim that the other
+    ; value works; checkGrammarRegularExpressionLiteral is that caller, and it
+    ; arrived with this slice. The two came back together, as the note said they
+    ; would.
     ;
     ; ★★ Two reads here are BYTE reads although this scanner decodes runes
     ; everywhere else, and both are ported as bytes on purpose: `ch :=
@@ -3385,14 +3850,17 @@ define Scanner
     ; continuation byte is >= 0x80). The trailing-trim loop below decodes
     ; properly. The asymmetry is upstream's, not a simplification.
     ;
-    ; ★ The `namedCaptureGroups` arm of the first loop is deliberately ABSENT,
-    ; and the argument is checkable rather than a judgement: the variable has
-    ; exactly one reader — the `regExpParser` built inside the `shouldReportErrors`
-    ; branch (`grep -rn namedCaptureGroups internal/scanner` answers regexp.go:391
-    ; and nothing else) — and the arm assigns nothing besides it. So omitting it
-    ; is observationally identical for every caller this port has. It returns
-    ; with the branch that reads it.
-    procedure re_scan_slash_token(this) returns int
+    ; ★ The `namedCaptureGroups` arm of the first loop is back for the same
+    ; reason the parameter is: its ONE reader is the regExpParser built inside
+    ; the reportErrors branch (`grep -rn namedCaptureGroups internal/scanner`
+    ; answered regexp.go:391 and nothing else), and that reader now exists. It is
+    ; what makes a bare `\k` an error in a pattern that has a `(?<name>` in it
+    ; and an ordinary escape in one that has not.
+    ;
+    ; ★ Its guard is FOUR bytes of lookahead and the fourth is a NEGATIVE test:
+    ; `(?<` opens a named group, but `(?<=` and `(?<!` are lookbehind and are not
+    ; a group at all.
+    procedure re_scan_slash_token(this, report_errors: bool) returns int
     {
         if (state.token <> KindSlashToken) and (state.token <> KindSlashEqualsToken)
             return state.token
@@ -3406,6 +3874,7 @@ define Scanner
         var p: int start_of_body
         var in_escape: bool false
         var in_character_class: bool false
+        var named_capture_groups: bool false
         while true
         {
             ; End of file or a line break: unterminated. Report and keep what we
@@ -3441,6 +3910,33 @@ define Scanner
                 set in_escape: true
             if ch = ("]" as char) as int
                 set in_character_class: false
+            ; `(?<` opens a named capturing group — but `(?<=` and `(?<!` are
+            ; lookbehind, which is why the fourth byte is tested and why the test
+            ; passes at the end of the text.
+            if (not in_character_class) and (ch = ("(" as char) as int)
+            {
+                if (p + 1) < end
+                {
+                    if (buffer[p + 1] as int) = (("?" as char) as int)
+                    {
+                        if (p + 2) < end
+                        {
+                            if (buffer[p + 2] as int) = (("<" as char) as int)
+                            {
+                                var lookbehind false
+                                if (p + 3) < end
+                                {
+                                    let c3 buffer[p + 3] as int
+                                    if (c3 = (("=" as char) as int)) or (c3 = (("!" as char) as int))
+                                        set lookbehind: true
+                                }
+                                if not lookbehind
+                                    set named_capture_groups: true
+                            }
+                        }
+                    }
+                }
+            }
             set p: p + 1
         }
 
@@ -3538,9 +4034,8 @@ define Scanner
         }
         else
         {
-            ; Consume the closing slash, then the flags. Validating them is the
-            ; `reportErrors` half (see the header note); what is left is finding
-            ; where they END.
+            ; Consume the closing slash, then the flags — finding where they END
+            ; under either caller, and VALIDATING them under reportErrors.
             ;
             ; ★ The RuneError test is kept for fidelity and is MEASURED
             ; redundant, which is worth stating so nobody deletes it as dead or
@@ -3552,6 +4047,7 @@ define Scanner
             ; invalid byte exactly where a flag would go (slice 16, row 13:
             ; indistinguishable, not uncovered).
             set p: p + 1
+            var reg_exp_flags: int RegExpFlagsNone
             while p < end
             {
                 let ch this.utf8_decode_at(p)
@@ -3559,7 +4055,55 @@ define Scanner
                     break
                 if not is_identifier_part(ch)
                     break
-                set p: p + this.utf8_size_at(p)
+                let size this.utf8_size_at(p)
+                if report_errors
+                {
+                    ; ★ The four arms are an if/else CHAIN and their order is the
+                    ; whole report: an unknown letter, then a repeated one, then
+                    ; `u` and `v` together, and only what survives all three is
+                    ; accepted and asked whether the target admits it.
+                    let flag reg_exp_flag_of_char(ch)
+                    if flag = RegExpFlagsNone
+                        this.error_at(DiagUnknown_regular_expression_flag, p, size)
+                    else
+                    {
+                        if (reg_exp_flags & flag) <> 0
+                            this.error_at(DiagDuplicate_regular_expression_flag, p, size)
+                        else
+                        {
+                            if ((reg_exp_flags | flag) & RegExpFlagsAnyUnicodeMode) = RegExpFlagsAnyUnicodeMode
+                                this.error_at(DiagThe_Unicode_u_flag_and_the_Unicode_Sets_v_flag_cannot_be_set_simultaneously, p, size)
+                            else
+                            {
+                                set reg_exp_flags: reg_exp_flags | flag
+                                this.check_regular_expression_flag_availability(flag, p, size)
+                            }
+                        }
+                    }
+                }
+                set p: p + size
+            }
+
+            ; ★★★ THE SECOND GRAMMAR RUNS HERE, over the BODY only — the scanner's
+            ; own `end` becomes the closing slash's position for the duration, which
+            ; is what lets every `char()` inside RegExpParser stop without a bound
+            ; of its own. pos, token_start and the token flags are saved with it,
+            ; because the parse walks all three and the caller's token is not
+            ; finished yet.
+            if report_errors
+            {
+                set state.pos: start_of_body
+                let save_end end
+                let save_token_start state.token_start
+                let save_token_flags state.token_flags
+                set end: end_of_body
+                let host Page.get(this)
+                let rp &RegExpParser^host(host, this, end_of_body, reg_exp_flags, named_capture_groups)
+                rp.run()
+                set end: save_end
+                set state.pos: p
+                set state.token_start: save_token_start
+                set state.token_flags: save_token_flags
             }
         }
 
@@ -4246,5 +4790,1504 @@ define Scanner
         set state.pos: state.pos + n
         set state.token: k
         k
+    }
+}
+
+; ── the regular expression grammar ──────────────────────────────────────────
+;
+; internal/scanner/regexp.go, whole. A SECOND grammar of about a thousand lines
+; that validates the pattern between the slashes and the flags after it, and it
+; runs only when the CHECKER asks — `ReScanSlashToken(true)`. The parser calls
+; the same entry point bare, gets the extent and none of this.
+;
+; ★★★ IT REPORTS AND ANSWERS NOTHING ELSE. There is no tree, no compiled matcher
+; and no value: every one of its thirty-odd routines exists to walk a position
+; forward and to emit diagnostics on the way. That is why the port can be a
+; faithful transcription — there is no representation to choose.
+;
+; ★★★ THE SCANNER'S `end` IS THE BODY'S END WHILE THIS RUNS, which is the
+; reference's own arrangement (`s.end = endOfRegExpBody`) and the reason
+; `p.char()` needs no bound of its own: the scanner already answers -1 past the
+; closing slash. re_scan_slash_token saves and restores it, along with pos,
+; token_start and the token flags.
+;
+; ★★ THE STRING RETURNS ARE THREE INTS. Upstream's atom scanners answer a Go
+; string, and the grammar asks exactly three things of it — is it empty, what is
+; its first code point, and is that code point the whole of it. So the value
+; type here is (len, cp, size) and no string is ever built; see Scanner.esc_len
+; for the same reduction on the escape scanner's side, which is where the
+; representation had to be decided first.
+;
+; ★★ THE SPELLING SUGGESTIONS ARE DELIBERATELY ABSENT, and the argument is
+; checkable rather than a judgement. All four `Did_you_mean_0` reports are
+; emitted at EXACTLY the (pos, length) of the error immediately above them, and
+; `Did_you_mean_0` is the only CategoryMessage message this file uses — so in
+; the checker's error callback every one of them takes the first branch, which
+; attaches RELATED INFO to the diagnostic just added rather than adding a
+; diagnostic. The yardstick's dump is `D <pos> <end> <code>` and carries no
+; related info (Diagnostics.scaly's header says so), so the four are
+; unobservable by construction. `core.GetSpellingSuggestionForStrings` — a
+; Levenshtein walk over 400-odd property names — comes back with the reader that
+; would earn it.
+
+define RegExpGroupRef (pos: int  end: int  name: Slice[char])
+
+; A numeric backreference, checked against the capturing-group count at the end
+; of the run rather than where it stands — `\3` may name a group that is only
+; opened later in the pattern.
+define RegExpDecimalEscape (pos: int  end: int  value: int)
+
+; The value of one atom: the reference's `string`, reduced to what is asked of
+; it. `len` 0 IS the empty string.
+define RegExpValue (len: int  cp: int  size: int)
+
+define RegExpParser
+(
+    s: ref[Scanner]
+
+    ; The body's end. Equal to the scanner's own `end` for the whole run — see
+    ; the header — and kept as a field because the reference keeps it as one.
+    end: int
+
+    reg_exp_flags: int
+    any_unicode_mode: bool
+    unicode_sets_mode: bool
+    annex_b: bool
+
+    any_unicode_mode_or_non_annex_b: bool
+    named_capture_groups: bool
+
+    ; See scan_class_set_expression.
+    may_contain_strings: bool
+
+    ; The number of all (named and unnamed) capturing groups defined in the regex.
+    number_of_capturing_groups: int
+
+    ; All named capturing groups defined in the regex.
+    group_specifiers: ref[Array[Slice[char]]]
+
+    ; All references to named capturing groups in the regex.
+    group_name_references: ref[Array[RegExpGroupRef]]
+
+    ; All numeric backreferences within the regex.
+    decimal_escapes: ref[Array[RegExpDecimalEscape]]
+
+    ; ★★★ THE STACK OF SCOPES FOR NAMED CAPTURING GROUPS IS A FLAT LIST AND A
+    ; COUNT, and the count is the whole of the pop. Upstream keeps
+    ; `namedCapturingGroups []map[string]bool` and truncates it by one at the end
+    ; of every alternative; the question it answers is *is this name in ANY scope
+    ; on the stack*, which over a flat list is a scan of the first `count`
+    ; entries. So the push is nothing at all and the pop is one assignment —
+    ; scan_disjunction holds the mark in a LOCAL, which is exactly the nesting
+    ; the reference gets from the slice header.
+    ;
+    ; Two names in different alternatives of one disjunction are mutually
+    ; exclusive and legal; two in the same alternative are TS1515. That is the
+    ; whole purpose of the stack, and the truncation is what draws the line.
+    group_scope_names: ref[Array[Slice[char]]]
+    group_scope_count: int
+
+    ; ★ The low surrogate to emit on the next scan_source_character, when a
+    ; non-BMP character has to be split into UTF-16 code units in non-unicode
+    ; mode. Upstream's comment names the reason it exists here and not in the
+    ; TypeScript original: Strada indexed its source as UTF-16 already.
+    pending_low_surrogate: int
+)
+{
+    init(host: ref[Page], scanner: ref[Scanner], body_end: int, flags: int, named_groups: bool)
+    {
+        set s: scanner
+        set end: body_end
+        set reg_exp_flags: flags
+        set any_unicode_mode: (flags & RegExpFlagsAnyUnicodeMode) <> 0
+        set unicode_sets_mode: (flags & RegExpFlagsUnicodeSets) <> 0
+        set annex_b: true
+        set any_unicode_mode_or_non_annex_b: false
+        set named_capture_groups: named_groups
+        set may_contain_strings: false
+        set number_of_capturing_groups: 0
+        set group_specifiers: &Array[Slice[char]]^host()
+        set group_name_references: &Array[RegExpGroupRef]^host()
+        set decimal_escapes: &Array[RegExpDecimalEscape]^host()
+        set group_scope_names: &Array[Slice[char]]^host()
+        set group_scope_count: 0
+        set pending_low_surrogate: 0
+    }
+
+    ; ── the eight one-liners the reference gives its own names ──────────────
+
+    function pos(this) returns int
+        s.pos()
+
+    procedure set_pos(this, v: int)
+        s.set_pos(v)
+
+    procedure inc_pos(this, n: int)
+        s.set_pos(s.pos() + n)
+
+    function char(this) returns int
+        s.char()
+
+    ; The reference's `charAt(pos)`, whose argument is ABSOLUTE — it forwards to
+    ; the scanner's relative one by subtracting the current position, and so does
+    ; this. A single byte either way, and -1 past the body's end.
+    function char_at(this, p: int) returns int
+        s.char_at(p - s.pos())
+
+    procedure error(this, code: int, p: int, length: int)
+        s.error_at(code, p, length)
+
+    ; The reference's `compareDecimalStrings`: leading zeros are not part of the
+    ; number, a shorter number is the smaller one, and equal lengths compare
+    ; bytewise. Both operands are runs of DIGITS out of the source, so no
+    ; conversion is involved and a quantifier as long as the file still compares
+    ; exactly — which is the reason the reference does not use strconv here.
+    function compare_decimal_strings(a: Slice[char], b: Slice[char]) returns int
+    {
+        var ai 0
+        while ai < a.length
+        {
+            if (a[ai] as int) <> (("0" as char) as int)
+                break
+            set ai: ai + 1
+        }
+        var bi 0
+        while bi < b.length
+        {
+            if (b[bi] as int) <> (("0" as char) as int)
+                break
+            set bi: bi + 1
+        }
+        let alen a.length - ai
+        let blen b.length - bi
+        ; `if a == "" { a = "0" }` — a trimmed-away number is zero, and zero
+        ; against zero is equal, so the two empty cases fall out of the length
+        ; comparison below without an arm of their own.
+        if alen <> blen
+        {
+            if alen < blen
+                return 0 - 1
+            return 1
+        }
+        var i 0
+        while i < alen
+        {
+            let ca a[ai + i] as int
+            let cb b[bi + i] as int
+            if ca < cb
+                return 0 - 1
+            if ca > cb
+                return 1
+            set i: i + 1
+        }
+        0
+    }
+
+    ; ── Disjunction ::= Alternative ('|' Alternative)* ──────────────────────
+    ;
+    ; The mark is the flat scope list's length at entry to each alternative; see
+    ; group_scope_names for why that is the whole of the reference's push and pop.
+    procedure scan_disjunction(this, is_in_group: bool)
+    {
+        repeat
+        {
+            let mark group_scope_count
+            this.scan_alternative(is_in_group)
+            set group_scope_count: mark
+            if this.char() <> (("|" as char) as int)
+                return
+            this.inc_pos(1)
+        }
+    }
+
+    ; Alternative ::= Term*
+    ; Term ::=
+    ;   | Assertion
+    ;   | Atom Quantifier?
+    ; Assertion ::=
+    ;   | '^' | '$' | '\b' | '\B'
+    ;   | '(?=' Disjunction ')' | '(?!' Disjunction ')'
+    ;   | '(?<=' Disjunction ')' | '(?<!' Disjunction ')'
+    ; Quantifier ::= QuantifierPrefix '?'?
+    ; QuantifierPrefix ::=
+    ;   | '*' | '+' | '?'
+    ;   | '{' DecimalDigits (',' DecimalDigits?)? '}'
+    ; Atom ::=
+    ;   | PatternCharacter | '.' | '\' AtomEscape | CharacterClass
+    ;   | '(?<' RegExpIdentifierName '>' Disjunction ')'
+    ;   | '(?' RegularExpressionFlags ('-' RegularExpressionFlags)? ':' Disjunction ')'
+    ; CharacterClass ::= unicodeMode ? '[' ClassRanges ']' : '[' ClassSetExpression ']'
+    ;
+    ; ★★★ THE `{` ARM FALLS THROUGH INTO THE QUANTIFIER ARM and the fallthrough
+    ; is load-bearing: everything the braced form does is VALIDATION, and what
+    ; consumes the quantifier and decides `isPreviousTermQuantifiable` is the
+    ; `*`/`+`/`?` arm below it. Here it is a flag the `{` arm sets on its way out,
+    ; which is the only shape that keeps the reference's four `continue`s — each
+    ; of them leaves the brace unconsumed and treats it as an ordinary character.
+    procedure scan_alternative(this, is_in_group: bool)
+    {
+        var is_previous_term_quantifiable false
+        while this.pos() < end
+        {
+            let start this.pos()
+            let ch this.char()
+
+            if (ch = (("^" as char) as int)) or (ch = (("$" as char) as int))
+            {
+                this.inc_pos(1)
+                set is_previous_term_quantifiable: false
+                continue
+            }
+
+            if ch = (("\\" as char) as int)
+            {
+                this.inc_pos(1)
+                let c2 this.char()
+                if (c2 = (("b" as char) as int)) or (c2 = (("B" as char) as int))
+                {
+                    this.inc_pos(1)
+                    set is_previous_term_quantifiable: false
+                }
+                else
+                {
+                    this.scan_atom_escape()
+                    set is_previous_term_quantifiable: true
+                }
+                continue
+            }
+
+            if ch = (("(" as char) as int)
+            {
+                this.inc_pos(1)
+                if this.char() = (("?" as char) as int)
+                {
+                    this.inc_pos(1)
+                    let c2 this.char()
+                    if (c2 = (("=" as char) as int)) or (c2 = (("!" as char) as int))
+                    {
+                        this.inc_pos(1)
+                        ; In Annex B, `(?=Disjunction)` and `(?!Disjunction)` are
+                        ; quantifiable.
+                        set is_previous_term_quantifiable: not any_unicode_mode_or_non_annex_b
+                    }
+                    else
+                    {
+                        if c2 = (("<" as char) as int)
+                        {
+                            let group_name_start this.pos()
+                            this.inc_pos(1)
+                            let c3 this.char()
+                            if (c3 = (("=" as char) as int)) or (c3 = (("!" as char) as int))
+                            {
+                                this.inc_pos(1)
+                                set is_previous_term_quantifiable: false
+                            }
+                            else
+                            {
+                                this.scan_group_name(false)
+                                this.scan_expected_char((">" as char) as int)
+                                if s.language_version() < ScriptTargetES2018
+                                    this.error(DiagNamed_capturing_groups_are_only_available_when_targeting_ES2018_or_later, group_name_start, this.pos() - group_name_start)
+                                set number_of_capturing_groups: number_of_capturing_groups + 1
+                                set is_previous_term_quantifiable: true
+                            }
+                        }
+                        else
+                        {
+                            let flags_start this.pos()
+                            let set_flags this.scan_pattern_modifiers(RegExpFlagsNone)
+                            if this.char() = (("-" as char) as int)
+                            {
+                                this.inc_pos(1)
+                                this.scan_pattern_modifiers(set_flags)
+                                if this.pos() = (flags_start + 1)
+                                    this.error(DiagSubpattern_flags_must_be_present_when_there_is_a_minus_sign, flags_start, this.pos() - flags_start)
+                            }
+                            this.scan_expected_char((":" as char) as int)
+                            set is_previous_term_quantifiable: true
+                        }
+                    }
+                }
+                else
+                {
+                    set number_of_capturing_groups: number_of_capturing_groups + 1
+                    set is_previous_term_quantifiable: true
+                }
+                this.scan_disjunction(true)
+                this.scan_expected_char((")" as char) as int)
+                continue
+            }
+
+            ; The braced quantifier, and then the fallthrough. `quantifier` is
+            ; false wherever the reference writes `continue` inside this arm.
+            var quantifier false
+            if ch = (("{" as char) as int)
+            {
+                this.inc_pos(1)
+                let digits_start this.pos()
+                this.scan_digits()
+                let min_start digits_start
+                let min_end this.pos()
+                let min_len min_end - min_start
+                var abandon false
+                if (not any_unicode_mode_or_non_annex_b) and (min_len = 0)
+                {
+                    set is_previous_term_quantifiable: true
+                    set abandon: true
+                }
+                if not abandon
+                {
+                    if this.char() = ((("," as char)) as int)
+                    {
+                        this.inc_pos(1)
+                        let max_start this.pos()
+                        this.scan_digits()
+                        let max_len this.pos() - max_start
+                        if min_len = 0
+                        {
+                            if (max_len <> 0) or (this.char() = (("}" as char) as int))
+                                this.error(DiagIncomplete_quantifier_Digit_expected, digits_start, 0)
+                            else
+                            {
+                                this.error(DiagUnexpected_0_Did_you_mean_to_escape_it_with_backslash, start, 1)
+                                set is_previous_term_quantifiable: true
+                                set abandon: true
+                            }
+                        }
+                        else
+                        {
+                            if max_len <> 0
+                            {
+                                if RegExpParser.compare_decimal_strings(s.source_range(min_start, min_end), s.source_range(max_start, max_start + max_len)) > 0
+                                {
+                                    if any_unicode_mode_or_non_annex_b or (this.char() = (("}" as char) as int))
+                                        this.error(DiagNumbers_out_of_order_in_quantifier, digits_start, this.pos() - digits_start)
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if min_len = 0
+                        {
+                            if any_unicode_mode_or_non_annex_b
+                                this.error(DiagUnexpected_0_Did_you_mean_to_escape_it_with_backslash, start, 1)
+                            set is_previous_term_quantifiable: true
+                            set abandon: true
+                        }
+                    }
+                }
+                if not abandon
+                {
+                    if this.char() <> (("}" as char) as int)
+                    {
+                        if any_unicode_mode_or_non_annex_b
+                        {
+                            this.error(DiagX_0_expected, this.pos(), 0)
+                            this.inc_pos(0 - 1)
+                        }
+                        else
+                        {
+                            set is_previous_term_quantifiable: true
+                            set abandon: true
+                        }
+                    }
+                }
+                if abandon
+                    continue
+                set quantifier: true
+            }
+            if (ch = (("*" as char) as int)) or (ch = (("+" as char) as int)) or (ch = (("?" as char) as int))
+                set quantifier: true
+            if quantifier
+            {
+                this.inc_pos(1)
+                if this.char() = (("?" as char) as int)
+                {
+                    ; Non-greedy
+                    this.inc_pos(1)
+                }
+                if not is_previous_term_quantifiable
+                    this.error(DiagThere_is_nothing_available_for_repetition, start, this.pos() - start)
+                set is_previous_term_quantifiable: false
+                continue
+            }
+
+            if ch = (("." as char) as int)
+            {
+                this.inc_pos(1)
+                set is_previous_term_quantifiable: true
+                continue
+            }
+
+            if ch = (("[" as char) as int)
+            {
+                this.inc_pos(1)
+                if unicode_sets_mode
+                    this.scan_class_set_expression()
+                else
+                {
+                    this.scan_class_ranges()
+                    set pending_low_surrogate: 0
+                }
+                this.scan_expected_char((("]" as char)) as int)
+                set is_previous_term_quantifiable: true
+                continue
+            }
+
+            ; `)` closes a group and otherwise falls through into the `]`/`}`
+            ; arm, which is what makes an unbalanced `)` report where an
+            ; unbalanced `]` outside a Unicode mode does not.
+            if ch = ((")" as char) as int)
+            {
+                if is_in_group
+                    return
+            }
+            if (ch = ((")" as char) as int)) or (ch = (("]" as char) as int)) or (ch = (("}" as char) as int))
+            {
+                if any_unicode_mode_or_non_annex_b or (ch = ((")" as char) as int))
+                    this.error(DiagUnexpected_0_Did_you_mean_to_escape_it_with_backslash, this.pos(), 1)
+                this.inc_pos(1)
+                set is_previous_term_quantifiable: true
+                continue
+            }
+
+            if (ch = (("/" as char) as int)) or (ch = (("|" as char) as int))
+                return
+
+            this.scan_source_character()
+            set is_previous_term_quantifiable: true
+        }
+    }
+
+    ; The flags of a `(?ims-ims:...)` subpattern.
+    procedure scan_pattern_modifiers(this, curr_flags: int) returns int
+    {
+        var flags curr_flags
+        while this.pos() < end
+        {
+            let ch s.utf8_decode_at(this.pos())
+            let size s.utf8_size_at(this.pos())
+            if ch = 0xFFFD
+                break
+            if not Scanner.is_identifier_part(ch)
+                break
+            let flag reg_exp_flag_of_char(ch)
+            if flag = RegExpFlagsNone
+                this.error(DiagUnknown_regular_expression_flag, this.pos(), size)
+            else
+            {
+                if (flags & flag) <> 0
+                    this.error(DiagDuplicate_regular_expression_flag, this.pos(), size)
+                else
+                {
+                    if (flag & RegExpFlagsModifiers) = 0
+                        this.error(DiagThis_regular_expression_flag_cannot_be_toggled_within_a_subpattern, this.pos(), size)
+                    else
+                    {
+                        set flags: flags | flag
+                        s.check_regular_expression_flag_availability(flag, this.pos(), size)
+                    }
+                }
+            }
+            this.inc_pos(size)
+        }
+        flags
+    }
+
+    ; AtomEscape ::= DecimalEscape | CharacterClassEscape | CharacterEscape
+    ;              | 'k<' RegExpIdentifierName '>'
+    procedure scan_atom_escape(this)
+    {
+        let ch this.char()
+        if ch = (("k" as char) as int)
+        {
+            this.inc_pos(1)
+            if this.char() = (("<" as char) as int)
+            {
+                this.inc_pos(1)
+                this.scan_group_name(true)
+                this.scan_expected_char((">" as char) as int)
+            }
+            else
+            {
+                if any_unicode_mode_or_non_annex_b or named_capture_groups
+                    this.error(DiagX_k_must_be_followed_by_a_capturing_group_name_enclosed_in_angle_brackets, this.pos() - 2, 2)
+            }
+            return
+        }
+        if (ch = (("q" as char) as int)) and unicode_sets_mode
+        {
+            this.inc_pos(1)
+            this.error(DiagX_q_is_only_available_inside_character_class, this.pos() - 2, 2)
+            return
+        }
+        ; ★ The reference asserts the result is non-empty rather than reading it
+        ; — *"Regex literals cannot contain line breaks here, so a character
+        ; escape must consume something"* — so what is ported is the CALL.
+        if this.scan_character_class_escape()
+            return
+        if this.scan_decimal_escape()
+            return
+        this.scan_character_escape(true)
+    }
+
+    ; DecimalEscape ::= [1-9] [0-9]*
+    procedure scan_decimal_escape(this) returns bool
+    {
+        let ch this.char()
+        if ch < (("1" as char) as int)
+            return false
+        if ch > (("9" as char) as int)
+            return false
+        let start this.pos()
+        this.scan_digits()
+        ; The reference's strconv.Atoi, whose overflow answer is math.MaxInt.
+        ; ★ The accumulation SATURATES rather than wrapping, and that is the whole
+        ; of what an unrepresentable backreference means here: the value's only
+        ; reader is `> number_of_capturing_groups` in run(), so every number past
+        ; the ceiling answers that test identically.
+        var val 0
+        var i start
+        while i < this.pos()
+        {
+            if val <= 0x0FFFFFFFFFFFFFFF
+                set val: (val * 10) + (s.byte_at(i) - (("0" as char) as int))
+            set i: i + 1
+        }
+        decimal_escapes.add(RegExpDecimalEscape(start, this.pos(), val))
+        true
+    }
+
+    ; CharacterEscape ::= `c` ControlLetter | IdentityEscape
+    ;                   | (Other sequences handled by scan_escape_sequence)
+    ; IdentityEscape ::=
+    ;   | '^' | '$' | '/' | '\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']'
+    ;   | '{' | '}' | '|'
+    ;   | [~AnyUnicodeMode] (any other non-identifier characters)
+    procedure scan_character_escape(this, atom_escape: bool) returns RegExpValue
+    {
+        var ch this.char()
+        if ch < 0
+        {
+            this.error(DiagUndetermined_character_escape, this.pos() - 1, 1)
+            return RegExpValue(1, ("\\" as char) as int, 1)
+        }
+        if ch = (("c" as char) as int)
+        {
+            this.inc_pos(1)
+            set ch: this.char()
+            if Scanner.is_ascii_letter(ch)
+            {
+                this.inc_pos(1)
+                return RegExpParser.value_of_codepoint(ch & 0x1F)
+            }
+            if any_unicode_mode_or_non_annex_b
+                this.error(DiagX_c_must_be_followed_by_an_ASCII_letter, this.pos() - 2, 2)
+            else
+            {
+                if atom_escape
+                {
+                    this.inc_pos(0 - 1)
+                    return RegExpValue(1, ("\\" as char) as int, 1)
+                }
+            }
+            ; `return string(ch)` on a `ch` that may be -1 at the body's end,
+            ; where Go writes U+FFFD's three bytes. The length test the callers
+            ; make is `== ""`, and neither answer is empty.
+            if ch < 0
+                return RegExpParser.value_of_codepoint(0xFFFD)
+            return RegExpParser.value_of_codepoint(ch)
+        }
+        if RegExpParser.is_identity_escape_char(ch)
+        {
+            this.inc_pos(1)
+            return RegExpParser.value_of_codepoint(ch)
+        }
+
+        ; Back up to include the backslash for scan_escape_sequence, which reads
+        ; it again.
+        this.inc_pos(0 - 1)
+        var flags EscapeSequenceScanningFlagsRegularExpression
+        if annex_b
+            set flags: flags | EscapeSequenceScanningFlagsAnnexB
+        if any_unicode_mode
+            set flags: flags | EscapeSequenceScanningFlagsAnyUnicodeMode
+        if atom_escape
+            set flags: flags | EscapeSequenceScanningFlagsAtomEscape
+        s.scan_escape_sequence(flags)
+        RegExpValue(s.escape_len(), s.escape_cp(), s.escape_size())
+    }
+
+    ; The fifteen characters an IdentityEscape admits in every mode.
+    function is_identity_escape_char(ch: int) returns bool
+    {
+        if ch = (("^" as char) as int)
+            return true
+        if ch = (("$" as char) as int)
+            return true
+        if ch = (("/" as char) as int)
+            return true
+        if ch = (("\\" as char) as int)
+            return true
+        if ch = (("." as char) as int)
+            return true
+        if ch = (("*" as char) as int)
+            return true
+        if ch = (("+" as char) as int)
+            return true
+        if ch = (("?" as char) as int)
+            return true
+        if ch = (("(" as char) as int)
+            return true
+        if ch = ((")" as char) as int)
+            return true
+        if ch = (("[" as char) as int)
+            return true
+        if ch = (("]" as char) as int)
+            return true
+        if ch = (("{" as char) as int)
+            return true
+        if ch = (("}" as char) as int)
+            return true
+        ch = (("|" as char) as int)
+    }
+
+    ; A one-code-point value, the shape almost every atom answers. Its byte
+    ; length is what a JS string would take for it, INCLUDING the three bytes of
+    ; a lone surrogate; Scanner.utf8_encoded_size carries that agreement.
+    function value_of_codepoint(cp: int) returns RegExpValue
+    {
+        let n Scanner.utf8_encoded_size(cp)
+        RegExpValue(n, cp, n)
+    }
+
+    function empty_value() returns RegExpValue
+        RegExpValue(0, 0xFFFD, 0)
+
+    procedure scan_group_name(this, is_reference: bool)
+    {
+        s.set_token_start(this.pos())
+        let kind s.scan_identifier(0)
+        if kind = 2
+            s.scan_identifier_decoded(s.token_start(), 0)
+        if this.pos() = s.token_start()
+        {
+            this.error(DiagExpected_a_capturing_group_name, this.pos(), 0)
+            return
+        }
+        let name Slice[char](s.token_value_length(), s.token_value())
+        if is_reference
+        {
+            group_name_references.add(RegExpGroupRef(s.token_start(), this.pos(), name))
+            return
+        }
+        if this.named_capturing_groups_contains(name)
+        {
+            this.error(DiagNamed_capturing_groups_with_the_same_name_must_be_mutually_exclusive_to_each_other, s.token_start(), this.pos() - s.token_start())
+            return
+        }
+        ; The reference's `if len(p.namedCapturingGroups) > 0` cannot be false
+        ; here: scan_disjunction has pushed a scope before every alternative and
+        ; a group name is only reachable from inside one.
+        if group_scope_count < (group_scope_names.get_length() as int)
+            group_scope_names.put(group_scope_count as size_t, name)
+        else
+            group_scope_names.add(name)
+        set group_scope_count: group_scope_count + 1
+        group_specifiers.add(name)
+    }
+
+    function named_capturing_groups_contains(this, name: Slice[char]) returns bool
+    {
+        var i 0
+        while i < group_scope_count
+        {
+            if RegExpParser.names_equal(group_scope_names[i], name)
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    function names_equal(a: Slice[char], b: Slice[char]) returns bool
+    {
+        if a.length <> b.length
+            return false
+        var i 0
+        while i < a.length
+        {
+            if (a[i] as int) <> (b[i] as int)
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    function is_class_content_exit(this, ch: int) returns bool
+    {
+        if ch = (("]" as char) as int)
+            return true
+        this.pos() >= end
+    }
+
+    ; ClassRanges ::= '^'? (ClassAtom ('-' ClassAtom)?)*
+    procedure scan_class_ranges(this)
+    {
+        set pending_low_surrogate: 0
+        if this.char() = (("^" as char) as int)
+            this.inc_pos(1)
+        while this.pos() < end
+        {
+            var ch this.char()
+            if this.is_class_content_exit(ch)
+                return
+            let min_start this.pos()
+            let min_character this.scan_class_atom()
+            if this.char() = (("-" as char) as int)
+            {
+                this.inc_pos(1)
+                set ch: this.char()
+                if this.is_class_content_exit(ch)
+                    return
+                if (min_character.len = 0) and any_unicode_mode_or_non_annex_b
+                    this.error(DiagA_character_class_range_must_not_be_bounded_by_another_character_class, min_start, (this.pos() - 1) - min_start)
+                let max_start this.pos()
+                let max_character this.scan_class_atom()
+                if (max_character.len = 0) and any_unicode_mode_or_non_annex_b
+                {
+                    this.error(DiagA_character_class_range_must_not_be_bounded_by_another_character_class, max_start, this.pos() - max_start)
+                    continue
+                }
+                if min_character.len = 0
+                    continue
+                if min_character.len = min_character.size
+                {
+                    if max_character.len = max_character.size
+                    {
+                        if min_character.cp > max_character.cp
+                            this.error(DiagRange_out_of_order_in_character_class, min_start, this.pos() - min_start)
+                    }
+                }
+            }
+        }
+    }
+
+    ; A value that is a RUN OF SOURCE — the two-byte operator the class-set
+    ; recovery paths hand on as an operand. Its first code point is the byte at
+    ; `from`, so `len <> size` and every range comparison against it drops out,
+    ; exactly as the reference's `len(s) == size` test does.
+    function value_of_range(this, from: int, to: int) returns RegExpValue
+        RegExpValue(to - from, s.utf8_decode_at(from), s.utf8_size_at(from))
+
+    ; Static Semantics: MayContainStrings
+    ;     ClassUnion: ClassSetOperands.some(o => o.MayContainStrings)
+    ;     ClassIntersection: ClassSetOperands.every(o => o.MayContainStrings)
+    ;     ClassSubtraction: ClassSetOperands[0].MayContainStrings
+    ;     ClassSetOperand:
+    ;         || ClassStringDisjunctionContents.MayContainStrings
+    ;         || CharacterClassEscape.UnicodePropertyValueExpression
+    ;              .LoneUnicodePropertyNameOrValue.MayContainStrings
+    ;     ClassStringDisjunctionContents:
+    ;         ClassStrings.some(s => s.ClassSetCharacters.length !== 1)
+    ;     LoneUnicodePropertyNameOrValue:
+    ;         isBinaryUnicodePropertyOfStrings(LoneUnicodePropertyNameOrValue)
+    ;
+    ; ClassSetExpression ::= '^'? (ClassUnion | ClassIntersection | ClassSubtraction)
+    ; ClassUnion ::= (ClassSetRange | ClassSetOperand)*
+    ; ClassIntersection ::= ClassSetOperand ('&&' ClassSetOperand)+
+    ; ClassSubtraction ::= ClassSetOperand ('--' ClassSetOperand)+
+    ; ClassSetRange ::= ClassSetCharacter '-' ClassSetCharacter
+    ;
+    ; ★ THE THREE ARMS OF THE FIRST SWITCH DO NOT AGREE ON WHAT THEY LEAVE
+    ; BEHIND, and that is upstream's shape rather than an oversight: a `-` that
+    ; is not `--` and a `&` that is not `&&` fall out of the switch WITHOUT
+    ; copying may_contain_strings into expression_may_contain_strings, where the
+    ; default arm copies it. Reading the three as one would change what the
+    ; union at the bottom answers.
+    procedure scan_class_set_expression(this)
+    {
+        var is_character_complement false
+        if this.char() = (("^" as char) as int)
+        {
+            this.inc_pos(1)
+            set is_character_complement: true
+        }
+        var expression_may_contain_strings false
+        let ch0 this.char()
+        if this.is_class_content_exit(ch0)
+            return
+        var start this.pos()
+        var operand RegExpParser.empty_value()
+        if this.two_chars_are(("-" as char) as int) or this.two_chars_are(("&" as char) as int)
+        {
+            this.error(DiagExpected_a_class_set_operand, this.pos(), 0)
+            set may_contain_strings: false
+        }
+        else
+            set operand: this.scan_class_set_operand()
+
+        let ch1 this.char()
+        var handled false
+        if ch1 = (("-" as char) as int)
+        {
+            if (this.pos() + 1) < end
+            {
+                if this.char_at(this.pos() + 1) = (("-" as char) as int)
+                {
+                    if is_character_complement and may_contain_strings
+                        this.error(DiagAnything_that_would_possibly_match_more_than_a_single_character_is_invalid_inside_a_negated_character_class, start, this.pos() - start)
+                    set expression_may_contain_strings: may_contain_strings
+                    this.scan_class_set_sub_expression(ClassSetExpressionTypeClassSubtraction)
+                    set may_contain_strings: (not is_character_complement) and expression_may_contain_strings
+                    return
+                }
+            }
+            set handled: true
+        }
+        if (not handled) and (ch1 = (("&" as char) as int))
+        {
+            var pair false
+            if (this.pos() + 1) < end
+            {
+                if this.char_at(this.pos() + 1) = (("&" as char) as int)
+                    set pair: true
+            }
+            if pair
+            {
+                this.scan_class_set_sub_expression(ClassSetExpressionTypeClassIntersection)
+                if is_character_complement and may_contain_strings
+                    this.error(DiagAnything_that_would_possibly_match_more_than_a_single_character_is_invalid_inside_a_negated_character_class, start, this.pos() - start)
+                set expression_may_contain_strings: may_contain_strings
+                set may_contain_strings: (not is_character_complement) and expression_may_contain_strings
+                return
+            }
+            this.error(DiagUnexpected_0_Did_you_mean_to_escape_it_with_backslash, this.pos(), 1)
+            set handled: true
+        }
+        if not handled
+        {
+            if is_character_complement and may_contain_strings
+                this.error(DiagAnything_that_would_possibly_match_more_than_a_single_character_is_invalid_inside_a_negated_character_class, start, this.pos() - start)
+            set expression_may_contain_strings: may_contain_strings
+        }
+
+        while this.pos() < end
+        {
+            var ch this.char()
+            var again false
+            if ch = (("-" as char) as int)
+            {
+                this.inc_pos(1)
+                set ch: this.char()
+                if this.is_class_content_exit(ch)
+                {
+                    set may_contain_strings: (not is_character_complement) and expression_may_contain_strings
+                    return
+                }
+                if ch = (("-" as char) as int)
+                {
+                    this.inc_pos(1)
+                    this.error(DiagOperators_must_not_be_mixed_within_a_character_class_Wrap_it_in_a_nested_class_instead, this.pos() - 2, 2)
+                    set start: this.pos() - 2
+                    set operand: this.value_of_range(start, this.pos())
+                    set again: true
+                }
+                else
+                {
+                    if operand.len = 0
+                        this.error(DiagA_character_class_range_must_not_be_bounded_by_another_character_class, start, (this.pos() - 1) - start)
+                    let second_start this.pos()
+                    let second_operand this.scan_class_set_operand()
+                    if is_character_complement and may_contain_strings
+                        this.error(DiagAnything_that_would_possibly_match_more_than_a_single_character_is_invalid_inside_a_negated_character_class, second_start, this.pos() - second_start)
+                    set expression_may_contain_strings: expression_may_contain_strings or may_contain_strings
+                    if second_operand.len = 0
+                        this.error(DiagA_character_class_range_must_not_be_bounded_by_another_character_class, second_start, this.pos() - second_start)
+                    else
+                    {
+                        if operand.len <> 0
+                        {
+                            if operand.len = operand.size
+                            {
+                                if second_operand.len = second_operand.size
+                                {
+                                    if operand.cp > second_operand.cp
+                                        this.error(DiagRange_out_of_order_in_character_class, start, this.pos() - start)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                if ch = (("&" as char) as int)
+                {
+                    set start: this.pos()
+                    this.inc_pos(1)
+                    if this.char() = (("&" as char) as int)
+                    {
+                        this.inc_pos(1)
+                        this.error(DiagOperators_must_not_be_mixed_within_a_character_class_Wrap_it_in_a_nested_class_instead, this.pos() - 2, 2)
+                        if this.char() = (("&" as char) as int)
+                        {
+                            this.error(DiagUnexpected_0_Did_you_mean_to_escape_it_with_backslash, this.pos(), 1)
+                            this.inc_pos(1)
+                        }
+                    }
+                    else
+                        this.error(DiagUnexpected_0_Did_you_mean_to_escape_it_with_backslash, this.pos() - 1, 1)
+                    set operand: this.value_of_range(start, this.pos())
+                    set again: true
+                }
+            }
+            if again
+                continue
+
+            if this.is_class_content_exit(this.char())
+                break
+            set start: this.pos()
+            if this.two_chars_are(("-" as char) as int) or this.two_chars_are(("&" as char) as int)
+            {
+                this.error(DiagOperators_must_not_be_mixed_within_a_character_class_Wrap_it_in_a_nested_class_instead, this.pos(), 2)
+                this.inc_pos(2)
+                set operand: this.value_of_range(start, this.pos())
+            }
+            else
+                set operand: this.scan_class_set_operand()
+        }
+        set may_contain_strings: (not is_character_complement) and expression_may_contain_strings
+    }
+
+    ; The reference's `twoChars := p.text()[p.pos():p.pos()+2]` compared against
+    ; "--" or "&&" — the slice is empty when it would run past the body, and an
+    ; empty string matches neither, so the bound is part of the question.
+    function two_chars_are(this, ch: int) returns bool
+    {
+        if (this.pos() + 1) >= end
+            return false
+        if this.char() <> ch
+            return false
+        this.char_at(this.pos() + 1) = ch
+    }
+
+    procedure scan_class_set_sub_expression(this, expression_type: int)
+    {
+        var expression_may_contain_strings may_contain_strings
+        while this.pos() < end
+        {
+            var ch this.char()
+            if this.is_class_content_exit(ch)
+                break
+            if ch = (("-" as char) as int)
+            {
+                this.inc_pos(1)
+                if this.char() = (("-" as char) as int)
+                {
+                    this.inc_pos(1)
+                    if expression_type <> ClassSetExpressionTypeClassSubtraction
+                        this.error(DiagOperators_must_not_be_mixed_within_a_character_class_Wrap_it_in_a_nested_class_instead, this.pos() - 2, 2)
+                }
+                else
+                    this.error(DiagOperators_must_not_be_mixed_within_a_character_class_Wrap_it_in_a_nested_class_instead, this.pos() - 1, 1)
+            }
+            else
+            {
+                if ch = (("&" as char) as int)
+                {
+                    this.inc_pos(1)
+                    if this.char() = (("&" as char) as int)
+                    {
+                        this.inc_pos(1)
+                        if expression_type <> ClassSetExpressionTypeClassIntersection
+                            this.error(DiagOperators_must_not_be_mixed_within_a_character_class_Wrap_it_in_a_nested_class_instead, this.pos() - 2, 2)
+                        if this.char() = (("&" as char) as int)
+                        {
+                            this.error(DiagUnexpected_0_Did_you_mean_to_escape_it_with_backslash, this.pos(), 1)
+                            this.inc_pos(1)
+                        }
+                    }
+                    else
+                        this.error(DiagUnexpected_0_Did_you_mean_to_escape_it_with_backslash, this.pos() - 1, 1)
+                }
+                else
+                {
+                    if expression_type = ClassSetExpressionTypeClassSubtraction
+                        this.error(DiagX_0_expected, this.pos(), 0)
+                    if expression_type = ClassSetExpressionTypeClassIntersection
+                        this.error(DiagX_0_expected, this.pos(), 0)
+                }
+            }
+            set ch: this.char()
+            if this.is_class_content_exit(ch)
+            {
+                this.error(DiagExpected_a_class_set_operand, this.pos(), 0)
+                break
+            }
+            this.scan_class_set_operand()
+            if expression_type = ClassSetExpressionTypeClassIntersection
+                set expression_may_contain_strings: expression_may_contain_strings and may_contain_strings
+        }
+        set may_contain_strings: expression_may_contain_strings
+    }
+
+    ; ClassSetOperand ::=
+    ;   | '[' ClassSetExpression ']'
+    ;   | '\' CharacterClassEscape
+    ;   | '\q{' ClassStringDisjunctionContents '}'
+    ;   | ClassSetCharacter
+    procedure scan_class_set_operand(this) returns RegExpValue
+    {
+        set may_contain_strings: false
+        let ch this.char()
+        if ch = (("[" as char) as int)
+        {
+            this.inc_pos(1)
+            this.scan_class_set_expression()
+            this.scan_expected_char((("]" as char)) as int)
+            return RegExpParser.empty_value()
+        }
+        if ch = (("\\" as char) as int)
+        {
+            this.inc_pos(1)
+            if this.scan_character_class_escape()
+                return RegExpParser.empty_value()
+            if this.char() = (("q" as char) as int)
+            {
+                this.inc_pos(1)
+                if this.char() = (("{" as char) as int)
+                {
+                    this.inc_pos(1)
+                    this.scan_class_string_disjunction_contents()
+                    this.scan_expected_char((("}" as char)) as int)
+                    return RegExpParser.empty_value()
+                }
+                this.error(DiagX_q_must_be_followed_by_string_alternatives_enclosed_in_braces, this.pos() - 2, 2)
+                return RegExpParser.value_of_codepoint(("q" as char) as int)
+            }
+            ; The reference backs up over the backslash and FALLS THROUGH into
+            ; the character arm, which reads it again.
+            this.inc_pos(0 - 1)
+        }
+        this.scan_class_set_character()
+    }
+
+    ; ClassStringDisjunctionContents ::= ClassSetCharacter* ('|' ClassSetCharacter*)*
+    procedure scan_class_string_disjunction_contents(this)
+    {
+        var character_count 0
+        while this.pos() < end
+        {
+            let ch this.char()
+            if ch = (("}" as char) as int)
+            {
+                if character_count <> 1
+                    set may_contain_strings: true
+                return
+            }
+            if ch = (("|" as char) as int)
+            {
+                if character_count <> 1
+                    set may_contain_strings: true
+                this.inc_pos(1)
+                set character_count: 0
+            }
+            else
+            {
+                this.scan_class_set_character()
+                set character_count: character_count + 1
+            }
+        }
+    }
+
+    ; ClassSetCharacter ::=
+    ;   | SourceCharacter -- ClassSetSyntaxCharacter -- ClassSetReservedDoublePunctuator
+    ;   | '\' (CharacterEscape | ClassSetReservedPunctuator | 'b')
+    procedure scan_class_set_character(this) returns RegExpValue
+    {
+        let ch this.char()
+        if ch = (("\\" as char) as int)
+        {
+            this.inc_pos(1)
+            let inner this.char()
+            if inner = (("b" as char) as int)
+            {
+                this.inc_pos(1)
+                return RegExpParser.value_of_codepoint(8)
+            }
+            if RegExpParser.is_class_set_reserved_punctuator(inner)
+            {
+                this.inc_pos(1)
+                return RegExpParser.value_of_codepoint(inner)
+            }
+            return this.scan_character_escape(false)
+        }
+        if (this.pos() + 1) < end
+        {
+            if ch = this.char_at(this.pos() + 1)
+            {
+                if RegExpParser.is_class_set_reserved_double_punctuator(ch)
+                {
+                    this.error(DiagA_character_class_must_not_contain_a_reserved_double_punctuator_Did_you_mean_to_escape_it_with_backslash, this.pos(), 2)
+                    this.inc_pos(2)
+                    return this.value_of_range(this.pos() - 2, this.pos())
+                }
+            }
+        }
+        if RegExpParser.is_class_set_syntax_character(ch)
+        {
+            this.error(DiagUnexpected_0_Did_you_mean_to_escape_it_with_backslash, this.pos(), 1)
+            this.inc_pos(1)
+            return RegExpParser.value_of_codepoint(ch)
+        }
+        this.scan_source_character()
+    }
+
+    ; ClassSetReservedPunctuator — the fourteen a backslash may escape inside a
+    ; class set.
+    function is_class_set_reserved_punctuator(ch: int) returns bool
+    {
+        if ch = (("&" as char) as int)
+            return true
+        if ch = (("-" as char) as int)
+            return true
+        if ch = (("!" as char) as int)
+            return true
+        if ch = (("#" as char) as int)
+            return true
+        if ch = (("%" as char) as int)
+            return true
+        if ch = (("," as char) as int)
+            return true
+        if ch = ((":" as char) as int)
+            return true
+        if ch = ((";" as char) as int)
+            return true
+        if ch = (("<" as char) as int)
+            return true
+        if ch = (("=" as char) as int)
+            return true
+        if ch = ((">" as char) as int)
+            return true
+        if ch = (("@" as char) as int)
+            return true
+        if ch = (("\`" as char) as int)
+            return true
+        ch = (("~" as char) as int)
+    }
+
+    ; ClassSetReservedDoublePunctuator — the seventeen that may not appear twice
+    ; in a row unescaped. It is the punctuator list above plus `*`, `+`, `.` and
+    ; `?`, and minus the `-`, which is the range operator and has its own arm.
+    function is_class_set_reserved_double_punctuator(ch: int) returns bool
+    {
+        if ch = (("*" as char) as int)
+            return true
+        if ch = (("+" as char) as int)
+            return true
+        if ch = (("." as char) as int)
+            return true
+        if ch = (("?" as char) as int)
+            return true
+        if ch = (("-" as char) as int)
+            return false
+        RegExpParser.is_class_set_reserved_punctuator(ch)
+    }
+
+    ; ClassSetSyntaxCharacter — the nine that must be escaped to stand for
+    ; themselves inside a class set.
+    function is_class_set_syntax_character(ch: int) returns bool
+    {
+        if ch = (("/" as char) as int)
+            return true
+        if ch = (("(" as char) as int)
+            return true
+        if ch = ((")" as char) as int)
+            return true
+        if ch = (("[" as char) as int)
+            return true
+        if ch = (("]" as char) as int)
+            return true
+        if ch = (("{" as char) as int)
+            return true
+        if ch = (("}" as char) as int)
+            return true
+        if ch = (("-" as char) as int)
+            return true
+        ch = (("|" as char) as int)
+    }
+
+    ; ClassAtom ::=
+    ;   | SourceCharacter but not one of '\' or ']'
+    ;   | '\' ClassEscape
+    ; ClassEscape ::= 'b' | '-' | CharacterClassEscape | CharacterEscape
+    procedure scan_class_atom(this) returns RegExpValue
+    {
+        if this.char() <> (("\\" as char) as int)
+            return this.scan_source_character()
+        this.inc_pos(1)
+        let ch this.char()
+        if ch = (("b" as char) as int)
+        {
+            this.inc_pos(1)
+            return RegExpParser.value_of_codepoint(8)
+        }
+        if ch = (("-" as char) as int)
+        {
+            this.inc_pos(1)
+            return RegExpParser.value_of_codepoint(ch)
+        }
+        if this.scan_character_class_escape()
+            return RegExpParser.empty_value()
+        this.scan_character_escape(false)
+    }
+
+    ; CharacterClassEscape ::=
+    ;   | 'd' | 'D' | 's' | 'S' | 'w' | 'W'
+    ;   | [+AnyUnicodeMode] ('P' | 'p') '{' UnicodePropertyValueExpression '}'
+    procedure scan_character_class_escape(this) returns bool
+    {
+        var is_character_complement false
+        let start this.pos() - 1
+        let ch this.char()
+        if RegExpParser.is_simple_class_escape(ch)
+        {
+            this.inc_pos(1)
+            return true
+        }
+        if ch = (("P" as char) as int)
+            set is_character_complement: true
+        else
+        {
+            if ch <> (("p" as char) as int)
+                return false
+        }
+        this.inc_pos(1)
+        if this.char() <> (("{" as char) as int)
+        {
+            if any_unicode_mode_or_non_annex_b
+            {
+                this.error(DiagX_0_must_be_followed_by_a_Unicode_property_value_expression_enclosed_in_braces, this.pos() - 2, 2)
+                return true
+            }
+            this.inc_pos(0 - 1)
+            return false
+        }
+        this.inc_pos(1)
+        let name_start this.pos()
+        let name_or_value this.scan_word_characters()
+        if this.char() = (("=" as char) as int)
+        {
+            ; A property NAME and a property VALUE, `\p{Script=Greek}`.
+            let property_name non_binary_unicode_property(name_or_value)
+            if this.pos() = name_start
+                this.error(DiagExpected_a_Unicode_property_name, this.pos(), 0)
+            else
+            {
+                if property_name = 0
+                    this.error(DiagUnknown_Unicode_property_name, name_start, this.pos() - name_start)
+            }
+            this.inc_pos(1)
+            let value_start this.pos()
+            let value this.scan_word_characters()
+            if this.pos() = value_start
+                this.error(DiagExpected_a_Unicode_property_value, this.pos(), 0)
+            else
+            {
+                ; ★ The reference's `values != nil` cannot fail — every canonical
+                ; name has a value set — and UnicodeProps says so where it drops
+                ; the test.
+                if property_name <> 0
+                {
+                    if values_of_non_binary_unicode_property_has(property_name, value) = false
+                        this.error(DiagUnknown_Unicode_property_value, value_start, this.pos() - value_start)
+                }
+            }
+        }
+        else
+        {
+            ; A LONE property name or value, `\p{Letter}`.
+            if this.pos() = name_start
+                this.error(DiagExpected_a_Unicode_property_name_or_value, this.pos(), 0)
+            else
+            {
+                if is_binary_unicode_property_of_strings(name_or_value)
+                {
+                    if not unicode_sets_mode
+                        this.error(DiagAny_Unicode_property_that_would_possibly_match_more_than_a_single_character_is_only_available_when_the_Unicode_Sets_v_flag_is_set, name_start, this.pos() - name_start)
+                    else
+                    {
+                        if is_character_complement
+                            this.error(DiagAnything_that_would_possibly_match_more_than_a_single_character_is_invalid_inside_a_negated_character_class, name_start, this.pos() - name_start)
+                        else
+                            set may_contain_strings: true
+                    }
+                }
+                else
+                {
+                    if is_general_category_value(name_or_value) = false
+                    {
+                        if is_binary_unicode_property(name_or_value) = false
+                            this.error(DiagUnknown_Unicode_property_name_or_value, name_start, this.pos() - name_start)
+                    }
+                }
+            }
+        }
+        this.scan_expected_char((("}" as char)) as int)
+        if not any_unicode_mode
+            this.error(DiagUnicode_property_value_expressions_are_only_available_when_the_Unicode_u_flag_or_the_Unicode_Sets_v_flag_is_set, start, this.pos() - start)
+        true
+    }
+
+    function is_simple_class_escape(ch: int) returns bool
+    {
+        if ch = (("d" as char) as int)
+            return true
+        if ch = (("D" as char) as int)
+            return true
+        if ch = (("s" as char) as int)
+            return true
+        if ch = (("S" as char) as int)
+            return true
+        if ch = (("w" as char) as int)
+            return true
+        ch = (("W" as char) as int)
+    }
+
+    ; isWordCharacter over a run: ASCII letters, digits and `_`.
+    procedure scan_word_characters(this) returns Slice[char]
+    {
+        let start this.pos()
+        while this.pos() < end
+        {
+            let ch this.char()
+            if Scanner.is_word_character(ch) = false
+                break
+            this.inc_pos(1)
+        }
+        s.source_range(start, this.pos())
+    }
+
+    ; ★★★ THE SPLIT INTO SURROGATES IS UPSTREAM'S AND IT IS WHY THIS ROUTINE HAS
+    ; A FIELD. Outside a Unicode mode a pattern sees UTF-16 CODE UNITS, so a
+    ; non-BMP character is TWO atoms: the first call answers the high surrogate
+    ; WITHOUT advancing and remembers the low one, the second answers the low one
+    ; and steps over the whole sequence. Upstream's comment says the TypeScript
+    ; original needed none of this because its source was already indexed as
+    ; UTF-16.
+    procedure scan_source_character(this) returns RegExpValue
+    {
+        if this.pos() >= end
+            return RegExpParser.empty_value()
+        if not any_unicode_mode
+        {
+            if pending_low_surrogate <> 0
+            {
+                this.inc_pos(s.utf8_size_at(this.pos()))
+                let low pending_low_surrogate
+                set pending_low_surrogate: 0
+                return RegExpParser.value_of_codepoint(low)
+            }
+            let ch s.utf8_decode_at(this.pos())
+            if ch = 0xFFFD
+            {
+                ; Not a valid rune; consume one raw byte and answer it as the
+                ; code point of that byte's value, which is what Go's
+                ; `string(p.text()[p.pos()-1])` builds.
+                let b s.byte_at(this.pos())
+                this.inc_pos(1)
+                return RegExpParser.value_of_codepoint(b)
+            }
+            if ch > 0xFFFF
+            {
+                let high 0xD800 + ((ch - 0x10000) >> 10)
+                set pending_low_surrogate: 0xDC00 + ((ch - 0x10000) & 0x3FF)
+                return RegExpParser.value_of_codepoint(high)
+            }
+            this.inc_pos(s.utf8_size_at(this.pos()))
+            return RegExpParser.value_of_codepoint(ch)
+        }
+        let ch s.utf8_decode_at(this.pos())
+        let size s.utf8_size_at(this.pos())
+        if ch = 0xFFFD
+        {
+            ; Invalid UTF-8; consume the byte to avoid infinite loops.
+            this.inc_pos(size)
+            return RegExpParser.empty_value()
+        }
+        this.inc_pos(size)
+        RegExpParser.value_of_codepoint(ch)
+    }
+
+    procedure scan_expected_char(this, ch: int)
+    {
+        if this.char() = ch
+            this.inc_pos(1)
+        else
+            this.error(DiagX_0_expected, this.pos(), 0)
+    }
+
+    procedure scan_digits(this)
+    {
+        let start this.pos()
+        while this.pos() < end
+        {
+            if Scanner.is_digit(this.char()) = false
+                break
+            this.inc_pos(1)
+        }
+        s.set_token_value_range(start, this.pos())
+    }
+
+    ; ★ THE TWO END-OF-RUN PASSES ARE WHAT MAKE A FORWARD REFERENCE LEGAL:
+    ; `\k<name>` and `\3` may both name a group that is opened LATER in the
+    ; pattern, so neither can be judged where it stands.
+    procedure run(this)
+    {
+        ; Regular expressions are checked more strictly when either in 'u' or 'v'
+        ; mode, or when not using the looser interpretation of the syntax from
+        ; ECMA-262 Annex B.
+        set any_unicode_mode_or_non_annex_b: any_unicode_mode or (not annex_b)
+
+        this.scan_disjunction(false)
+
+        var i 0
+        while i < (group_name_references.get_length() as int)
+        {
+            let r group_name_references[i]
+            if this.group_specifiers_contains(r.name) = false
+                this.error(DiagThere_is_no_capturing_group_named_0_in_this_regular_expression, r.pos, r.end - r.pos)
+            set i: i + 1
+        }
+        set i: 0
+        while i < (decimal_escapes.get_length() as int)
+        {
+            ; Although a DecimalEscape with a value greater than the number of
+            ; capturing groups is treated as either a LegacyOctalEscapeSequence
+            ; or an IdentityEscape in Annex B, an error is nevertheless reported
+            ; since it is most likely a mistake.
+            let e decimal_escapes[i]
+            if e.value > number_of_capturing_groups
+            {
+                if number_of_capturing_groups > 0
+                    this.error(DiagThis_backreference_refers_to_a_group_that_does_not_exist_There_are_only_0_capturing_groups_in_this_regular_expression, e.pos, e.end - e.pos)
+                else
+                    this.error(DiagThis_backreference_refers_to_a_group_that_does_not_exist_There_are_no_capturing_groups_in_this_regular_expression, e.pos, e.end - e.pos)
+            }
+            set i: i + 1
+        }
+    }
+
+    function group_specifiers_contains(this, name: Slice[char]) returns bool
+    {
+        var i 0
+        while i < (group_specifiers.get_length() as int)
+        {
+            if RegExpParser.names_equal(group_specifiers[i], name)
+                return true
+            set i: i + 1
+        }
+        false
     }
 }
