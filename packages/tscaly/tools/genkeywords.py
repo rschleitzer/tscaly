@@ -139,9 +139,17 @@ def emit(entries):
         out.append("    if len = %d" % n)
         out.append("    {")
         for text, kind in sorted(by_len[n]):
-            # Slice[T] ist {length, data} seit dem Feld-Flip 2026-08-30:
-            # die LAENGE steht vorn.
-            out.append('        if kw_eq(buf, Slice[char](%d, "%s"))' % (n, text))
+            # ★★★THE LITERAL GOES STRAIGHT INTO THE SLICE PARAMETER, since the
+            # compiler materialises it there (2026-09-05).  Before, the
+            # hand-counted length stood here -- `Slice[char](%d, "%s")` -- and
+            # that price per call site was why a pointer[const_char] parameter
+            # did not seem worth it.  Same emission: the compiler builds the
+            # same tuple.
+            # ★The length it takes is the DECODED byte count.  For plain ASCII
+            # identifiers that is n; the assertion stands here so that a keyword
+            # with an escape does not silently miss.
+            assert len(text) == n and text.isascii() and "\\" not in text, text
+            out.append('        if kw_eq(buf, "%s")' % text)
             out.append("            return %s" % kind)
         out.append("    }")
         out.append("")

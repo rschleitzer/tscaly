@@ -86,7 +86,14 @@ def dispatch(out, fn, doc, words, result):
         out.append('    if s.length = %d' % n)
         out.append('    {')
         for w in by_len[n]:
-            out.append('        if kw_eq(s.data, Slice[char](%d, "%s"))' % (n, w))
+            # ★★★THE LITERAL GOES STRAIGHT INTO THE SLICE PARAMETER, since the
+            # compiler materialises it there (2026-09-05).  Before, the
+            # hand-counted length stood here; same emission, because the compiler
+            # builds the same tuple.  The length it takes is the DECODED byte
+            # count -- for these property names that is n, and the assertion
+            # holds that down in case one ever carries an escape.
+            assert len(w) == n and w.isascii() and "\\" not in w, w
+            out.append('        if kw_eq(s.data, "%s")' % w)
             out.append('            return %s' % (result[w] if result else 'true'))
         out.append('    }')
     out.append('    %s' % ('0' if result else 'false'))
