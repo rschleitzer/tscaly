@@ -199,7 +199,7 @@ def emit(entries):
     out.append("; depend on the order (see the generator).")
     out.append("define KEYWORD_SUGGESTION_COUNT: int %d" % len(viable))
     out.append("")
-    out.append("function viable_keyword_suggestion(i: int) returns pointer[const_char]")
+    out.append("function viable_keyword_suggestion(i: int) returns Slice[char]")
     out.append("{")
     for n, text in enumerate(viable):
         out.append("    if i = %d" % n)
