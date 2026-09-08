@@ -471,6 +471,13 @@ define Binder
     ; The unreachable sentinel. One per binder, and compared by IDENTITY.
     unreachable_flow: ref[FlowNode]
 
+    ; SourceFile.ECMALineMap, lazily. The reference computes the line map on
+    ; first ask and keeps it on the SourceFile; this port keeps it here, because
+    ; the Binder is what holds the scanner the text lives in. Null until the
+    ; first caller — today error_range_for_arrow_function, which is the only
+    ; place in the checker's whole span machinery that asks for a LINE.
+    ecma_line_map: ref[Array[int]]?
+
     ; The unported report, in the parser's shape: the first construct this slice
     ; does not implement stops the bind and names itself.
     unported_pos: int
@@ -516,6 +523,7 @@ define Binder
         set b.expando_assignments: ea
         let dl &DiagnosticList^host(host)
         set b.bind_diagnostics: dl
+        set b.ecma_line_map: null
         set b.unported_pos: 0 - 1
         set b.unported_tag.data: null
         set b.unported_tag.length: 0
@@ -1081,23 +1089,149 @@ define Binder
         trivia.buffer.subslice(start as size_t, stop as size_t)
     }
 
-    ; scanner.GetErrorRangeForNode. Answers false when it meets one of the FIVE
-    ; arms that are still deferred — see error_range_needs_rescan, which carries
-    ; the reason and the enumeration behind it. ★The list started at eight: slice
-    ; 64 took the two clause arms, slice 83 the constructor and slice 84 the
-    ; return/yield pair, and the count is written out rather than inherited because
-    ; the prose said *eight* for two slices after it was six. It is now THREE.
+    ; ── the ECMA line map, and its two lookups ──
+    ;
+    ; ★★★ THE SPAN MACHINERY ASKED FOR A LINE FOR THE FIRST TIME IN THIS SLICE.
+    ; Everything above works in OFFSETS — pos, end, skip_trivia, a re-scanned
+    ; token — and getErrorRangeForArrowFunction is the one arm of
+    ; GetErrorRangeForNode that does not: *the arrow function spans multiple
+    ; lines, make the error span be the first line, inclusive*. That question
+    ; cannot be answered from two offsets, so the map is a new machine rather
+    ; than a call, which is why the arm outlived the other seven.
+    ;
+    ; ★ Lazily, as upstream: a unit whose diagnostics never touch an arrow
+    ; function never walks its text a second time, and the lib file — bound
+    ; through a Binder of its own — never does at all.
+    procedure ecma_line_starts(this) returns ref[Array[int]]
+    {
+        if ecma_line_map = null
+            set ecma_line_map: trivia.compute_ecma_line_starts(host)
+        ecma_line_map as ref[Array[int]]
+    }
+
+    ; scanner.ComputeLineOfPosition, whole. ★Its answer for a position BEFORE the
+    ; first line start is `low - 1` = -1, and that is the reference's own answer
+    ; rather than a guard to add: the array's first entry is 0, so only a
+    ; negative position can reach it and no caller here has one.
+    function compute_line_of_position(starts: ref[Array[int]], pos: int) returns int
+    {
+        var low 0
+        var high (starts.get_length() as int) - 1
+        while low <= high
+        {
+            let middle low + ((high - low) >> 1)
+            let value: int starts.at(middle as size_t)
+            if value < pos
+                set low: middle + 1
+            else
+            {
+                if value > pos
+                    set high: middle - 1
+                else
+                    return middle
+            }
+        }
+        low - 1
+    }
+
+    procedure ecma_line_of_position(this, pos: int) returns int
+        Binder.compute_line_of_position(this.ecma_line_starts(), pos)
+
+    ; scanner.GetECMAEndLinePosition — the position of the character BEFORE the
+    ; line's terminator, or before the end of the text. ★The `size == 0` half of
+    ; the reference's test is the end of the string and is written as the bound
+    ; check: DecodeRuneInString of an empty remainder answers size 0, and this
+    ; port's utf8_decode_at answers -1 there, which is not a line break.
+    procedure ecma_end_line_position(this, line: int) returns int
+    {
+        let starts this.ecma_line_starts()
+        var pos: int starts.at(line as size_t)
+        repeat
+        {
+            if pos >= trivia.end
+                return pos - 1
+            if Scanner.is_line_break_rune(trivia.utf8_decode_at(pos))
+                return pos - 1
+            set pos: pos + trivia.utf8_size_at(pos)
+        }
+    }
+
+    ; scanner.getErrorRangeForArrowFunction — the FIFTH of the eight deferred
+    ; arms to come due, and the first that needed a machine rather than a call.
+    ; Its reader is the same one the other three had: an arrow function is what
+    ; a great many checker reports point at, and until this arm existed every one
+    ; of them was DROPPED with `error-range 220` in its place — 75 units of the
+    ; stage-2 corpus, the frontier's third row.
+    procedure error_range_for_arrow_function(this, n: ref[AstNode], out_start: ref[int], out_end: ref[int])
+    {
+        let pos this.skip_trivia_at(AstNode.pos_of(n))
+        let body AstNode.body_of(n)
+        if body <> null
+        {
+            let bd body as ref[AstNode]
+            if AstNode.kind_of(bd) = KindBlock
+            {
+                let start_line this.ecma_line_of_position(AstNode.pos_of(bd))
+                let end_line this.ecma_line_of_position(AstNode.end_of(bd))
+                if start_line < end_line
+                {
+                    ; "The arrow function spans multiple lines, make the error
+                    ; span be the first line, inclusive."
+                    set out_start: pos
+                    set out_end: this.ecma_end_line_position(start_line) + 1
+                    return
+                }
+            }
+        }
+        set out_start: pos
+        set out_end: AstNode.end_of(n)
+    }
+
+    ; scanner.GetErrorRangeForNode. Answers false when it meets the ONE arm that
+    ; is still deferred — see error_range_needs_rescan, which carries the reason
+    ; and the enumeration behind it. ★The list started at eight: slice 64 took the
+    ; two clause arms, slice 83 the constructor, slice 84 the return/yield pair and
+    ; this slice the SourceFile and the ARROW FUNCTION, and the count is written
+    ; out rather than inherited because the prose said *eight* for two slices after
+    ; it was six. It is now ONE: SatisfiesExpression.
     function error_range_for_node(this, n: ref[AstNode], out_start: ref[int], out_end: ref[int]) returns bool
     {
         let k AstNode.kind_of(n)
 
-        ; The three arms still deferred. Reported rather than approximated: an
+        ; The ONE arm still deferred. Reported rather than approximated: an
         ; approximated SPAN is a wrong answer that looks like a right one, which
         ; is the class §3.5bw records for is_in_top_level_context.
         if Binder.error_range_needs_rescan(k)
         {
             this.record_unported("error-range-rescan", k)
             return false
+        }
+
+        ; `case ast.KindSourceFile:` — the FOURTH of the eight arms to come due,
+        ; and it is three lines because the machine it needs (skip_trivia_at and
+        ; the re-scan) has been here since slice 31. ★The empty-file answer is
+        ; the reference's own and is not a degenerate case to fold away: a file
+        ; that is nothing but trivia reports at (0, 0), where the re-scan would
+        ; report the END-OF-FILE token's own zero-width span at the text end.
+        if k = KindSourceFile
+        {
+            let sf_pos this.skip_trivia_at(0)
+            if sf_pos = trivia.end
+            {
+                set out_start: 0
+                set out_end: 0
+                return true
+            }
+            this.range_of_token_at_position(sf_pos, out_start, out_end)
+            return true
+        }
+
+        ; `case ast.KindArrowFunction:` — the FIFTH, and the one that needed the
+        ; line map; see error_range_for_arrow_function above.
+        if k = KindArrowFunction
+        {
+            this.error_range_for_arrow_function(n, out_start, out_end)
+            return true
         }
 
         ; `case KindCaseClause, KindDefaultClause:` — the first of the eight
@@ -1170,12 +1304,22 @@ define Binder
                 if k = KindMethodDeclaration
                     set reparsed: true
             }
+            ; ★★★ THE GUARD THAT STOOD HERE WAS A LATCH, NOT A TEST, AND IT WAS
+            ; READ AT CHECK TIME. `is_unported()` asks *has this BINDER stopped at
+            ; all* — the deliberate abort of the bind walk — and get_name_of_declaration
+            ; has not reported since slice 124 took its last stop out, so the line
+            ; could only ever answer about somebody else's report. It is not
+            ; harmless there: error_range_for_node's ONE caller is the CHECKER, long
+            ; after the bind artifact is written, and the binder still records during
+            ; the check (get_module_instance_state, and this very function's
+            ; error-range-rescan arm eight lines up). So the FIRST such record turned
+            ; every later span in the unit into `error-range <kind>` — a named
+            ; VariableDeclaration answering false is the tell, because its arm has no
+            ; other way to fail. ★★★§ 3.5gd's shape one file over: slice 148 read the
+            ; binder's predicate as a deliberate abort and it is one for the bind
+            ; WALK; the two routines the checker calls into are not the bind walk.
             if reparsed = false
-            {
                 set error_node: this.get_name_of_declaration(n)
-                if this.is_unported()
-                    return false
-            }
         }
         ; ★ The reference asks GetNameOfDeclaration for the list above and plain
         ; `node.Name()` for a CLASS EXPRESSION, one line apart. That is not an
@@ -1253,28 +1397,29 @@ define Binder
     ; ImportTypeData.is_type_of, the commonJS half of the name resolver, and the
     ; bigint token value.
     ;
-    ; ★ WHAT EACH ARM NEEDS BESIDES THE RE-SCAN, so the next reader does not
-    ; re-derive it. SourceFile, ReturnStatement and YieldExpression need nothing
-    ; else — skip_trivia_at plus the re-scan, both ported, and the SourceFile arm's
-    ; own empty-file test. CaseClause and DefaultClause need the clause's statement
-    ; list, for `statements[0].Pos()` as the end. Constructor needs a scan LOOP
-    ; with the token kind read back, to the `constructor` keyword or a string
-    ; literal or the end of file. SatisfiesExpression needs nothing but the re-scan
-    ; while its type is not Reparsed, and the parent walk plus the originating
-    ; JSDoc `@satisfies` tag when it is. ArrowFunction is the only one asking for
-    ; machinery this port does not have at all: the ECMA LINE MAP, to decide
-    ; whether the body spans more than one line — there is no line map anywhere in
-    ; this package, and a diagnostic here is a byte range.
+    ; ★ WHAT EACH ARM NEEDED BESIDES THE RE-SCAN, kept because the LAST one is
+    ; still owed and the record of what the others cost is what dates this note.
+    ; SourceFile, ReturnStatement and YieldExpression needed nothing else —
+    ; skip_trivia_at plus the re-scan, both ported since slice 31, plus the
+    ; SourceFile arm's own empty-file test. CaseClause and DefaultClause needed the
+    ; clause's statement list, for `statements[0].Pos()` as the end. Constructor
+    ; needed a scan LOOP with the token kind read back. ArrowFunction was named
+    ; here as *the only one asking for machinery this port does not have at all:
+    ; the ECMA LINE MAP* — this slice built it (ecma_line_starts above), and it is
+    ; the smallest machine in the file: one pass over the text, a binary search and
+    ; a forward scan to the line's terminator.
+    ;
+    ; ★★★ WHAT SATISFIES-EXPRESSION STILL OWES IS NOT THE RE-SCAN EITHER. Its
+    ; unreparsed half is two lines (`SkipTrivia(text, expression.End())` and the
+    ; re-scan). The REPARSED half needs findOriginatingJSDocSatisfiesTag: a climb
+    ; through the parents for the first one carrying HasJSDoc, then that node's
+    ; EAGER JSDoc list, then the `@satisfies` tag whose type expression is the very
+    ; node this expression's type was reparsed from — an identity test on a Loc,
+    ; which this port compares as (pos, end). It is one function and it is left
+    ; here rather than guessed at, because reporting at the EXPRESSION where the
+    ; reference reports at the TAG is a wrong span that looks like a right one.
     function error_range_needs_rescan(k: int) returns bool
-    {
-        if k = KindSourceFile
-            return true
-        if k = KindArrowFunction
-            return true
-        if k = KindSatisfiesExpression
-            return true
-        false
-    }
+        k = KindSatisfiesExpression
 
     ; ★★★ SLICE 64 PAYS THE FIRST INSTALMENT OF THAT LIST, AND THE NOTE ABOVE NAMED
     ; BOTH THE READER AND THE PRICE. It wrote *the reader that earns them is the
