@@ -1,28 +1,38 @@
-// Slice 147's PROBE, and it is UNPORTED on purpose — read its header before
-// deleting it for looking inert.
+// Slice 147's PROBE, and slice 148 is where what it pins was FIXED. It is still
+// UNPORTED — read the header before deleting it for looking inert.
 //
-// ★★★ WHAT IT PINS IS CONTAMINATION BETWEEN TWO CLASSES' `this.foo`. C1 alone
-// and C5 alone each answer what the reference answers: the port narrows C5's
-// second read to `number[]` (`T 212 70 78 number[]` in the isolated file, and no
-// stop at all). TOGETHER the port answers `number[] | undefined` at that node
-// and `flow-assignment-automatic-assigned-type` fires TWICE. So C1's presence —
-// a this-property assigned in a CONSTRUCTOR — makes C5's this-property, assigned
-// only in a METHOD, take the AUTO branch, and the declared type of a method-only
-// assignment declaration is what the successor has to fix.
+// ★★★ WHAT IT PINNED WAS CONTAMINATION BETWEEN TWO CLASSES' `this.foo`, and the
+// cause was not in either class. C5's two reads narrow to `number[]` when the
+// class stands alone; with C1 in front of them they came out
+// `number[] | undefined`, `report-object-possibly-null-or-undefined` fired on
+// the second one and the reporter's six text-decided codes then invented a
+// TS2532 the reference does not report. **The cause was
+// `get_type_of_expression` testing `is_unported()` — the unit-wide LATCH — where
+// a per-call `unported_mark()` delta belonged**: C1's read stops
+// (`flow-assignment-automatic-assigned-type`), the latch closes for the rest of
+// the unit, and every later expression answers null, so the assignment that
+// narrows C5's property stopped being seen. The name of the property does not
+// matter and neither does the second class; ORDER does. Thirty-one sites carried
+// the same test and all of them moved to the mark.
 //
-// ★★★ NO YARDSTICK IS RED ON IT TODAY and that is stated here rather than left
-// to be rediscovered: the unit STOPS, so the type dump is UNPORTED and not
-// compared, and with the six text-decided codes of
-// report_object_possibly_null_or_undefined_error taken back out (see its header)
-// the port emits no diagnostic either, so diagcheck is green on it too. The
-// finding is visible in ONE command and nowhere else:
+// ★★★ IT IS NOT THE PROBE'S OWN COMMAND THAT SHOWS IT — the command has to run
+// from the REPO ROOT, or the lib is not found (`UNPORTED 0 lib 0`) and every
+// class answers nothing:
 //
-//     tests/out/tscaly_types --stops tests/fixtures/checker_this_property_flow_probe.js
+//     packages/tscaly/tests/out/tscaly_types --stops \
+//       packages/tscaly/tests/fixtures/checker_this_property_flow_probe.js
 //
-// two `flow-assignment-automatic-assigned-type`, against none for either class
-// on its own. ★It is committed anyway for the reason every UNPORTED fixture is:
-// the shape is in the corpus, so the day the chapter lands the unit turns green
-// by itself and nobody has to remember this paragraph.
+// Today that prints exactly the two `flow-assignment-automatic-assigned-type`
+// and the one `check-arithmetic-operand-type` that C1 records ALONE, and nothing
+// for C5. Before the fix it printed those plus a
+// `report-object-possibly-null-or-undefined` and a second arithmetic stop, both
+// belonging to C5.
+//
+// ★ The unit still STOPS, on C1's own wall — the assigned type of an `auto`
+// declared type, which is a measured non-termination and not this slice's — so
+// no yardstick is red or green on it. It is committed for the reason every
+// UNPORTED fixture is: the shape is in the corpus, so the day that chapter lands
+// the unit turns green by itself.
 class C1 {
     constructor() {
         this.foo = [3];
