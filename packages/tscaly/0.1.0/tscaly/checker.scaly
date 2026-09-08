@@ -815,6 +815,19 @@ define MapTypeKindMutableArrayOrTuple: int 9
 ; whole difference between including undefined and not.
 define MapTypeKindTupleElementOutOfStartCount: int 10
 
+; getRestType's own union arm (slice 145) — the OBJECT-REST recursion, which is
+; the reference's `mapType(source, func(t) { return c.getRestType(t, properties,
+; symbol) })`. Two captures, the omitted property NAMES and the symbol the
+; anonymous result is named after.
+define MapTypeKindRestType: int 11
+; isValidSpreadType's head (slice 145) — `mapType(t, c.getBaseConstraintOrType)`.
+; Captures nothing.
+define MapTypeKindBaseConstraintOrType: int 13
+; checkArrayLiteralDestructuringElementAssignment's rest arm (slice 145) —
+; `mapType(sourceType, func(t) { return c.sliceTupleType(t, elementIndex, 0) })`.
+; The captured index rides `index`, which is already a field.
+define MapTypeKindSliceTuple: int 12
+
 define MapTypeArgs
 (
     mapped: ref[Type]?
@@ -838,6 +851,11 @@ define MapTypeArgs
     ; MapTypeKindTupleElementOutOfStartCount's two (slice 142).
     start_index: u64
     undefined_like: ref[Type]?
+
+    ; MapTypeKindRestType's two (slice 145). MapTypeKindSliceTuple adds none —
+    ; its one capture is `index` above.
+    rest_properties: ref[Array[ref[AstNode]?]]?
+    rest_symbol: ref[Symbol]?
 )
 
 ; addSpans' captured state (slice 126) — §3.21. The builder is a SLOT because the
@@ -2784,13 +2802,19 @@ define InferenceFlagsNoDefault: int 1 << 0
 define InferenceFlagsAnyDefault: int 1 << 1
 define InferenceFlagsSkippedGenericFunction: int 1 << 2
 
-; The reference's TypeComparer, which is a func value there and a FLAG here on
-; §3.5e's rule: the whole set of comparers is static. Only `Assignable` is ever
-; passed today — the two callers that pass another (instantiateSignatureInContextOf
-; and the relater's own inference for signature parameters) are both stops — and a
-; flag makes the day one arrives a compile error rather than a silent default.
-define CompareKindAssignable: int 0
-define CompareKindSubtype: int 1
+; ★★★ THE SECOND TypeComparer ENUM IS RETIRED (slice 145), AND THE NOTE THAT
+; STOOD HERE IS WHY IT HAD TO BE. It read *only `Assignable` is ever passed today
+; — the two callers that pass another (instantiateSignatureInContextOf and the
+; relater's own inference for signature parameters) are both stops — and a flag
+; makes the day one arrives a compile error rather than a silent default.*
+; instantiateSignatureInContextOf is the day, and the comparer it forwards is
+; compareSignaturesRelated's OWN — which is a `SignatureComparer` tag, a six-value
+; set this file already had. Two enums for one func value would have been worse
+; than a default: `CompareKindSubtype` is 1 and `SignatureComparerRelaterWorker` is
+; 1 too, so passing the relater's comparer through unmapped would have compiled and
+; silently asked for the SUBTYPE relation. So the InferenceContext carries a
+; `SignatureComparer` and compare_types_by_comparer answers for it; `CompareKind`
+; had one writer and no second value.
 
 ; The reference's *InferenceInfo. `candidate_depths` is a PARALLEL int array and
 ; not a slot on the candidate, exactly as upstream: the pair is inserted and
@@ -2865,6 +2889,9 @@ define SignatureCacheKindErased: int 2
 ; other two.
 define SignatureCacheKindOptionalInner: int 3
 define SignatureCacheKindOptionalOuter: int 4
+; getCanonicalSignature's row, slice 145 — the reference's SignatureKeyCanonical,
+; the third sentinel of the same table.
+define SignatureCacheKindCanonical: int 5
 
 ; The reference's *InferenceState — the per-inferTypes scratch the walk threads.
 ;
@@ -2899,6 +2926,36 @@ define InferenceState
     source_stack: ref[Array[ref[Type]?]]
     target_stack: ref[Array[ref[Type]?]]
     depth: int
+)
+
+; ── applyToParameterTypes / applyToReturnTypes: the CALLBACK (slice 145) ──
+;
+; ★★★ THE TAG NAMES THE CALLER, AND EACH BODY STILL HOLDS ITS OWN CALLEE. The two
+; functions take a `callback func(s, t *Type)` upstream and are called from three
+; places with three different pairs, so §3.5e's flag is now owed — but the pair
+; passed at one call site is not one function: inference.go's
+; `inferFromSignature` hands applyToParameterTypes
+; `inferFromContravariantTypesIfStrictFunctionTypes` and applyToReturnTypes
+; `inferFromTypes`, which are two different callees for ONE caller. So the tag
+; cannot name a callee; it names the caller, and the parameter body and the return
+; body each resolve it to their own.
+;
+; ★ The THIRD caller — getTypeOfExpression's contextual-generic block, still a stop
+; — passes `inferTypes(inferences, s, t, InferencePriorityNone, contravariant)` on
+; both sides with the contravariant flag TRUE for parameters and FALSE for
+; returns, which is why the flag is a field here and not baked into the kind.
+define ApplyCallbackKindInferFromSignature: int 0
+define ApplyCallbackKindInferTypes: int 1
+
+define ApplyCallback
+(
+    kind: int
+    ; ApplyCallbackKindInferFromSignature's one capture.
+    state: ref[InferenceState]?
+    ; ApplyCallbackKindInferTypes' three.
+    inferences: ref[Array[ref[InferenceInfo]?]]?
+    priority: int
+    contravariant: bool
 )
 
 ; ── the TypeMapper (slice 86) ───────────────────────────────────────────────
@@ -14113,27 +14170,82 @@ define Checker
         {
             if AstNode.dot_dot_dot_token_of(declaration) <> null
             {
-                ; getRestType — Omit over the spreadable properties, plus the
-                ; TS2700 report when the source is not an object type.
-                this.record_unported("get-rest-type", pk)
-                return null
+                ; ── the object binding pattern's REST (slice 145) ────────────
+                ;
+                ; ★★ THE REDUCTION IS NOT COSMETIC AND IT HAPPENS BEFORE THE GUARD:
+                ; getReducedType removes the never-valued discriminant members, so a
+                ; union whose every constituent is empty after reduction is what the
+                ; TS2700 guard is actually asked about. Asking isValidSpreadType of
+                ; the unreduced type would accept sources the reference rejects.
+                ;
+                ; ★ The omitted names are the pattern's OTHER elements, taken through
+                ; PropertyNameOrName so that `{ p: q, ...rest }` omits `p` and not
+                ; `q` — the same accessor the non-rest arm below uses.
+                let reduced this.get_reduced_type(parent_type)
+                if this.unported_mark() <> mark
+                    return null
+                if reduced = null
+                    return null
+                set parent_type: reduced as ref[Type]
+                var invalid (parent_type.flags & TypeFlagsUnknown) <> 0
+                if invalid = false
+                {
+                    if this.is_valid_spread_type(parent_type) = false
+                        set invalid: true
+                }
+                if this.unported_mark() <> mark
+                    return null
+                if invalid
+                {
+                    this.error_on_node(declaration, DiagRest_types_may_only_be_created_from_object_types)
+                    return error_type
+                }
+                let literal_members &Array[ref[AstNode]?]^host()
+                let pattern_elements AstNode.elements_of(pattern)
+                if pattern_elements <> null
+                {
+                    let plist pattern_elements as ref[Array[ref[AstNode]?]]
+                    let pn plist.get_length() as int
+                    var i 0
+                    while i < pn
+                    {
+                        let row plist[i]
+                        set i: i + 1
+                        if row = null
+                            continue
+                        if AstNode.dot_dot_dot_token_of(row as ref[AstNode]) <> null
+                            continue
+                        literal_members.add(Checker.property_name_or_name_of(row as ref[AstNode]))
+                    }
+                }
+                let rest this.get_rest_type(parent_type, literal_members as ref[Array[ref[AstNode]?]]?, this.get_symbol_of_declaration(declaration))
+                if this.unported_mark() <> mark
+                    return null
+                if rest = null
+                    return null
+                set t: rest
             }
-            let name Checker.property_name_or_name_of(declaration)
-            if name = null
-                return null
-            let index_type this.get_literal_type_from_property_name(name as ref[AstNode])
-            if this.unported_mark() <> mark
-                return null
-            if index_type = null
-                return null
-            let declared_type this.get_indexed_access_type_ex(parent_type, index_type as ref[Type], access_flags, name, null)
-            if this.unported_mark() <> mark
-                return null
-            if declared_type = null
-                return null
-            set t: this.get_flow_type_of_destructuring(declaration, declared_type as ref[Type])
-            if this.unported_mark() <> mark
-                return null
+            else
+            {
+                ; "Use explicitly specified property name ({ p: xxx } form), or
+                ; otherwise the implied name ({ p } form)."
+                let name Checker.property_name_or_name_of(declaration)
+                if name = null
+                    return null
+                let index_type this.get_literal_type_from_property_name(name as ref[AstNode])
+                if this.unported_mark() <> mark
+                    return null
+                if index_type = null
+                    return null
+                let declared_type this.get_indexed_access_type_ex(parent_type, index_type as ref[Type], access_flags, name, null)
+                if this.unported_mark() <> mark
+                    return null
+                if declared_type = null
+                    return null
+                set t: this.get_flow_type_of_destructuring(declaration, declared_type as ref[Type])
+                if this.unported_mark() <> mark
+                    return null
+            }
         }
         else
         {
@@ -14242,6 +14354,223 @@ define Checker
         if widened_source = null
             return null
         this.widen_type_inferred_from_initializer(declaration, widened_source)
+    }
+
+    ; ── the OBJECT REST type (slice 145) ─────────────────────────────────────
+    ;
+    ; getRestType — what `{a, ...rest} = o` gives `rest`, and what the object
+    ; BINDING pattern's `...rest` gives too. Two call sites, one function, and it
+    ; was two rows on the frontier (`get-rest-type` and the assignment chapter's).
+    ;
+    ; ★★★ THE ANSWER IS A DIFFERENT KIND OF TYPE ON EACH SIDE OF ONE TEST, and the
+    ; test is `isGenericObjectType(source) || isGenericIndexType(omitKeyType)`. For a
+    ; CONCRETE source it builds an anonymous type out of the spreadable properties
+    ; — a real member table, flagged ObjectRestType. For a GENERIC one it cannot
+    ; enumerate anything, so it hands back `Omit<Source, Keys>` from the global
+    ; type alias and lets instantiation do the work later. A port that built only
+    ; the first would answer a member-less object for every generic rest.
+    ;
+    ; ★★ THE UNSPREADABLE PROPERTIES ARE ADDED TO THE OMIT KEY ONLY ON THE GENERIC
+    ; PATH, and the reference says why: *if the type we're spreading from has
+    ; properties that cannot be spread into the rest type (e.g. getters, methods),
+    ; ensure they are explicitly omitted, as they would in the non-generic case.*
+    ; On the concrete path they are omitted by construction — they never enter the
+    ; member table — so the same effect needs no key.
+    ;
+    ; ★ The head filter is the reference's `filterType(source, t.flags&Nullable == 0)`
+    ; and filter_type_outside_flags is that predicate: for any constituent a
+    ; nullable flag is the WHOLE of its flags, so *has no nullable flag* and *has a
+    ; flag outside the nullable mask* pick the same constituents.
+    function get_rest_type(this, source_in: ref[Type], properties: ref[Array[ref[AstNode]?]]?, symbol: ref[Symbol]?) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let filtered this.filter_type_outside_flags(source_in, TypeFlagsNullable)
+        if this.unported_mark() <> mark
+            return null
+        if filtered = null
+            return null
+        let source filtered as ref[Type]
+        if (source.flags & TypeFlagsNever) <> 0
+            return empty_object_type
+        if (source.flags & TypeFlagsUnion) <> 0
+        {
+            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, properties, symbol) as ref[MapTypeArgs]?
+            return this.map_type(source, MapTypeKindRestType, a)
+        }
+        ; `getUnionType(core.Map(properties, c.getLiteralTypeFromPropertyName))` —
+        ; the properties are NAME nodes on both call sites.
+        let omit_names this.new_type_list(null)
+        if properties <> null
+        {
+            let plist properties as ref[Array[ref[AstNode]?]]
+            let pn plist.get_length() as int
+            var i 0
+            while i < pn
+            {
+                let row plist[i]
+                set i: i + 1
+                if row = null
+                    continue
+                let lit this.get_literal_type_from_property_name(row as ref[AstNode])
+                if this.unported_mark() <> mark
+                    return null
+                if lit = null
+                    return null
+                omit_names.add(lit)
+            }
+        }
+        var omit_key_type this.get_union_type(omit_names)
+        if this.unported_mark() <> mark
+            return null
+        if omit_key_type = null
+            return null
+        let spreadable &Array[ref[Symbol]?]^host()
+        let unspreadable_keys this.new_type_list(null)
+        let props this.get_properties_of_type(source)
+        if this.unported_mark() <> mark
+            return null
+        var i 0
+        while i < Checker.symbol_count(props)
+        {
+            let row (props as ref[Array[ref[Symbol]?]])[i]
+            set i: i + 1
+            if row = null
+                continue
+            let prop row as ref[Symbol]
+            let literal this.get_literal_type_from_property(prop, TypeFlagsStringOrNumberLiteralOrUnique, false)
+            if this.unported_mark() <> mark
+                return null
+            if literal = null
+                return null
+            let lt literal as ref[Type]
+            var keep false
+            if this.is_type_assignable_to(lt, omit_key_type as ref[Type]) = false
+            {
+                if (this.get_declaration_modifier_flags_from_symbol(prop) & (ModifierFlagsPrivate | ModifierFlagsProtected)) = 0
+                {
+                    if this.is_spreadable_property(prop)
+                        set keep: true
+                }
+            }
+            if this.unported_mark() <> mark
+                return null
+            if keep
+                spreadable.add(row)
+            else
+                unspreadable_keys.add(literal)
+        }
+        var generic this.is_generic_object_type(source)
+        if generic = false
+            set generic: this.is_generic_index_type(omit_key_type as ref[Type])
+        if this.unported_mark() <> mark
+            return null
+        if generic
+        {
+            if (unspreadable_keys.get_length() as int) <> 0
+            {
+                let widened this.new_type_list(null)
+                widened.add(omit_key_type)
+                let un unspreadable_keys.get_length() as int
+                var j 0
+                while j < un
+                {
+                    widened.add(unspreadable_keys[j])
+                    set j: j + 1
+                }
+                set omit_key_type: this.get_union_type(widened)
+                if this.unported_mark() <> mark
+                    return null
+                if omit_key_type = null
+                    return null
+            }
+            if ((omit_key_type as ref[Type]).flags & TypeFlagsNever) <> 0
+                return source
+            let omit_alias this.get_global_omit_symbol()
+            if this.unported_mark() <> mark
+                return null
+            if omit_alias = null
+                return error_type
+            let args this.new_type_list(null)
+            args.add(source)
+            args.add(omit_key_type)
+            return this.get_type_alias_instantiation(omit_alias as ref[Symbol], args, null)
+        }
+        let members SymbolTable.create(host)
+        let sn spreadable.get_length() as int
+        var k 0
+        while k < sn
+        {
+            let row spreadable[k]
+            set k: k + 1
+            if row = null
+                continue
+            let prop row as ref[Symbol]
+            SymbolTable.set_entry(host, members, Symbol.name_of(prop), this.get_spread_symbol(prop, false))
+            if this.unported_mark() <> mark
+                return null
+        }
+        let infos this.get_index_infos_of_type(source)
+        if this.unported_mark() <> mark
+            return null
+        let result this.new_anonymous_type(symbol, members, null, null, infos)
+        if this.unported_mark() <> mark
+            return null
+        if result = null
+            return null
+        let r result as ref[Type]
+        set r.object_flags: r.object_flags | ObjectFlagsObjectRestType
+        r
+    }
+
+    ; getGlobalOmitSymbol — `Omit<T, K>`, the two-parameter alias every generic
+    ; object rest is expressed through. ★It answers NULL where the lib does not
+    ; declare it, and getRestType turns that into `error_type` rather than into a
+    ; report: the reference does the same, because a missing `Omit` has already been
+    ; reported by the global-type resolution itself.
+    function get_global_omit_symbol(this) returns ref[Symbol]?
+        this.get_global_type_alias_symbol("Omit", 2)
+
+    ; isValidSpreadType — the object BINDING pattern's rest guard (slice 145).
+    ; ★★ THE UNION ARM RECURSES ON THE FILTERED TYPE'S OWN CONSTITUENTS and not on
+    ; the argument's, which matters because the head has already mapped every
+    ; constituent to its base constraint and removed the definitely-falsy ones: the
+    ; question is about what the spread would actually see.
+    function is_valid_spread_type(this, t: ref[Type]) returns bool
+    {
+        let mark this.unported_mark()
+        let based this.map_type(t, MapTypeKindBaseConstraintOrType, null)
+        if this.unported_mark() <> mark
+            return false
+        if based = null
+            return false
+        let cleaned this.remove_definitely_falsy_types(based as ref[Type])
+        if this.unported_mark() <> mark
+            return false
+        if cleaned = null
+            return false
+        let sv cleaned as ref[Type]
+        if (sv.flags & (TypeFlagsAny | TypeFlagsNonPrimitive | TypeFlagsObject | TypeFlagsInstantiableNonPrimitive)) <> 0
+            return true
+        if (sv.flags & TypeFlagsUnionOrIntersection) = 0
+            return false
+        let types Checker.union_or_intersection_types_of(sv)
+        if types = null
+            return false
+        let list types as ref[Array[ref[Type]?]]
+        let n list.get_length() as int
+        var i 0
+        while i < n
+        {
+            let row list[i]
+            set i: i + 1
+            if row = null
+                continue
+            if this.is_valid_spread_type(row as ref[Type]) = false
+                return false
+            if this.unported_mark() <> mark
+                return false
+        }
+        true
     }
 
     ; ── the destructuring's FLOW type (slice 117) ────────────────────────────
@@ -29140,7 +29469,7 @@ define Checker
             let subject types[union_index]
             if subject = null
                 return null
-            let a &MapTypeArgs^host(null, null, null, null, null, false, texts, types, union_index, 0, 0, 0, 0, 0, null)
+            let a &MapTypeArgs^host(null, null, null, null, null, false, texts, types, union_index, 0, 0, 0, 0, 0, null, null, null)
             return this.map_type(subject as ref[Type], MapTypeKindTemplateLiteralSpan, a)
         }
         ; slices.Contains(types, wildcardType).
@@ -30181,7 +30510,7 @@ define Checker
                 let infer_tps root.infer_type_parameters as ref[Array[ref[Type]?]]
                 if (infer_tps.get_length() as int) <> 0
                 {
-                    let context this.new_inference_context(infer_tps, null, InferenceFlagsNone, CompareKindAssignable)
+                    let context this.new_inference_context(infer_tps, null, InferenceFlagsNone, SignatureComparerAssignable)
                     if mapper <> null
                         set context.non_fixing_mapper: this.merge_type_mappers(context.non_fixing_mapper, mapper)
                     if check_type_deferred = false
@@ -48393,6 +48722,503 @@ define Checker
         this.get_unary_result_type(ot)
     }
 
+    ; ── the DESTRUCTURING ASSIGNMENT (slice 145) ─────────────────────────────
+    ;
+    ; `[a, b] = xs`, `({a} = o)`, `({a, ...rest} = o)` and every nesting of them,
+    ; plus the for-of head that is one of those. Six functions, mutually recursive
+    ; through checkDestructuringAssignment, and the whole chapter was ONE stop with
+    ; two rows (the object-literal kind and the array-literal kind).
+    ;
+    ; ★★★ THE LEFT SIDE IS NOT AN EXPRESSION AND THAT IS THE POINT OF THE CHAPTER.
+    ; `{a} = o` parses as an object LITERAL, so the ordinary binary path would ask
+    ; for its type and check assignability against it; the reference leaves
+    ; checkBinaryLikeExpression before that and re-reads the literal as a PATTERN,
+    ; taking each element's type out of the SOURCE by property name or index and
+    ; recursing. Nothing here asks the pattern for a type.
+    ;
+    ; ★★ THE THREE HEADS OF checkDestructuringAssignment ARE THREE DIFFERENT
+    ; TARGETS AND EACH ONE MOVES `sourceType`. A shorthand `{a = 1}` checks its own
+    ; default through checkBinaryLikeExpression and then strips undefined off the
+    ; source; a `[a = 1]` element is a BinaryExpression whose whole self is checked
+    ; and whose LEFT becomes the target, stripping undefined again; anything else is
+    ; the target as it stands. Only after that is the target's kind dispatched on.
+    ;
+    ; ★★ EVERY SLOT THE REFERENCE DEREFERENCES UNCONDITIONALLY IS A ROW HERE, not a
+    ; silent `null`: `destructuring-slot-missing` names the kind. A shorthand's Name
+    ; and EqualsToken, a default's Left, a spread's Expression and the two element
+    ; lists are all non-nil in any tree the parser produces, so the row should never
+    ; fire — which is precisely why it must be a row and not a bail. A `null` with no
+    ; stop is an answer, and answering nothing about a pattern the walk did enter is
+    ; the shape §3.5cz calls an unmeasured claim.
+    ;
+    ; ★ markPropertyAsReferenced is CALLED in the reference and is not ported, for
+    ; the reason its neighbours already carry: its entire effect is
+    ; `symbolReferenceLinks.Get(target).referenceKinds |= SymbolFlagsAll`, and every
+    ; reader of that table is in the checkUnusedIdentifiers family, which this port
+    ; does not have. ★★It cannot interact with the one row that does name the table
+    ; (check_unused_renamed_binding_elements' `symbol-reference-links`): that drain
+    ; asks about a BINDING ELEMENT's symbol, and this writer only ever marks a
+    ; CLASS MEMBER — `prop.Flags&ClassMember == 0` returns on its first line.
+    function check_destructuring_assignment(this, node: ref[AstNode], source_type_in: ref[Type], check_mode: int, right_is_this: bool) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        var source_type: ref[Type] source_type_in
+        var target: ref[AstNode] node
+        if AstNode.kind_of(node) = KindShorthandPropertyAssignment
+        {
+            let initializer AstNode.shorthand_object_assignment_initializer_of(node)
+            if initializer <> null
+            {
+                let init_expr initializer as ref[AstNode]
+                ; "In strict null checking mode, if a default value of a
+                ; non-undefined type is specified, remove undefined from the final
+                ; type."
+                if Checker.strict_null_checks()
+                {
+                    let init_type this.check_expression(init_expr)
+                    if this.unported_mark() <> mark
+                        return null
+                    if init_type = null
+                        return null
+                    if this.has_type_facts(init_type as ref[Type], TypeFactsIsUndefined) = false
+                    {
+                        let stripped this.get_type_with_facts(source_type, TypeFactsNEUndefined)
+                        if this.unported_mark() <> mark
+                            return null
+                        if stripped = null
+                            return null
+                        set source_type: stripped as ref[Type]
+                    }
+                }
+                let name AstNode.name_of(node)
+                let equals AstNode.shorthand_equals_token_of(node)
+                if name = null
+                {
+                    this.record_unported("destructuring-slot-missing", KindShorthandPropertyAssignment)
+                    return null
+                }
+                if equals = null
+                {
+                    this.record_unported("destructuring-slot-missing", KindShorthandPropertyAssignment)
+                    return null
+                }
+                this.check_binary_like_expression(name as ref[AstNode], equals as ref[AstNode], init_expr, check_mode, null)
+                if this.unported_mark() <> mark
+                    return null
+            }
+            let name AstNode.name_of(node)
+            if name = null
+            {
+                this.record_unported("destructuring-slot-missing", KindShorthandPropertyAssignment)
+                return null
+            }
+            set target: name as ref[AstNode]
+        }
+        var default_valued false
+        if AstNode.kind_of(target) = KindBinaryExpression
+        {
+            if Checker.kind_or_unknown(AstNode.binary_operator_token_of(target)) = KindEqualsToken
+                set default_valued: true
+        }
+        if default_valued
+        {
+            this.check_binary_expression(target, check_mode)
+            if this.unported_mark() <> mark
+                return null
+            let left AstNode.binary_left_of(target)
+            if left = null
+            {
+                this.record_unported("destructuring-slot-missing", KindBinaryExpression)
+                return null
+            }
+            set target: left as ref[AstNode]
+            ; "A default value is specified, so remove undefined from the final
+            ; type."
+            if Checker.strict_null_checks()
+            {
+                let stripped this.get_type_with_facts(source_type, TypeFactsNEUndefined)
+                if this.unported_mark() <> mark
+                    return null
+                if stripped = null
+                    return null
+                set source_type: stripped as ref[Type]
+            }
+        }
+        let tk AstNode.kind_of(target)
+        if tk = KindObjectLiteralExpression
+            return this.check_object_literal_assignment(target, source_type, right_is_this)
+        if tk = KindArrayLiteralExpression
+            return this.check_array_literal_assignment(target, source_type, check_mode)
+        this.check_reference_assignment(target, source_type, check_mode)
+    }
+
+    ; checkObjectLiteralAssignment. ★The EMPTY pattern is the one arm that answers
+    ; something other than the source: `({} = o)` under strictNullChecks is a
+    ; non-null assertion and nothing else, which is why the report it can make is
+    ; checkNonNullType's and not this function's.
+    function check_object_literal_assignment(this, node: ref[AstNode], source_type: ref[Type], right_is_this: bool) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let properties AstNode.properties_of(node)
+        var count 0
+        if properties <> null
+            set count: (properties as ref[Array[ref[AstNode]?]]).get_length() as int
+        if Checker.strict_null_checks()
+        {
+            if count = 0
+                return this.check_non_null_type(source_type, node)
+        }
+        var i 0
+        while i < count
+        {
+            this.check_object_literal_destructuring_property_assignment(node, source_type, i, properties, right_is_this)
+            if this.unported_mark() <> mark
+                return null
+            set i: i + 1
+        }
+        source_type
+    }
+
+    ; checkObjectLiteralDestructuringPropertyAssignment — one property of an object
+    ; pattern, and the reference's own note is the reason `all_properties` is a
+    ; parameter of its own: *if property cannot be a SpreadAssignment, then
+    ; allProperties does not need to be provided.*
+    ;
+    ; ★★ THE ELEMENT TYPE IS TAKEN TWICE OVER AND THE SECOND READ IS THE FLOW'S.
+    ; getIndexedAccessTypeEx answers the DECLARED element type; getFlowTypeOfDestructuring
+    ; then narrows it through the synthetic `o["x"]` reference, which is the machinery
+    ; slice 117 built. Skipping the second read would lose every narrowing a
+    ; destructuring assignment inherits from its source.
+    ;
+    ; ★ `AccessFlagsAllowMissing` is conditional on hasDefaultValue and nothing
+    ; else: `{a = 1} = o` may read a property `o` does not have, `{a} = o` may not.
+    function check_object_literal_destructuring_property_assignment(this, node: ref[AstNode], object_literal_type: ref[Type], property_index: int, all_properties: ref[Array[ref[AstNode]?]]?, right_is_this: bool) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let properties AstNode.properties_of(node)
+        if properties = null
+        {
+            this.record_unported("destructuring-slot-missing", KindObjectLiteralExpression)
+            return null
+        }
+        let plist properties as ref[Array[ref[AstNode]?]]
+        let popt plist[property_index]
+        if popt = null
+        {
+            this.record_unported("destructuring-slot-missing", KindObjectLiteralExpression)
+            return null
+        }
+        let property popt as ref[AstNode]
+        let pk AstNode.kind_of(property)
+        var assignment false
+        if pk = KindPropertyAssignment
+            set assignment: true
+        if pk = KindShorthandPropertyAssignment
+            set assignment: true
+        if assignment
+        {
+            let name_opt AstNode.name_of(property)
+            if name_opt = null
+            {
+                this.record_unported("destructuring-slot-missing", pk)
+                return null
+            }
+            let name name_opt as ref[AstNode]
+            let expr_type this.get_literal_type_from_property_name(name)
+            if this.unported_mark() <> mark
+                return null
+            if expr_type = null
+                return null
+            let et expr_type as ref[Type]
+            if Checker.is_type_usable_as_property_name(et)
+            {
+                var nb char[JSNUM_MAX_TEXT]
+                let text this.get_property_name_from_type(et, Slice[char](JSNUM_MAX_TEXT as size_t, &nb[0]))
+                let prop this.get_property_of_type(object_literal_type, text)
+                if this.unported_mark() <> mark
+                    return null
+                if prop <> null
+                {
+                    ; markPropertyAsReferenced — see the chapter header for why it
+                    ; is not ported and cannot change an answer here.
+                    this.check_property_accessibility(property, false, true, object_literal_type, prop as ref[Symbol])
+                    if this.unported_mark() <> mark
+                        return null
+                }
+            }
+            var access_flags AccessFlagsExpressionPosition
+            if this.has_default_value(property)
+                set access_flags: access_flags | AccessFlagsAllowMissing
+            let element_type this.get_indexed_access_type_ex(object_literal_type, et, access_flags, name, null)
+            if this.unported_mark() <> mark
+                return null
+            if element_type = null
+                return null
+            let t this.get_flow_type_of_destructuring(property, element_type as ref[Type])
+            if this.unported_mark() <> mark
+                return null
+            if t = null
+                return null
+            var expr: ref[AstNode] property
+            if pk = KindPropertyAssignment
+            {
+                let init_node AstNode.initializer_of(property)
+                if init_node = null
+                {
+                    this.record_unported("destructuring-slot-missing", pk)
+                    return null
+                }
+                set expr: init_node as ref[AstNode]
+            }
+            return this.check_destructuring_assignment(expr, t as ref[Type], CheckModeNormal, false)
+        }
+        if pk = KindSpreadAssignment
+        {
+            if property_index < ((plist.get_length() as int) - 1)
+            {
+                this.error_on_node(property, DiagA_rest_element_must_be_last_in_a_destructuring_pattern)
+                return null
+            }
+            ; `checkExternalEmitHelpers(property, ExternalEmitHelpersRest)` behind
+            ; `languageVersion < ObjectSpreadRest` — a provable no-op, because the
+            ; callee's own first line is `if !c.compilerOptions.ImportHelpers
+            ; .IsTrue() { return }` and ImportHelpers is unset (§3.5cx).
+            let non_rest_names &Array[ref[AstNode]?]^host()
+            if all_properties <> null
+            {
+                let alist all_properties as ref[Array[ref[AstNode]?]]
+                let an alist.get_length() as int
+                var j 0
+                while j < an
+                {
+                    let other alist[j]
+                    set j: j + 1
+                    if other = null
+                        continue
+                    if AstNode.kind_of(other as ref[AstNode]) = KindSpreadAssignment
+                        continue
+                    non_rest_names.add(AstNode.name_of(other as ref[AstNode]))
+                }
+            }
+            let t this.get_rest_type(object_literal_type, non_rest_names as ref[Array[ref[AstNode]?]]?, object_literal_type.symbol)
+            if this.unported_mark() <> mark
+                return null
+            if t = null
+                return null
+            this.check_grammar_for_disallowed_trailing_comma(all_properties, DiagA_rest_parameter_or_binding_pattern_may_not_have_a_trailing_comma)
+            let e AstNode.expression_of(property)
+            if e = null
+            {
+                this.record_unported("destructuring-slot-missing", KindSpreadAssignment)
+                return null
+            }
+            return this.check_destructuring_assignment(e as ref[AstNode], t as ref[Type], CheckModeNormal, false)
+        }
+        this.error_on_node(property, DiagProperty_assignment_expected)
+        null
+    }
+
+    ; checkArrayLiteralAssignment.
+    ;
+    ; ★★★ TWO ELEMENT TYPES, AND THE SECOND ONE IS ASKED LAZILY BECAUSE ASKING IT
+    ; REPORTS. `possiblyOutOfBoundsType` comes from one
+    ; checkIteratedTypeOrElementType with PossiblyOutOfBounds set — which is also
+    ; the call that CHECKS the source is iterable at all, so it must happen once and
+    ; unconditionally. The in-bounds type is the same question without that flag,
+    ; and under noUncheckedIndexedAccess it is asked only when a SPREAD element
+    ; needs it: a second call would run the iterability check, and its reports, a
+    ; second time.
+    function check_array_literal_assignment(this, node: ref[AstNode], source_type: ref[Type], check_mode: int) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let elements AstNode.elements_of(node)
+        var count 0
+        if elements <> null
+            set count: (elements as ref[Array[ref[AstNode]?]]).get_length() as int
+        let possibly this.check_iterated_type_or_element_type(IterationUseDestructuring | IterationUsePossiblyOutOfBounds, source_type, undefined_type, node)
+        if this.unported_mark() <> mark
+            return null
+        var possibly_out_of_bounds: ref[Type] error_type
+        if possibly <> null
+            set possibly_out_of_bounds: possibly as ref[Type]
+        var in_bounds: ref[Type]? possibly_out_of_bounds
+        if Checker.no_unchecked_indexed_access()
+            set in_bounds: null
+        var i 0
+        while i < count
+        {
+            let row (elements as ref[Array[ref[AstNode]?]])[i]
+            var t: ref[Type] possibly_out_of_bounds
+            if row <> null
+            {
+                if AstNode.kind_of(row as ref[AstNode]) = KindSpreadElement
+                {
+                    if in_bounds = null
+                    {
+                        let strict this.check_iterated_type_or_element_type(IterationUseDestructuring, source_type, undefined_type, node)
+                        if this.unported_mark() <> mark
+                            return null
+                        if strict = null
+                            set in_bounds: error_type
+                        else
+                            set in_bounds: strict
+                    }
+                    set t: in_bounds as ref[Type]
+                }
+            }
+            this.check_array_literal_destructuring_element_assignment(node, source_type, i, t, check_mode)
+            if this.unported_mark() <> mark
+                return null
+            set i: i + 1
+        }
+        source_type
+    }
+
+    ; checkArrayLiteralDestructuringElementAssignment — one element of an array
+    ; pattern.
+    ;
+    ; ★★★ THE ARRAY-LIKE ARM SYNTHESIZES AN EXPRESSION AND THE REFERENCE SAYS WHY:
+    ; *we create a synthetic expression so that getIndexedAccessType doesn't get
+    ; confused when the element is a SyntaxKind.ElementAccessExpression.* The access
+    ; NODE is what an indexed-access report points at, and for `[o[0]] = xs` the
+    ; element is itself an element access — pointing the report at it would name the
+    ; wrong access.
+    ;
+    ; ★★ THE REST ELEMENT'S TYPE IS A TUPLE SLICE WHERE IT CAN BE AND AN ARRAY
+    ; OTHERWISE, and the test is `everyType(sourceType, isTupleType)`: slicing a
+    ; tuple keeps the remaining elements' individual types, while
+    ; `createArrayType(elementType)` collapses them into one. The port already had
+    ; the predicate as every_type_is_tuple.
+    ;
+    ; ★ A HOLE — `[, a] = xs` — is an OmittedExpression and the whole function is
+    ; skipped for it, which is not the same as checking it against `undefined`.
+    function check_array_literal_destructuring_element_assignment(this, node: ref[AstNode], source_type: ref[Type], element_index: int, element_type: ref[Type], check_mode: int) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let elements AstNode.elements_of(node)
+        if elements = null
+        {
+            this.record_unported("destructuring-slot-missing", KindArrayLiteralExpression)
+            return null
+        }
+        let elist elements as ref[Array[ref[AstNode]?]]
+        let eopt elist[element_index]
+        if eopt = null
+        {
+            this.record_unported("destructuring-slot-missing", KindArrayLiteralExpression)
+            return null
+        }
+        let element eopt as ref[AstNode]
+        let ek AstNode.kind_of(element)
+        if ek = KindOmittedExpression
+            return null
+        if ek <> KindSpreadElement
+        {
+            let index_type this.get_number_literal_type(jsnum_from_int(element_index))
+            if this.is_array_like_type(source_type)
+            {
+                if this.unported_mark() <> mark
+                    return null
+                var access_flags AccessFlagsExpressionPosition
+                let has_default this.has_default_value(element)
+                if has_default
+                    set access_flags: access_flags | AccessFlagsAllowMissing
+                let synthetic this.new_synthetic_expression(element, index_type, false, null)
+                let accessed this.get_indexed_access_type_or_undefined(source_type, index_type, access_flags, synthetic, null)
+                if this.unported_mark() <> mark
+                    return null
+                var assigned: ref[Type] error_type
+                if accessed <> null
+                    set assigned: accessed as ref[Type]
+                if has_default
+                {
+                    let stripped this.get_type_with_facts(assigned, TypeFactsNEUndefined)
+                    if this.unported_mark() <> mark
+                        return null
+                    if stripped = null
+                        return null
+                    set assigned: stripped as ref[Type]
+                }
+                let t this.get_flow_type_of_destructuring(element, assigned)
+                if this.unported_mark() <> mark
+                    return null
+                if t = null
+                    return null
+                return this.check_destructuring_assignment(element, t as ref[Type], check_mode, false)
+            }
+            if this.unported_mark() <> mark
+                return null
+            return this.check_destructuring_assignment(element, element_type, check_mode, false)
+        }
+        if element_index < ((elist.get_length() as int) - 1)
+        {
+            this.error_on_node(element, DiagA_rest_element_must_be_last_in_a_destructuring_pattern)
+            return null
+        }
+        let rest_opt AstNode.expression_of(element)
+        if rest_opt = null
+        {
+            this.record_unported("destructuring-slot-missing", KindSpreadElement)
+            return null
+        }
+        let rest_expression rest_opt as ref[AstNode]
+        var initialized false
+        if AstNode.kind_of(rest_expression) = KindBinaryExpression
+        {
+            if Checker.kind_or_unknown(AstNode.binary_operator_token_of(rest_expression)) = KindEqualsToken
+                set initialized: true
+        }
+        if initialized
+        {
+            this.error_on_node(AstNode.binary_operator_token_of(rest_expression), DiagA_rest_element_cannot_have_an_initializer)
+            return null
+        }
+        this.check_grammar_for_disallowed_trailing_comma(elements, DiagA_rest_parameter_or_binding_pattern_may_not_have_a_trailing_comma)
+        var t: ref[Type]? null
+        if this.every_type_is_tuple(source_type)
+        {
+            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, element_index, 0, 0, 0, 0, 0, null, null, null) as ref[MapTypeArgs]?
+            set t: this.map_type(source_type, MapTypeKindSliceTuple, a)
+        }
+        else
+            set t: this.create_array_type(element_type)
+        if this.unported_mark() <> mark
+            return null
+        if t = null
+            return null
+        this.check_destructuring_assignment(rest_expression, t as ref[Type], check_mode, false)
+    }
+
+    ; checkReferenceAssignment — the LEAF of the chapter: the target is an ordinary
+    ; reference, so it is checked as an expression and the source is checked against
+    ; it. ★The two diagnostics are chosen by the target's PARENT and not by the
+    ; target: inside a `{...x}` the message names the object-rest form.
+    function check_reference_assignment(this, target: ref[AstNode], source_type: ref[Type], check_mode: int) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let target_type this.check_expression_ex(target, check_mode)
+        if this.unported_mark() <> mark
+            return null
+        if target_type = null
+            return null
+        var message DiagThe_left_hand_side_of_an_assignment_expression_must_be_a_variable_or_a_property_access
+        var optional_message DiagThe_left_hand_side_of_an_assignment_expression_may_not_be_an_optional_property_access
+        if Checker.kind_or_unknown(AstNode.parent_node_of(target)) = KindSpreadAssignment
+        {
+            set message: DiagThe_target_of_an_object_rest_assignment_must_be_a_variable_or_a_property_access
+            set optional_message: DiagThe_target_of_an_object_rest_assignment_may_not_be_an_optional_property_access
+        }
+        if this.check_reference_expression(target, message, optional_message)
+        {
+            if this.unported_mark() <> mark
+                return null
+            this.check_type_assignable_to_and_optionally_elaborate(source_type, target_type as ref[Type], target, target, 0)
+            if this.unported_mark() <> mark
+                return null
+        }
+        source_type
+    }
+
     ; checkBinaryLikeExpression. The head, the pre-pass and the switch.
     ;
     ; ★★ `errorNode` IS OPTIONAL UPSTREAM AND IS OPTIONAL HERE: checkDestructuring
@@ -48404,6 +49230,7 @@ define Checker
     ; lines. The reporter family's header states the same rule from its own side.
     function check_binary_like_expression(this, left: ref[AstNode], operator_token: ref[AstNode], right: ref[AstNode], check_mode: int, error_node: ref[AstNode]?) returns ref[Type]?
     {
+        let mark this.unported_mark()
         let op_kind AstNode.kind_of(operator_token)
 
         ; The destructuring fork. `[a, b] = xs` and `({a} = o)` are not binary
@@ -48419,12 +49246,17 @@ define Checker
                 set pattern: true
             if pattern
             {
-                ; The reference evaluates `c.checkExpressionEx(right, checkMode)`
-                ; as the ARGUMENT, so the right side is checked before the stop and
-                ; its own row is reached.
-                this.check_expression_ex(right, check_mode)
-                this.record_unported("check-destructuring-assignment", lk)
-                return null
+                ; The reference evaluates `c.checkExpressionEx(right, checkMode)` as
+                ; the ARGUMENT, so the right side is checked FIRST — the order is
+                ; observable and the stop that stood here already relied on it.
+                ; ★`rightIsThis` is `right.Kind == KindThisKeyword`, which is what
+                ; makes `{a} = this` mark its properties as self-accesses.
+                let source_type this.check_expression_ex(right, check_mode)
+                if this.unported_mark() <> mark
+                    return null
+                if source_type = null
+                    return null
+                return this.check_destructuring_assignment(left, source_type as ref[Type], check_mode, AstNode.kind_of(right) = KindThisKeyword)
             }
         }
 
@@ -51035,7 +51867,7 @@ define Checker
     {
         if t = null
             return null
-        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, index, length, first_spread_index, last_spread_index, 0, null) as ref[MapTypeArgs]?
+        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, index, length, first_spread_index, last_spread_index, 0, null, null, null) as ref[MapTypeArgs]?
         this.map_type_ex(t as ref[Type], MapTypeKindContextualElement, a, true)
     }
 
@@ -52300,7 +53132,7 @@ define Checker
                     var flags InferenceFlagsNone
                     if Parser.is_in_js_file(node)
                         set flags: InferenceFlagsAnyDefault
-                    let ctx this.new_inference_context(candidate.type_parameters, candidate, flags, CompareKindAssignable)
+                    let ctx this.new_inference_context(candidate.type_parameters, candidate, flags, SignatureComparerAssignable)
                     set inference_context: ctx
                     set type_argument_types: this.infer_type_arguments(node, candidate, args, s.arg_check_mode | CheckModeSkipGenericFunctions, ctx)
                     if this.unported_mark() <> mark
@@ -52790,7 +53622,7 @@ define Checker
         var flags InferenceFlagsNone
         if Parser.is_in_js_file(node)
             set flags: InferenceFlagsAnyDefault
-        let ctx this.new_inference_context(type_parameters, candidate, flags, CompareKindAssignable)
+        let ctx this.new_inference_context(type_parameters, candidate, flags, SignatureComparerAssignable)
         let type_arguments this.infer_type_arguments(node, candidate, args, check_mode | CheckModeSkipContextSensitive | CheckModeSkipGenericFunctions, ctx)
         if this.unported_mark() <> mark
             return null
@@ -63135,31 +63967,58 @@ define Checker
                 set destructuring: true
             if destructuring
             {
-                ; checkDestructuringAssignment — the destructuring-ASSIGNMENT
-                ; chapter, which this port does not have. The iteration question
-                ; above is answered, so the row is the narrower one.
-                this.record_unported("check-destructuring-assignment", vk)
-                return
-            }
-            if var_expr <> null
-            {
-                let ve var_expr as ref[AstNode]
-                let left_type this.check_expression(ve)
-                if this.unported_mark() <> mark
-                    return
-                this.check_reference_expression(ve, DiagThe_left_hand_side_of_a_for_of_statement_must_be_a_variable_or_a_property_access, DiagThe_left_hand_side_of_a_for_of_statement_may_not_be_an_optional_property_access)
-                if this.unported_mark() <> mark
-                    return
-                ; "iteratedType will be undefined if the rightType was missing
-                ; properties/signatures required to get its iteratedType (like
-                ; [Symbol.iterator] or next)."
-                if iterated_type <> null
+                ; checkDestructuringAssignment, since slice 145. ★The iterated type
+                ; is the SOURCE here, not the sequence's own type, and it is already
+                ; in hand from check_right_hand_side_of_for_of above — asking again
+                ; would run that check's reports twice.
+                ;
+                ; ★★ A MISSING ITERATED TYPE IS `error_type` AND NOT A RETURN, and
+                ; the reference explains it: *iteratedType may be undefined. In this
+                ; case, we still want to check the structure of varExpr, in
+                ; particular making sure it's a valid LeftHandSideExpression* — so
+                ; `core.OrElse(iteratedType, c.errorType)` keeps the pattern walked
+                ; while short-circuiting the assignability relation.
+                ;
+                ; ★★★ AND IT MUST NOT RETURN — THE STOP'S `return` WAS PART OF THE
+                ; STOP AND NOT PART OF THE ARM. The reference's if/else is followed
+                ; by `checkSourceElement(data.Statement)`, so returning here checks
+                ; the pattern and then never checks the loop BODY. It cost the two
+                ; `sourceMapValidationDestructuringForOf*` units twelve TS2454
+                ; reports each, and the shape of the symptom is what made it hard to
+                ; see: the type WALK still visits every node in the body and prints
+                ; its type, so the dump looked complete and only the diagnostics were
+                ; gone. **Replacing a stop means deleting the whole stop, and a
+                ; `return` that used to mean *abandon the arm* is part of it.**
+                if var_expr <> null
                 {
-                    if left_type <> null
+                    var source: ref[Type] error_type
+                    if iterated_type <> null
+                        set source: iterated_type as ref[Type]
+                    this.check_destructuring_assignment(var_expr as ref[AstNode], source, CheckModeNormal, false)
+                }
+            }
+            else
+            {
+                if var_expr <> null
+                {
+                    let ve var_expr as ref[AstNode]
+                    let left_type this.check_expression(ve)
+                    if this.unported_mark() <> mark
+                        return
+                    this.check_reference_expression(ve, DiagThe_left_hand_side_of_a_for_of_statement_must_be_a_variable_or_a_property_access, DiagThe_left_hand_side_of_a_for_of_statement_may_not_be_an_optional_property_access)
+                    if this.unported_mark() <> mark
+                        return
+                    ; "iteratedType will be undefined if the rightType was missing
+                    ; properties/signatures required to get its iteratedType (like
+                    ; [Symbol.iterator] or next)."
+                    if iterated_type <> null
                     {
-                        this.check_type_assignable_to_and_optionally_elaborate(iterated_type as ref[Type], left_type as ref[Type], ve, AstNode.expression_of(node), 0)
-                        if this.unported_mark() <> mark
-                            return
+                        if left_type <> null
+                        {
+                            this.check_type_assignable_to_and_optionally_elaborate(iterated_type as ref[Type], left_type as ref[Type], ve, AstNode.expression_of(node), 0)
+                            if this.unported_mark() <> mark
+                                return
+                        }
                     }
                 }
             }
@@ -73694,8 +74553,17 @@ define Checker
     ; ★★ Ternary collapses to bool on the file's own rule (see check_type_related_to
     ; ex's header): every test upstream is `!= TernaryFalse` and `result &= related`
     ; over values that are only False or not-False is a conjunction.
-    function compare_signatures_related(this, source: ref[Signature], target: ref[Signature], check_mode: int, comparer: int) returns bool
+    function compare_signatures_related(this, source_in: ref[Signature], target_in: ref[Signature], check_mode: int, comparer: int) returns bool
     {
+        ; ★★ THE TWO ARE REBOUND HALFWAY DOWN, WHICH IS WHY THEY ARE LOCALS AND NOT
+        ; THE PARAMETERS (slice 145). The generic block below replaces `target` by
+        ; its CANONICAL signature and `source` by the instantiation inferred in that
+        ; target's context, and everything after it — the parameter loop, the rest
+        ; types, the return comparison — reads the REPLACEMENTS. Reading the
+        ; parameters there would compare the uninstantiated pair, which is exactly
+        ; the answer the stop that stood here avoided giving.
+        var source: ref[Signature] source_in
+        var target: ref[Signature] target_in
         if source = target
             return true
         let mark this.unported_mark()
@@ -73764,20 +74632,31 @@ define Checker
         }
         if source_has_more_parameters
             return false
-        ; ★★★ THE GENERIC RE-INSTANTIATION IS A STOP AND IT IS THE ONE THIS
-        ; CHAPTER LEAVES: `getCanonicalSignature(target)` plus
-        ; `instantiateSignatureInContextOf(source, target, nil, compareTypes)`,
-        ; which runs a whole INFERENCE against the target's parameter types
-        ; (applyToParameterTypes over inferTypes) and clones the context to avoid
-        ; fixing. Everything for it exists since slice 122; what it needs is its
-        ; own measurement, because it changes which SIGNATURE is compared and not
-        ; only the answer.
+        ; ★★★ THE GENERIC RE-INSTANTIATION, SLICE 145. The stop that stood here said
+        ; the chapter *changes which SIGNATURE is compared and not only the answer*,
+        ; and that is literally what the two lines do: the TARGET becomes its
+        ; canonical form and the SOURCE becomes the instantiation inferred against
+        ; that canonical target, so the rest of the function compares a pair neither
+        ; caller passed.
+        ;
+        ; ★ `compareTypes` travels as the comparer TAG this port already threads, so
+        ; the reference's TypeComparer func value needs nothing new here.
         if Checker.type_parameter_count_of_signature(source) <> 0
         {
             if Checker.same_type_parameters(source, target) = false
             {
-                this.record_unported("compare-signatures-generic-source", Checker.type_parameter_count_of_signature(source))
-                return false
+                let canonical this.get_canonical_signature(target)
+                if this.unported_mark() <> mark
+                    return false
+                if canonical = null
+                    return false
+                set target: canonical as ref[Signature]
+                let instantiated this.instantiate_signature_in_context_of(source, target, null, comparer)
+                if this.unported_mark() <> mark
+                    return false
+                if instantiated = null
+                    return false
+                set source: instantiated as ref[Signature]
             }
         }
         let source_count this.get_parameter_count(source)
@@ -84534,6 +85413,8 @@ define Checker
             return this.get_definitely_falsy_part_of_type(t)
         if mk = MapTypeKindWidenedLiteral
             return this.get_widened_literal_type(t)
+        if mk = MapTypeKindBaseConstraintOrType
+            return this.get_base_constraint_or_type(t)
         if mk = MapTypeKindMutableArrayOrTuple
             return this.get_mutable_array_or_tuple_type(t)
         if mk = MapTypeKindTupleElementOutOfStartCount
@@ -84564,6 +85445,12 @@ define Checker
         if a = null
             return null
         let args a as ref[MapTypeArgs]
+        ; getRestType's own recursion over the union's constituents (slice 145).
+        if mk = MapTypeKindRestType
+            return this.get_rest_type(t, args.rest_properties, args.rest_symbol)
+        ; sliceTupleType at the captured element index, end skip count 0.
+        if mk = MapTypeKindSliceTuple
+            return this.slice_tuple_type(t, args.index, 0)
         if mk = MapTypeKindMappedConstituent
             return this.instantiate_mapped_constituent(args, t)
         if mk = MapTypeKindConditionalDistribution
@@ -84605,7 +85492,7 @@ define Checker
     ; flag becomes, so a nullable capture is the honest carrier and not a bool.
     function get_tuple_element_type_out_of_start_count(this, t: ref[Type], index: u64, undefined_like: ref[Type]?) returns ref[Type]?
     {
-        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, index, undefined_like) as ref[MapTypeArgs]?
+        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, index, undefined_like, null, null) as ref[MapTypeArgs]?
         this.map_type(t, MapTypeKindTupleElementOutOfStartCount, a)
     }
 
@@ -84816,7 +85703,7 @@ define Checker
         }
         if distribute
         {
-            let a &MapTypeArgs^host(null, null, new_mapper as ref[TypeMapper]?, root, check_type, for_constraint, null, null, 0, 0, 0, 0, 0, 0, null)
+            let a &MapTypeArgs^host(null, null, new_mapper as ref[TypeMapper]?, root, check_type, for_constraint, null, null, 0, 0, 0, 0, 0, 0, null, null, null)
             set result: this.map_type_with_alias(distribution_type as ref[Type], MapTypeKindConditionalDistribution, a, alias)
         }
         if distribute = false
@@ -85365,7 +86252,7 @@ define Checker
                     return null
                 if reduced = null
                     return null
-                let a &MapTypeArgs^host(t, type_variable, m, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null)
+                let a &MapTypeArgs^host(t, type_variable, m, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null)
                 return this.map_type_with_alias(reduced as ref[Type], MapTypeKindMappedConstituent, a, alias)
             }
         }
@@ -107215,6 +108102,159 @@ define Checker
         erased
     }
 
+    ; ── the CANONICAL signature (slice 145) ──────────────────────────────────
+    ;
+    ; getCanonicalSignature + createCanonicalSignature, the third row of the same
+    ; cache. The reference's own comment is the argument for it: *when a generic
+    ; class or interface is instantiated, each generic method in it is instantiated
+    ; with a fresh set of CLONED type parameters, which we need to handle scenarios
+    ; where different generations of the same type parameter are in scope. This
+    ; leads to a lot of new type identities* — so the canonicalisation replaces
+    ; every UNCONSTRAINED clone by the original it was cloned from, and two
+    ; comparisons of the same method through two instantiations then meet the same
+    ; identities.
+    ;
+    ; ★★ THE PREDICATE IS `tp.Target() != nil && constraintOf(tp.Target()) == nil`
+    ; AND BOTH HALVES MATTER. `Target()` is what makes it a CLONE rather than a
+    ; declaration's own parameter, and the constraint is asked of the TARGET and not
+    ; of the clone — a constrained parameter keeps its clone, because two
+    ; generations of a constrained parameter can have different constraints and
+    ; collapsing them would compare the wrong thing.
+    function get_canonical_signature(this, signature: ref[Signature]) returns ref[Signature]?
+    {
+        if signature.type_parameters = null
+            return signature
+        let tps signature.type_parameters as ref[Array[ref[Type]?]]
+        if (tps.get_length() as int) = 0
+            return signature
+        let cached this.signature_cache_lookup(signature, SignatureCacheKindCanonical)
+        if cached <> null
+            return cached
+        let mark this.unported_mark()
+        let canonical this.create_canonical_signature(signature)
+        if this.unported_mark() <> mark
+            return null
+        if canonical = null
+            return null
+        let row &CachedSignature^host(signature, SignatureCacheKindCanonical, null, canonical)
+        cached_signatures.add(row as ref[CachedSignature]?)
+        canonical
+    }
+
+    function create_canonical_signature(this, signature: ref[Signature]) returns ref[Signature]?
+    {
+        let mark this.unported_mark()
+        if signature.type_parameters = null
+            return signature
+        let tps signature.type_parameters as ref[Array[ref[Type]?]]
+        let n tps.get_length() as int
+        let type_arguments this.new_type_list(null)
+        var i 0
+        while i < n
+        {
+            let e tps[i]
+            if e = null
+                return null
+            let tp e as ref[Type]
+            var chosen tp
+            let tgt Checker.target_of(tp)
+            if tgt <> null
+            {
+                let c this.get_constraint_of_type_parameter(tgt as ref[Type])
+                if this.unported_mark() <> mark
+                    return null
+                if c = null
+                    set chosen: tgt as ref[Type]
+            }
+            type_arguments.add(chosen)
+            set i: i + 1
+        }
+        this.get_signature_instantiation(signature, type_arguments, Parser.is_in_js_file(signature.declaration), null)
+    }
+
+    ; ── instantiateSignatureInContextOf (slice 145) ──────────────────────────
+    ;
+    ; *Instantiate a generic signature in the context of a non-generic signature
+    ; (section 3.8.5 in the TypeScript spec).* It runs a whole INFERENCE of the
+    ; signature's own type parameters from the contextual signature's parameter
+    ; types, and then instantiates with what came out — which is why the stop it
+    ; replaces said the chapter *changes which SIGNATURE is compared and not only
+    ; the answer*.
+    ;
+    ; ★★★ THE CLONE THE REFERENCE'S COMMENT TALKS ABOUT IS NOT A CLONE OF THE
+    ; CONTEXT AND THE COMMENT IS IN THE WRONG PLACE. It reads *we clone the
+    ; inferenceContext to avoid fixing*, but the line under it makes a FRESH
+    ; context with `newInferenceContext` and then reads the PASSED context's mapper
+    ; only to instantiate the contextual signature — the non-fixing mapper is the
+    ; device, and `cloneInferenceContext` is not called here at all. Following the
+    ; comment instead of the code would have added a clone with no reader.
+    ;
+    ; ★★ THE MAPPER CHOICE IS THE REST TYPE'S DOING: a rest type that is itself a
+    ; type PARAMETER takes the NON-FIXING mapper, so that inferring the element
+    ; type of `A`'s constraint for `T` leaves `[any]` inferable back to `A` later.
+    ; With no inference context there is no mapper and the contextual signature is
+    ; used as it stands.
+    ;
+    ; ★ The RETURN types are only applied when there is NO inference context, and
+    ; the source there is the ORIGINAL contextual signature rather than the
+    ; instantiated one — both are the reference's, and neither is symmetrical with
+    ; the parameter call above it.
+    function instantiate_signature_in_context_of(this, signature: ref[Signature], contextual_signature: ref[Signature], inference_context: ref[InferenceContext]?, compare_kind: int) returns ref[Signature]?
+    {
+        let mark this.unported_mark()
+        let tps this.get_type_parameters_for_mapper(signature)
+        if this.unported_mark() <> mark
+            return null
+        let context this.new_inference_context(tps, signature, InferenceFlagsNone, compare_kind)
+        let rest_type this.get_effective_rest_type(contextual_signature)
+        if this.unported_mark() <> mark
+            return null
+        var m: ref[TypeMapper]? null
+        if inference_context <> null
+        {
+            let ic inference_context as ref[InferenceContext]
+            var non_fixing false
+            if rest_type <> null
+            {
+                if ((rest_type as ref[Type]).flags & TypeFlagsTypeParameter) <> 0
+                    set non_fixing: true
+            }
+            if non_fixing
+                set m: ic.non_fixing_mapper
+            else
+                set m: ic.mapper
+        }
+        var source_signature: ref[Signature] contextual_signature
+        if m <> null
+        {
+            let inst this.instantiate_signature(contextual_signature, m as ref[TypeMapper])
+            if this.unported_mark() <> mark
+                return null
+            if inst = null
+                return null
+            set source_signature: inst as ref[Signature]
+        }
+        ; "Type parameters from outer context referenced by source type are fixed
+        ; by instantiation of the source type."
+        let param_cb &ApplyCallback^host(ApplyCallbackKindInferTypes, null, context.inferences, InferencePriorityNone, false)
+        this.apply_to_parameter_types(param_cb, source_signature, signature)
+        if this.unported_mark() <> mark
+            return null
+        if inference_context = null
+        {
+            let return_cb &ApplyCallback^host(ApplyCallbackKindInferTypes, null, context.inferences, InferencePriorityReturnType, false)
+            this.apply_to_return_types(return_cb, contextual_signature, signature)
+            if this.unported_mark() <> mark
+                return null
+        }
+        let inferred this.get_inferred_types(context)
+        if this.unported_mark() <> mark
+            return null
+        if inferred = null
+            return null
+        this.get_signature_instantiation(signature, inferred, Parser.is_in_js_file(contextual_signature.declaration), null)
+    }
+
     procedure infer_from_signature(this, n: ref[InferenceState], source: ref[Signature], target: ref[Signature])
     {
         let mark this.unported_mark()
@@ -107231,20 +108271,58 @@ define Checker
                 set n.bivariant: true
             if kind = KindConstructor
                 set n.bivariant: true
-            this.apply_to_parameter_types(n, source, target)
+            this.apply_to_parameter_types(&ApplyCallback^host(ApplyCallbackKindInferFromSignature, n, null, InferencePriorityNone, false), source, target)
             set n.bivariant: save_bivariant
             if this.unported_mark() <> mark
                 return
         }
-        this.apply_to_return_types(n, source, target)
+        this.apply_to_return_types(&ApplyCallback^host(ApplyCallbackKindInferFromSignature, n, null, InferencePriorityNone, false), source, target)
     }
 
-    ; applyToParameterTypes and applyToReturnTypes. The reference's `callback`
-    ; func value is dropped rather than turned into a tag, and the reason is
-    ; §3.5e read strictly: inference.go passes exactly ONE callback to each, so a
-    ; tag would have a single value. The relater's own two calls pass a different
-    ; pair and are still stops; the day one lands, the tag lands with it.
-    procedure apply_to_parameter_types(this, n: ref[InferenceState], source: ref[Signature], target: ref[Signature])
+    ; The callback of applyToParameterTypes, resolved. See the ApplyCallback header
+    ; for why the parameter side and the return side need one of these each.
+    procedure apply_parameter_callback(this, cb: ref[ApplyCallback], s: ref[Type], t: ref[Type])
+    {
+        if cb.kind = ApplyCallbackKindInferFromSignature
+        {
+            if cb.state = null
+                return
+            this.infer_from_contravariant_types_if_strict_function_types(cb.state as ref[InferenceState], s, t)
+            return
+        }
+        if cb.inferences = null
+            return
+        this.infer_types(cb.inferences as ref[Array[ref[InferenceInfo]?]], s, t, cb.priority, cb.contravariant)
+    }
+
+    ; The callback of applyToReturnTypes. ★The InferFromSignature arm is
+    ; `inferFromTypes` and NOT the contravariant-if-strict wrapper the parameter
+    ; side gets — a return type is covariant, so the wrapper would be wrong here
+    ; and it is the reason the tag names the caller rather than the callee.
+    procedure apply_return_callback(this, cb: ref[ApplyCallback], s: ref[Type], t: ref[Type])
+    {
+        if cb.kind = ApplyCallbackKindInferFromSignature
+        {
+            if cb.state = null
+                return
+            this.infer_from_types(cb.state as ref[InferenceState], s, t)
+            return
+        }
+        if cb.inferences = null
+            return
+        this.infer_types(cb.inferences as ref[Array[ref[InferenceInfo]?]], s, t, cb.priority, cb.contravariant)
+    }
+
+    ; applyToParameterTypes and applyToReturnTypes.
+    ;
+    ; ★★★ THE `callback` IS A TAG SINCE SLICE 145, AND THE NOTE THAT STOOD HERE
+    ; PREDICTED THE DAY. It read *inference.go passes exactly ONE callback to each,
+    ; so a tag would have a single value — the relater's own two calls pass a
+    ; different pair and are still stops; the day one lands, the tag lands with it.*
+    ; instantiateSignatureInContextOf is that call, so ApplyCallback exists and
+    ; carries both shapes. **A deferral written at the line it changes was read by
+    ; the slice that changed it, which is the whole of §0.4's argument.**
+    procedure apply_to_parameter_types(this, cb: ref[ApplyCallback], source: ref[Signature], target: ref[Signature])
     {
         let mark this.unported_mark()
         let source_count this.get_parameter_count(source)
@@ -107278,7 +108356,7 @@ define Checker
             if this.unported_mark() <> mark
                 return
             if target_this <> null
-                this.infer_from_contravariant_types_if_strict_function_types(n, source_this as ref[Type], target_this as ref[Type])
+                this.apply_parameter_callback(cb, source_this as ref[Type], target_this as ref[Type])
             if this.unported_mark() <> mark
                 return
         }
@@ -107295,7 +108373,7 @@ define Checker
             {
                 if t <> null
                 {
-                    this.infer_from_contravariant_types_if_strict_function_types(n, s as ref[Type], t as ref[Type])
+                    this.apply_parameter_callback(cb, s as ref[Type], t as ref[Type])
                     if this.unported_mark() <> mark
                         return
                 }
@@ -107327,7 +108405,7 @@ define Checker
     ; ★ getTypePredicateOfSignature is asked on the TARGET first, and the SOURCE is
     ; only asked if the target has one: two matching predicates infer from
     ; predicate type to predicate type and from nothing else.
-    procedure apply_to_return_types(this, n: ref[InferenceState], source: ref[Signature], target: ref[Signature])
+    procedure apply_to_return_types(this, cb: ref[ApplyCallback], source: ref[Signature], target: ref[Signature])
     {
         let mark this.unported_mark()
         let target_predicate this.get_type_predicate_of_signature(target)
@@ -107348,7 +108426,7 @@ define Checker
                     {
                         if tp.t <> null
                         {
-                            this.infer_from_types(n, sp.t as ref[Type], tp.t as ref[Type])
+                            this.apply_return_callback(cb, sp.t as ref[Type], tp.t as ref[Type])
                             return
                         }
                     }
@@ -107370,7 +108448,7 @@ define Checker
             return
         if source_return = null
             return
-        this.infer_from_types(n, source_return as ref[Type], target_return as ref[Type])
+        this.apply_return_callback(cb, source_return as ref[Type], target_return as ref[Type])
     }
 
     procedure infer_from_index_types(this, n: ref[InferenceState], source: ref[Type], target: ref[Type])
@@ -107782,15 +108860,6 @@ define Checker
         false
 
     ; ── from candidates to a type ───────────────────────────────────────────
-
-    ; The reference's TypeComparer, applied. See CompareKind's own note for why
-    ; the func value is a flag.
-    function compare_types(this, kind: int, source: ref[Type], target: ref[Type]) returns bool
-    {
-        if kind = CompareKindSubtype
-            return this.is_type_related_to(source, target, RelationSubtype)
-        this.is_type_related_to(source, target, RelationAssignable)
-    }
 
     ; getNullableType.
     function get_nullable_type(this, t: ref[Type], flags: int) returns ref[Type]?
@@ -108408,7 +109477,7 @@ define Checker
                 if with_this = null
                     return null
                 let cwt with_this as ref[Type]
-                if this.compare_types(n.compare_kind, inferred as ref[Type], cwt) = false
+                if this.compare_types_by_comparer(n.compare_kind, inferred as ref[Type], cwt) = false
                 {
                     if this.unported_mark() <> mark
                         return null
@@ -108439,7 +109508,7 @@ define Checker
                         return null
                     if fwt <> null
                     {
-                        set take_fallback: this.compare_types(n.compare_kind, fb, fwt as ref[Type])
+                        set take_fallback: this.compare_types_by_comparer(n.compare_kind, fb, fwt as ref[Type])
                         if this.unported_mark() <> mark
                             return null
                     }
@@ -109009,7 +110078,7 @@ define Checker
         }
         ; The second, isolated pass: its inferences never enter `context`, only
         ; `context.return_mapper`.
-        let return_context this.new_inference_context(signature.type_parameters, signature, context.flags, CompareKindAssignable)
+        let return_context this.new_inference_context(signature.type_parameters, signature, context.flags, SignatureComparerAssignable)
         var outer_return_mapper: ref[TypeMapper]? null
         if outer_context <> null
         {
