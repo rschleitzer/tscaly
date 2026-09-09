@@ -4995,6 +4995,16 @@ define FlowReachableLink
     reachable: bool
 )
 
+; c.flowNodePostSuper's row — the Shared-node memo of isPostSuperFlowNodeWorker.
+; A SEPARATE table from FlowReachableLink above for the reason that one is
+; separate from SharedFlow: the two walks answer different questions about the
+; same node, and one table keyed on the node could hold only one of the answers.
+define FlowPostSuperLink
+(
+    flow: ref[FlowNode]?
+    post_super: bool
+)
+
 define Checker
 (
     host: ref[Page]
@@ -6021,6 +6031,7 @@ define Checker
     flow_trace: ref[Array[ref[FlowTraceEvent]?]]
 
     flow_node_reachable: ref[Array[ref[FlowReachableLink]?]]
+    flow_node_post_super: ref[Array[ref[FlowPostSuperLink]?]]
     last_flow_node: ref[FlowNode]?
     last_flow_node_reachable: bool
 
@@ -6585,6 +6596,8 @@ define Checker
         set c.flow_analysis_disabled: false
         let fnr &Array[ref[FlowReachableLink]?]^host()
         set c.flow_node_reachable: fnr
+        let fps &Array[ref[FlowPostSuperLink]?]^host()
+        set c.flow_node_post_super: fps
         let ftr &Array[ref[FlowTraceEvent]?]^host()
         set c.flow_trace: ftr
         set c.last_flow_node: null
@@ -40160,6 +40173,136 @@ define Checker
         flow.antecedents
     }
 
+    ; c.flowNodePostSuper[flow] — the LOOKUP, and it is flow_reachable_lookup's
+    ; twin for the same reason that one is not a mint-on-miss reader: the payload
+    ; is a BOOL, so an absent row and a row holding false are different facts.
+    function flow_post_super_lookup(this, flow: ref[FlowNode]) returns ref[FlowPostSuperLink]?
+    {
+        let len flow_node_post_super.get_length() as int
+        var i 0
+        while i < len
+        {
+            let row flow_node_post_super[i]
+            if row <> null
+            {
+                let r row as ref[FlowPostSuperLink]
+                if r.flow = flow
+                    return r
+            }
+            set i: i + 1
+        }
+        null
+    }
+
+    ; isPostSuperFlowNode. The reference borrows a FlowState for the reduce-label
+    ; stack and returns it; here the stack is the worker's parameter, exactly as at
+    ; isReachableFlowNodeWorker, so the entry is the call.
+    function is_post_super_flow_node(this, flow: ref[FlowNode], no_cache_check: bool) returns bool
+        this.is_post_super_flow_node_worker(null, flow, no_cache_check)
+
+    ; isPostSuperFlowNodeWorker — the fifth walk over the flow graph in this file,
+    ; and the ONE that asks the checker nothing at all: every arm reads a flag, an
+    ; antecedent or a node KIND, so it has no stop and cannot acquire one.
+    ;
+    ; ★★★ THE `default` ARM IS THE ANSWER AND NOT A FALLBACK: *unreachable nodes
+    ; are considered post-super to silence errors*. A start node, a node the binder
+    ; marked unreachable and anything else without one of the five flags answers
+    ; `Unreachable`'s own bit — so the function says TRUE for dead code and FALSE
+    ; for a live path that has not passed a `super()`. Reading it as "no evidence,
+    ; so false" inverts exactly the case TS17009 exists for.
+    ;
+    ; ★ The Call arm is the only one that looks at a node, and it looks at the
+    ; CALLEE: a flow Call node whose expression is the `super` keyword is the
+    ; barrier. It needs no effects signature, which is what separates this walk from
+    ; is_reachable_flow_node_worker's Call arm.
+    function is_post_super_flow_node_worker(this, reduce_labels: ref[ReduceLabelStack]?, flow_in: ref[FlowNode], no_cache_check_in: bool) returns bool
+    {
+        var flow flow_in
+        var no_cache_check no_cache_check_in
+        repeat
+        {
+            let flags flow.flags
+            if (flags & FlowFlagsShared) <> 0
+            {
+                if no_cache_check = false
+                {
+                    let hit this.flow_post_super_lookup(flow)
+                    if hit <> null
+                        return (hit as ref[FlowPostSuperLink]).post_super
+                    let post_super this.is_post_super_flow_node_worker(reduce_labels, flow, true)
+                    let made &FlowPostSuperLink^host(flow, post_super)
+                    flow_node_post_super.add(made)
+                    ; ★★★ THE REFERENCE DOES NOT RETURN HERE AND THIS PORT MUST NOT
+                    ; EITHER. It caches and falls through with noCacheCheck cleared,
+                    ; so the loop below recomputes the same node's answer once — a
+                    ; difference from is_reachable_flow_node_worker, which RETURNS
+                    ; the memoised value at the same place. Returning early is the
+                    ; obvious tidy-up and it is a divergence: the two functions
+                    ; differ here in upstream, and the second pass is what leaves
+                    ; the walk positioned on the antecedent chain.
+                }
+                set no_cache_check: false
+            }
+            var advance false
+            if (flags & (FlowFlagsAssignment | FlowFlagsCondition | FlowFlagsArrayMutation | FlowFlagsSwitchClause)) <> 0
+                set advance: true
+            if advance = false
+            {
+                if (flags & FlowFlagsCall) <> 0
+                {
+                    if Checker.kind_or_unknown(AstNode.expression_of(flow.node as ref[AstNode])) = KindSuperKeyword
+                        return true
+                    set advance: true
+                }
+            }
+            if advance = false
+            {
+                if (flags & FlowFlagsBranchLabel) <> 0
+                {
+                    ; A branch point is post-super only if EVERY branch is, where
+                    ; reachability asks whether ANY is — the two walks differ in the
+                    ; quantifier and in nothing else at this arm.
+                    var list Checker.get_branch_label_antecedents(flow, reduce_labels)
+                    while list <> null
+                    {
+                        let l list as ref[FlowList]
+                        if l.flow <> null
+                        {
+                            if this.is_post_super_flow_node_worker(reduce_labels, l.flow as ref[FlowNode], false) = false
+                                return false
+                        }
+                        set list: l.next
+                    }
+                    return true
+                }
+            }
+            if advance = false
+            {
+                if (flags & FlowFlagsLoopLabel) <> 0
+                {
+                    ; "A loop is post-super if the control flow path that leads to
+                    ; the top is post-super."
+                    let ants flow.antecedents
+                    if ants = null
+                        return false
+                    set flow: (ants as ref[FlowList]).flow as ref[FlowNode]
+                    continue
+                }
+            }
+            if advance = false
+            {
+                if (flags & FlowFlagsReduceLabel) <> 0
+                {
+                    let cell &ReduceLabelStack^host(flow.node, reduce_labels)
+                    return this.is_post_super_flow_node_worker(cell, flow.antecedent as ref[FlowNode], false)
+                }
+            }
+            if advance = false
+                return (flags & FlowFlagsUnreachable) <> 0
+            set flow: flow.antecedent as ref[FlowNode]
+        }
+    }
+
     ; isReachableFlowNode. The one-entry cache is written here rather than in the
     ; worker, exactly as upstream: the worker recurses and would otherwise
     ; overwrite the entry with an inner question's answer.
@@ -47692,13 +47835,15 @@ define Checker
         }
         if k = KindThisKeyword
             return this.get_explicit_this_type(node)
+        ; ★★★ THE ONE ARM OF THIS FUNCTION THAT IS NOT A LOOKUP, AND ITS STOP HAD
+        ; EXPIRED. The note that stood here called checkSuperExpression *the
+        ; expression chapter*; that function has been whole since slice 94 and
+        ; nothing re-read the sentence. §3.5eo, thirteenth harvest — and the
+        ; refutation was not expiredstops.py's, which reads the note for a callee
+        ; this file defines and found this one: it was the FRONTIER, which ranked
+        ; `check-super-expression` over 276 units.
         if k = KindSuperKeyword
-        {
-            ; checkSuperExpression — the expression chapter, and the one arm of
-            ; this function that is not a lookup.
-            this.record_unported("check-super-expression", k)
-            return null
-        }
+            return this.check_super_expression(node)
         if k = KindPropertyAccessExpression
         {
             let e AstNode.expression_of(node)
@@ -51262,10 +51407,72 @@ define Checker
             return boolean_type
         }
 
+        ; ── checkInstanceOfExpression ───────────────────────────────────
+        ;
+        ; ★★★ THE OPERATOR IS RESOLVED AS A CALL, AND THAT IS THE WHOLE SHAPE OF THE
+        ; FUNCTION. `x instanceof y` where y carries a `[Symbol.hasInstance]` method
+        ; is checked *as if it were a call to `right[Symbol.hasInstance](left)`* —
+        ; the reference's own comment — so getResolvedSignature is asked about the
+        ; BINARY EXPRESSION itself, and it is that call which checks the left
+        ; operand against the method's first parameter. The two reports below are
+        ; what is left over once the call has spoken: the left operand's kind and
+        ; the method's return type.
+        ;
+        ; ★ `left.Parent` rather than the binary node in hand: the reference reaches
+        ; the expression through the operand because the operand is what it was
+        ; given, and the two are the same node — written the reference's way so the
+        ; line still reads against it.
         if op_kind = KindInstanceOfKeyword
         {
-            this.record_unported("check-instance-of-expression", op_kind)
-            return null
+            if left_type = null
+                return null
+            if right_type = null
+                return null
+            let lt2 left_type as ref[Type]
+            let rt2 right_type as ref[Type]
+            if lt2 = silent_never_type
+                return silent_never_type
+            if rt2 = silent_never_type
+                return silent_never_type
+            let mark this.unported_mark()
+            ; "The instanceof operator requires the left operand to be of type Any,
+            ; an object type, or a type parameter type. NOTE: do not raise error if
+            ; leftType is unknown as related error was already reported."
+            if Checker.is_type_any(lt2) = false
+            {
+                let all_primitive this.all_types_assignable_to_kind(lt2, TypeFlagsPrimitive)
+                if this.unported_mark() <> mark
+                    return null
+                if all_primitive
+                    this.error_on_node(left, DiagThe_left_hand_side_of_an_instanceof_expression_must_be_of_type_any_an_object_type_or_a_type_parameter)
+            }
+            let parent AstNode.parent_node_of(left)
+            if parent = null
+                return null
+            let signature this.get_resolved_signature(parent as ref[AstNode], check_mode)
+            if this.unported_mark() <> mark
+                return null
+            if signature = null
+                return null
+            let sig signature as ref[Signature]
+            ; "CheckMode.SkipGenericFunctions is enabled and this is a call to a
+            ; generic function that returns a function type. We defer checking and
+            ; return silentNeverType."
+            if sig = resolving_signature
+                return silent_never_type
+            let return_type this.get_return_type_of_signature(sig)
+            if this.unported_mark() <> mark
+                return null
+            if return_type = null
+                return null
+            ; "We also verify that the return type of the `[Symbol.hasInstance]`
+            ; method is assignable to `boolean`. According to the spec, the runtime
+            ; will actually perform `ToBoolean` on the result, but this is more
+            ; type-safe."
+            this.check_type_assignable_to(return_type as ref[Type], boolean_type as ref[Type], right, DiagAn_object_s_Symbol_hasInstance_method_must_return_a_boolean_value_for_it_to_be_used_on_the_right_hand_side_of_an_instanceof_expression)
+            if this.unported_mark() <> mark
+                return null
+            return boolean_type
         }
         ; ── checkInExpression, slice 143 ────────────────────────────────
         ;
@@ -52947,10 +53154,7 @@ define Checker
         if jsx
             return this.record_call(node, k, this.resolve_jsx_opening_like_element(node, check_mode))
         if k = KindBinaryExpression
-        {
-            this.record_unported("resolve-instanceof-expression", k)
-            return null
-        }
+            return this.record_call(node, k, this.resolve_instanceof_expression(node, check_mode))
         ; `panic("Unhandled case in resolveSignature")`, held as a row on this
         ; file's rule about the reference's own assertions.
         this.record_unported("resolve-signature-unhandled", k)
@@ -53955,13 +54159,63 @@ define Checker
             return null
         }
         let expr callee as ref[AstNode]
+        ; ★★★ THE SECOND EXPIRED `check-super-expression` STOP, AND ITS NOTE NAMED
+        ; ITS OWN REFUTATION. It read *the base constructors, resolveCall and
+        ; resolveUntypedCall all wait behind it* — three functions, and all three
+        ; have been in this file for slices (resolveUntypedCall since 108,
+        ; getInstantiatedConstructorsForTypeArguments with the base-type chapter,
+        ; resolveCall with the call resolution). §3.5eo again, and the same lesson
+        ; in a sharper form: a note that ENUMERATES its blockers is refutable by
+        ; grepping the list, which is cheaper than re-deriving the chapter.
+        ;
+        ; ★ The `IsTypeAny` arm still CHECKS the arguments before answering
+        ; anySignature — the reference's own comment is *still visit arguments so
+        ; they get marked for visibility, etc* — so the loop is not a formality and
+        ; may not be dropped for having no value.
         if AstNode.kind_of(expr) = KindSuperKeyword
         {
-            ; The super branch hangs off checkSuperExpression's answer — the base
-            ; constructors, resolveCall and resolveUntypedCall all wait behind it —
-            ; and that is the dispatch's own row for a bare `super`.
-            this.record_unported("check-super-expression", KindSuperKeyword)
-            return null
+            let super_mark this.unported_mark()
+            let super_type this.check_super_expression(expr)
+            if this.unported_mark() <> super_mark
+                return null
+            if Checker.is_type_any(super_type)
+            {
+                let args AstNode.call_arguments_of(node)
+                if args <> null
+                {
+                    let al args as ref[Array[ref[AstNode]?]]
+                    let an al.get_length() as int
+                    var ai 0
+                    while ai < an
+                    {
+                        let arg al[ai]
+                        if arg <> null
+                            this.check_expression(arg as ref[AstNode])
+                        set ai: ai + 1
+                    }
+                }
+                return any_signature
+            }
+            if super_type = null
+                return this.resolve_untyped_call(node)
+            let st super_type as ref[Type]
+            if this.is_error_type(st) = false
+            {
+                let containing Checker.get_containing_class(node)
+                if containing <> null
+                {
+                    let base_type_node Checker.get_extends_heritage_clause_element(containing as ref[AstNode])
+                    if base_type_node <> null
+                    {
+                        let btn base_type_node as ref[AstNode]
+                        let base_constructors this.get_instantiated_constructors_for_type_arguments(st, AstNode.type_arguments_of(btn), btn)
+                        if this.unported_mark() <> super_mark
+                            return null
+                        return this.resolve_call(node, base_constructors, check_mode, SignatureFlagsNone, 0)
+                    }
+                }
+            }
+            return this.resolve_untyped_call(node)
         }
         ; ★ ast.IsImportCall is asked AGAIN here, and this port cannot reach the
         ; branch: the dispatch has already sent an import call to
@@ -54373,6 +54627,92 @@ define Checker
     ; an untyped decorator (`@d` on an `any`) a stop, which is nine units and the
     ; one wall the decorator chapter left behind for no reason. **A stop is a claim
     ; about the reference, and a claim about a `switch` has to name the arms.**
+    ; resolveInstanceofExpression. ★★★ THE ONLY BINARY EXPRESSION resolveSignature
+    ; IS EVER ASKED ABOUT IS AN `instanceof`, and the reference does not test for
+    ; it: checkInstanceOfExpression is the one caller that hands a binary node to
+    ; getResolvedSignature, so the arm's kind IS the operator. The port keeps that
+    ; — a test here would be a claim about callers rather than about the node.
+    ;
+    ; ★ The fall-through answer is anySignature and not an error: an `instanceof`
+    ; whose right operand is a plain class has no `[Symbol.hasInstance]` method, and
+    ; that is the ordinary case rather than a failure. The reference's own comment
+    ; is *fall back to a default signature*.
+    function resolve_instanceof_expression(this, node: ref[AstNode], check_mode: int) returns ref[Signature]?
+    {
+        let right AstNode.binary_right_of(node)
+        if right = null
+            return null
+        let r right as ref[AstNode]
+        let mark this.unported_mark()
+        let right_type this.check_expression(r)
+        if this.unported_mark() <> mark
+            return null
+        if right_type = null
+            return null
+        let rt right_type as ref[Type]
+        if Checker.is_type_any(rt)
+            return any_signature
+        ; "if rightType is an object type with a custom `[Symbol.hasInstance]`
+        ; method, then it is potentially valid on the right-hand side of the
+        ; `instanceof` operator. This allows normal `object` types to participate in
+        ; `instanceof`, as per Step 2 of the ECMA-262 InstanceofOperator."
+        let has_instance_method_type this.get_symbol_has_instance_method_of_object_type(rt)
+        if this.unported_mark() <> mark
+            return null
+        if has_instance_method_type = null
+        {
+            var function_like this.type_has_call_or_construct_signatures(rt)
+            if this.unported_mark() <> mark
+                return null
+            if function_like = false
+            {
+                let gf this.get_global_function_type()
+                if this.unported_mark() <> mark
+                    return null
+                if gf <> null
+                    set function_like: this.is_type_subtype_of(rt, gf as ref[Type])
+                if this.unported_mark() <> mark
+                    return null
+            }
+            if function_like = false
+            {
+                this.error_on_node(r, DiagThe_right_hand_side_of_an_instanceof_expression_must_be_either_of_type_any_a_class_function_or_other_type_assignable_to_the_Function_interface_type_or_an_object_type_with_a_Symbol_hasInstance_method)
+                return this.resolve_error_call(node)
+            }
+            return any_signature
+        }
+        let him has_instance_method_type as ref[Type]
+        let apparent_type this.get_apparent_type(him)
+        if this.unported_mark() <> mark
+            return null
+        if apparent_type = null
+            return null
+        let at apparent_type as ref[Type]
+        if this.is_error_type(at)
+            return this.resolve_error_call(node)
+        let call_signatures this.get_signatures_of_type(at, SignatureKindCall)
+        if this.unported_mark() <> mark
+            return null
+        let construct_signatures this.get_signatures_of_type(at, SignatureKindConstruct)
+        if this.unported_mark() <> mark
+            return null
+        var num_call 0
+        if call_signatures <> null
+            set num_call: (call_signatures as ref[Array[ref[Signature]?]]).get_length() as int
+        var num_construct 0
+        if construct_signatures <> null
+            set num_construct: (construct_signatures as ref[Array[ref[Signature]?]]).get_length() as int
+        let untyped this.is_untyped_function_call(him, at, num_call, num_construct)
+        if this.unported_mark() <> mark
+            return null
+        if untyped
+            return this.resolve_untyped_call(node)
+        if num_call <> 0
+            return this.resolve_call(node, call_signatures, check_mode, SignatureFlagsNone, 0)
+        ; "fall back to a default signature"
+        any_signature
+    }
+
     function resolve_untyped_call(this, node: ref[AstNode]) returns ref[Signature]?
     {
         let mark this.unported_mark()
@@ -54414,8 +54754,17 @@ define Checker
         }
         if k = KindBinaryExpression
         {
-            this.record_unported("resolve-untyped-call-instanceof", k)
-            return null
+            ; `c.checkExpression(node.AsBinaryExpression().Left)` — the LEFT operand,
+            ; because the right one has already been checked by the caller that got
+            ; here (resolveInstanceofExpression checks it to ask about
+            ; `[Symbol.hasInstance]` at all).
+            let bl AstNode.binary_left_of(node)
+            if bl = null
+                return null
+            let ignored_left this.check_expression(bl as ref[AstNode])
+            if this.unported_mark() <> mark
+                return null
+            return any_signature
         }
         var walks_arguments false
         if k = KindCallExpression
@@ -54905,19 +55254,46 @@ define Checker
     {
         let mark this.unported_mark()
         ; "We already perform checking on the type arguments on the class
-        ; declaration itself" — the exclusion is the `super` callee, and a bare
-        ; `super(...)` stops in check_super_expression long before this.
+        ; declaration itself" — the inner guard's exclusion is the `super` callee.
         ;
-        ; ★★ THE DECORATOR IS EXCLUDED FROM THE WHOLE BLOCK, `node.TypeArguments()`
-        ; included (slice 134). Upstream's guard is `!isDecorator && !isInstanceof
-        ; && !isSuperCall(node) && !IsJsxOpeningFragment(node)`: a Decorator node
-        ; carries no type-argument list, so reading one and checking it would be a
-        ; question about a slot the kind does not have.
+        ; ★★★ THE OUTER GUARD IS FOUR DISJUNCTS AND THIS PORT CARRIED ONE, ON A
+        ; PREMISE SLICE 152 EXPIRED. The note that stood here read *a bare
+        ; `super(...)` stops in check_super_expression long before this* and wrote
+        ; only the DECORATOR test, because the other three arrivals were
+        ; unreachable when slice 134 wrote it. Slice 152 opened two of them in one
+        ; go — resolve_call_expression's super branch and
+        ; resolve_instanceof_expression — and the missing `!isSuperCall(node)`
+        ; showed up immediately as an INVENTED TS2558 on `super<T>()`: the call's
+        ; own type arguments were read and checked for arity against the base
+        ; constructor, which the reference deliberately does not do.
+        ;
+        ; ★★★ **A GUARD WRITTEN WITH ITS UNREACHABLE DISJUNCTS LEFT OUT IS A STOP
+        ; WITH NO TAG.** Nothing records it, `frontier.sh` cannot rank it and
+        ; `expiredstops.py` cannot see it — the first evidence is a wrong answer in
+        ; the slice that opens the route. Write the whole condition and let the
+        ; unreachable disjuncts be dead; they cost nothing and they are the only
+        ; part of the line that a later slice needs.
         var type_arguments: ref[Array[ref[AstNode]?]]? null
-        if AstNode.kind_of(node) <> KindDecorator
+        var reads_type_arguments true
+        if AstNode.kind_of(node) = KindDecorator
+            set reads_type_arguments: false
+        if AstNode.kind_of(node) = KindBinaryExpression
+            set reads_type_arguments: false
+        if Checker.is_super_call(node)
+            set reads_type_arguments: false
+        if AstNode.kind_of(node) = KindJsxOpeningFragment
+            set reads_type_arguments: false
+        if reads_type_arguments
         {
             set type_arguments: AstNode.type_arguments_of(node)
+            var checks_them false
+            if AstNode.kind_of(node) = KindTaggedTemplateExpression
+                set checks_them: true
+            if AstNode.is_jsx_opening_like_element(node)
+                set checks_them: true
             if Checker.kind_or_unknown(AstNode.expression_of(node)) <> KindSuperKeyword
+                set checks_them: true
+            if checks_them
                 this.check_source_elements(type_arguments)
             if this.unported_mark() <> mark
                 return null
@@ -61719,28 +62095,20 @@ define Checker
     ; checkThisBeforeSuper, taken to the same ONE call that bounds slice 82's
     ; find-first-super-call — and it is the same call, in a second function.
     ;
-    ; ★★★ TS17009 IS UNREACHABLE TODAY AND THE PROOF IS TWO LINES ABOVE THE REPORT,
-    ; NOT AN ARGUMENT. The reference skips the whole check when the containing class
-    ; has no `extends` clause or extends null, so the report needs a class that HAS
-    ; a base — and classDeclarationExtendsNull's third call,
-    ; getBaseConstructorTypeOfClass, reports `is-constructor-type` for exactly that
-    ; class (its no-base early return is the only arm it can answer from). So the
-    ; guard above the report can be passed only by a class the guard below stops on,
-    ; and the stop is that function's rather than this one's — which is why the mark
-    ; is read here and the tag a `this` in a derived constructor carries is
-    ; `is-constructor-type`.
+    ; ★★★ THE NOTE THAT STOOD HERE CALLED TS17009 UNREACHABLE *TODAY* AND ITS
+    ; TODAY WAS SLICE 82's. The argument was that the report needs a class with a
+    ; base, and that classDeclarationExtendsNull's third call reports
+    ; `is-constructor-type` for exactly such a class — so the guard above the report
+    ; could only be passed by a class the guard below stopped on. Slice 120 ported
+    ; isConstructorType and the stop went away; the argument went with it and
+    ; nothing said so. 88 units of stage 2 log the tag today, which is the
+    ; counter-example — §3.5gh, and check_constructor_declaration's own note carries
+    ; the general form of it.
     ;
-    ; ★★ SO isPostSuperFlowNode IS NOT WRITTEN, and that is §3.5be rather than a
-    ; shortcut: it is a fifty-line walk over the flow graph — the fourth in this
-    ; file, and the only one whose Call arm needs no effects signature — with no
-    ; caller that can reach it. It lands with the base constructor type, in the same
-    ; slice, where its input first exists.
-    ;
-    ; ★ The one path out of classDeclarationExtendsNull that does NOT stop is the
-    ; type-resolution CYCLE arm (`push_type_resolution` false answers errorType,
-    ; which is not nullWideningType), so the row below is written rather than
-    ; argued away — and it reads ZERO at both stages, `class A extends A` included,
-    ; because the class's own resolution is not on the stack at that point.
+    ; ★ The mark is still read, and for the reason the old note gave in its last
+    ; paragraph: the one path out of classDeclarationExtendsNull that does not
+    ; answer is the type-resolution CYCLE arm, and a cannot-answer must not be taken
+    ; for a `false`.
     procedure check_this_before_super(this, node: ref[AstNode], container: ref[AstNode], code: int)
     {
         let containing_class AstNode.parent_node_of(container)
@@ -61758,7 +62126,16 @@ define Checker
             return
         if extends_null
             return
-        this.record_unported("is-post-super-flow-node", KindConstructor)
+        ; `node.FlowNodeData() != nil` — a node KIND that carries no flow slot is
+        ; skipped rather than asked, and in this port the unset slot is the same
+        ; question. The reference would panic on a set-but-nil one, so the two
+        ; spellings cover the same inputs.
+        let flow AstNode.flow_node_of(node)
+        if flow = null
+            return
+        if this.is_post_super_flow_node(flow as ref[FlowNode], false)
+            return
+        this.error_on_node(node, code)
     }
 
     ; getFlowTypeOfReference — the two-argument entry, and this is the slice slice
@@ -93817,33 +94194,270 @@ define Checker
         ; reachability read off one is a claim about the wrong frame.**
         if Checker.get_extends_heritage_clause_element(containing_class as ref[AstNode]) = null
             return
-        ; ★★ SO THE SUPER-CALL BLOCK IS REACHABLE AND ITS FIRST QUESTION IS A TYPE.
-        ; classDeclarationExtendsNull is three calls and all three are here — but
-        ; the third, getBaseConstructorTypeOfClass, reports `is-constructor-type`
-        ; for every class that HAS a base (its no-base early return is the only arm
-        ; it can answer from), so the stop is that function's and this arm merely
-        ; asks. That is the tag naming the FIRST thing not implemented rather than
-        ; the nearest caller.
+        ; ★★★ THE STOP THAT STOOD HERE WAS ARGUED UNREACHABLE, AND THE ARGUMENT
+        ; EXPIRED WITHOUT ANYTHING SAYING SO. It read: classDeclarationExtendsNull's
+        ; third call, getBaseConstructorTypeOfClass, *reports `is-constructor-type`
+        ; for every class that HAS a base*, so everything below it is behind a stop
+        ; in the statement above and §3.5ao leaves it unwritten. That was true when
+        ; slice 82 wrote it. Slice 120 ported isConstructorType; `is-constructor-type`
+        ; has not been a live tag since, and this arm has been REACHED ever since —
+        ; 241 units of stage 2 log `find-first-super-call` today.
         ;
-        ; ★ Everything behind it — findFirstSuperCall, the root-level test and the
-        ; four super-call reports — is left unwritten for §3.5ao's reason: an
-        ; unreachable body cannot be gated, and this one is unreachable behind a
-        ; stop in the statement above rather than behind an argument.
-        ; ★★★ THE MARK IS THE COUNT AND NOT `is_unported()`, and the first draft
-        ; used the wrong one. `is_unported()` answers *has this UNIT stopped* — a
-        ; bool that is already true here, because the class arm this walk came
-        ; through stopped at its own extends clause — so the comparison could never
-        ; fire and five units logged `find-first-super-call` behind a
-        ; classDeclarationExtendsNull that had reported one line earlier. The
-        ; monotone `unported_mark()` is the one that answers *did THIS call stop*,
-        ; and its field's own note says so. ★The two are not interchangeable and
-        ; the difference is invisible at any call site that is the unit's FIRST
-        ; stop — which is every site the class and interface arms have.
+        ; ★★★ **A NOTE THAT ARGUES UNREACHABILITY BEHIND ANOTHER STOP IS REFUTED BY
+        ; ITS OWN TAG APPEARING ON THE FRONTIER, AND NO INSTRUMENT READS IT.**
+        ; `expiredstops.py` reads the note for a callee THIS FILE DEFINES and the tag
+        ; for a function defined elsewhere; neither question touches a claim of the
+        ; form *nothing can get here*. The refutation is free and already computed:
+        ; `frontier.sh`/`stops.sh` list the tag with a hit count, and a hit count
+        ; above zero IS the counter-example. Same shape at check_this_before_super,
+        ; whose note named the same blocker — §3.5gh.
+        ;
+        ; ★★ THE MARK IS THE COUNT AND NOT `is_unported()`, and the first draft of
+        ; the old stop used the wrong one. `is_unported()` answers *has this UNIT
+        ; stopped*; the monotone `unported_mark()` answers *did THIS call stop*. The
+        ; distinction survives the stop's removal because the guard below is still
+        ; read off it: a classDeclarationExtendsNull that could not answer must not
+        ; be taken for a `false`.
         let mark this.unported_mark()
-        let extends_null this.class_declaration_extends_null(containing_class as ref[AstNode])
+        let class_extends_null this.class_declaration_extends_null(containing_class as ref[AstNode])
         if this.unported_mark() <> mark
             return
-        this.record_unported("find-first-super-call", KindConstructor)
+        let body AstNode.body_of(node)
+        if body = null
+            return
+        let bd body as ref[AstNode]
+        ; "TS 1.0 spec (April 2014): 8.3.2 — Constructors of classes with no extends
+        ; clause may not contain super calls, whereas constructors of derived classes
+        ; must contain at least one super call somewhere in their function body."
+        let super_call Checker.find_first_super_call(bd)
+        if super_call = null
+        {
+            if class_extends_null = false
+                this.error_on_node(node, DiagConstructors_for_derived_classes_must_contain_a_super_call)
+            return
+        }
+        let sc super_call as ref[AstNode]
+        if class_extends_null
+            this.error_on_node(sc, DiagA_constructor_cannot_contain_a_super_call_when_its_class_extends_null)
+        ; "A super call must be root-level in a constructor if both of the following
+        ; are true: the containing class is a derived class; the constructor declares
+        ; parameter properties or the containing class declares instance member
+        ; variables with initializers."
+        ;
+        ; ★ The whole test is short-circuited by emit_standard_class_fields, which is
+        ; TRUE on this port's options — so the two `core.Some` walks below are written
+        ; and never taken today. They are not §3.5be's case: the reference's gate is
+        ; ONE bool and the walks are its operand, not a chapter behind it, and a
+        ; `false` in their place would be a claim about the class rather than about
+        ; the option.
+        var should_be_root_level false
+        if emit_standard_class_fields = false
+        {
+            let members AstNode.member_list_of(containing_class as ref[AstNode])
+            if members <> null
+            {
+                let ms members as ref[Array[ref[AstNode]?]]
+                let mn ms.get_length() as int
+                var mi 0
+                while mi < mn
+                {
+                    let m ms[mi]
+                    if m <> null
+                    {
+                        if this.is_instance_property_with_initializer_or_private_identifier_property(m as ref[AstNode])
+                        {
+                            set should_be_root_level: true
+                            break
+                        }
+                    }
+                    set mi: mi + 1
+                }
+            }
+            if should_be_root_level = false
+            {
+                let parameters AstNode.parameters_of(node)
+                if parameters <> null
+                {
+                    let ps parameters as ref[Array[ref[AstNode]?]]
+                    let pn ps.get_length() as int
+                    var pi 0
+                    while pi < pn
+                    {
+                        let par ps[pi]
+                        if par <> null
+                        {
+                            if b.has_syntactic_modifier(par as ref[AstNode], ModifierFlagsParameterPropertyModifier)
+                            {
+                                set should_be_root_level: true
+                                break
+                            }
+                        }
+                        set pi: pi + 1
+                    }
+                }
+            }
+        }
+        if should_be_root_level = false
+            return
+        ; "Until we have better flow analysis, it is an error to place the super call
+        ; within any kind of block or conditional. See GH #8277."
+        if Checker.super_call_is_root_level_in_constructor(sc, bd) = false
+        {
+            this.error_on_node(sc, DiagA_super_call_must_be_a_root_level_statement_within_a_constructor_of_a_derived_class_that_contains_initialized_properties_parameter_properties_or_private_identifiers)
+            return
+        }
+        ; The reference's `superCallStatement` loop: the first statement that either
+        ; IS the super call or references `super`/`this` decides. ★The two arms are
+        ; asymmetric on purpose — a statement that references `super` or `this`
+        ; BREAKS without setting the statement, so the report below fires; only an
+        ; expression statement whose expression is the super call clears it.
+        var has_super_call_statement false
+        let statements AstNode.statements_of(bd)
+        if statements <> null
+        {
+            let sts statements as ref[Array[ref[AstNode]?]]
+            let sn sts.get_length() as int
+            var si 0
+            while si < sn
+            {
+                let st sts[si]
+                if st = null
+                    break
+                let stmt st as ref[AstNode]
+                if AstNode.kind_of(stmt) = KindExpressionStatement
+                {
+                    if Checker.is_super_call(Parser.skip_outer_expressions(AstNode.expression_of(stmt), OEKAll))
+                    {
+                        set has_super_call_statement: true
+                        break
+                    }
+                }
+                if Checker.node_immediately_references_super_or_this(stmt)
+                    break
+                set si: si + 1
+            }
+        }
+        if has_super_call_statement = false
+            this.error_on_node(node, DiagA_super_call_must_be_the_first_statement_in_the_constructor_to_refer_to_super_or_this_when_a_derived_class_contains_initialized_properties_parameter_properties_or_private_identifiers)
+    }
+
+    ; isSuperCall. ★It is a CALL whose callee is the keyword, not a node kind: the
+    ; parser gives `super(x)` an ordinary CallExpression, and `super.f(x)` is one
+    ; too whose expression is the property access — which is why the test reads the
+    ; callee rather than asking whether a `super` occurs anywhere in the call.
+    function is_super_call(n: ref[AstNode]?) returns bool
+    {
+        if n = null
+            return false
+        let node n as ref[AstNode]
+        if AstNode.kind_of(node) <> KindCallExpression
+            return false
+        Checker.kind_or_unknown(AstNode.expression_of(node)) = KindSuperKeyword
+    }
+
+    ; findFirstSuperCall. §3.9d: the reference's `visit` closure answers true to
+    ; STOP the walk and writes the node into a captured cell; here the recursion
+    ; RETURNS the node, which is the same walk without the cell.
+    ;
+    ; ★ The function-like test is what makes the answer belong to THIS constructor:
+    ; a `super()` inside a nested function expression is a different frame's
+    ; problem, and the reference refuses to descend into one.
+    function find_first_super_call(node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if Checker.is_super_call(node)
+            return node
+        if AstNode.is_function_like(node)
+            return null
+        let n AstNode.child_count(node)
+        var i 0
+        while i < n
+        {
+            let child AstNode.child_at(node, i)
+            if child <> null
+            {
+                let found Checker.find_first_super_call(child as ref[AstNode])
+                if found <> null
+                    return found
+            }
+            set i: i + 1
+        }
+        null
+    }
+
+    ; isInstancePropertyWithInitializerOrPrivateIdentifierProperty.
+    function is_instance_property_with_initializer_or_private_identifier_property(this, n: ref[AstNode]) returns bool
+    {
+        if AstNode.is_private_identifier_class_element_declaration(n)
+            return true
+        if AstNode.kind_of(n) <> KindPropertyDeclaration
+            return false
+        if b.is_static(n)
+            return false
+        AstNode.initializer_of(n) <> null
+    }
+
+    ; superCallIsRootLevelInConstructor. ★The parenthesis walk is on the PARENT and
+    ; not on the call: `(super())` is still root-level, and it is the statement that
+    ; must be the body's own child.
+    function super_call_is_root_level_in_constructor(super_call: ref[AstNode], body: ref[AstNode]) returns bool
+    {
+        let parent Checker.walk_up_parenthesized_expressions(AstNode.parent_node_of(super_call))
+        if parent = null
+            return false
+        let pp parent as ref[AstNode]
+        if AstNode.kind_of(pp) <> KindExpressionStatement
+            return false
+        let gp AstNode.parent_node_of(pp)
+        if gp = null
+            return false
+        (gp as ref[AstNode]) = body
+    }
+
+    ; nodeImmediatelyReferencesSuperOrThis. §3.9d again, and the BLOCK arm is the
+    ; one that is not a plain fork: a block whose parent is a constructor, method or
+    ; accessor is another frame's `this`, so the walk stops — but a block anywhere
+    ; else (an `if`'s consequent, a bare block) FALLS THROUGH to its children rather
+    ; than answering false.
+    function node_immediately_references_super_or_this(node: ref[AstNode]) returns bool
+    {
+        let k AstNode.kind_of(node)
+        if k = KindSuperKeyword
+            return true
+        if k = KindThisKeyword
+            return true
+        if k = KindArrowFunction
+            return false
+        if k = KindFunctionDeclaration
+            return false
+        if k = KindFunctionExpression
+            return false
+        if k = KindPropertyDeclaration
+            return false
+        if k = KindBlock
+        {
+            let pk Checker.kind_or_unknown(AstNode.parent_node_of(node))
+            if pk = KindConstructor
+                return false
+            if pk = KindMethodDeclaration
+                return false
+            if pk = KindGetAccessor
+                return false
+            if pk = KindSetAccessor
+                return false
+        }
+        let n AstNode.child_count(node)
+        var i 0
+        while i < n
+        {
+            let child AstNode.child_at(node, i)
+            if child <> null
+            {
+                if Checker.node_immediately_references_super_or_this(child as ref[AstNode])
+                    return true
+            }
+            set i: i + 1
+        }
+        false
     }
 
     ; getAccessorThisParameter and ast.GetThisParameter, folded into the one
