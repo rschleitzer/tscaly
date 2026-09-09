@@ -3508,6 +3508,85 @@ define TypeMapper
         set data: d
 }
 
+; ── the ACTIVE-MAPPER memo (slice 163) ──────────────────────────────────────
+;
+; `c.activeMappers` and `c.activeTypeMappersCaches`: upstream a stack of mappers
+; and a parallel stack of (type, alias) → type maps, indexed by the same
+; position. ONE list of records here (§3.35) — `findActiveMapper` answers an
+; INDEX into both and every reader of that index reads the pair, so a record per
+; level is the same data with the pairing made structural. Upstream's own reason
+; for two slices is to keep a popped map's allocation for reuse, which is an
+; allocator question RBMM answers by itself.
+;
+; ★★★ WHAT IT IS FOR IS NOT A CYCLE BUT A RE-VISIT. `instantiation_depth` bounds
+; NESTING; this memo answers *I am already instantiating under this very mapper,
+; and this type under this alias came past once before*, which collapses repeated
+; work rather than breaking a loop.
+;
+; ★★★ AND IT IS INERT ON THIS CORPUS, MEASURED, WHICH IS THE HONEST THING TO SAY
+; ABOUT IT. It was ported in slice 163 because slices 151/158 had named it as the
+; mechanism whose absence forced a deliberate divergence at
+; `get_object_type_instantiation` — and that attribution turned out to be wrong
+; (the blocker was the printer's dropped `symbolDepth` guard). Kept anyway: it is
+; the reference's own line, and the two things a cache can be judged on were both
+; measured against a build with the lookup disabled — the whole stage-1 corpus,
+; 1674 units, **byte-identical on every artifact**, and 2.4 s of wall against
+; 2.4 s. A faithful mechanism that changes no answer and costs nothing stays;
+; what may not stay is a claim that it did work it did not do.
+;
+; ★★★ AND IT IS ONLY WRITTEN FOR A MAPPER THAT WAS ALREADY ACTIVE, which is the
+; reference's own asymmetry and not an optimisation: a level PUSHED by this call
+; is popped again on the way out, so nothing it memoised could be read; a level
+; found ALREADY on the stack is one an outer frame still owns, and the entry is
+; what that frame's next ask reads.
+define MapperCacheEntry
+(
+    t: ref[Type]?
+    alias_symbol: ref[Symbol]?
+    alias_type_arguments: ref[Array[ref[Type]?]]?
+    instantiated: ref[Type]?
+)
+
+define ActiveMapper
+(
+    mapper: ref[TypeMapper]?
+    entries: ref[Array[ref[MapperCacheEntry]?]]?
+)
+
+; ── the printer's symbolDepth (slice 163) ───────────────────────────────────
+;
+; `visitAndTransformType`'s OTHER guard, and the reference's own comment says what
+; it is for: *"Since instantiations of the same anonymous type have the same
+; symbol, tracking symbols instead of types allows us to catch circular references
+; to instantiations of the same anonymous type"*.
+;
+; ★★★ IT IS THE HALF `visited_types` CANNOT DO, and the difference is measurable
+; rather than theoretical. `visitedTypes` is keyed on the type ID, so it closes a
+; cycle only where the SAME type object comes round again; a walk that mints a
+; fresh instantiation at every level — `foo<typeof y>()` inside `foo`, where each
+; level's type argument is the previous level's type — never repeats an id and
+; recurses until the stack is gone. The symbol is what stays the same.
+;
+; ★★ A `ref[Symbol]` AND NOT AN ID, which is §3.31 applied rather than a new
+; decision — and here the second reason is sharper than the collision one.
+; Upstream needs a hashable key and takes `ast.GetSymbolId(t.symbol)`, which
+; ASSIGNS a number on first request; drawing one from a PRINTER would mint ids
+; in a phase that has no business minting them, and this port's counter is per
+; file (§3.10) and observable through the private-name minter. A linear scan
+; compares the symbol itself, which is the identity the id stands for.
+;
+; ★ `is_constructor_object` is upstream's own first field: a class's constructor
+; object and the class type share a symbol, and the two are printed differently,
+; so the pair is the identity and not the symbol alone. The other two shapes of
+; upstream's CompositeSymbolIdentity — a type reference's NODE and a conditional
+; type's root node — belong to visitAndTransformType call sites this printer does
+; not have; its one transform is createTypeNodeFromObjectType.
+define PrinterSymbolFrame
+(
+    is_constructor_object: bool
+    symbol: ref[Symbol]?
+)
+
 ; ── IndexInfo (slice 85) ────────────────────────────────────────────────────
 ;
 ; The reference's *IndexInfo, minus `components`. That slot holds the member
@@ -5937,6 +6016,14 @@ define Checker
     visited_types: ref[Array[int]]?
     visited_type_depth: int
 
+    ; `b.ctx.symbolDepth` — see PrinterSymbolFrame. A stack rather than a map, and
+    ; the two are the same thing here: upstream writes `symbolDepth[id] = depth+1`
+    ; on the way in and restores the old value on the way out, so its value at any
+    ; moment is the number of ACTIVE frames carrying that identity — which is what
+    ; counting occurrences on a stack answers.
+    printer_symbols: ref[Array[ref[PrinterSymbolFrame]?]]?
+    printer_symbol_count: int
+
     ; ── the printed node's PRECEDENCE, slice 111, WIDENED IN SLICE 115 ──────
     ;
     ; The emit printer parenthesizes by precedence — `emitTypeNode(node, prec)`
@@ -6636,6 +6723,16 @@ define Checker
     instantiation_depth: int
     instantiation_count: int
 
+    ; c.activeMappers + c.activeTypeMappersCaches, as one stack — see
+    ; ActiveMapper for why the two lists are one here and what the memo answers.
+    ; ★ A LIST PLUS A COUNT, which is this file's idiom for a stack
+    ; (`type_resolutions` / `type_resolution_count`) and is upstream's own shape
+    ; here too: `popActiveMapper` shortens the slice but keeps the popped map in
+    ; its capacity so the next push can reuse it, and reusing the row is exactly
+    ; what a count does.
+    active_mappers: ref[Array[ref[ActiveMapper]?]]?
+    active_mapper_count: int
+
     ; c.conditionalConstraintDepth — computeBaseConstraint's own limiter, and it is
     ; a SEPARATE budget from instantiation_depth because the recursion it bounds is
     ; a different one: a conditional's constraint is another conditional's input,
@@ -6980,6 +7077,9 @@ define Checker
         set c.in_variance_computation: false
         set c.instantiation_depth: 0
         set c.instantiation_count: 0
+        let am &Array[ref[ActiveMapper]?]^host()
+        set c.active_mappers: am
+        set c.active_mapper_count: 0
         set c.conditional_constraint_depth: 0
         set c.current_node: null
         let ml &Array[ref[MemberEvent]?]^host()
@@ -7051,6 +7151,9 @@ define Checker
         let vts &Array[int]^host()
         set c.visited_types: vts
         set c.visited_type_depth: 0
+        let pss &Array[ref[PrinterSymbolFrame]?]^host()
+        set c.printer_symbols: pss
+        set c.printer_symbol_count: 0
         ; Seeded here and immediately overwritten by type_to_string's first line,
         ; so this value is never read; NonArray is the harmless one either way.
         set c.wrote_type_precedence: TypePrecedenceNonArray
@@ -35194,6 +35297,34 @@ define Checker
     }
 
 
+    ; getTypeAliasForTypeLiteral — the name a circular type literal prints under.
+    ;
+    ; ★ The DECLARATION's parent and not the declaration: the symbol belongs to the
+    ; `{ … }` node, and what carries the alias name is whatever the literal is the
+    ; right-hand side OF, with parenthesised types walked through.
+    function type_alias_for_type_literal(this, t: ref[Type]) returns ref[Symbol]?
+    {
+        if t.symbol = null
+            return null
+        let sym t.symbol as ref[Symbol]
+        if (sym.flags & SymbolFlagsTypeLiteral) = 0
+            return null
+        if sym.declarations = null
+            return null
+        let decls sym.declarations as ref[Array[ref[AstNode]?]]
+        if (decls.get_length() as int) = 0
+            return null
+        let first decls[0]
+        if first = null
+            return null
+        let node Checker.walk_up_parenthesized_types(AstNode.parent_node_of(first as ref[AstNode]))
+        if node = null
+            return null
+        if AstNode.kind_of(node as ref[AstNode]) <> KindTypeAliasDeclaration
+            return null
+        this.symbol_of_declaration(node)
+    }
+
     ; ── slice 111: the anonymous object type ─────────────────────────────────
     ;
     ; createAnonymousTypeNode → createAnonymousTypeNodeEx, then
@@ -35275,17 +35406,26 @@ define Checker
         if this.visited_type(t.id)
         {
             ; The recursion has closed. Upstream answers the type ALIAS's name when
-            ; the literal is one alias's right-hand side, and the elision `...`
-            ; otherwise.
+            ; the literal is one alias's right-hand side, and the elision otherwise.
             ;
-            ; ★ Both are names rather than failures, and both are still a stop:
-            ; getTypeAliasForTypeLiteral needs SymbolFlagsTypeLiteral, which this
-            ; port's binder does not set, so the fork cannot be DECIDED here — and
-            ; answering the elision unconditionally would print `...` where the
-            ; reference prints an alias name. A well-formed wrong name is what this
-            ; arm exists to avoid.
-            this.record_unported("type-to-string-circular-object", t.object_flags)
-            return false
+            ; ★★★ IT WAS A STOP UNTIL SLICE 163 AND ITS PREMISE HAD EXPIRED. The note
+            ; read: *getTypeAliasForTypeLiteral needs SymbolFlagsTypeLiteral, which
+            ; this port's binder does not set, so the fork cannot be DECIDED here —
+            ; and answering the elision unconditionally would print `...` where the
+            ; reference prints an alias name.* The reasoning was right and the fact
+            ; was wrong: `binder.scaly` sets SymbolFlagsTypeLiteral at three sites
+            ; (`bind_anonymous_declaration` for a TypeLiteral node among them), so
+            ; the fork is decidable and the arm is four lines. ★The elision half is
+            ; `any` here rather than `...` for the reason
+            ; write_elided_information_placeholder gives.
+            let alias_symbol this.type_alias_for_type_literal(t)
+            if this.unported_mark() <> mark
+                return false
+            if alias_symbol <> null
+                ; "The specified symbol flags need to be reinterpreted as type
+                ; flags" — upstream's own comment on the mask.
+                return this.symbol_to_type_node(alias_symbol as ref[Symbol], SymbolFlagsType, out)
+            return Checker.write_elided_information_placeholder(out)
         }
         ; visitAndTransformType, minus its memo. ★★★THE MEMO IS NOT AN OMISSION AND
         ; IT WOULD NOT BE SAFE TO ADD: upstream keys `ctx.typeCache` on the type id
@@ -35293,9 +35433,33 @@ define Checker
         ; here the answer is already TEXT, so re-walking produces the same bytes and
         ; a cache would buy time and change nothing. What it would COST is the
         ; visited set's own meaning, because a cached hit never enters the bracket.
+        ;
+        ; ★★★ AND THE `symbolDepth` GUARD IS SLICE 163'S, DROPPED SILENTLY UNTIL
+        ; THEN. The note above accounted for the memo and said nothing about the
+        ; other half of the same function, which is not a cache at all: it is the
+        ; recursion bound, and it is the ONE this printer needed. `visited_types`
+        ; closes a cycle only where the same type ID comes round; a walk that mints
+        ; a FRESH instantiation at each level repeats no id and recurses until the
+        ; stack is gone. The reference's own comment names the fix — *instantiations
+        ; of the same anonymous type have the same symbol* — and the eleven nested
+        ; `{ y2: … }` of its `cyclicGenericTypeInstantiation` baseline are this
+        ; `> 10` counted out. A dropped guard has no tag, no stop and no row
+        ; (§3.5gi), so nothing in this apparatus was going to point at it; what
+        ; found it was a BACKTRACE, after twelve slices of a note that blamed the
+        ; instantiation (see get_object_type_instantiation's combined mapper).
+        var is_constructor_object false
+        if (t.object_flags & ObjectFlagsAnonymous) <> 0
+        {
+            if (sym.flags & SymbolFlagsClass) <> 0
+                set is_constructor_object: true
+        }
+        if this.printer_symbol_visits(is_constructor_object, sym) > 10
+            return Checker.write_elided_information_placeholder(out)
+        this.push_printer_symbol(is_constructor_object, sym)
         this.push_visited_type(t.id)
         let ok this.create_type_node_from_object_type(t, out)
         this.pop_visited_type()
+        this.pop_printer_symbol()
         ok
     }
 
@@ -35661,6 +35825,76 @@ define Checker
 
     procedure pop_visited_type(this)
         set visited_type_depth: visited_type_depth - 1
+
+    ; ── the printer's symbolDepth (slice 163) ────────────────────────────────
+    ;
+    ; See PrinterSymbolFrame. `printer_symbol_visits` is upstream's
+    ; `ctx.symbolDepth[id]` read, and the push/pop pair is its write and restore.
+
+    function printer_symbol_visits(this, is_constructor_object: bool, symbol: ref[Symbol]) returns int
+    {
+        if printer_symbols = null
+            return 0
+        let st printer_symbols as ref[Array[ref[PrinterSymbolFrame]?]]
+        var n 0
+        var i 0
+        while i < printer_symbol_count
+        {
+            let row st[i]
+            if row <> null
+            {
+                let r row as ref[PrinterSymbolFrame]
+                if r.is_constructor_object = is_constructor_object
+                {
+                    if r.symbol <> null
+                    {
+                        if (r.symbol as ref[Symbol]) = symbol
+                            set n: n + 1
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        n
+    }
+
+    procedure push_printer_symbol(this, is_constructor_object: bool, symbol: ref[Symbol])
+    {
+        if printer_symbols = null
+            return
+        let st printer_symbols as ref[Array[ref[PrinterSymbolFrame]?]]
+        if printer_symbol_count < (st.get_length() as int)
+        {
+            let row st[printer_symbol_count]
+            if row <> null
+            {
+                let r row as ref[PrinterSymbolFrame]
+                set r.is_constructor_object: is_constructor_object
+                set r.symbol: symbol as ref[Symbol]?
+                set printer_symbol_count: printer_symbol_count + 1
+                return
+            }
+        }
+        let page Page.get(st)
+        st.add(&PrinterSymbolFrame^page(is_constructor_object, symbol as ref[Symbol]?))
+        set printer_symbol_count: printer_symbol_count + 1
+    }
+
+    procedure pop_printer_symbol(this)
+        set printer_symbol_count: printer_symbol_count - 1
+
+    ; createElidedInformationPlaceholder. ★★★ IT IS `any` HERE AND NOT `...`:
+    ; the placeholder reads `if ctx.flags&NoTruncation == 0 { "..." }` and
+    ; typeToStringEx sets NoTruncation, so this entry point always takes the second
+    ; return — a bare `any` keyword node carrying a synthetic `/*elided*/` leading
+    ; comment that the emit printer this dump goes through does not write. The
+    ; reference's own baselines are the witness: `cyclicGenericTypeInstantiation`
+    ; prints eleven nested `{ y2: … }` and then a plain `any`.
+    function write_elided_information_placeholder(out: ref[StringBuilder]) returns bool
+    {
+        out.append("any")
+        true
+    }
 
     function visited_type(this, id: int) returns bool
     {
@@ -91592,6 +91826,173 @@ define Checker
         result
     }
 
+    ; ── the active-mapper stack (slice 163) ─────────────────────────────────
+    ;
+    ; findActiveMapper / pushActiveMapper / popActiveMapper /
+    ; clearActiveMapperCaches. ONE stack of ActiveMapper records where upstream has
+    ; two parallel slices — the record's header carries the mapping decision and
+    ; what the memo is for.
+
+    ; core.FindLastIndex over c.activeMappers. ★LAST and not first: the same mapper
+    ; can be pushed at two depths, and the entry an outer frame is filling is the
+    ; one nearest the top.
+    function find_active_mapper(this, m: ref[TypeMapper]) returns int
+    {
+        if active_mappers = null
+            return 0 - 1
+        let list active_mappers as ref[Array[ref[ActiveMapper]?]]
+        var i active_mapper_count - 1
+        while i >= 0
+        {
+            let row list[i]
+            if row <> null
+            {
+                let r row as ref[ActiveMapper]
+                if r.mapper <> null
+                {
+                    if (r.mapper as ref[TypeMapper]) = m
+                        return i
+                }
+            }
+            set i: i - 1
+        }
+        0 - 1
+    }
+
+    ; pushActiveMapper. A row past the count is one pop_active_mapper left
+    ; behind: its `entries` list is already empty (the pop clears it, as upstream's
+    ; does) and only the mapper has to be re-pointed.
+    procedure push_active_mapper(this, m: ref[TypeMapper])
+    {
+        if active_mappers = null
+            return
+        let list active_mappers as ref[Array[ref[ActiveMapper]?]]
+        let n list.get_length() as int
+        if active_mapper_count < n
+        {
+            let row list[active_mapper_count]
+            if row <> null
+            {
+                let r row as ref[ActiveMapper]
+                set r.mapper: m as ref[TypeMapper]?
+                set active_mapper_count: active_mapper_count + 1
+                return
+            }
+        }
+        let page Page.get(list)
+        let entries &Array[ref[MapperCacheEntry]?]^page()
+        list.add(&ActiveMapper^page(m as ref[TypeMapper]?, entries as ref[Array[ref[MapperCacheEntry]?]]?))
+        set active_mapper_count: active_mapper_count + 1
+    }
+
+    ; popActiveMapper — the level leaves the stack and its memo is CLEARED, which
+    ; is upstream's own `clear(...)` and not tidiness: the row is reused by the next
+    ; push, and an entry taken under the previous occupant of this level is keyed on
+    ; a mapper nobody will compare against again.
+    procedure pop_active_mapper(this)
+    {
+        if active_mappers = null
+            return
+        if active_mapper_count = 0
+            return
+        let list active_mappers as ref[Array[ref[ActiveMapper]?]]
+        set active_mapper_count: active_mapper_count - 1
+        let row list[active_mapper_count]
+        if row <> null
+        {
+            let r row as ref[ActiveMapper]
+            set r.mapper: null
+            if r.entries <> null
+                (r.entries as ref[Array[ref[MapperCacheEntry]?]]).clear()
+        }
+    }
+
+    ; clearActiveMapperCaches — every LIVE level's memo is dropped, the stack
+    ; itself stays. ★★★ IT IS A CORRECTNESS CALL AND NOT A HOUSEKEEPING ONE:
+    ; getInferredType calls it the moment an inference is settled, because an
+    ; InferenceTypeMapper asked before and after that moment answers differently,
+    ; and an entry taken under such a mapper is then a wrong answer with nothing to
+    ; say so.
+    procedure clear_active_mapper_caches(this)
+    {
+        if active_mappers = null
+            return
+        let list active_mappers as ref[Array[ref[ActiveMapper]?]]
+        var i 0
+        while i < active_mapper_count
+        {
+            let row list[i]
+            if row <> null
+            {
+                let r row as ref[ActiveMapper]
+                if r.entries <> null
+                    (r.entries as ref[Array[ref[MapperCacheEntry]?]]).clear()
+            }
+            set i: i + 1
+        }
+    }
+
+    ; The level's map, read and written. The key upstream is a hash of
+    ; `writeType(t)` + `writeAlias(alias)`; here it is the association-list scan
+    ; find_object_instantiation uses for the very same key parts (§3.16), so a nil
+    ; alias and an alias with a nil symbol and no arguments are one key — which is
+    ; the existing idiom's tolerance too, and every TypeAlias this port mints
+    ; carries a symbol.
+    function find_active_mapper_entry(level: ref[ActiveMapper], t: ref[Type], alias: ref[TypeAlias]?) returns ref[MapperCacheEntry]?
+    {
+        if level.entries = null
+            return null
+        let rows level.entries as ref[Array[ref[MapperCacheEntry]?]]
+        var asym: ref[Symbol]? null
+        var aargs: ref[Array[ref[Type]?]]? null
+        if alias <> null
+        {
+            let al alias as ref[TypeAlias]
+            set asym: al.symbol
+            set aargs: al.type_arguments
+        }
+        let n rows.get_length() as int
+        var i 0
+        while i < n
+        {
+            let row rows[i]
+            if row <> null
+            {
+                let r row as ref[MapperCacheEntry]
+                if r.t <> null
+                {
+                    if (r.t as ref[Type]) = t
+                    {
+                        if r.alias_symbol = asym
+                        {
+                            if Checker.type_lists_equal(r.alias_type_arguments, aargs)
+                                return row
+                        }
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        null
+    }
+
+    procedure add_active_mapper_entry(level: ref[ActiveMapper], t: ref[Type], alias: ref[TypeAlias]?, result: ref[Type]?)
+    {
+        if level.entries = null
+            return
+        let rows level.entries as ref[Array[ref[MapperCacheEntry]?]]
+        var asym: ref[Symbol]? null
+        var aargs: ref[Array[ref[Type]?]]? null
+        if alias <> null
+        {
+            let al alias as ref[TypeAlias]
+            set asym: al.symbol
+            set aargs: al.type_arguments
+        }
+        let page Page.get(rows)
+        rows.add(&MapperCacheEntry^page(t as ref[Type]?, asym, aargs, result))
+    }
+
     ; instantiateType / instantiateTypeWithAlias, folded into one because `alias`
     ; is nil at every call site this port has — the reference's own instantiateType
     ; passes nil, and the three callers that do not are all behind stops.
@@ -91606,14 +92007,17 @@ define Checker
     ; are type variables the BODY never mentions is not instantiated at all, and the
     ; cache then leaks type parameters out of their scope.
     ;
-    ; ★ THE ACTIVE-MAPPER CACHE IS NOT PORTED and its reader is named:
-    ; `activeTypeMappersCaches` memoises one (mapper, type) pair for the duration of
-    ; a nested instantiation, so that a recursive generic answers the SAME type
-    ; object on the second visit. It is a claim about identity, and identity is
-    ; observable — so it arrives with the first recursion that can reach it, which
-    ; is the conditional-type chapter. The five-million-instantiation limiter is not
-    ; carried either: its counter is reset per statement by checkSourceElement, a
-    ; line this port does not have.
+    ; ★★★ THE PARAGRAPH THAT STOOD HERE WAS EXPIRED IN BOTH ITS HALVES, and
+    ; neither half had a tag. It read: *THE ACTIVE-MAPPER CACHE IS NOT PORTED and
+    ; its reader is named … it arrives with the first recursion that can reach it,
+    ; which is the conditional-type chapter. The five-million-instantiation limiter
+    ; is not carried either: its counter is reset per statement by
+    ; checkSourceElement, a line this port does not have.* The second sentence
+    ; expired in slice 154 (checkSourceElement had been in the file since slice 47
+    ; and the limiter is a disjunction here now, §3.5gi); the first named the
+    ; conditional-type chapter as its arrival, and that chapter landed in slice 121
+    ; — the cache is this slice's, and its READER turned out not to be identity but
+    ; the last `combineTypeMappers` site, four hundred lines below.
     function instantiate_type(this, t: ref[Type]?, m: ref[TypeMapper]?) returns ref[Type]?
         this.instantiate_type_with_alias(t, m, null)
 
@@ -91671,10 +92075,70 @@ define Checker
             this.error_on_node(current_node, DiagType_instantiation_is_excessively_deep_and_possibly_infinite)
             return error_type
         }
+        ; ── the active-mapper memo, slice 163 ────────────────────────────────
+        ;
+        ; The reference's own five lines, in its order: find the mapper on the
+        ; stack, push it if it is not there, read the level's (type, alias) memo,
+        ; and on the way out either POP the level this call pushed or WRITE the
+        ; entry into the level somebody else owns.
+        ;
+        ; ★★★ THE ASYMMETRY IS THE MECHANISM (see ActiveMapper): a level this call
+        ; pushed is gone before anyone could read it, so upstream does not write
+        ; there; a level already on the stack belongs to an outer frame that is
+        ; still instantiating under the same mapper, and the entry is what its next
+        ; ask reads. ★It is a memo and not a cycle breaker, and it is measured inert
+        ; on this corpus — ActiveMapper's header carries both halves of that.
+        let mapper m as ref[TypeMapper]
+        let index this.find_active_mapper(mapper)
+        if index = 0 - 1
+            this.push_active_mapper(mapper)
+        var level: ref[ActiveMapper]? null
+        if active_mappers <> null
+        {
+            let list active_mappers as ref[Array[ref[ActiveMapper]?]]
+            var at index
+            if index = 0 - 1
+                set at: active_mapper_count - 1
+            if at >= 0
+            {
+                if at < (list.get_length() as int)
+                    set level: list[at]
+            }
+        }
+        if level <> null
+        {
+            let cached Checker.find_active_mapper_entry(level as ref[ActiveMapper], ty, alias)
+            if cached <> null
+            {
+                ; ★ The entry is the answer even when it holds null: upstream's map
+                ; is read with the two-value form (`if cachedType, ok := ...; ok`),
+                ; so a stored nil is a HIT there too. Nothing stores a nil here —
+                ; the write below is skipped for a reported walk — so this is the
+                ; reference's shape rather than a case with a producer.
+                if index = 0 - 1
+                    this.pop_active_mapper()
+                return (cached as ref[MapperCacheEntry]).instantiated
+            }
+        }
         set instantiation_count: instantiation_count + 1
         set instantiation_depth: instantiation_depth + 1
         let result this.instantiate_type_worker(ty, m as ref[TypeMapper], alias)
         set instantiation_depth: instantiation_depth - 1
+        if index = 0 - 1
+            this.pop_active_mapper()
+        else
+        {
+            ; ★★★ A REPORTED WALK IS NOT MEMOISED. `instantiate_type_worker`
+            ; answering null because it met a wall is not an answer about the type,
+            ; and an entry holding it would hand that null back to a later ask
+            ; whose walk might have got further — this port's own hazard, with no
+            ; counterpart upstream.
+            if this.unported_mark() = mark
+            {
+                if level <> null
+                    Checker.add_active_mapper_entry(level as ref[ActiveMapper], ty, alias, result)
+            }
+        }
         result
     }
 
@@ -92089,29 +92553,44 @@ define Checker
         ; The mapper for the outer parameters, and the key built from what it
         ; answers for each of them.
         ;
-        ; ★★★ THIS ONE SITE KEEPS `mergeTypeMappers` WHERE THE REFERENCE WRITES
-        ; `combineTypeMappers`, AND THE DIVERGENCE IS MEASURED RATHER THAN ASSUMED
-        ; (slice 151). Written the reference's way, `compiler/cyclicGenericType
-        ; Instantiation` and its `…Inference` sibling die of stack exhaustion
-        ; (rc 139, all six artifacts of the unit at once) — with a 64 MB stack too, so
-        ; it is an UNBOUNDED recursion and not a deep one.
+        ; ★★★ THIS IS `combineTypeMappers` AGAIN SINCE SLICE 163, AND THE THING
+        ; THAT HAD BLOCKED IT FOR TWELVE SLICES WAS IN ANOTHER FUNCTION ENTIRELY.
+        ; It kept `mergeTypeMappers` from slice 151 because the reference's spelling
+        ; took `compiler/cyclicGenericTypeInstantiation` and its `…Inference` sibling
+        ; to rc 139 on all six artifacts, with a 64 MB stack too. That measurement
+        ; was right every time it was repeated. The DIAGNOSIS was wrong: the note
+        ; blamed the eager instantiation and named `findActiveMapper` /
+        ; `pushActiveMapper` / `activeTypeMappersCaches` as the missing mechanism,
+        ; slice 158 reproduced the crash and slice 159 wrote a hand-composition
+        ; around half of it — and a BACKTRACE says the recursion is not here at all.
+        ; It is the PRINTER: type_to_string -> create_anonymous_type_node ->
+        ; create_type_node_from_object_type -> write_type_literal ->
+        ; write_property_member -> get_non_missing_type_of_symbol -> ONE
+        ; instantiate_type -> back into type_to_string, one level deeper. The
+        ; instantiation frames are a leaf of that walk, which is exactly why
+        ; `instantiation_depth` oscillated 0-1-0-1 — the observation the old note
+        ; recorded and then read as evidence about the instantiation.
         ;
-        ; ★★★ THE MISSING MECHANISM IS NAMED AND IT IS NOT THE DEPTH LIMIT.
-        ; `instantiation_depth` sits in instantiate_type_with_alias and is decremented
-        ; on the way out; probed here it oscillates 0-1-0-1 and never grows, because
-        ; the cycle does not NEST — it runs type_mapper_map's Composite arm ->
-        ; instantiate_type -> get_type_of_instantiated_symbol -> get_type_of_symbol ->
-        ; back into instantiate_type, i.e. through a chain that RETURNS from the
-        ; instantiation before re-entering it. What stops it upstream is the OTHER
-        ; guard in that function: `findActiveMapper` / `pushActiveMapper` and
-        ; `activeTypeMappersCaches`, a memo of (type, alias) PER ACTIVE MAPPER, which
-        ; this port does not have. ★The day that cache lands, this line is the
-        ; reference's again and the two units are its gate.
+        ; ★★★ WHAT THE COMPOSITION CHANGES IS ONLY THAT THE CYCLIC TYPE GETS BUILT.
+        ; The merged mapper leaves a type variable standing where `m` still had
+        ; something to do, so `foo<typeof y>()` inside `foo` never becomes the
+        ; genuinely self-referential object type; composed, it does, and the printer
+        ; then walks it forever. The fix is `visitAndTransformType`'s `symbolDepth`
+        ; guard, dropped silently when that function was ported (see
+        ; create_anonymous_type_node) — eleven levels and then `any`, which is what
+        ; the reference's own baseline for these two units prints.
         ;
-        ; ★The other four `combineTypeMappers` sites ARE the reference's spelling
-        ; since this slice — see get_conditional_type's combined mapper for the
-        ; account and for what the two compositions differ in.
-        let combined_mapper this.merge_type_mappers(Checker.mapper_of(t), m)
+        ; ★★★ AND THE DIFFERENCE THE COMPOSITION MAKES IS THE WHOLE ROW: the merged
+        ; mapper answers `m1.Map(tp)` and stops, so wherever `m` still had something
+        ; to do to that answer this port kept a type variable the reference
+        ; substitutes — `Partial<T extends string ? 1 : 2>` inside a generic alias,
+        ; asked at `SF<number>`, answered the uninstantiated mapped type where
+        ; upstream answers `2`, at rc 0 and with a TS2322 the reference does not
+        ; have. Slice 159's hand-composition of the TYPE-PARAMETER half and slice
+        ; 158's report for the rest (`merged-mapper-not-combined`) are both gone with
+        ; it: they were the divergence made visible, and there is no divergence left
+        ; to see.
+        let combined_mapper this.combine_type_mappers(Checker.mapper_of(t), m)
         if combined_mapper = null
             return t
         let cm combined_mapper as ref[TypeMapper]
@@ -92122,143 +92601,7 @@ define Checker
             let mapped this.type_mapper_map(cm, tpl[i])
             if this.unported_mark() <> mark
                 return null
-            ; ★★★ AND SINCE SLICE 158 THE DIVERGENCE ABOVE IS SAID AND NOT ONLY
-            ; COMMENTED. `combineTypeMappers(m1, m2).Map(tp)` is
-            ; `instantiateType(m1.Map(tp), m2)`; the merged mapper answers
-            ; `m1.Map(tp)` and stops there, so wherever `m` would still change that
-            ; answer this port keeps a type variable the reference substitutes —
-            ; `Partial<T extends string ? 1 : 2>` inside a generic alias, asked at
-            ; `SF<number>`, answers the uninstantiated mapped type where upstream
-            ; answers `2`, at rc 0 and with a TS2322 the reference does not have.
-            ; It stood unsaid for seven slices because a comment is invisible to the
-            ; stop census.
-            ;
-            ; ★★★ THE GUARD IS A CONSERVATIVE ONE AND IT HAS TO BE: the exact test
-            ; is whether `instantiate_type(mapped, m)` differs, and computing THAT
-            ; is the very thing that dies — measured this slice, the reference
-            ; spelling takes `compiler/cyclicGenericTypeInstantiation` and its
-            ; `…Inference` sibling to SIGSEGV on all six artifacts of both, exactly
-            ; as slice 151 recorded. So the report fires on the SUFFICIENT
-            ; condition: the enclosing type is a MAPPED one and its own mapper
-            ; answered a DEFERRED CONDITIONAL — the shape whose wrong answer is
-            ; measured above.
-            ;
-            ; ★★★ THE SCOPE IS THE DIVERGENT SHAPE AND IT WAS PRICED, NOT GUESSED
-            ; (slice 157's discipline). Reported on the wider sufficient condition —
-            ; any answer that still `could_contain_type_variables` — it takes
-            ; **23 units of stage 2 from MATCH to UNPORTED**, and their reported
-            ; flags say why: 19 answer a bare TypeParameter, 3 an Object and 1 an
-            ; IndexedAccess, all shapes on which the two spellings agree over this
-            ; corpus. Only the CONDITIONAL answer is a measured wrong answer, and
-            ; scoping to it brings the price down to **four** units of stage 2 —
-            ; `omitTypeTestErrors01`, `objectRestNegative`, `staticIndexSignature5`
-            ; and `inlineMappedTypeModifierDeclarationEmit@other.ts`, each of which
-            ; the merge spelling happens to answer correctly even for a conditional.
-            ; ★Stage 1 prices this guard at ZERO, and that is the trap: the four are
-            ; visible only in the stage-2 verdict TRANSITION, never in the totals.
-            ; Four correct answers making no claim is the price of the divergence
-            ; being visible in the stop census at all, which is what it lacked for
-            ; seven slices. A second divergent shape would be one of the other three
-            ; flags turning out to diverge on a later unit; the flags ride in the
-            ; report so the next reader can tell which.
-            ; ★★★ SLICE 159 — THE TYPE-PARAMETER SHAPE IS COMPOSED EXACTLY RATHER
-            ; THAN REPORTED, AND THE REASON IT IS SAFE IS THE SHAPE ITSELF.
-            ; `combineTypeMappers(m1, m2).Map(tp)` is by definition
-            ; `instantiateType(m1.Map(tp), m2)`; slice 158 measured that computing
-            ; it in general is what dies (`cyclicGenericTypeInstantiation`, signal
-            ; 11 on all six artifacts, twice) — but `instantiate_type` of a BARE
-            ; TYPE PARAMETER is `type_mapper_map(m, t)` and nothing else, a table
-            ; lookup with no recursion under it. So for `m1.Map(tp)` a type
-            ; parameter the faithful composition is one call and it terminates.
-            ;
-            ; ★★★ AND IT IS FAITHFUL IN BOTH DIRECTIONS, WHICH IS WHAT SLICE 158'S
-            ; FIRST ATTEMPT WAS NOT. That attempt computed the composition through
-            ; the MERGED mapper and applied `m` twice for a parameter outside m1's
-            ; domain (six units MATCH → FAIL). Here the first hop is `own` ALONE,
-            ; and for a tp outside its domain `own.Map(tp)` is `tp` itself — so
-            ; `type_mapper_map(m, raw)` answers `m.Map(tp)`, which is exactly what
-            ; the merged mapper answers. The two spellings coincide there and
-            ; differ only where `own` HAS tp and answers a parameter `m` maps on.
-            ;
-            ; ★★★ THE UNIT THAT FOUND IT WAS UNPORTED WHEN THE SCOPE WAS PRICED,
-            ; WHICH IS §3.5gm'S POLARITY AGAIN. Slice 158 measured the wide guard
-            ; at 23 units and recorded that *19 answer a bare TypeParameter … all
-            ; shapes on which the two spellings agree over this corpus*; the claim
-            ; was true of the corpus it could see. `compiler/keyofUnresolvedBaseMembers`
-            ; — `type CreateAttrs<T> = Partial<Attrs<T>>` asked at `CreateAttrs<MA>`
-            ; — was UNPORTED that day and became comparable in this slice, and it
-            ; answers `Partial<Attrs<T>>` where the reference answers
-            ; `Partial<Attrs<MA>>`, with `raw` a bare TypeParameter (524288). ★A
-            ; measurement over the reachable corpus is never a proof about the
-            ; shape; it is a price, and a price ages.
-            ;
-            ; ★The CONDITIONAL arm below is unchanged and still a report: there the
-            ; composition is the recursion slice 158 could not afford, and the
-            ; account of both failed attempts stands in §3.5gn.
-            var value mapped
-            if (t.object_flags & ObjectFlagsMapped) <> 0
-            {
-                let own Checker.mapper_of(t)
-                if own <> null
-                {
-                    let raw this.type_mapper_map(own as ref[TypeMapper], tpl[i])
-                    if this.unported_mark() <> mark
-                        return null
-                    if raw <> tpl[i]
-                    {
-                        if raw <> null
-                        {
-                            let rt raw as ref[Type]
-                            if (rt.flags & TypeFlagsTypeParameter) <> 0
-                            {
-                                ; Spelled as `instantiate_type` and not as a bare
-                                ; mapper lookup: it is the reference's own second
-                                ; hop, it tolerates a nil `m` the way the reference
-                                ; does, and for this shape its worker's FIRST arm is
-                                ; the lookup — so the faithful spelling and the cheap
-                                ; one are the same instruction here.
-                                set value: this.instantiate_type(rt, m)
-                                if this.unported_mark() <> mark
-                                    return null
-                            }
-                            else
-                            {
-                                ; ★★★ EVERYTHING THAT IS NOT A TYPE PARAMETER IS
-                                ; REPORTED SINCE SLICE 159, AND THE WIDENING IS WHAT
-                                ; THE OLD NOTE ASKED THE NEXT READER FOR: *a second
-                                ; divergent shape would be one of the other three
-                                ; flags turning out to diverge on a later unit; the
-                                ; flags ride in the report so the next reader can
-                                ; tell which.* `compiler/keyofUnresolvedBaseMembers`
-                                ; is that unit and its `raw` is `Attrs<T>` — a
-                                ; STRUCTURED answer, where the composition is the
-                                ; recursion slice 158 measured as fatal, so this half
-                                ; cannot be answered the way the type-parameter half
-                                ; above now is.
-                                ;
-                                ; ★★ THE CONDITION IS `could_contain_type_variables`
-                                ; AND NOT THE CONDITIONAL FLAG, because the flag was
-                                ; never the mechanism: what makes the two spellings
-                                ; differ is that `m` still has something to do to
-                                ; `raw`, and the only cheap sufficient test for that
-                                ; is whether `raw` carries type variables at all. An
-                                ; answer that carries none is one both spellings
-                                ; leave alone.
-                                if this.could_contain_type_variables(rt)
-                                {
-                                    if this.unported_mark() <> mark
-                                        return null
-                                    this.record_unported("merged-mapper-not-combined", rt.flags)
-                                    return null
-                                }
-                                if this.unported_mark() <> mark
-                                    return null
-                            }
-                        }
-                    }
-                }
-            }
-            type_arguments.add(value)
+            type_arguments.add(mapped)
             set i: i + 1
         }
         var alias alias_in
@@ -121514,14 +121857,16 @@ define Checker
         this.get_common_subtype(inference.contra_candidates)
     }
 
-    ; clearActiveMapperCaches. Upstream this drops the memo of the restrictive and
-    ; permissive instantiations that were made while an inference was in flight;
-    ; this port has neither mapper and neither cache, so the call site keeps the
-    ; name and the body is empty (§3.5v — an inert step with an argument beats a
-    ; missing one nobody can find).
-    procedure clear_active_mapper_caches(this)
-    {
-    }
+    ; ★★★ clearActiveMapperCaches STOOD HERE AS AN EMPTY BODY FOR THIRTY SLICES,
+    ; and its note was expired in both halves: *this port has neither mapper and
+    ; neither cache, so the call site keeps the name and the body is empty (§3.5v)*.
+    ; The restrictive and permissive mappers landed in slice 151 and the cache is
+    ; slice 163's — and the reason nothing retired the note is that an INERT BODY
+    ; has no tag, no row and no stop, so not one instrument in this apparatus can
+    ; see it. §3.5v's advice (an inert step with an argument beats a missing one
+    ; nobody can find) is still right about the alternative and says nothing about
+    ; the expiry. The real body is beside `instantiate_type_with_alias`, with the
+    ; stack it clears.
 
     ; ── getInferredType, the one function every caller of this chapter wants ──
     ;
