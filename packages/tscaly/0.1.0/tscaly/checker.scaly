@@ -159,6 +159,7 @@ define ObjectFlagsTuple: int 1 << 3                   ; Synthesized generic tupl
 define ObjectFlagsAnonymous: int 1 << 4               ; Anonymous
 define ObjectFlagsMapped: int 1 << 5                  ; Mapped
 define ObjectFlagsInstantiated: int 1 << 6            ; Instantiated anonymous or mapped type
+define ObjectFlagsInstantiatedMapped: int ObjectFlagsMapped | ObjectFlagsInstantiated
 define ObjectFlagsObjectLiteral: int 1 << 7           ; Originates in an object literal
 define ObjectFlagsEvolvingArray: int 1 << 8           ; Evolving array type
 define ObjectFlagsObjectLiteralPatternWithComputedProperties: int 1 << 9
@@ -736,6 +737,61 @@ define MappedTypeData
         set contains_error: false
     }
 }
+
+; ── ReverseMappedTypeData (slice 160) ───────────────────────────────────────
+;
+; The reference's `ReverseMappedType`, flattened the way MappedTypeData is: the
+; embedded `ObjectType` gives the first four slots and its own three follow. It
+; is the type a HOMOMORPHIC mapped type is inferred BACKWARDS through — the
+; source object whose properties still have to be run through the mapping — and
+; its members are resolved lazily, one reverse inference per property.
+;
+; ★ `source`, `mapped_type` and `constraint_type` are never null on a type this
+; port mints: create_reverse_mapped_type writes all three in the line after
+; new_object_type, which is the reference's own order. They are declared nullable
+; because the arm answers null where `AsReverseMappedType()` would panic.
+define ReverseMappedTypeData
+(
+    resolved: ref[StructuredMembers]?
+    target: ref[Type]?
+    mapper: ref[TypeMapper]?
+    instantiations: ref[Array[ref[ObjectInstantiation]?]]?
+
+    source: ref[Type]?
+    mapped_type: ref[Type]?
+    constraint_type: ref[Type]?
+)
+{
+    init()
+    {
+        set resolved: null
+        set target: null
+        set mapper: null
+        set instantiations: null
+        set source: null
+        set mapped_type: null
+        set constraint_type: null
+    }
+}
+
+; ── the reverse-mapped memo rows (slice 160) ────────────────────────────────
+;
+; `c.reverseMappedCache` and `c.reverseHomomorphicMappedCache`, both keyed on the
+; reference's `ReverseMappedTypeKey{sourceId, targetId, constraintId}`.
+;
+; ★★★ THE TWO TABLES ARE NOT INTERCHANGEABLE AND THE DIFFERENCE IS `ok`. The
+; homomorphic one is read as `if cached := …; cached != nil`, so a null result is
+; recomputed; the other is read as `cached, ok := …` and a PRESENT null answers
+; `unknownType`. That is why the lookup here returns the ROW and not the type:
+; absence and a null result are two answers, and folding them would make a failed
+; reverse inference retry on every property of every arrival.
+define ReverseMappedRow
+(
+    source_id: int
+    target_id: int
+    constraint_id: int
+    result: ref[Type]?
+)
 
 ; ── the three closure STATES of the mapped type (slice 125) ─────────────────
 ;
@@ -1809,6 +1865,17 @@ define ValueSymbolLink
     deferred_parent: ref[Type]?
     deferred_constituents: ref[Array[ref[Type]?]]?
     deferred_write_constituents: ref[Array[ref[Type]?]]?
+
+    ; ── slice 160: the REVERSE-MAPPED property's three slots ────────────────
+    ;
+    ; The reference's SEPARATE `ReverseMappedSymbolLinks` table, merged here on
+    ; the same test the mapped four and the deferred three passed (§3.22): its
+    ; only question is *what does this property have to be inferred back through*,
+    ; asked behind `CheckFlagsReverseMapped`, and the one place upstream that asks
+    ; `Has` is `emitresolver.go`, which this port does not build.
+    reverse_property_type: ref[Type]?
+    reverse_mapped_type: ref[Type]?
+    reverse_constraint_type: ref[Type]?
 )
 {
     init(sym: ref[Symbol]?)
@@ -1827,6 +1894,9 @@ define ValueSymbolLink
         set deferred_parent: null
         set deferred_constituents: null
         set deferred_write_constituents: null
+        set reverse_property_type: null
+        set reverse_mapped_type: null
+        set reverse_constraint_type: null
     }
 }
 
@@ -2978,6 +3048,16 @@ define CheckFlagsDeferredType: int 1 << 16
 ; modifiers of the source and not of a declaration. A bit with a reader and no
 ; writer, on CheckFlagsLate's convention — the writer is the mapped chapter.
 define CheckFlagsMapped: int 1 << 18
+; CheckFlagsReverseMapped — *property of reverse-inferred homomorphic mapped
+; type*, and slice 160 gives it both halves at once: resolve_reverse_mapped_type_
+; members sets it on every property it synthesizes, get_type_of_symbol dispatches
+; on it into get_type_of_reverse_mapped_symbol. It is the bit that answers *is
+; this a reverse-mapped property* for the two readers upstream keeps its own links
+; table for, which is the argument the three slots on ValueSymbolLink carry.
+define CheckFlagsReverseMapped: int 1 << 13
+; MAX_REVERSE_MAPPED_NESTING_INSPECTION_DEPTH — the printer's budget for
+; condition (3) of shouldUsePlaceholderForProperty (slice 160).
+define MaxReverseMappedNestingInspectionDepth: int 3
 
 ; ★★★ `Unresolved` GETS A WRITER IN SLICE 114, and until then the note in
 ; get_type_from_type_alias_reference proved its arm unreachable from the one
@@ -3679,6 +3759,17 @@ define RecursionId
 (
     target_symbol: ref[Symbol]?
     target_type: ref[Type]?
+
+    ; ★★★ THE THIRD KIND OF IDENTITY, SLICE 160. Two of getRecursionIdentity's
+    ; arms answer an AST NODE rather than a symbol or a type — a DEFERRED type
+    ; reference is tracked through its own type node, and a CONDITIONAL through
+    ; its root's node, *the origin of the conditional type* — and both were
+    ; missing while nothing reached them. Without them every instantiation of one
+    ; conditional has an identity of its own, the deeply-nested guard can never
+    ; count two occurrences, and an expanding chain of instantiations does not
+    ; terminate. It is not a diagnostic: it is a SIGSEGV at the default stack and
+    ; a hang at 64 MB (`submodule_compiler_recursiveTupleTypeInference`).
+    target_node: ref[AstNode]?
 )
 
 ; ── the STOP LOG's element (slice 75) ───────────────────────────────────────
@@ -4748,6 +4839,7 @@ define TypeData union
     TypeParameter: TypeParameterTypeData
     Anonymous: AnonymousTypeData
     Mapped: MappedTypeData
+    ReverseMapped: ReverseMappedTypeData
     Literal: LiteralTypeData
     Union: UnionTypeData
     Intersection: IntersectionTypeData
@@ -6380,6 +6472,31 @@ define Checker
     rel_expanding_flags: int
     rel_overflow: bool
 
+    ; ── the reverse-mapped family's own state (slice 160) ───────────────────
+    ;
+    ; `reverseMappedCache`, `reverseHomomorphicMappedCache`,
+    ; `reverseMappedSourceStack`, `reverseMappedTargetStack` and
+    ; `reverseExpandingFlags`. The two stacks are the THIRD pair of this kind —
+    ; the relater's above, inference's on its own state — and is_deeply_nested_
+    ; type_in was written with a stack PARAMETER for exactly this arrival.
+    ;
+    ; ★ They live on the Checker and not on an inference state because the
+    ; reference puts them there, and the reason is visible in the call graph:
+    ; infer_reverse_mapped_type is reached from resolve_reverse_mapped_type_
+    ; members, i.e. from a MEMBER RESOLUTION long after the inference that minted
+    ; the type has finished, where no inference state is in hand.
+    reverse_mapped_cache: ref[Array[ref[ReverseMappedRow]?]]
+    reverse_homomorphic_cache: ref[Array[ref[ReverseMappedRow]?]]
+    reverse_mapped_source_stack: ref[Array[ref[Type]?]]
+    reverse_mapped_target_stack: ref[Array[ref[Type]?]]
+    reverse_expanding_flags: int
+
+    ; The PRINTER's reverse-mapped stack — upstream's `b.ctx.reverseMappedStack`,
+    ; which lives on the node builder's context. This port's printer is the
+    ; Checker's own, so the stack is a field beside the other three; it is pushed
+    ; only across a reverse-mapped property's type and is empty everywhere else.
+    printer_reverse_mapped_stack: ref[Array[ref[Symbol]?]]
+
     ; ★★★ ONE DIAGNOSTIC PER RELATION CALL, AND IT STANDS IN FOR THE MESSAGE CHAIN
     ; THIS PORT DOES NOT HAVE. `Relater.reportError` accumulates into `errorInfo`
     ; and `checkTypeRelatedTo` turns the whole chain into ONE diagnostic at the
@@ -6858,6 +6975,17 @@ define Checker
         set c.rel_target_depth: 0
         set c.rel_expanding_flags: ExpandingFlagsNone
         set c.rel_overflow: false
+        let rmc &Array[ref[ReverseMappedRow]?]^host()
+        set c.reverse_mapped_cache: rmc as ref[Array[ref[ReverseMappedRow]?]]
+        let rhc &Array[ref[ReverseMappedRow]?]^host()
+        set c.reverse_homomorphic_cache: rhc as ref[Array[ref[ReverseMappedRow]?]]
+        let rmss &Array[ref[Type]?]^host()
+        set c.reverse_mapped_source_stack: rmss as ref[Array[ref[Type]?]]
+        let rmts &Array[ref[Type]?]^host()
+        set c.reverse_mapped_target_stack: rmts as ref[Array[ref[Type]?]]
+        set c.reverse_expanding_flags: ExpandingFlagsNone
+        let prms &Array[ref[Symbol]?]^host()
+        set c.printer_reverse_mapped_stack: prms as ref[Array[ref[Symbol]?]]
         set c.rel_reported: false
         set c.rel_head_code: 0
         set c.rel_unmatched_code: 0
@@ -7697,11 +7825,12 @@ define Checker
         ; MappedTypeData, the reference's own struct.
         if (object_flags & ObjectFlagsMapped) <> 0
             return this.new_type(TypeFlagsObject, object_flags, sym, TypeData.Mapped(MappedTypeData()))
+        ; ★ Slice 160 fills the reverse-mapped arm. It stands where the reference's
+        ; switch puts it — directly after Mapped — and its payload starts empty:
+        ; create_reverse_mapped_type writes the three slots in the next line, the
+        ; way getEvolvingArrayType does for its own arm.
         if (object_flags & ObjectFlagsReverseMapped) <> 0
-        {
-            this.record_unported("new-object-type-reverse-mapped", 0)
-            return null
-        }
+            return this.new_type(TypeFlagsObject, object_flags, sym, TypeData.ReverseMapped(ReverseMappedTypeData()))
         ; ★ Slice 141 fills the evolving-array arm. Upstream's switch reaches
         ; `&EvolvingArrayType{}` here and getEvolvingArrayType writes the element
         ; type onto the payload one line later; both slots therefore start null and
@@ -8017,6 +8146,49 @@ define Checker
                 set d.target: target
                 set d.mapper: m
                 set t.data: TypeData.Mapped(d)
+            }
+    }
+
+    ; ── the reverse-mapped payload's three slots (slice 160) ────────────────
+    ;
+    ; `t.AsReverseMappedType().x`. All three are written once, by
+    ; create_reverse_mapped_type, so the write is ONE procedure and not three —
+    ; the copy / mutate / write-back dance (§3.14) is paid once per type.
+
+    function reverse_source_of(t: ref[Type]) returns ref[Type]?
+    {
+        choose t.data
+            when r: ReverseMapped
+                return r.source
+        null
+    }
+
+    function reverse_mapped_type_of(t: ref[Type]) returns ref[Type]?
+    {
+        choose t.data
+            when r: ReverseMapped
+                return r.mapped_type
+        null
+    }
+
+    function reverse_constraint_type_of(t: ref[Type]) returns ref[Type]?
+    {
+        choose t.data
+            when r: ReverseMapped
+                return r.constraint_type
+        null
+    }
+
+    procedure set_reverse_mapped_slots(t: ref[Type], source: ref[Type]?, mapped: ref[Type]?, constraint: ref[Type]?)
+    {
+        choose t.data
+            when r: ReverseMapped
+            {
+                var d r
+                set d.source: source
+                set d.mapped_type: mapped
+                set d.constraint_type: constraint
+                set t.data: TypeData.ReverseMapped(d)
             }
     }
 
@@ -10802,6 +10974,11 @@ define Checker
         ; it to the declaration it does not have.
         if (Symbol.check_flags_of(symbol) & CheckFlagsMapped) <> 0
             return this.get_type_of_mapped_symbol(symbol)
+        ; ★ The REVERSE-MAPPED arm, slice 160 — beside the mapped one and for the
+        ; same reason: a synthesized reverse-mapped property carries
+        ; SymbolFlagsProperty and has no declaration of its own.
+        if (Symbol.check_flags_of(symbol) & CheckFlagsReverseMapped) <> 0
+            return this.get_type_of_reverse_mapped_symbol(symbol)
         let f Symbol.flags_of(symbol)
         if (f & SymbolFlagsAccessor) <> 0
             return this.get_type_of_accessors(symbol)
@@ -26648,24 +26825,40 @@ define Checker
         false
     }
 
-    ; getRecursionIdentity, whole for the two arms a type here can reach.
+    ; getRecursionIdentity, WHOLE since slice 160.
     ;
     ; ★★ THE REFERENCE'S COMMENT IS THE WHOLE POINT OF THE SYMBOL ARMS: an object
     ; type is tracked by the symbol it ORIGINATES in, and a type parameter by its
     ; symbol so that every "fresh" instantiation of it shares one identity. The two
     ; EXCLUSIONS in the object arm are live here and named at their line.
     ;
-    ; ★ Two arms are absent for the reason RecursionId's note gives — the deferred
-    ; type reference needs a `node` slot this port does not carry — and two more
-    ; (indexed access, conditional) for the chapter header's reason. The tail
+    ; ★★★ THE FOUR ARMS SLICE 160 ADDS ARE TERMINATION, NOT GRANULARITY, and the
+    ; note that stood here had it the other way round: it read *the tail
     ; (`asRecursionId(t)`) covers all four, which is why their absence changes the
-    ; identity of nothing that exists.
+    ; identity of nothing that exists*. The tail gives every type its OWN identity,
+    ; which is the opposite of what these arms are for — a conditional's
+    ; instantiations must SHARE one, or `is_deeply_nested_type` can never count two
+    ; occurrences of the same origin and an expanding chain runs until the stack
+    ; ends. It cost `submodule_compiler_recursiveTupleTypeInference` a SIGSEGV the
+    ; moment the reverse-mapped chapter let the walk reach it (`F<T> = null extends
+    ; T ? [F<NonNullable<T>>, "null"] : …` through a mapped type), and the tuple arm
+    ; is in the same cycle as the conditional one.
     function get_recursion_identity(this, t: ref[Type]) returns ref[RecursionId]
     {
         var sym: ref[Symbol]? null
-        var decided false
+        var node: ref[AstNode]? null
+        var ty: ref[Type]? null
         if (t.flags & TypeFlagsObject) <> 0
         {
+            ; A DEFERRED type reference is tracked through its AST node —
+            ; *finer granularity than using their associated target, because each
+            ; manifest type reference has a unique AST node*.
+            if (t.object_flags & ObjectFlagsReference) <> 0
+            {
+                let rn Checker.reference_node_of(t)
+                if rn <> null
+                    return &RecursionId^host(sym, ty, rn)
+            }
             ; isObjectOrArrayLiteralType. Both flags are declared and neither is
             ; set by anything this port mints — checkObjectLiteral and
             ; checkArrayLiteral are work-list rows — so the guard is written and
@@ -26692,29 +26885,52 @@ define Checker
                     if (t.object_flags & ObjectFlagsFromTypeNode) <> 0
                         set excluded: true
                     if excluded = false
-                    {
-                        set sym: t.symbol
-                        set decided: true
-                    }
+                        return &RecursionId^host(t.symbol, ty, node)
                 }
             }
-        }
-        if decided = false
-        {
-            if (t.flags & TypeFlagsTypeParameter) <> 0
+            ; A TUPLE is tracked by its TARGET, so every instantiation of one
+            ; tuple type shares an identity.
+            if Checker.is_tuple_type(t)
             {
-                if t.symbol <> null
-                {
-                    set sym: t.symbol
-                    set decided: true
-                }
+                if (t.object_flags & ObjectFlagsFromTypeNode) = 0
+                    return &RecursionId^host(sym, Checker.get_target_type(t), node)
             }
         }
-        var ty: ref[Type]? null
-        if decided = false
-            set ty: t
-        let r &RecursionId^host(sym, ty)
-        r
+        ; A type parameter by its symbol, *such that all "fresh" instantiations of
+        ; that type parameter have the same recursion identity*.
+        if (t.flags & TypeFlagsTypeParameter) <> 0
+        {
+            if t.symbol <> null
+                return &RecursionId^host(t.symbol, ty, node)
+        }
+        ; An INDEXED ACCESS is *the leftmost object type in a chain of indexed
+        ; accesses* — in `A[P1][P2][P3]` it is A.
+        if (t.flags & TypeFlagsIndexedAccess) <> 0
+        {
+            var cur: ref[Type] t
+            var walking true
+            while walking
+            {
+                set walking: false
+                let obj Checker.indexed_access_object_type_of(cur)
+                if obj <> null
+                {
+                    set cur: obj as ref[Type]
+                    if (cur.flags & TypeFlagsIndexedAccess) <> 0
+                        set walking: true
+                }
+            }
+            return &RecursionId^host(sym, cur, node)
+        }
+        ; A CONDITIONAL is its ROOT's node — *the root object represents the
+        ; origin of the conditional type*.
+        if (t.flags & TypeFlagsConditional) <> 0
+        {
+            let root Checker.conditional_root_of(t)
+            if root <> null
+                return &RecursionId^host(sym, ty, (root as ref[ConditionalRoot]).node)
+        }
+        &RecursionId^host(sym, t, node)
     }
 
     ; The three operations the reference gets from a slice: `append(stack, id)`,
@@ -35465,7 +35681,10 @@ define Checker
             this.record_unported("type-to-string-abstract-construct-signature", t.object_flags)
             return false
         }
-        let ok this.write_type_literal(sm, calls, ctors, out)
+        var reverse_mapped false
+        if (t.object_flags & ObjectFlagsReverseMapped) <> 0
+            set reverse_mapped: true
+        let ok this.write_type_literal(sm, calls, ctors, reverse_mapped, out)
         ; A TypeLiteralNode is TypePrecedenceNonArray — never parenthesized. It is
         ; set explicitly rather than left alone because a MEMBER of this literal may
         ; have been a function type and lowered the field on the way past.
@@ -35486,7 +35705,7 @@ define Checker
     ; call signatures, then construct signatures, then index signatures, then
     ; properties — so `{ (a: string): void; x: number; }` comes out that way even
     ; where the source wrote `x` first.
-    function write_type_literal(this, sm: ref[StructuredMembers], calls: ref[Array[ref[Signature]?]], ctors: ref[Array[ref[Signature]?]], out: ref[StringBuilder]) returns bool
+    function write_type_literal(this, sm: ref[StructuredMembers], calls: ref[Array[ref[Signature]?]], ctors: ref[Array[ref[Signature]?]], reverse_mapped: bool, out: ref[StringBuilder]) returns bool
     {
         out.append("{ ")
         var i 0
@@ -35528,7 +35747,14 @@ define Checker
                 let info infos[i]
                 if info = null
                     return false
-                if this.write_index_signature(info as ref[IndexInfo], out) = false
+                ; ★★★ A REVERSE-MAPPED TYPE'S INDEX SIGNATURE IS ELIDED, VALUE AND
+                ; ALL (slice 160). The reference hands the helper a
+                ; createElidedInformationPlaceholder for exactly this type kind, so
+                ; `{ [x: string]: number }` prints as `{ [x: string]: any }` — the
+                ; value is COMPUTED (the members are resolved, the reverse
+                ; inference runs) and then not shown, which is a decision about
+                ; the DISPLAY and not about the type.
+                if this.write_index_signature_ex(info as ref[IndexInfo], reverse_mapped, out) = false
                     return false
                 out.append("; ")
                 set i: i + 1
@@ -36667,6 +36893,9 @@ define Checker
     ; there is no declaration — which is the reference's own fallback and not an
     ; invention.
     function write_index_signature(this, info: ref[IndexInfo], out: ref[StringBuilder]) returns bool
+        this.write_index_signature_ex(info, false, out)
+
+    function write_index_signature_ex(this, info: ref[IndexInfo], elide: bool, out: ref[StringBuilder]) returns bool
     {
         if info.is_readonly
             out.append("readonly ")
@@ -36694,6 +36923,10 @@ define Checker
         if this.type_to_string(info.key_type, out) = false
             return false
         out.append("]: ")
+        ; The elided placeholder is `any` under NoErrorTruncation, which the
+        ; harness sets (see type_to_string's header) — it is `...` without it.
+        if elide
+            return Checker.write_keyword(out, "any")
         ; `valueType == nil` answers the `any` keyword AND sets encounteredError,
         ; which typeToString's IgnoreErrors swallows — so the name is `any`.
         if info.value_type = null
@@ -36743,19 +36976,29 @@ define Checker
     ; the tracker, which typeToString does not read. The ACCESSOR fork is the one
     ; this port cannot take and it stops.
     ;
-    ; ★★ shouldUsePlaceholderForProperty is the reverse-mapped stack, whose only
-    ; filler is a reverse-mapped type — resolve_structured_type_members already
-    ; refuses those, so the placeholder cannot arrive and getNonMissingTypeOfSymbol
-    ; is the whole of the type.
+    ; ★★★ shouldUsePlaceholderForProperty IS LIVE SINCE SLICE 160, AND THE NOTE
+    ; THAT STOOD HERE WAS RIGHT UNTIL THE DAY IT WASN'T. It read *"the reverse-
+    ; mapped stack, whose only filler is a reverse-mapped type —
+    ; resolve_structured_type_members already refuses those, so the placeholder
+    ; cannot arrive"* — a claim about a STOP, and the stop is gone. A reverse-
+    ; mapped property whose printing has already been entered, or which is nested
+    ; inside a mapping over a non-anonymous type, is written `any` rather than
+    ; descended into, so without this the printer follows a reverse mapping as
+    ; deep as the type goes and prints a name the reference does not.
     function write_property_member(this, sym: ref[Symbol], out: ref[StringBuilder]) returns bool
     {
         let mark this.unported_mark()
-        let pt this.get_non_missing_type_of_symbol(sym)
-        if this.unported_mark() <> mark
-            return false
-        if pt = null
-            return false
-        let ptype pt as ref[Type]
+        let use_placeholder this.should_use_placeholder_for_property(sym)
+        var ptype: ref[Type] any_type
+        if use_placeholder = false
+        {
+            let pt this.get_non_missing_type_of_symbol(sym)
+            if this.unported_mark() <> mark
+                return false
+            if pt = null
+                return false
+            set ptype: pt as ref[Type]
+        }
         ; ── the ACCESSOR fork, slice 143 ────────────────────────────────
         ;
         ; Upstream writes TWO members — `get x(): T; set x(v: U);` — whenever the
@@ -36916,10 +37159,130 @@ define Checker
         if optional
             out.append("?" as char)
         out.append(": ")
-        if this.type_to_string(ptype, out) = false
+        ; ★★★ THE STACK IS PUSHED ACROSS THE TYPE AND NOT AROUND THE MEMBER, which
+        ; is what makes condition (1) above mean *already descended into*: the
+        ; printer is inside this property's own type while it decides about the
+        ; properties of the reverse-mapped types that type contains.
+        var pushed false
+        if (Symbol.check_flags_of(sym) & CheckFlagsReverseMapped) <> 0
+        {
+            if use_placeholder = false
+            {
+                printer_reverse_mapped_stack.add(sym as ref[Symbol]?)
+                set pushed: true
+            }
+        }
+        let named this.type_to_string(ptype, out)
+        if pushed
+            this.pop_symbol_stack(printer_reverse_mapped_stack)
+        if named = false
             return false
         out.append("; ")
         true
+    }
+
+    ; shouldUsePlaceholderForProperty — *use a placeholder for a reverse mapped
+    ; property we have (1) already descended into, (2) that is a nested reverse
+    ; mapping within a mapping over a non-anonymous type, or (3) that is a deeply
+    ; nested property originating from the same mapped type*.
+    ;
+    ; ★★ THE THREE CONDITIONS ARE NOT ONE RULE. (1) is termination for a cycle,
+    ; (3) is termination for an infinitely deep reverse mapping, and (2) is a SIZE
+    ; budget with the reference's own reasoning attached — a deep reverse mapping
+    ; over a library type such as `Window` would print pages, while an anonymous
+    ; source usually came from an expression the reader wants to see.
+    ;
+    ; ★ Upstream asks `ReverseMappedSymbolLinks.Has(prop)` before every read. The
+    ; three slots live on ValueSymbolLink here (see its own note), so `Has` is the
+    ; slot the branch is about to read being non-null — which is the same question
+    ; and one lookup rather than two.
+    function should_use_placeholder_for_property(this, prop: ref[Symbol]) returns bool
+    {
+        if (Symbol.check_flags_of(prop) & CheckFlagsReverseMapped) = 0
+            return false
+        let depth printer_reverse_mapped_stack.get_length() as int
+        var i 0
+        while i < depth
+        {
+            let row printer_reverse_mapped_stack[i]
+            set i: i + 1
+            if row = null
+                continue
+            if (row as ref[Symbol]) = prop
+                return true
+        }
+        if depth > 0
+        {
+            let last_row printer_reverse_mapped_stack[depth - 1]
+            if last_row <> null
+            {
+                let last_links this.value_symbol_link_of(last_row as ref[Symbol])
+                let last_property_type last_links.reverse_property_type
+                if last_property_type <> null
+                {
+                    if (((last_property_type as ref[Type]).object_flags) & ObjectFlagsAnonymous) = 0
+                        return true
+                }
+            }
+        }
+        ; (3) — only the last MAX_REVERSE_MAPPED_NESTING_INSPECTION_DEPTH entries
+        ; are inspected, *to catch tight infinite loops*; upstream's own comment
+        ; says the reasoning behind the number is lost.
+        if depth < MaxReverseMappedNestingInspectionDepth
+            return false
+        let links this.value_symbol_link_of(prop)
+        let prop_mapped links.reverse_mapped_type
+        if prop_mapped = null
+            return false
+        let prop_mapped_symbol (prop_mapped as ref[Type]).symbol
+        if prop_mapped_symbol = null
+            return false
+        var k 0
+        while k < depth
+        {
+            ; `if i > MAX…DEPTH { break }` — upstream's loop is over the WHOLE
+            ; stack with the break inside, so it inspects one entry more than the
+            ; constant names.
+            if k > MaxReverseMappedNestingInspectionDepth
+                break
+            let row printer_reverse_mapped_stack[depth - 1 - k]
+            set k: k + 1
+            if row = null
+                continue
+            let row_links this.value_symbol_link_of(row as ref[Symbol])
+            let row_mapped row_links.reverse_mapped_type
+            if row_mapped = null
+                continue
+            let row_symbol (row_mapped as ref[Type]).symbol
+            if row_symbol = null
+                continue
+            if (row_symbol as ref[Symbol]) = (prop_mapped_symbol as ref[Symbol])
+                return true
+        }
+        false
+    }
+
+    ; The symbol stack's pop, which is pop_type_stack's twin for the same reason:
+    ; `Array` has no pop, so one shorter is rebuilt.
+    procedure pop_symbol_stack(this, stack: ref[Array[ref[Symbol]?]])
+    {
+        let n stack.get_length() as int
+        if n = 0
+            return
+        let kept &Array[ref[Symbol]?]^host()
+        var i 0
+        while i < (n - 1)
+        {
+            kept.add(stack[i])
+            set i: i + 1
+        }
+        stack.clear()
+        set i: 0
+        while i < (n - 1)
+        {
+            stack.add(kept[i])
+            set i: i + 1
+        }
     }
 
     ; filterType, at the ONE predicate this port calls it with — `!Undefined`.
@@ -59366,6 +59729,68 @@ define Checker
     ; ★ CheckModeSkipContextSensitive is never set at this call site (argCheckMode is
     ; Normal for a single non-generic candidate), so getRegularTypeOfObjectLiteral is
     ; not asked and `checkArgType` is the argument's own type.
+    ; ── THE `this` ARGUMENT OF A CALL (slice 160) ───────────────────────────
+    ;
+    ; getThisArgumentOfCall and getThisArgumentType. The receiver of `x.f()` as a
+    ; NODE and as a TYPE, which two chapters ask for: the applicability check
+    ; relates it to the signature's declared `this` (TS2684), and
+    ; inferTypeArguments infers to it when the declared `this` could contain a
+    ; type variable.
+    ;
+    ; ★★ A CALL WITHOUT A RECEIVER ANSWERS `void`, AND THAT IS THE POINT rather
+    ; than a fallback: *if the called expression is not of the form `x.f` or
+    ; `x["f"]`, then sourceType = voidType* — so `f()` on a method declaring
+    ; `this: T` is the case the check exists to catch.
+    ;
+    ; ★ The DECORATOR arm is guarded by `!legacyDecorators`, which is false here
+    ; (the field's own note), so the arm is written and unreachable — as the
+    ; reference has it, and not as an omission.
+    function get_this_argument_of_call(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if AstNode.kind_of(node) = KindBinaryExpression
+            return AstNode.binary_right_of(node)
+        var expression: ref[AstNode]? null
+        let k AstNode.kind_of(node)
+        if k = KindCallExpression
+            set expression: AstNode.expression_of(node)
+        if k = KindTaggedTemplateExpression
+            set expression: AstNode.tagged_template_tag_of(node)
+        if k = KindDecorator
+        {
+            if legacy_decorators = false
+                set expression: AstNode.expression_of(node)
+        }
+        if expression = null
+            return null
+        let callee Parser.skip_outer_expressions(expression as ref[AstNode], OEKAll)
+        if Parser.is_access_expression(callee) = false
+            return null
+        AstNode.expression_of(callee as ref[AstNode])
+    }
+
+    ; ★★ THE TWO OPTIONAL-CHAIN ARMS ARE NOT ONE. At the ROOT of a chain the
+    ; receiver's null and undefined are what the `?.` removed, so the `this` type
+    ; is the NON-NULLABLE one; further along a chain the type carries the
+    ; optional-type MARKER instead, and only the marker comes off.
+    function get_this_argument_type(this, node: ref[AstNode]?) returns ref[Type]?
+    {
+        if node = null
+            return void_type
+        let n node as ref[AstNode]
+        let mark this.unported_mark()
+        let t this.check_expression(n)
+        if this.unported_mark() <> mark
+            return null
+        if t = null
+            return null
+        let parent AstNode.parent_node_of(n)
+        if Binder.is_optional_chain_root(parent)
+            return this.get_non_nullable_type(t as ref[Type])
+        if Binder.is_optional_chain(parent)
+            return this.remove_optional_type_marker(t as ref[Type])
+        t
+    }
+
     function is_signature_applicable(this, node: ref[AstNode], args: ref[Array[ref[AstNode]?]]?, signature: ref[Signature], relation: int, check_mode: int, report_errors: bool) returns bool
     {
         ; ★★★ THE JSX FORK IS THE FUNCTION'S FIRST LINE UPSTREAM AND SLICE 119 WIRES
@@ -59394,8 +59819,24 @@ define Checker
                 }
                 if skipped = false
                 {
-                    this.record_unported("get-this-argument-of-call", tt.flags)
-                    return false
+                    let this_argument_node this.get_this_argument_of_call(node)
+                    let this_argument_type this.get_this_argument_type(this_argument_node)
+                    if this.unported_mark() <> mark
+                        return false
+                    if this_argument_type = null
+                        return false
+                    var en0: ref[AstNode]? null
+                    if report_errors
+                    {
+                        set en0: this_argument_node
+                        if this_argument_node = null
+                            set en0: node
+                    }
+                    let related this.check_type_related_to_ex(this_argument_type as ref[Type], tt, relation, en0, DiagThe_this_context_of_type_0_is_not_assignable_to_method_s_this_of_type_1)
+                    if this.unported_mark() <> mark
+                        return false
+                    if related = false
+                        return false
                 }
             }
         }
@@ -87870,6 +88311,8 @@ define Checker
                 return a.resolved
             when m: Mapped
                 return m.resolved
+            when rm: ReverseMapped
+                return rm.resolved
             when r: Reference
                 return r.resolved
             when u: Union
@@ -87904,6 +88347,12 @@ define Checker
                 var d m
                 set d.resolved: sm
                 set t.data: TypeData.Mapped(d)
+            }
+            when rm: ReverseMapped
+            {
+                var d rm
+                set d.resolved: sm
+                set t.data: TypeData.ReverseMapped(d)
             }
             when r: Reference
             {
@@ -95704,21 +96153,25 @@ define Checker
                         this.resolve_class_or_interface_members(t)
                     if (t.object_flags & ObjectFlagsClassOrInterface) = 0
                     {
+                        ; ★ Slice 160. The arm stands here, ABOVE Anonymous, because a
+                        ; reverse-mapped type carries `ReverseMapped | Anonymous`
+                        ; (create_reverse_mapped_type mints it with both) and the
+                        ; anonymous resolver would ask it for a symbol it has none of.
                         if (t.object_flags & ObjectFlagsReverseMapped) <> 0
+                            this.resolve_reverse_mapped_type_members(t)
+                        if (t.object_flags & ObjectFlagsReverseMapped) = 0
                         {
-                            this.record_unported("resolve-reverse-mapped-type-members", t.object_flags)
-                            return null
-                        }
-                        if (t.object_flags & ObjectFlagsAnonymous) <> 0
-                            this.resolve_anonymous_type_members(t)
-                        if (t.object_flags & ObjectFlagsAnonymous) = 0
-                        {
-                            if (t.object_flags & ObjectFlagsMapped) <> 0
-                                this.resolve_mapped_type_members(t)
-                            if (t.object_flags & ObjectFlagsMapped) = 0
+                            if (t.object_flags & ObjectFlagsAnonymous) <> 0
+                                this.resolve_anonymous_type_members(t)
+                            if (t.object_flags & ObjectFlagsAnonymous) = 0
                             {
-                                this.record_unported("resolve-structured-type-members-object", t.object_flags)
-                                return null
+                                if (t.object_flags & ObjectFlagsMapped) <> 0
+                                    this.resolve_mapped_type_members(t)
+                                if (t.object_flags & ObjectFlagsMapped) = 0
+                                {
+                                    this.record_unported("resolve-structured-type-members-object", t.object_flags)
+                                    return null
+                                }
                             }
                         }
                     }
@@ -105226,12 +105679,98 @@ define Checker
     ; `get_recursion_identity` mints a fresh record per call — `RecursionId` is a
     ; pair of slots, not an interned value, which is `stack_has_recursion_identity`'s
     ; reading of the same type one chapter over.
-    function has_matching_recursion_identity(this, t: ref[Type], id: ref[RecursionId]) returns bool
+    ; hasMatchingRecursionIdentity — the identity of `t` compared with one already
+    ; taken, and since slice 160 it carries the reference's two wrappers: an
+    ; INSTANTIATED MAPPED type is unwrapped to its deepest target that has a
+    ; symbol, and an INTERSECTION matches when any constituent does.
+    ;
+    ; ★ The three slots are compared one for one because a RecursionId is a record
+    ; here and an interface value upstream: the arms are disjoint (exactly one slot
+    ; is ever non-null), so equality on all three is `==` on the interface.
+    function has_matching_recursion_identity(this, t_in: ref[Type], id: ref[RecursionId]) returns bool
     {
+        let t this.get_mapped_target_with_symbol(t_in)
+        if (t.flags & TypeFlagsIntersection) <> 0
+        {
+            let list Checker.intersection_types_of(t)
+            if list = null
+                return false
+            let types list as ref[Array[ref[Type]?]]
+            let n types.get_length() as int
+            var i 0
+            while i < n
+            {
+                let e types[i]
+                set i: i + 1
+                if e = null
+                    continue
+                if this.has_matching_recursion_identity(e as ref[Type], id)
+                    return true
+            }
+            return false
+        }
         let other this.get_recursion_identity(t)
         if other.target_symbol <> id.target_symbol
             return false
+        if other.target_node <> id.target_node
+            return false
         other.target_type = id.target_type
+    }
+
+    ; getMappedTargetWithSymbol — *unwrap nested homomorphic mapped types and
+    ; return the deepest target type that has a symbol*, which is what keeps
+    ; `Mapped<{x: Mapped<{x: string}>}>` from looking deeply nested: each
+    ; application's identity is its own target object literal's.
+    function get_mapped_target_with_symbol(this, t_in: ref[Type]) returns ref[Type]
+    {
+        var t: ref[Type] t_in
+        var walking true
+        while walking
+        {
+            set walking: false
+            if (t.object_flags & ObjectFlagsInstantiatedMapped) = ObjectFlagsInstantiatedMapped
+            {
+                let mark this.unported_mark()
+                let target this.get_modifiers_type_from_mapped_type(t)
+                if this.unported_mark() <> mark
+                    return t
+                if target <> null
+                {
+                    let tt target as ref[Type]
+                    var has_symbol false
+                    if tt.symbol <> null
+                        set has_symbol: true
+                    if has_symbol = false
+                    {
+                        if (tt.flags & TypeFlagsIntersection) <> 0
+                        {
+                            let list Checker.intersection_types_of(tt)
+                            if list <> null
+                            {
+                                let types list as ref[Array[ref[Type]?]]
+                                let n types.get_length() as int
+                                var i 0
+                                while i < n
+                                {
+                                    let e types[i]
+                                    set i: i + 1
+                                    if e = null
+                                        continue
+                                    if (e as ref[Type]).symbol <> null
+                                        set has_symbol: true
+                                }
+                            }
+                        }
+                    }
+                    if has_symbol
+                    {
+                        set t: tt
+                        set walking: true
+                    }
+                }
+            }
+        }
+        t
     }
 
     ; isDeeplyNestedType, whole, against ONE of the two stacks — `which` is
@@ -115121,10 +115660,34 @@ define Checker
     ; own pair on its own state, and the reverse-mapped family will have a third.
     ; The body is one function with the stack as a parameter, and the two-stack
     ; entry point above now chooses which one to hand it.
-    function is_deeply_nested_type_in(this, t: ref[Type], stack: ref[Array[ref[Type]?]], depth: int, max_depth: int) returns bool
+    function is_deeply_nested_type_in(this, t_in: ref[Type], stack: ref[Array[ref[Type]?]], depth: int, max_depth: int) returns bool
     {
         if depth < max_depth
             return false
+        ; ★ Slice 160 adds the reference's two pre-passes, both inside the depth
+        ; guard where it has them: an instantiated mapped type is *considered
+        ; deeply nested if its target type is*, and an intersection *if any
+        ; constituent is*.
+        let t this.get_mapped_target_with_symbol(t_in)
+        if (t.flags & TypeFlagsIntersection) <> 0
+        {
+            let list Checker.intersection_types_of(t)
+            if list <> null
+            {
+                let types list as ref[Array[ref[Type]?]]
+                let n types.get_length() as int
+                var k 0
+                while k < n
+                {
+                    let e types[k]
+                    set k: k + 1
+                    if e = null
+                        continue
+                    if this.is_deeply_nested_type_in(e as ref[Type], stack, depth, max_depth)
+                        return true
+                }
+            }
+        }
         let id this.get_recursion_identity(t)
         var count 0
         var last_type_id 0
@@ -116770,13 +117333,33 @@ define Checker
                     return
             }
         }
+        ; ★ Slice 160. The guard is the reference's: a mapped type with a NAME TYPE
+        ; (`{ [P in K as N]: X }`) is not inferred to this way, because the
+        ; property names of the result are not the keys the mapping ran over.
         if (target.object_flags & ObjectFlagsMapped) <> 0
         {
-            ; `target.AsMappedType().declaration.NameType == nil`, then
-            ; getConstraintTypeFromMappedType and inferToMappedType — the mapped
-            ; chapter's own half of this function.
-            this.record_unported("infer-to-mapped-type", target.object_flags)
-            return
+            var has_name_type false
+            let decl Checker.mapped_declaration_of(target)
+            if decl <> null
+            {
+                if AstNode.mapped_type_name_type_of(decl as ref[AstNode]) <> null
+                    set has_name_type: true
+            }
+            if has_name_type = false
+            {
+                let constraint_type this.get_constraint_type_from_mapped_type(target)
+                if this.unported_mark() <> mark
+                    return
+                if constraint_type = null
+                {
+                    this.record_unported("infer-to-mapped-type-constraint", target.object_flags)
+                    return
+                }
+                if this.infer_to_mapped_type(n, source, target, constraint_type as ref[Type])
+                    return
+                if this.unported_mark() <> mark
+                    return
+            }
         }
         let unrelated this.types_definitely_unrelated(source, target)
         if this.unported_mark() <> mark
@@ -117881,18 +118464,775 @@ define Checker
         }
         if (t.object_flags & (ObjectFlagsJSLiteral | ObjectFlagsObjectRestType)) <> 0
             return true
+        ; ★ Slice 160 closes this arm with the recursion the reference has: a
+        ; reverse-mapped type has an inferable index exactly when its SOURCE has.
         if (t.object_flags & ObjectFlagsReverseMapped) <> 0
-            this.record_unported("is-object-type-with-inferable-index-reverse-mapped", t.object_flags)
+        {
+            let src Checker.reverse_source_of(t)
+            if src = null
+                return false
+            return this.is_object_type_with_inferable_index(src as ref[Type])
+        }
         false
     }
 
-    ; inferToMappedType and the whole reverse-mapped family behind it — the
-    ; homomorphic inference, createReverseMappedType, the ReverseMapped type kind
-    ; and its member resolution. One chapter, named once.
+    ; The two reverse memos' shared lookup — the reference's map keyed on
+    ; `ReverseMappedTypeKey{sourceId, targetId, constraintId}`, as this file's
+    ; linear scan (find_subtype_reduction's idiom). It answers the ROW so that the
+    ; caller can tell a cached null from an absent key; see ReverseMappedRow.
+    function find_reverse_row(rows: ref[Array[ref[ReverseMappedRow]?]], source_id: int, target_id: int, constraint_id: int) returns ref[ReverseMappedRow]?
+    {
+        let n rows.get_length() as int
+        var i 0
+        while i < n
+        {
+            let row rows[i]
+            set i: i + 1
+            if row = null
+                continue
+            let r row as ref[ReverseMappedRow]
+            if r.source_id <> source_id
+                continue
+            if r.target_id <> target_id
+                continue
+            if r.constraint_id <> constraint_id
+                continue
+            return r
+        }
+        null
+    }
+
+    ; ══ THE REVERSE-MAPPED TYPE (slice 160) ═════════════════════════════════
+    ;
+    ; inferToMappedType and the whole family behind it: the homomorphic
+    ; inference, createReverseMappedType, the ReverseMapped type kind, its member
+    ; resolution and the reverse inference of one property's type.
+    ;
+    ; ★★★ WHAT THE CHAPTER IS. Inferring `S` to `{ [P in keyof T]: X }` cannot go
+    ; property by property, because the target has no properties — it has a RULE.
+    ; So the reference turns the question around: it builds an object with the same
+    ; property NAMES as the source whose property TYPES are each inferred BACKWARDS
+    ; through `X` (treating `T[P]` as the variable), and then infers from THAT
+    ; object to `T`. The object is the ReverseMapped type, and it is lazy in two
+    ; steps — its members are resolved on first ask, and each member's type on
+    ; first read — because a reverse inference is a whole inference run per
+    ; property.
+    ;
+    ; ★★ THE SECOND INFERENCE IS WHY THE PRIORITY EXISTS. `inferWithPriority` with
+    ; HomomorphicMappedType keeps a DIRECT inference to `T` ahead of one made
+    ; through `Partial<T>`, and PartialHomomorphicMappedType lowers it again where
+    ; the source contains a non-inferrable type — a partial result is worth less
+    ; than a whole one, which is a statement about the SOURCE and not about the
+    ; mapping.
     function infer_to_mapped_type(this, n: ref[InferenceState], source: ref[Type], target: ref[Type], constraint_type: ref[Type]) returns bool
     {
-        this.record_unported("infer-to-mapped-type", constraint_type.flags)
+        let mark this.unported_mark()
+        if (constraint_type.flags & (TypeFlagsUnion | TypeFlagsIntersection)) <> 0
+        {
+            ; Every constituent is asked and the answers are OR'd — `core.OrElse`
+            ; over a bool — so a union constraint infers through each half.
+            let list Checker.union_or_intersection_types_of(constraint_type)
+            if list = null
+                return false
+            let types list as ref[Array[ref[Type]?]]
+            let cnt types.get_length() as int
+            var result false
+            var i 0
+            while i < cnt
+            {
+                let e types[i]
+                set i: i + 1
+                if e = null
+                    continue
+                if this.infer_to_mapped_type(n, source, target, e as ref[Type])
+                    set result: true
+                if this.unported_mark() <> mark
+                    return result
+            }
+            return result
+        }
+        if (constraint_type.flags & TypeFlagsIndex) <> 0
+        {
+            ; The HOMOMORPHIC case: `{ [P in keyof T]: X }` where T is a variable.
+            let index_target Checker.index_target_of(constraint_type)
+            let inference Checker.get_inference_info_for_type(n, index_target)
+            if inference = null
+                return true
+            let info inference as ref[InferenceInfo]
+            if info.is_fixed
+                return true
+            if this.is_from_inference_blocked_source(source)
+                return true
+            let inferred this.infer_type_for_homomorphic_mapped_type(source, target, constraint_type)
+            if this.unported_mark() <> mark
+                return true
+            if inferred = null
+                return true
+            var priority InferencePriorityHomomorphicMappedType
+            if (source.object_flags & ObjectFlagsNonInferrableType) <> 0
+                set priority: InferencePriorityPartialHomomorphicMappedType
+            let tp info.type_parameter
+            if tp = null
+                return true
+            this.infer_with_priority(n, inferred as ref[Type], tp as ref[Type], priority)
+            return true
+        }
+        if (constraint_type.flags & TypeFlagsTypeParameter) <> 0
+        {
+            ; `{ [P in K]: X }` with K a type parameter: first infer from `keyof S`
+            ; to K.
+            var index_flags IndexFlagsNone
+            if this.pattern_for_type(source) <> null
+                set index_flags: IndexFlagsNoIndexSignatures
+            let keyof this.get_index_type_ex(source, index_flags)
+            if this.unported_mark() <> mark
+                return true
+            if keyof = null
+            {
+                this.record_unported("infer-to-mapped-type-keyof-source", source.object_flags)
+                return true
+            }
+            this.infer_with_priority(n, keyof as ref[Type], constraint_type, InferencePriorityMappedTypeConstraint)
+            if this.unported_mark() <> mark
+                return true
+            ; If K is constrained to C, make the same inferences as for the
+            ; homomorphic shape — this is what makes `Pick<T, K>` meaningful.
+            let extended this.get_constraint_of_type(constraint_type)
+            if this.unported_mark() <> mark
+                return true
+            if extended <> null
+            {
+                if this.infer_to_mapped_type(n, source, target, extended as ref[Type])
+                    return true
+                if this.unported_mark() <> mark
+                    return true
+            }
+            ; And otherwise from a union of the source's property and index types
+            ; to the template type X.
+            let all this.new_type_list(null)
+            let props this.get_properties_of_type(source)
+            if this.unported_mark() <> mark
+                return true
+            if props <> null
+            {
+                let list props as ref[Array[ref[Symbol]?]]
+                let pn list.get_length() as int
+                var i 0
+                while i < pn
+                {
+                    let row list[i]
+                    set i: i + 1
+                    if row = null
+                        continue
+                    let pt this.get_type_of_symbol(row as ref[Symbol])
+                    if this.unported_mark() <> mark
+                        return true
+                    all.add(pt)
+                }
+            }
+            let infos this.get_index_infos_of_type(source)
+            if this.unported_mark() <> mark
+                return true
+            if infos <> null
+            {
+                let list infos as ref[Array[ref[IndexInfo]?]]
+                let inn list.get_length() as int
+                var i 0
+                while i < inn
+                {
+                    let row list[i]
+                    set i: i + 1
+                    if row = null
+                        continue
+                    let info row as ref[IndexInfo]
+                    ; The enum's own number index info contributes `never`, which
+                    ; is upstream's way of saying an enum's numeric index is not a
+                    ; property of the source for this purpose.
+                    var v: ref[Type]? never_type
+                    if enum_number_index_info = null
+                        set v: info.value_type
+                    else
+                    {
+                        if (enum_number_index_info as ref[IndexInfo]) <> info
+                            set v: info.value_type
+                    }
+                    all.add(v)
+                }
+            }
+            let u this.get_union_type(all)
+            if this.unported_mark() <> mark
+                return true
+            if u = null
+            {
+                this.record_unported("infer-to-mapped-type-source-union", source.object_flags)
+                return true
+            }
+            let template this.get_template_type_from_mapped_type(target)
+            if this.unported_mark() <> mark
+                return true
+            if template = null
+            {
+                this.record_unported("infer-to-mapped-type-template", target.object_flags)
+                return true
+            }
+            this.infer_from_types(n, u as ref[Type], template as ref[Type])
+            return true
+        }
         false
+    }
+
+    ; inferTypeForHomomorphicMappedType — createReverseMappedType behind a memo on
+    ; the triple (source, target, constraint).
+    ;
+    ; ★ The memo is read as *non-null* rather than as *present*, which is the
+    ; reference's own asymmetry with the other reverse table: a null answer here
+    ; is recomputed. See ReverseMappedRow's note.
+    function infer_type_for_homomorphic_mapped_type(this, source: ref[Type], target: ref[Type], constraint: ref[Type]) returns ref[Type]?
+    {
+        let cached Checker.find_reverse_row(reverse_homomorphic_cache, source.id, target.id, constraint.id)
+        if cached <> null
+        {
+            let row cached as ref[ReverseMappedRow]
+            if row.result <> null
+                return row.result
+        }
+        let mark this.unported_mark()
+        let made this.create_reverse_mapped_type(source, target, constraint)
+        if this.unported_mark() <> mark
+            return null
+        let row &ReverseMappedRow^this(source.id, target.id, constraint.id, made) as ref[ReverseMappedRow]?
+        reverse_homomorphic_cache.add(row)
+        made
+    }
+
+    ; createReverseMappedType. The three shapes are the reference's: an array and a
+    ; tuple get the mapping applied to their ELEMENT types eagerly, every other
+    ; object type gets the lazy ReverseMapped kind.
+    ;
+    ; ★★ THE GUARD IS THE CHAPTER'S ADMISSION TEST — *a source is reverse mappable
+    ; if it has a string index signature, or has properties and is partially
+    ; inferable*. A null here is an ANSWER (the reference returns nil), not a hole,
+    ; which is why nothing reports.
+    function create_reverse_mapped_type(this, source: ref[Type], target: ref[Type], constraint: ref[Type]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let string_index this.get_index_info_of_type(source, string_type)
+        if this.unported_mark() <> mark
+            return null
+        if string_index = null
+        {
+            let props this.get_properties_of_type(source)
+            if this.unported_mark() <> mark
+                return null
+            var any_props false
+            if props <> null
+            {
+                if ((props as ref[Array[ref[Symbol]?]]).get_length() as int) <> 0
+                    set any_props: true
+            }
+            if any_props = false
+                return null
+            if this.is_partially_inferable_type(source) = false
+                return null
+            if this.unported_mark() <> mark
+                return null
+        }
+        if this.is_array_type(source)
+        {
+            let args this.get_type_arguments(source)
+            if this.unported_mark() <> mark
+                return null
+            if args = null
+                return null
+            let list args as ref[Array[ref[Type]?]]
+            if (list.get_length() as int) = 0
+                return null
+            let first list[0]
+            if first = null
+                return null
+            let element this.infer_reverse_mapped_type(first as ref[Type], target, constraint)
+            if this.unported_mark() <> mark
+                return null
+            if element = null
+                return null
+            return this.create_array_type_ex(element, this.is_readonly_array_type(source))
+        }
+        if Checker.is_tuple_type(source)
+        {
+            let elements this.get_element_types(source)
+            if this.unported_mark() <> mark
+                return null
+            if elements = null
+                return null
+            let list elements as ref[Array[ref[Type]?]]
+            let cnt list.get_length() as int
+            let mapped_elements this.new_type_list(null)
+            var i 0
+            while i < cnt
+            {
+                let e list[i]
+                set i: i + 1
+                if e = null
+                    return null
+                let m this.infer_reverse_mapped_type(e as ref[Type], target, constraint)
+                if this.unported_mark() <> mark
+                    return null
+                ; core.Every over the results: one nil and the whole tuple is not
+                ; reverse mappable.
+                if m = null
+                    return null
+                mapped_elements.add(m)
+            }
+            let tuple_target Checker.get_target_type(source)
+            let infos Checker.tuple_element_infos_of(tuple_target)
+            if infos = null
+                return null
+            var element_infos infos as ref[Array[ref[TupleElementInfo]?]]
+            ; An OPTIONAL element becomes REQUIRED where the mapping adds `?`,
+            ; because the mapped type will put the optionality back on.
+            if (Checker.get_mapped_type_modifiers(target) & MappedTypeModifiersIncludeOptional) <> 0
+            {
+                let same &Array[ref[TupleElementInfo]?]^host()
+                let inn element_infos.get_length() as int
+                var j 0
+                while j < inn
+                {
+                    let row element_infos[j]
+                    set j: j + 1
+                    if row = null
+                    {
+                        same.add(row)
+                        continue
+                    }
+                    let info row as ref[TupleElementInfo]
+                    if (info.flags & ElementFlagsOptional) = 0
+                    {
+                        same.add(row)
+                        continue
+                    }
+                    let required &TupleElementInfo^host(ElementFlagsRequired, info.labeled_declaration) as ref[TupleElementInfo]?
+                    same.add(required)
+                }
+                set element_infos: same as ref[Array[ref[TupleElementInfo]?]]
+            }
+            return this.create_tuple_type_ex(mapped_elements, element_infos, Checker.tuple_readonly_of(tuple_target))
+        }
+        let reversed this.new_object_type(ObjectFlagsReverseMapped | ObjectFlagsAnonymous, null)
+        if reversed = null
+            return null
+        let rt reversed as ref[Type]
+        Checker.set_reverse_mapped_slots(rt, source, target, constraint)
+        rt
+    }
+
+    ; isPartiallyInferableType — *not marked non-inferable, or an object literal
+    ; with at least one property of an inferable type, or a tuple with one*. The
+    ; three disjuncts are the reference's and the recursion is over the properties.
+    function is_partially_inferable_type(this, t: ref[Type]) returns bool
+    {
+        if (t.object_flags & ObjectFlagsNonInferrableType) = 0
+            return true
+        let mark this.unported_mark()
+        if Checker.is_object_literal_type(t)
+        {
+            let props this.get_properties_of_type(t)
+            if this.unported_mark() <> mark
+                return false
+            if props <> null
+            {
+                let list props as ref[Array[ref[Symbol]?]]
+                let pn list.get_length() as int
+                var i 0
+                while i < pn
+                {
+                    let row list[i]
+                    set i: i + 1
+                    if row = null
+                        continue
+                    let pt this.get_type_of_symbol(row as ref[Symbol])
+                    if this.unported_mark() <> mark
+                        return false
+                    if pt = null
+                        continue
+                    if this.is_partially_inferable_type(pt as ref[Type])
+                        return true
+                    if this.unported_mark() <> mark
+                        return false
+                }
+            }
+        }
+        if Checker.is_tuple_type(t)
+        {
+            let elements this.get_element_types(t)
+            if this.unported_mark() <> mark
+                return false
+            if elements <> null
+            {
+                let list elements as ref[Array[ref[Type]?]]
+                let cnt list.get_length() as int
+                var i 0
+                while i < cnt
+                {
+                    let e list[i]
+                    set i: i + 1
+                    if e = null
+                        continue
+                    if this.is_partially_inferable_type(e as ref[Type])
+                        return true
+                    if this.unported_mark() <> mark
+                        return false
+                }
+            }
+        }
+        false
+    }
+
+    ; inferReverseMappedType — the memo, the recursion guard and the worker.
+    ;
+    ; ★★★ THE MEMO HERE IS READ AS *PRESENT*, so a null result is an ANSWER and
+    ; the caller turns it into `unknownType`. That is what makes the guard below
+    ; terminating: a source that is deeply nested twice over stores its null and
+    ; every later arrival reads it instead of descending again.
+    function infer_reverse_mapped_type(this, source: ref[Type], target: ref[Type], constraint: ref[Type]) returns ref[Type]?
+    {
+        let cached Checker.find_reverse_row(reverse_mapped_cache, source.id, target.id, constraint.id)
+        if cached <> null
+        {
+            let row cached as ref[ReverseMappedRow]
+            if row.result = null
+                return unknown_type
+            return row.result
+        }
+        let mark this.unported_mark()
+        reverse_mapped_source_stack.add(source as ref[Type]?)
+        reverse_mapped_target_stack.add(target as ref[Type]?)
+        let save_expanding reverse_expanding_flags
+        if this.is_deeply_nested_type_in(source, reverse_mapped_source_stack, reverse_mapped_source_stack.get_length() as int, 2)
+            set reverse_expanding_flags: reverse_expanding_flags | ExpandingFlagsSource
+        if this.is_deeply_nested_type_in(target, reverse_mapped_target_stack, reverse_mapped_target_stack.get_length() as int, 2)
+            set reverse_expanding_flags: reverse_expanding_flags | ExpandingFlagsTarget
+        var t: ref[Type]? null
+        if reverse_expanding_flags <> ExpandingFlagsBoth
+            set t: this.infer_reverse_mapped_type_worker(source, target, constraint)
+        this.pop_type_stack(reverse_mapped_target_stack)
+        this.pop_type_stack(reverse_mapped_source_stack)
+        set reverse_expanding_flags: save_expanding
+        ; ★ A stop must not leave a memo behind: the row would answer for a
+        ; computation that never finished, and every later arrival would read it.
+        if this.unported_mark() <> mark
+            return null
+        let row &ReverseMappedRow^this(source.id, target.id, constraint.id, t) as ref[ReverseMappedRow]?
+        reverse_mapped_cache.add(row)
+        if t = null
+            return unknown_type
+        t
+    }
+
+    ; inferReverseMappedTypeWorker — ONE inference run per property, with `T[P]`
+    ; standing in for the variable being inferred.
+    function infer_reverse_mapped_type_worker(this, source: ref[Type], target: ref[Type], constraint: ref[Type]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let index_target Checker.index_target_of(constraint)
+        if index_target = null
+            return null
+        let tp this.get_type_parameter_from_mapped_type(target)
+        if this.unported_mark() <> mark
+            return null
+        if tp = null
+            return null
+        let type_parameter this.get_indexed_access_type(index_target as ref[Type], tp as ref[Type])
+        if this.unported_mark() <> mark
+            return null
+        if type_parameter = null
+            return null
+        let template this.get_template_type_from_mapped_type(target)
+        if this.unported_mark() <> mark
+            return null
+        if template = null
+            return null
+        let inference this.new_inference_info(type_parameter)
+        let inferences &Array[ref[InferenceInfo]?]^host()
+        inferences.add(inference as ref[InferenceInfo]?)
+        this.infer_types(inferences as ref[Array[ref[InferenceInfo]?]], source, template, InferencePriorityNone, false)
+        if this.unported_mark() <> mark
+            return null
+        var inferred this.get_type_from_inference(inference)
+        if this.unported_mark() <> mark
+            return null
+        if inferred = null
+            set inferred: unknown_type
+        this.get_widened_type(inferred as ref[Type])
+    }
+
+    ; resolveReverseMappedTypeMembers — one synthesized property per property of
+    ; the source, each carrying what its type will have to be inferred back
+    ; through. The type itself is NOT computed here; get_type_of_reverse_mapped_
+    ; symbol does that on first read.
+    procedure resolve_reverse_mapped_type_members(this, t: ref[Type])
+    {
+        let mark this.unported_mark()
+        let source_opt Checker.reverse_source_of(t)
+        let mapped_opt Checker.reverse_mapped_type_of(t)
+        let constraint_opt Checker.reverse_constraint_type_of(t)
+        if source_opt = null
+        {
+            this.record_unported("reverse-mapped-members-no-source", t.object_flags)
+            return
+        }
+        if mapped_opt = null
+        {
+            this.record_unported("reverse-mapped-members-no-mapped", t.object_flags)
+            return
+        }
+        if constraint_opt = null
+        {
+            this.record_unported("reverse-mapped-members-no-constraint", t.object_flags)
+            return
+        }
+        let source source_opt as ref[Type]
+        let mapped mapped_opt as ref[Type]
+        let constraint constraint_opt as ref[Type]
+        let index_info this.get_index_info_of_type(source, string_type)
+        if this.unported_mark() <> mark
+            return
+        let modifiers Checker.get_mapped_type_modifiers(mapped)
+        var readonly_mask true
+        if (modifiers & MappedTypeModifiersIncludeReadonly) <> 0
+            set readonly_mask: false
+        var optional_mask SymbolFlagsOptional
+        if (modifiers & MappedTypeModifiersIncludeOptional) <> 0
+            set optional_mask: 0
+        var index_infos: ref[Array[ref[IndexInfo]?]]? null
+        if index_info <> null
+        {
+            let ii index_info as ref[IndexInfo]
+            var value this.infer_reverse_mapped_type(ii.value_type as ref[Type], mapped, constraint)
+            if this.unported_mark() <> mark
+                return
+            if value = null
+                set value: unknown_type
+            var ro false
+            if readonly_mask
+            {
+                if ii.is_readonly
+                    set ro: true
+            }
+            let made this.new_index_info_list()
+            made.add(this.new_index_info(string_type, value, ro, null) as ref[IndexInfo]?)
+            set index_infos: made as ref[Array[ref[IndexInfo]?]]?
+        }
+        let members SymbolTable.create(host)
+        let limited this.get_limited_constraint(t)
+        if this.unported_mark() <> mark
+            return
+        let props this.get_properties_of_type(source)
+        if this.unported_mark() <> mark
+            return
+        if props <> null
+        {
+            let list props as ref[Array[ref[Symbol]?]]
+            let pn list.get_length() as int
+            var i 0
+            while i < pn
+            {
+                let row list[i]
+                set i: i + 1
+                if row = null
+                    continue
+                let prop row as ref[Symbol]
+                ; With an intersection constraint whose filtering literals could be
+                ; extracted, a property not assignable to them is skipped — the
+                ; mapping would not let it through anyway.
+                if limited <> null
+                {
+                    let name_type this.get_literal_type_from_property(prop, TypeFlagsStringOrNumberLiteralOrUnique, false)
+                    if this.unported_mark() <> mark
+                        return
+                    if name_type = null
+                        continue
+                    if this.is_type_assignable_to(name_type as ref[Type], limited as ref[Type]) = false
+                        continue
+                    if this.unported_mark() <> mark
+                        return
+                }
+                var check_flags CheckFlagsReverseMapped
+                if readonly_mask
+                {
+                    if this.is_readonly_symbol(prop)
+                        set check_flags: check_flags | CheckFlagsReadonly
+                    if this.unported_mark() <> mark
+                        return
+                }
+                let name Symbol.name_of(prop)
+                let inferred_prop this.new_symbol_ex(SymbolFlagsProperty | (Symbol.flags_of(prop) & optional_mask), name, check_flags)
+                Symbol.share_declarations(inferred_prop, prop)
+                let plinks this.value_symbol_link_of(inferred_prop)
+                set plinks.name_type: this.value_symbol_link_of(prop).name_type
+                let pt this.get_type_of_symbol(prop)
+                if this.unported_mark() <> mark
+                    return
+                set plinks.reverse_property_type: pt
+                ; A reverse mapping of `{[K in keyof T[K_1]]: T[K_1]}` is the same
+                ; as that of `{[K in keyof T]: T}` — all that matters is the shared
+                ; variable — so the indexed access is simplified to keep the number
+                ; of type identities down.
+                let constraint_target Checker.index_target_of(constraint)
+                var simplified false
+                if constraint_target <> null
+                {
+                    let ct constraint_target as ref[Type]
+                    if (ct.flags & TypeFlagsIndexedAccess) <> 0
+                    {
+                        let obj Checker.indexed_access_object_type_of(ct)
+                        let idx Checker.indexed_access_index_type_of(ct)
+                        if obj <> null
+                        {
+                            if idx <> null
+                            {
+                                if ((obj as ref[Type]).flags & TypeFlagsTypeParameter) <> 0
+                                {
+                                    if ((idx as ref[Type]).flags & TypeFlagsTypeParameter) <> 0
+                                    {
+                                        let new_type_param obj as ref[Type]
+                                        let new_mapped this.replace_indexed_access(mapped, ct, new_type_param)
+                                        if this.unported_mark() <> mark
+                                            return
+                                        let new_constraint this.get_index_type(new_type_param)
+                                        if this.unported_mark() <> mark
+                                            return
+                                        set plinks.reverse_mapped_type: new_mapped
+                                        set plinks.reverse_constraint_type: new_constraint
+                                        set simplified: true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if simplified = false
+                {
+                    set plinks.reverse_mapped_type: mapped
+                    set plinks.reverse_constraint_type: constraint
+                }
+                SymbolTable.set_entry(host, members, name, inferred_prop)
+            }
+        }
+        this.set_structured_type_members(t, members, null, null, index_infos)
+    }
+
+    ; getTypeOfReverseMappedSymbol — the property's type, inferred back through
+    ; the mapping on first read and memoised on the symbol's own link.
+    function get_type_of_reverse_mapped_symbol(this, symbol: ref[Symbol]) returns ref[Type]?
+    {
+        let links this.value_symbol_link_of(symbol)
+        if links.resolved_type <> null
+            return links.resolved_type
+        let pt links.reverse_property_type
+        let mt links.reverse_mapped_type
+        let ct links.reverse_constraint_type
+        if pt = null
+            return null
+        if mt = null
+            return null
+        if ct = null
+            return null
+        let mark this.unported_mark()
+        var t this.infer_reverse_mapped_type(pt as ref[Type], mt as ref[Type], ct as ref[Type])
+        if this.unported_mark() <> mark
+            return null
+        if t = null
+            set t: unknown_type
+        set links.resolved_type: t
+        links.resolved_type
+    }
+
+    ; getLimitedConstraint — where the mapped type's constraint was an
+    ; INTERSECTION, its filtering literals, so that resolve_reverse_mapped_type_
+    ; members can drop the properties the mapping would never produce.
+    ;
+    ; ★ The attempt is made even where the intersection has been REDUCED to a
+    ; union, which is what the `origin` read is for: a union that came out of an
+    ; intersection remembers the intersection it was.
+    function get_limited_constraint(this, t: ref[Type]) returns ref[Type]?
+    {
+        let mapped Checker.reverse_mapped_type_of(t)
+        if mapped = null
+            return null
+        let constraint_target Checker.reverse_constraint_type_of(t)
+        if constraint_target = null
+            return null
+        let mark this.unported_mark()
+        let constraint_opt this.get_constraint_type_from_mapped_type(mapped as ref[Type])
+        if this.unported_mark() <> mark
+            return null
+        if constraint_opt = null
+            return null
+        let constraint constraint_opt as ref[Type]
+        if (constraint.flags & (TypeFlagsUnion | TypeFlagsIntersection)) = 0
+            return null
+        var origin: ref[Type]? constraint
+        if (constraint.flags & TypeFlagsUnion) <> 0
+            set origin: Checker.union_origin_of(constraint)
+        if origin = null
+            return null
+        if ((origin as ref[Type]).flags & TypeFlagsIntersection) = 0
+            return null
+        let list Checker.union_or_intersection_types_of(origin as ref[Type])
+        if list = null
+            return null
+        let types list as ref[Array[ref[Type]?]]
+        let cnt types.get_length() as int
+        let kept this.new_type_list(null)
+        var i 0
+        while i < cnt
+        {
+            let e types[i]
+            set i: i + 1
+            if e = null
+                continue
+            if e = constraint_target
+                continue
+            kept.add(e)
+        }
+        let limited this.get_intersection_type(kept)
+        if this.unported_mark() <> mark
+            return null
+        if limited = null
+            return null
+        if (limited as ref[Type]) = never_type
+            return null
+        limited
+    }
+
+    ; replaceIndexedAccess — map `t.indexType` to `0` and `t.objectType` to
+    ; `[TReplacement]`, which turns the indexed access `T[K]` into
+    ; `[TReplacement][0]`, i.e. into TReplacement itself.
+    function replace_indexed_access(this, instantiable: ref[Type], t: ref[Type], replacement: ref[Type]) returns ref[Type]?
+    {
+        let idx Checker.indexed_access_index_type_of(t)
+        let obj Checker.indexed_access_object_type_of(t)
+        if idx = null
+            return null
+        if obj = null
+            return null
+        let sources this.new_type_list(null)
+        sources.add(idx)
+        sources.add(obj)
+        let mark this.unported_mark()
+        let zero: ref[Type]? this.get_number_literal_type(Checker.number_bits_from_int(0))
+        let one_element this.new_type_list(null)
+        one_element.add(replacement as ref[Type]?)
+        let tuple this.create_tuple_type(one_element)
+        if this.unported_mark() <> mark
+            return null
+        if tuple = null
+            return null
+        let targets this.new_type_list(null)
+        targets.add(zero)
+        targets.add(tuple)
+        let m this.new_type_mapper(sources, targets)
+        this.instantiate_type(instantiable, m)
     }
 
     ; ── typesDefinitelyUnrelated and the two tuple predicates ───────────────
@@ -119161,10 +120501,18 @@ define Checker
                 return null
             if could
             {
-                ; getThisArgumentOfCall plus getThisArgumentType — the receiver of
-                ; the call as a type, which is the call-resolution chapter's.
-                this.record_unported("infer-this-argument-type", nk)
-                return null
+                ; ★ Slice 160. The inference to the DECLARED `this` runs before the
+                ; arguments', which is the reference's order and observable: a
+                ; candidate inferred from the receiver is the FIRST candidate.
+                let this_argument_node this.get_this_argument_of_call(node)
+                let this_argument_type this.get_this_argument_type(this_argument_node)
+                if this.unported_mark() <> mark
+                    return null
+                if this_argument_type = null
+                    return null
+                this.infer_types(context.inferences, this_argument_type as ref[Type], this_type as ref[Type], InferencePriorityNone, false)
+                if this.unported_mark() <> mark
+                    return null
             }
         }
         var i 0
