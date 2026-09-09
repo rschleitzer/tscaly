@@ -5419,6 +5419,14 @@ define Checker
     ; expression LITERAL's type is, and nothing else reads it.
     global_reg_exp_type: ref[Type]?
 
+    ; c.valueSymbolLinks.Get(c.argumentsSymbol).resolvedType — `getGlobalType(
+    ; "IArguments", 0, reportErrors)`, the SECOND global this port asks for at
+    ; arity zero. It is lazy where the reference's is eager, for the reason every
+    ; other global here is (get_global_generic_type's header), and the memo is a
+    ; field rather than the symbol's link because the seed has to be able to say
+    ; *not asked yet* apart from *asked and absent*.
+    global_i_arguments_type: ref[Type]?
+
     ; ★★★ THE CHECKER OWNS A SECOND SCANNER, and it is not an optimization: the
     ; parser's is long finished and its state belongs to a completed parse, while
     ; this one is pointed at a regular expression literal, run over its body and
@@ -6782,6 +6790,7 @@ define Checker
         ; slice 128 — the iteration and async globals, all lazy for the reason the
         ; array memos give (see get_global_generic_type's header).
         set c.global_reg_exp_type: null
+        set c.global_i_arguments_type: null
         set c.reg_exp_scanner: null
         set c.global_typed_property_descriptor_type: null
         set c.global_class_decorator_context_type: null
@@ -10454,6 +10463,17 @@ define Checker
     ; reported: a report is a promise that an input can reach the line.
     function get_type_of_symbol(this, symbol: ref[Symbol]) returns ref[Type]?
     {
+        ; ★★★ THE DEFERRED ARM, AND ITS FUNCTION HAS BEEN IN THIS FILE SINCE SLICE
+        ; 127 — what was missing was the DISPATCH. `get_type_of_symbol_with_
+        ; deferred_type` was written with the three `deferred_*` link slots and
+        ; reached only from get_write_type_of_symbol's own deferred arm, so a
+        ; synthesized union or intersection property — which carries
+        ; SymbolFlagsProperty and no declaration — fell through the flag chain
+        ; below to the worker's `debug.Assert(symbol.ValueDeclaration != nil)`.
+        ; It stands FIRST because that is where the reference's chain has it and
+        ; because every later test would claim the symbol.
+        if (Symbol.check_flags_of(symbol) & CheckFlagsDeferredType) <> 0
+            return this.get_type_of_symbol_with_deferred_type(symbol)
         if (Symbol.check_flags_of(symbol) & CheckFlagsInstantiated) <> 0
             return this.get_type_of_instantiated_symbol(symbol)
         ; ★ The MAPPED arm, slice 125 — it stands where the reference's chain puts
@@ -10897,6 +10917,24 @@ define Checker
     {
         let mark this.unported_mark()
         let links this.value_symbol_link_of(symbol)
+        ; ★★★ THE `arguments` SEED, AND ITS PLACEMENT IS THE PORT'S LAZINESS AND
+        ; NOTHING ELSE. Upstream writes `valueSymbolLinks.Get(argumentsSymbol).
+        ; resolvedType = getGlobalType("IArguments", 0)` at the end of
+        ; initializeChecker, one line below the three seeds this port already does
+        ; there — it was left out because it is the only one of the four that needs
+        ; a LIB LOOKUP, and this port resolves a global on demand rather than
+        ; resolving forty at start-up (get_global_generic_type's header). The read
+        ; below is the ONE place any of that reaches: `arguments` carries
+        ; SymbolFlagsProperty, so getTypeOfSymbol routes it here, and without the
+        ; seed the worker meets a symbol with no value declaration — upstream's
+        ; `debug.Assert(symbol.ValueDeclaration != nil)`, i.e. a shape the reference
+        ; says cannot happen because THIS line made it impossible.
+        if symbol = arguments_symbol
+        {
+            if links.resolved_type = null
+                set links.resolved_type: this.get_global_i_arguments_type()
+            return links.resolved_type
+        }
         if links.resolved_type = null
         {
             let t this.get_type_of_variable_or_parameter_or_property_worker(symbol)
@@ -24976,11 +25014,25 @@ define Checker
         }
     }
 
-    ; checkInheritedPropertiesAreIdentical. `len(baseTypes) < 2` is the whole
-    ; function for an interface with fewer than two bases, which is every
-    ; interface on this corpus — and the rest of it (resolveDeclaredMembers,
-    ; getPropertiesOfType, isPropertyIdenticalTo and the TS2320 chain) is one
-    ; call deep behind that test.
+    ; checkInheritedPropertiesAreIdentical, whole. The note that stood here said the
+    ; rest of it — *resolveDeclaredMembers, getPropertiesOfType, isPropertyIdenticalTo
+    ; and the TS2320 chain* — was *one call deep behind that test*, and by the time
+    ; the row was read three of those four had been in this file for slices:
+    ; resolve_declared_members since 86, get_properties_of_type since 92,
+    ; compare_properties since the relation. What was actually missing is
+    ; isPropertyIdenticalTo, which is ONE line over compare_properties.
+    ;
+    ; ★★★ THE `seen` MAP IS TWO PARALLEL ARRAYS AND THE KEY IS THE SYMBOL'S NAME,
+    ; not the table's id. Upstream reads `declaredMembers` by (id, p) and stores
+    ; under `p.Name`, and the two differ for every reserved member name — which is
+    ; exactly what `isNamedMember` filters out on the way in, so the pair is
+    ; consistent by construction. A linear scan is the whole lookup because the
+    ; population is the members of ONE interface with at least two bases.
+    ;
+    ; ★★ THE REPORT IS A CHAIN AND SO ITS CODE IS TS2320, NOT TS2319.
+    ; `NewDiagnosticChain(errorInfo, msg)` builds a NEW diagnostic at the chained
+    ; one's own loc with `msg` as its head, so what reaches the list is the
+    ; interface message at `typeNode` — see Diagnostics' recode_from header.
     function check_inherited_properties_are_identical(this, t: ref[Type], type_node: ref[AstNode]?) returns bool
     {
         ; ★ The counter rather than the flag, for get_base_types' reason one call
@@ -24995,9 +25047,105 @@ define Checker
             set n: (base_types as ref[Array[ref[Type]?]]).get_length() as int
         if n < 2
             return true
-        this.record_unported("resolve-declared-members", 0)
-        false
+        let bases base_types as ref[Array[ref[Type]?]]
+        let declared this.resolve_declared_members(t)
+        if this.unported_mark() <> before
+            return false
+        if declared = null
+            return false
+        let seen_props &Array[ref[Symbol]?]^host()
+        let seen_types &Array[ref[Type]?]^host()
+        let members (declared as ref[DeclaredMembers]).members
+        let mn SymbolTable.length(members)
+        var mi 0
+        while mi < mn
+        {
+            let p SymbolTable.entry_symbol_at(members, mi)
+            let id SymbolTable.entry_name_at(members, mi)
+            set mi: mi + 1
+            if p = null
+                continue
+            if this.is_named_member(p, id) = false
+                continue
+            seen_props.add(p)
+            seen_types.add(t)
+        }
+        let this_type Checker.this_type_of(t)
+        var identical true
+        var bi 0
+        while bi < n
+        {
+            let base bases[bi]
+            set bi: bi + 1
+            if base = null
+                continue
+            let b base as ref[Type]
+            let widened this.get_type_with_this_argument(b, this_type, false)
+            if this.unported_mark() <> before
+                return false
+            if widened = null
+                continue
+            let props this.get_properties_of_type(widened as ref[Type])
+            if this.unported_mark() <> before
+                return false
+            if props = null
+                continue
+            let list props as ref[Array[ref[Symbol]?]]
+            let pn list.get_length() as int
+            var pi 0
+            while pi < pn
+            {
+                let prop list[pi]
+                set pi: pi + 1
+                if prop = null
+                    continue
+                let name Symbol.name_of(prop as ref[Symbol])
+                var found -1
+                let sn seen_props.get_length() as int
+                var si 0
+                while si < sn
+                {
+                    let e seen_props[si]
+                    if e <> null
+                    {
+                        if SymbolTable.names_equal(Symbol.name_of(e as ref[Symbol]), name)
+                        {
+                            set found: si
+                            set si: sn
+                        }
+                    }
+                    if si < sn
+                        set si: si + 1
+                }
+                if found < 0
+                {
+                    seen_props.add(prop)
+                    seen_types.add(b)
+                    continue
+                }
+                let containing seen_types[found]
+                if containing = t
+                    continue
+                let existing seen_props[found]
+                if existing = null
+                    continue
+                let same this.is_property_identical_to(existing as ref[Symbol], prop as ref[Symbol])
+                if this.unported_mark() <> before
+                    return false
+                if same
+                    continue
+                set identical: false
+                this.error_on_node(type_node, DiagInterface_0_cannot_simultaneously_extend_types_1_and_2)
+            }
+        }
+        identical
     }
+
+    ; isPropertyIdenticalTo — `compareProperties(source, target,
+    ; compareTypesIdentical) != TernaryFalse`, and the port's compare_properties
+    ; already answers the Ternary as a bool.
+    function is_property_identical_to(this, source_prop: ref[Symbol], target_prop: ref[Symbol]) returns bool
+        this.compare_properties(source_prop, target_prop, SignatureComparerIdentical)
 
     ; ── slice 81: the base constraint of a type parameter ────────────────────
     ;
@@ -41176,31 +41324,49 @@ define Checker
                 ; nothing is ever pushed.
                 if Checker.is_empty_array_assignment(node)
                     return this.get_evolving_array_type(never_type)
-                ; ★★★ THE ASSIGNED-TYPE HALF IS A STOP AND THE REASON IS A MEASURED
-                ; NON-TERMINATION, not an effort estimate. `getWidenedLiteralType(
-                ; getInitialOrAssignedType(...))` reads the right-hand side through
-                ; `getTypeOfExpression`, and where that side READS THE VARIABLE
-                ; BEING ASSIGNED the walk re-enters itself with a fresh FlowState:
-                ; `while (1) { bar = ~foo(...bar); }` — the reference's own
-                ; `noImplicitAnyLoopCrash` regression test — recursed until the
-                ; stack was gone, at 8 MB and at 64 MB alike, with the loop label's
-                ; in-process stack EMPTY at every arrival because the recursion runs
-                ; while the FIRST (non-looping) antecedent is being analyzed, which
-                ; is exactly where upstream pushes nothing either.
+                ; ★★★ THE ASSIGNED-TYPE HALF, AND ITS TERMINATION ARGUMENT IS THE
+                ; ONE SLICE 141 WENT LOOKING FOR IN THE WRONG PLACE. That stop read
+                ; *the guard that makes it terminate upstream is not the one this
+                ; slice ported … the candidates are `pushTypeResolution` around the
+                ; auto variable's type and the `resolutionStart` window*, and it is
+                ; NEITHER: what stops `while (1) { bar = ~foo(...bar); }` upstream is
+                ; getTypeAtFlowLoopLabel's OWN in-process stack. The re-entrant walk
+                ; arrives at the same junction with the same key while the LOOPING
+                ; antecedent is being analyzed, finds the row that antecedent pushed,
+                ; and answers the union of what the FIRST antecedent already
+                ; contributed — `undefined` for an unannotated `var` — marked
+                ; incomplete. The stack is EMPTY only while the first antecedent runs,
+                ; and the first antecedent of a loop junction is by construction the
+                ; path that does not go through the loop body, so this recursion
+                ; cannot start there.
                 ;
-                ; ★★★ SO THE GUARD THAT MAKES IT TERMINATE UPSTREAM IS NOT THE ONE
-                ; THIS SLICE PORTED, and saying which is the successor's first job —
-                ; the candidates are `pushTypeResolution` around the auto variable's
-                ; type (TS7022/TS7023) and the `resolutionStart` window, neither of
-                ; which is on this path here. **A stop is the honest answer to a
-                ; missing TERMINATION argument; a fallback would be a wrong type
-                ; with a note** (§3.5dt).
+                ; ★ Upstream's `flowLoopStart` window, which HIDES outer rows from a
+                ; nested walk, is moved by checkExpressionCached and
+                ; getContextFreeTypeOfExpression and NOT by getTypeOfExpression — the
+                ; function this path goes through — so the row stays visible. This
+                ; port has no window at all and walks the whole stack, which is the
+                ; same answer here and never a looser one.
                 ;
-                ; ★ The empty-array arm above stays, and it is what makes the family
-                ; a port rather than a transcription (§3.5fq): it is the producer of
-                ; every evolving array — `var x = []` — and it needs no type at all.
-                this.record_unported("flow-assignment-automatic-assigned-type", AstNode.kind_of(node))
-                return null
+                ; ★ The empty-array arm above is the producer of every evolving array
+                ; — `var x = []` — and needs no type at all; this arm is what widens
+                ; `var x = 1` and what pushes an element into the evolution.
+                let auto_mark this.unported_mark()
+                let assigned_raw this.get_initial_or_assigned_type(f, flow)
+                if this.unported_mark() <> auto_mark
+                    return null
+                if assigned_raw = null
+                    return null
+                let assigned this.get_widened_literal_type(assigned_raw as ref[Type])
+                if this.unported_mark() <> auto_mark
+                    return null
+                if assigned = null
+                    return null
+                let at assigned as ref[Type]
+                if this.is_type_assignable_to(at, declared)
+                    return at
+                ; `c.anyArrayType` — the fallback for a value the evolving array
+                ; cannot hold.
+                this.get_any_array_type()
             }
             var t declared
             if Checker.is_in_compound_like_assignment(node)
@@ -48014,10 +48180,14 @@ define Checker
             return null
         if declared = null
             return null
-        ; InterfaceType.thisType — the `this` type of a class, which this port
-        ; mints only where the interface chapter does.
-        this.record_unported("interface-this-type", (declared as ref[Type]).flags)
-        null
+        ; `getDeclaredTypeOfSymbol(symbol).AsInterfaceType().thisType`. ★★★ THE
+        ; STOP THAT STOOD HERE READ *the `this` type of a class, which this port
+        ; mints only where the interface chapter does* — and the class arm of
+        ; get_declared_type_of_class_or_interface has said `if is_class set
+        ; give_this_type: true` ever since that chapter landed, so the premise was
+        ; already false when it was written. A class-like parent is the only way
+        ; here, so the slot is filled by construction.
+        Checker.this_type_of(declared as ref[Type])
     }
 
     ; ── the EVOLVING ARRAY, slice 141 ───────────────────────────────────────
@@ -56535,7 +56705,23 @@ define Checker
                     let inner AstNode.expression_of(a)
                     if inner = null
                         return null
-                    set spread_type: this.check_expression_cached(inner as ref[AstNode])
+                    ; ★★★ THE FORK ON THE FLOW LOOP STACK IS NOT AN OPTIMISATION AND
+                    ; ITS ABSENCE WAS AN INFINITE RECURSION. Upstream's own comment
+                    ; is *we can call checkExpressionCached because spread expressions
+                    ; never have a contextual type* — and the guard above it says WHEN
+                    ; we cannot: `if len(c.flowLoopStack) != 0 { checkExpression }`.
+                    ; checkExpressionCached CLEARS the loop stack for the duration of
+                    ; the check, so calling it while a junction is being analyzed
+                    ; hides the in-process row that IS the termination argument for
+                    ; `while (1) { bar = ~foo(...bar); }` — the reference's own
+                    ; noImplicitAnyLoopCrash. Measured: stack exhausted, rc 139, with
+                    ; the loop label re-entered at depth 0 forever. The conjunct was
+                    ; dropped when this function was ported because `flow_loop_stack`
+                    ; did not exist yet (§3.5be), and the reader arrived in slice 141.
+                    if flow_loop_stack <> null
+                        set spread_type: this.check_expression(inner as ref[AstNode])
+                    else
+                        set spread_type: this.check_expression_cached(inner as ref[AstNode])
                     if this.unported_mark() <> mark_of_effective_arguments
                         return null
                 }
@@ -114049,6 +114235,19 @@ define Checker
             return global_reg_exp_type
         let t this.get_global_type_of_arity("RegExp", 0)
         set global_reg_exp_type: t
+        t
+    }
+
+    ; getGlobalType("IArguments", 0, reportErrors) — the type of the `arguments`
+    ; symbol, and the one line of initializeChecker that its neighbours' slice had
+    ; to leave out: the three seeds beside it (undefined, unknown, globalThis) name
+    ; a type this checker already holds, while this one names a LIB INTERFACE.
+    function get_global_i_arguments_type(this) returns ref[Type]?
+    {
+        if global_i_arguments_type <> null
+            return global_i_arguments_type
+        let t this.get_global_type_of_arity("IArguments", 0)
+        set global_i_arguments_type: t
         t
     }
 
