@@ -845,6 +845,20 @@ define MapTypeKindEmptyObjectLiteralRemap: int 14
 ; transcribed as the shape it names.
 define MapTypeKindContextualIndexInfoValue: int 15
 
+; MapTypeKindThisTypeFromContextual (slice 158) — getThisTypeFromContextualType's
+; closure, which captures nothing: it looks for a `ThisType<T>` in the constituent
+; and answers its one type argument. ★The INTERSECTION arm returns the FIRST
+; constituent that carries one and `nil` otherwise, so it is not a fold over the
+; whole intersection — a `A & ThisType<X> & ThisType<Y>` answers X.
+define MapTypeKindThisTypeFromContextual: int 16
+
+; MapTypeKindJsxChildElement (slice 158) — getContextualTypeForChildJsxExpression's
+; closure, whose one capture is the CHILD INDEX: an array-like `children` type is
+; indexed at that position, anything else is the answer as it stands. ★It reuses
+; MapTypeArgs' `index` field, which MapTypeKindTemplateLiteralSpan already carries
+; — the two kinds never share a call.
+define MapTypeKindJsxChildElement: int 17
+
 define MapTypeArgs
 (
     mapped: ref[Type]?
@@ -5621,6 +5635,8 @@ define Checker
     ; turns that into `unknown`, and the decorator's context parameter is `unknown`
     ; rather than a dangling reference.
     global_typed_property_descriptor_type: ref[Type]?
+    ; globalThisType — the `ThisType<T>` marker interface, arity 1 (slice 158).
+    global_this_marker_type: ref[Type]?
     global_class_decorator_context_type: ref[Type]?
     global_class_method_decorator_context_type: ref[Type]?
     global_class_getter_decorator_context_type: ref[Type]?
@@ -6971,6 +6987,7 @@ define Checker
         set c.global_i_arguments_type: null
         set c.reg_exp_scanner: null
         set c.global_typed_property_descriptor_type: null
+        set c.global_this_marker_type: null
         set c.global_class_decorator_context_type: null
         set c.global_class_method_decorator_context_type: null
         set c.global_class_getter_decorator_context_type: null
@@ -16556,12 +16573,40 @@ define Checker
             set considered: true
         if considered
         {
-            if Checker.containing_object_literal(fn) <> null
+            let containing Checker.containing_object_literal(fn)
+            if containing <> null
             {
-                ; getApparentTypeOfContextualType and the ThisType<T> lookup behind
-                ; it, then checkExpressionCached on the literal itself.
-                this.record_unported("get-this-type-of-object-literal", AstNode.kind_of(fn))
-                return null
+                let literal containing as ref[AstNode]
+                ; "We have an object literal method. Check if the containing object
+                ; literal has a contextual type that includes a ThisType<T>. If so,
+                ; T is the contextual type for 'this'."
+                let contextual this.get_apparent_type_of_contextual_type(literal, ContextFlagsNone)
+                if this.unported_mark() <> mark
+                    return null
+                let marker this.get_this_type_of_object_literal_from_contextual_type(literal, contextual)
+                if this.unported_mark() <> mark
+                    return null
+                if marker <> null
+                {
+                    let ctx this.get_inference_context(literal)
+                    if this.unported_mark() <> mark
+                        return null
+                    return this.instantiate_type(marker, Checker.get_mapper_from_context(ctx))
+                }
+                ; "There was no contextual ThisType<T> …, so the contextual type for
+                ; 'this' is the non-null form of the contextual type for the
+                ; containing object literal or the type of the object literal
+                ; itself."
+                var this_type: ref[Type]? null
+                if contextual <> null
+                    set this_type: this.get_non_nullable_type(contextual as ref[Type])
+                else
+                    set this_type: this.check_expression_cached(literal)
+                if this.unported_mark() <> mark
+                    return null
+                if this_type = null
+                    return null
+                return this.get_widened_type(this_type as ref[Type])
             }
             ; "In an assignment of the form 'obj.xxx = function(...)' or
             ; 'obj[xxx] = function(...)', the contextual type for 'this' is 'obj'."
@@ -16571,12 +16616,131 @@ define Checker
                 let target AstNode.binary_left_of(parent as ref[AstNode])
                 if Parser.is_access_expression(target)
                 {
-                    this.record_unported("check-expression-cached", AstNode.kind_of(target as ref[AstNode]))
-                    return null
+                    let expression AstNode.expression_of(target)
+                    if expression = null
+                        return null
+                    let expr expression as ref[AstNode]
+                    ; "Don't contextually type `this` as `exports` in
+                    ; `exports.Point = function(x, y) { … }`" — a JS-only guard, and
+                    ; the module-exports flag is what tells the two apart.
+                    if Parser.is_in_js_file(fn)
+                    {
+                        if AstNode.kind_of(expr) = KindIdentifier
+                        {
+                            ; The reference reads the indicator off
+                            ; `getSourceFileOfNode(parent)`; this port binds ONE file
+                            ; per unit and the Binder holds that file's flag, so the
+                            ; source-file hop has nothing to select between.
+                            if b.common_js_module_indicator_of() <> null
+                            {
+                                let resolved this.get_resolved_symbol(expr)
+                                if this.unported_mark() <> mark
+                                    return null
+                                if (Symbol.flags_of(resolved) & SymbolFlagsModuleExports) <> 0
+                                    return null
+                            }
+                        }
+                    }
+                    let et this.check_expression_cached(expr)
+                    if this.unported_mark() <> mark
+                        return null
+                    if et = null
+                        return null
+                    return this.get_widened_type(et as ref[Type])
                 }
             }
         }
         null
+    }
+
+    ; getThisTypeOfObjectLiteralFromContextualType — the walk OUTWARD through
+    ; enclosing object literals. ★★★ IT CLIMBS ONLY THROUGH A PROPERTY
+    ; ASSIGNMENT, two nodes at a time: the literal's parent is the property
+    ; assignment and ITS parent is the enclosing literal, so a literal reached any
+    ; other way ends the walk. That is what makes `ThisType<T>` on an outer literal
+    ; reach an inner method without reaching out of the literal nest entirely.
+    function get_this_type_of_object_literal_from_contextual_type(this, containing_literal: ref[AstNode], contextual_type: ref[Type]?) returns ref[Type]?
+    {
+        var literal containing_literal
+        var t contextual_type
+        let mark this.unported_mark()
+        while t <> null
+        {
+            let this_type this.get_this_type_from_contextual_type(t as ref[Type])
+            if this.unported_mark() <> mark
+                return null
+            if this_type <> null
+                return this_type
+            let parent AstNode.parent_node_of(literal)
+            if Checker.kind_or_unknown(parent) <> KindPropertyAssignment
+                return null
+            let grandparent AstNode.parent_node_of(parent as ref[AstNode])
+            if grandparent = null
+                return null
+            set literal: grandparent as ref[AstNode]
+            set t: this.get_apparent_type_of_contextual_type(literal, ContextFlagsNone)
+            if this.unported_mark() <> mark
+                return null
+        }
+        null
+    }
+
+    ; getThisTypeFromContextualType — mapType over the contextual type, per §3.18.
+    function get_this_type_from_contextual_type(this, t: ref[Type]) returns ref[Type]?
+        this.map_type(t, MapTypeKindThisTypeFromContextual, null)
+
+    ; The closure's body, per constituent.
+    function this_type_from_contextual_constituent(this, t: ref[Type]) returns ref[Type]?
+    {
+        if (t.flags & TypeFlagsIntersection) <> 0
+        {
+            let types Checker.intersection_types_of(t)
+            if types = null
+                return null
+            let list types as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            let mark this.unported_mark()
+            var i 0
+            while i < n
+            {
+                let row list[i]
+                set i: i + 1
+                if row = null
+                    continue
+                let arg this.get_this_type_argument(row as ref[Type])
+                if this.unported_mark() <> mark
+                    return null
+                if arg <> null
+                    return arg
+            }
+            return null
+        }
+        this.get_this_type_argument(t)
+    }
+
+    ; getThisTypeArgument — the one type argument of a `ThisType<T>` reference.
+    function get_this_type_argument(this, t: ref[Type]) returns ref[Type]?
+    {
+        if (t.object_flags & ObjectFlagsReference) = 0
+            return null
+        let target Checker.target_of(t)
+        if target = null
+            return null
+        let marker this.get_global_this_marker_type()
+        if marker = null
+            return null
+        if (target as ref[Type]) <> (marker as ref[Type])
+            return null
+        let mark this.unported_mark()
+        let args this.get_type_arguments(t)
+        if this.unported_mark() <> mark
+            return null
+        if args = null
+            return null
+        let list args as ref[Array[ref[Type]?]]
+        if (list.get_length() as int) = 0
+            return null
+        list[0]
     }
 
     ; getContainingObjectLiteral — two shapes, and the second reaches one level
@@ -34031,6 +34195,40 @@ define Checker
             {
                 this.record_unported("type-to-string-conditional", t.flags)
                 return false
+            }
+            ; ★★★ AN `infer` PARAMETER IN THE EXTENDS CLAUSE IS SAID AND NOT
+            ; WRITTEN — slice 158, and the shape is exact. Upstream's
+            ; typeToTypeNodeHelper carries the conditional root's
+            ; inferTypeParameters in the node-builder CONTEXT and emits an
+            ; InferTypeNode for any type parameter it finds there, so `T extends
+            ; (p: infer P) => any ? P : never` prints with the `infer` and — being
+            ; a node the emitter parenthesises by its own rules rather than by this
+            ; printer's — WITHOUT the parentheses this writer adds around a
+            ; function type at union precedence. This printer has no context to
+            ; carry the list in, so a type parameter of the root prints as its bare
+            ; NAME: measured against the oracle, `T extends (p: infer P) => any ? P
+            ; : never` comes out `T extends ((p: P) => any) ? P : never` and
+            ; `T extends Array<infer P> ? P : never` comes out `T extends P[] ? P :
+            ; never`.
+            ;
+            ; ★The guard is the ROOT'S OWN LIST and not the appearance of a type
+            ; parameter: a conditional with no infer parameter (`T extends string ?
+            ; 1 : 2`) prints identically on both sides and reporting it would
+            ; unport units this printer answers. Both halves of the divergence —
+            ; the missing keyword and the surplus parentheses — live inside that
+            ; one guard, which is why they are one report and not two.
+            let root Checker.conditional_root_of(t)
+            if root <> null
+            {
+                let infers (root as ref[ConditionalRoot]).infer_type_parameters
+                if infers <> null
+                {
+                    if ((infers as ref[Array[ref[Type]?]]).get_length() as int) <> 0
+                    {
+                        this.record_unported("type-to-string-conditional-infer", t.flags)
+                        return false
+                    }
+                }
             }
             if this.write_operand_at_union_precedence(ct, out) = false
                 return false
@@ -61642,12 +61840,17 @@ define Checker
     ; contextual type and the contextual index access — and both are this one
     ; function, which is why the row read as two.
     ;
-    ; ★★★ THE INTERSECTION HALF OF THE REFERENCE IS A CONTAINMENT PROOF, NOT A
-    ; GAP: its guard is `t.flags & TypeFlagsIntersection`, and nothing in this port
-    ; MINTS an intersection type — get_type_from_type_node reports for
-    ; KindIntersectionType — so no type reaching here can carry the bit. It is
-    ; written as a report rather than as a silent fall-through, because the day an
-    ; intersection can be built the constituent walk is what has to arrive.
+    ; ★★★ THE INTERSECTION HALF IS CODE SINCE SLICE 158, AND THE NOTE THAT STOOD
+    ; HERE WAS THE SAME EXPIRED PREMISE THE JSX ARM CARRIED (§3.5eo): it read *the
+    ; intersection half of the reference is a CONTAINMENT PROOF, not a gap …
+    ; nothing in this port MINTS an intersection type — get_type_from_type_node
+    ; reports for KindIntersectionType*. `intersect_types` landed at slice 121 and
+    ; `get_type_from_type_node`'s KindIntersectionType arm with it, so the bit had
+    ; been reachable for thirty-six slices; the stop was hit by 66 units of the
+    ; stage-2 corpus while the note claimed it could not be reached at all.
+    ; ★A containment proof about what a port can MINT is the one shape of note that
+    ; expires without any instrument noticing — the census counts the stop, and the
+    ; census is exactly what nobody reads while the note says the count must be 0.
     function get_type_of_property_of_contextual_type(this, t: ref[Type], name_data: Slice[char]) returns ref[Type]?
         this.get_type_of_property_of_contextual_type_ex(t, name_data, null)
 
@@ -61703,20 +61906,17 @@ define Checker
     function contextual_property_type_of_constituent(this, t: ref[Type], name_data: Slice[char], name_type: ref[Type]?) returns ref[Type]?
     {
         if (t.flags & TypeFlagsIntersection) <> 0
-        {
-            ; See the header: no intersection type exists in this port.
-            this.record_unported("contextual-property-of-intersection", t.flags)
-            return null
-        }
+            return this.contextual_property_type_of_intersection(t, name_data, name_type)
         if (t.flags & TypeFlagsObject) = 0
             return null
+        let mark0 this.unported_mark()
         if this.is_generic_mapped_type(t)
         {
-            ; getIndexedMappedTypeSubstitutedTypeOfContextualType, guarded by
-            ; getMappedTypeNameTypeKind — the mapped-type chapter, and nothing here
-            ; mints one either.
-            this.record_unported("indexed-mapped-type-substituted-contextual-type", t.flags)
-            return null
+            let kind this.get_mapped_type_name_type_kind(t)
+            if this.unported_mark() <> mark0
+                return null
+            if kind <> MappedTypeNameTypeKindRemapping
+                return this.get_indexed_mapped_type_substituted_type_of_contextual_type(t, name_data, name_type)
         }
         let mark this.unported_mark()
         let concrete this.get_type_of_concrete_property_of_contextual_type(t, name_data)
@@ -61725,6 +61925,204 @@ define Checker
         if concrete <> null
             return concrete
         this.get_type_from_index_infos_of_contextual_type(t, name_data, name_type)
+    }
+
+    ; The intersection arm of the closure. ★★★ ITS TWO LISTS ARE NOT ONE LIST WITH
+    ; A FLAG: a constituent that has the property CONCRETELY makes every index
+    ; signature of every OTHER constituent irrelevant (`ignoreIndexInfos`), and the
+    ; reference expresses that by DISCARDING the candidates collected so far — so
+    ; the index infos of a constituent that came BEFORE the concrete one are
+    ; dropped as well, not only the later ones. A single pass with a boolean would
+    ; keep the earlier ones and answer a wider type.
+    function contextual_property_type_of_intersection(this, t: ref[Type], name_data: Slice[char], name_type: ref[Type]?) returns ref[Type]?
+    {
+        let constituents Checker.intersection_types_of(t)
+        if constituents = null
+            return null
+        let list constituents as ref[Array[ref[Type]?]]
+        let n list.get_length() as int
+        let types this.new_type_list(null)
+        var candidates this.new_type_list(null)
+        var ignore_index_infos false
+        let mark this.unported_mark()
+        var i 0
+        while i < n
+        {
+            let row list[i]
+            set i: i + 1
+            if row = null
+                continue
+            let constituent row as ref[Type]
+            if (constituent.flags & TypeFlagsObject) = 0
+                continue
+            if this.is_generic_mapped_type(constituent)
+            {
+                let kind this.get_mapped_type_name_type_kind(constituent)
+                if this.unported_mark() <> mark
+                    return null
+                if kind <> MappedTypeNameTypeKindRemapping
+                {
+                    let substituted this.get_indexed_mapped_type_substituted_type_of_contextual_type(constituent, name_data, name_type)
+                    if this.unported_mark() <> mark
+                        return null
+                    this.append_contextual_property_type_constituent(types, substituted)
+                    continue
+                }
+            }
+            let property_type this.get_type_of_concrete_property_of_contextual_type(constituent, name_data)
+            if this.unported_mark() <> mark
+                return null
+            if property_type = null
+            {
+                if ignore_index_infos = false
+                    candidates.add(constituent)
+                continue
+            }
+            set ignore_index_infos: true
+            set candidates: this.new_type_list(null)
+            this.append_contextual_property_type_constituent(types, property_type)
+        }
+        let cn candidates.get_length() as int
+        var j 0
+        while j < cn
+        {
+            let crow candidates[j]
+            set j: j + 1
+            if crow = null
+                continue
+            let index_info_type this.get_type_from_index_infos_of_contextual_type(crow as ref[Type], name_data, name_type)
+            if this.unported_mark() <> mark
+                return null
+            this.append_contextual_property_type_constituent(types, index_info_type)
+        }
+        let count types.get_length() as int
+        if count = 0
+            return null
+        if count = 1
+            return types[0]
+        this.get_intersection_type(types)
+    }
+
+    ; appendContextualPropertyTypeConstituent. ★`any` is replaced by `unknown` and
+    ; not skipped: `T & any` is `any`, which would nullify what the other
+    ; constituents contribute, while `T & unknown` is `T` and everything computed
+    ; from it stays assignable to `any` anyway. The reference's comment is the
+    ; argument and it is the whole function.
+    procedure append_contextual_property_type_constituent(this, types: ref[Array[ref[Type]?]], t: ref[Type]?)
+    {
+        if t = null
+            return
+        if ((t as ref[Type]).flags & TypeFlagsAny) <> 0
+        {
+            types.add(unknown_type)
+            return
+        }
+        types.add(t)
+    }
+
+    ; getIndexedMappedTypeSubstitutedTypeOfContextualType — the property type of
+    ; `{ [P in K]: T }` at one NAME, which is `T` instantiated with `P := name`
+    ; whenever the name is in `K` and the mapped type does not filter it out.
+    function get_indexed_mapped_type_substituted_type_of_contextual_type(this, t: ref[Type], name_data: Slice[char], name_type: ref[Type]?) returns ref[Type]?
+    {
+        var property_name_type: ref[Type]? name_type
+        if property_name_type = null
+            set property_name_type: this.get_string_literal_type(name_data)
+        let pnt property_name_type as ref[Type]
+        let mark this.unported_mark()
+        let constraint this.get_constraint_type_from_mapped_type(t)
+        if this.unported_mark() <> mark
+            return null
+        if constraint = null
+            return null
+        ; "special case for conditional types pretending to be negated types" — a
+        ; `[P in K as P extends X ? never : P]` filter, asked of the nameType and of
+        ; the constraint alike.
+        let nt Checker.mapped_name_type_of(t)
+        if nt <> null
+        {
+            if this.is_excluded_mapped_property_name(nt as ref[Type], pnt)
+                return null
+            if this.unported_mark() <> mark
+                return null
+        }
+        if this.is_excluded_mapped_property_name(constraint as ref[Type], pnt)
+            return null
+        if this.unported_mark() <> mark
+            return null
+        let constraint_of_constraint this.get_base_constraint_or_type(constraint as ref[Type])
+        if this.unported_mark() <> mark
+            return null
+        if constraint_of_constraint = null
+            return null
+        if this.is_type_assignable_to(pnt, constraint_of_constraint as ref[Type]) = false
+            return null
+        if this.unported_mark() <> mark
+            return null
+        this.substitute_indexed_mapped_type(t, pnt)
+    }
+
+    ; isExcludedMappedPropertyName. The conditional arm is the `never`-producing
+    ; filter: a true branch that reduces to `never`, a false branch that is the
+    ; check type itself, and a name the extends clause accepts.
+    function is_excluded_mapped_property_name(this, t: ref[Type], property_name_type: ref[Type]) returns bool
+    {
+        if (t.flags & TypeFlagsConditional) <> 0
+        {
+            let mark this.unported_mark()
+            let true_type this.get_true_type_from_conditional_type(t)
+            if this.unported_mark() <> mark
+                return false
+            if true_type = null
+                return false
+            let reduced this.get_reduced_type(true_type as ref[Type])
+            if this.unported_mark() <> mark
+                return false
+            if reduced = null
+                return false
+            if ((reduced as ref[Type]).flags & TypeFlagsNever) = 0
+                return false
+            let false_type this.get_false_type_from_conditional_type(t)
+            if false_type = null
+                return false
+            let check_type Checker.conditional_check_type_of(t)
+            if check_type = null
+                return false
+            let fv this.get_actual_type_variable(false_type as ref[Type])
+            let cv this.get_actual_type_variable(check_type as ref[Type])
+            if this.unported_mark() <> mark
+                return false
+            if fv = null
+                return false
+            if cv = null
+                return false
+            if (fv as ref[Type]) <> (cv as ref[Type])
+                return false
+            let extends_type Checker.conditional_extends_type_of(t)
+            if extends_type = null
+                return false
+            return this.is_type_assignable_to(property_name_type, extends_type as ref[Type])
+        }
+        if (t.flags & TypeFlagsIntersection) <> 0
+        {
+            let types Checker.intersection_types_of(t)
+            if types = null
+                return false
+            let list types as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            var i 0
+            while i < n
+            {
+                let row list[i]
+                set i: i + 1
+                if row = null
+                    continue
+                if this.is_excluded_mapped_property_name(row as ref[Type], property_name_type)
+                    return true
+            }
+            return false
+        }
+        false
     }
 
     ; getTypeOfConcretePropertyOfContextualType.
@@ -62150,11 +62548,30 @@ define Checker
                     if AstNode.kind_of(nm) = KindPrivateIdentifier
                     {
                         ; GetSymbolNameForPrivateIdentifier over the type's own
-                        ; symbol — the mangled name the binder writes.
+                        ; symbol — the mangled name the binder writes. ★The guard
+                        ; is the reference's own: with no symbol on the type there
+                        ; is no id to mangle with and the lookup is skipped, which
+                        ; leaves `symbol` nil rather than answering about `#x` of
+                        ; some other class.
                         if tt.symbol <> null
                         {
-                            this.record_unported("contextual-this-private-property", ek)
-                            return null
+                            let ts tt.symbol as ref[Symbol]
+                            ; ★The `id <> 0` guard is lookup_symbol_for_private_
+                            ; identifier_declaration's, and it is not the
+                            ; reference's line: upstream's GetSymbolId DRAWS a
+                            ; number when the symbol has none, and drawing one from
+                            ; the checker would shift every later class's private
+                            ; names — see get_symbol_id's header. A class with no id
+                            ; has no private member either (the binder draws the id
+                            ; to MINT the name), so the lookup could only miss, and
+                            ; skipping it is the same answer without the side effect.
+                            if ts.id <> 0
+                            {
+                                let mangled Binder.private_identifier_name(Page.get(this), ts.id, AstNode.identifier_text_of(nm))
+                                set symbol: this.get_property_of_type(tt, mangled)
+                                if this.unported_mark() <> mark
+                                    return null
+                            }
                         }
                     }
                     else
@@ -62653,12 +63070,26 @@ define Checker
     {
         if this.is_tuple_like_type(t)
             return true
-        if this.is_generic_mapped_type(t)
-        {
-            this.record_unported("array-literal-mapped-tuple-context", t.flags)
+        if this.is_generic_mapped_type(t) = false
             return false
-        }
-        false
+        ; `t.AsMappedType().nameType == nil && getHomomorphicTypeVariable(
+        ; core.OrElse(t.AsMappedType().target, t)) != nil` — a HOMOMORPHIC mapped
+        ; type with no `as` clause maps a tuple to a tuple, so an array literal in
+        ; its context is contextually a tuple; a REMAPPING one does not. ★The
+        ; `OrElse` is the load-bearing half: an already-instantiated mapped type
+        ; carries its declaration's constraint on its TARGET, so asking the
+        ; instantiation itself answers about a substituted constraint.
+        if Checker.mapped_name_type_of(t) <> null
+            return false
+        var source t
+        let target Checker.target_of(t)
+        if target <> null
+            set source: target as ref[Type]
+        let mark this.unported_mark()
+        let tv this.get_homomorphic_type_variable(source)
+        if this.unported_mark() <> mark
+            return false
+        tv <> null
     }
 
     ; someType(t, c.isMutableArrayLikeType) — the readonly flag's own predicate.
@@ -64047,10 +64478,21 @@ define Checker
             }
             return null
         }
+        ; getContextualTypeForSubstitutionExpression, whole, and it is three lines:
+        ; `${x}` inside a TAGGED template is an ARGUMENT of the tag call and takes
+        ; the parameter's type; inside an untagged template it has no context.
+        ; ★The node it asks about is the template LITERAL, which is the span's
+        ; parent — the span itself is never a call's argument.
         if pk = KindTemplateSpan
         {
-            this.record_unported("get-contextual-type-for-substitution-expression", pk)
-            return null
+            let template AstNode.parent_node_of(parent as ref[AstNode])
+            if template = null
+                return null
+            let tmpl template as ref[AstNode]
+            if Checker.kind_or_unknown(AstNode.parent_node_of(tmpl)) <> KindTaggedTemplateExpression
+                return null
+            let tag AstNode.parent_node_of(tmpl)
+            return this.get_contextual_type_for_argument(tag as ref[AstNode], node)
         }
         if pk = KindParenthesizedExpression
             return this.get_contextual_type(parent, context_flags)
@@ -64147,21 +64589,141 @@ define Checker
         if k = KindParameter
             return this.get_contextually_typed_parameter_type(declaration)
         if k = KindBindingElement
-        {
-            this.record_unported("get-contextual-type-for-binding-element", k)
-            return null
-        }
+            return this.get_contextual_type_for_binding_element(declaration, context_flags)
         if k = KindPropertyDeclaration
         {
             if b.is_static(declaration)
-            {
-                this.record_unported("get-contextual-type-for-static-property", k)
-                return null
-            }
+                return this.get_contextual_type_for_static_property_declaration(declaration, context_flags)
         }
         ; "By default, do nothing and return nil - only the above cases have context
         ; implied by a parent."
         null
+    }
+
+    ; getContextualTypeForBindingElement, whole. ★★★ THE PARENT IT ASKS IS TWO
+    ; HOPS UP AND NOT ONE: a binding element's parent is the PATTERN and the
+    ; pattern's parent is the declaration that owns the initializer, so the
+    ; recursion goes through the declaration and never through the pattern — which
+    ; is also why a NESTED pattern recurses into this same function rather than
+    ; into the variable-declaration arm.
+    function get_contextual_type_for_binding_element(this, declaration: ref[AstNode], context_flags: int) returns ref[Type]?
+    {
+        let name_opt Checker.property_name_or_name_of(declaration)
+        if name_opt = null
+            return null
+        let name name_opt as ref[AstNode]
+        if AstNode.is_binding_pattern(name)
+            return null
+        if Checker.is_computed_non_literal_name(name)
+            return null
+        let pattern_opt AstNode.parent_node_of(declaration)
+        if pattern_opt = null
+            return null
+        let parent_opt AstNode.parent_node_of(pattern_opt as ref[AstNode])
+        if parent_opt = null
+            return null
+        let parent parent_opt as ref[AstNode]
+        let mark this.unported_mark()
+        var parent_type this.get_contextual_type_for_variable_like_declaration(parent, context_flags)
+        if this.unported_mark() <> mark
+            return null
+        if parent_type = null
+        {
+            ; The initializer is asked only of a declaration that is not itself a
+            ; binding element: inside a nested pattern the initializer belongs to
+            ; the OUTER declaration and checking it here would check it twice.
+            if AstNode.kind_of(parent) <> KindBindingElement
+            {
+                if AstNode.initializer_of(parent) <> null
+                {
+                    var check_mode CheckModeNormal
+                    if AstNode.dot_dot_dot_token_of(declaration) <> null
+                        set check_mode: CheckModeRestBindingElement
+                    set parent_type: this.check_declaration_initializer(parent, check_mode, null)
+                    if this.unported_mark() <> mark
+                        return null
+                }
+            }
+        }
+        if parent_type = null
+            return null
+        let pt parent_type as ref[Type]
+        let parent_name AstNode.name_of(parent)
+        if parent_name <> null
+        {
+            if AstNode.kind_of(parent_name as ref[AstNode]) = KindArrayBindingPattern
+            {
+                let elements AstNode.elements_of(pattern_opt as ref[AstNode])
+                if elements = null
+                    return null
+                let list elements as ref[Array[ref[AstNode]?]]
+                let en list.get_length() as int
+                var index 0 - 1
+                var e 0
+                while e < en
+                {
+                    let row list[e]
+                    if row <> null
+                    {
+                        if (row as ref[AstNode]) = declaration
+                        {
+                            set index: e
+                            set e: en
+                            continue
+                        }
+                    }
+                    set e: e + 1
+                }
+                if index < 0
+                    return null
+                return this.get_contextual_type_for_element_expression(pt, index, 0 - 1, 0 - 1, 0 - 1)
+            }
+        }
+        let name_type this.get_literal_type_from_property_name(name)
+        if this.unported_mark() <> mark
+            return null
+        if name_type = null
+            return null
+        let nt name_type as ref[Type]
+        if Checker.is_type_usable_as_property_name(nt) = false
+            return null
+        var nb char[JSNUM_MAX_TEXT]
+        let key this.get_property_name_from_type(nt, Slice[char](JSNUM_MAX_TEXT as size_t, &nb[0]))
+        this.get_type_of_property_of_type(pt, key)
+    }
+
+    ; getContextualTypeForStaticPropertyDeclaration — the EXPANDO shape: a static
+    ; property whose parent is an EXPRESSION is a property assignment on a function
+    ; or class expression, so its context is that expression's context at the
+    ; property's own name.
+    function get_contextual_type_for_static_property_declaration(this, declaration: ref[AstNode], context_flags: int) returns ref[Type]?
+    {
+        let parent_opt AstNode.parent_node_of(declaration)
+        if parent_opt = null
+            return null
+        let parent parent_opt as ref[AstNode]
+        ; `ast.IsExpression(declaration.Parent)` is `isExpressionKind` — a KIND test
+        ; — where is_expression_node is the CONTEXT-sensitive predicate, stricter for
+        ; the four kinds whose answer depends on a parent (Identifier,
+        ; MetaProperty, ExpressionWithTypeArguments, QualifiedName). None of them can
+        ; be the parent of a property DECLARATION, so the two agree over every shape
+        ; that reaches here and the context-sensitive one is used rather than a
+        ; second kind list nobody else calls.
+        if AstNode.is_expression_node(parent) = false
+            return null
+        let mark this.unported_mark()
+        let parent_type this.get_contextual_type(parent, context_flags)
+        if this.unported_mark() <> mark
+            return null
+        if parent_type = null
+            return null
+        let symbol this.get_symbol_of_declaration(declaration)
+        if this.unported_mark() <> mark
+            return null
+        if symbol = null
+            return null
+        let sym symbol as ref[Symbol]
+        this.get_type_of_property_of_contextual_type(parent_type as ref[Type], Symbol.name_of(sym))
     }
 
     ; getContextualTypeForObjectLiteralElement. ★★★ ITS FIRST TWO LINES ARE THE
@@ -65580,23 +66142,23 @@ define Checker
     ; `number | undefined`, so the very first shape the argument walk meets is a
     ; union — and while the whole arm was a row, `g(1)` could not resolve. The arm is
     ; `core.Some` over the constituents and one recursive call, which is why it is
-    ; ported rather than deferred: it needs nothing this port does not have. ★★The
-    ; INTERSECTION half of the same test stays a row, and the split is what makes it
-    ; honest: this file has a `union_types_of` and no intersection twin, so the
-    ; constituents of an intersection are not readable here at all.
+    ; ported rather than deferred: it needs nothing this port does not have.
+    ; ★★★THE SPLIT INTO A UNION ARM AND AN INTERSECTION ROW WAS AN EXPIRED NOTE
+    ; (slice 158, §3.5eo): it read *this file has a `union_types_of` and no
+    ; intersection twin, so the constituents of an intersection are not readable
+    ; here at all* — `intersection_types_of` and `union_or_intersection_types_of`
+    ; are both in this file, and the reference asks the pair in ONE guard
+    ; (`TypeFlagsUnionOrIntersection`) rather than in two, which is what it does
+    ; again here. A note about a missing ACCESSOR is the cheapest kind to check and
+    ; the easiest to leave standing after the accessor lands.
     function is_literal_of_contextual_type(this, candidate_type: ref[Type], contextual_type: ref[Type]?) returns bool
     {
         if contextual_type = null
             return false
         let ct contextual_type as ref[Type]
-        if (ct.flags & TypeFlagsIntersection) <> 0
+        if (ct.flags & TypeFlagsUnionOrIntersection) <> 0
         {
-            this.record_unported("is-literal-of-contextual-type-intersection", ct.flags)
-            return false
-        }
-        if (ct.flags & TypeFlagsUnion) <> 0
-        {
-            let types Checker.union_types_of(ct)
+            let types Checker.union_or_intersection_types_of(ct)
             if types = null
                 return false
             let list types as ref[Array[ref[Type]?]]
@@ -76417,6 +76979,19 @@ define Checker
         t
     }
 
+    ; getGlobalType("ThisType", 1). ★ The reference's field is `globalThisType`,
+    ; which is NOT the type of the global `this` — that is `globalThisSymbol`'s
+    ; type, a different thing this file also reads. The name here says marker so
+    ; the two cannot be confused at a call site.
+    function get_global_this_marker_type(this) returns ref[Type]?
+    {
+        if global_this_marker_type <> null
+            return global_this_marker_type
+        let t this.get_global_type_of_arity("ThisType", 1)
+        set global_this_marker_type: t
+        t
+    }
+
     function get_global_class_decorator_context_type(this) returns ref[Type]?
     {
         if global_class_decorator_context_type <> null
@@ -83121,14 +83696,12 @@ define Checker
             if k = KindFunctionExpression
                 this.check_grammar_for_generator(node)
         }
-        if AstNode.full_signature_of(node) <> null
-        {
-            ; getContextualCallSignature(getTypeFromTypeNode(FullSignature), node)
-            ; — the same stop check_function_or_method_declaration carries, at the
-            ; reference's own line and on the same node.
-            this.record_unported("get-contextual-call-signature", k)
-            return null
-        }
+        ; ★The note that stood here — *the same stop
+        ; check_function_or_method_declaration carries* — deferred a function this
+        ; file has had since the contextual-signature chapter;
+        ; get_contextual_call_signature is at its own name above, and the row was
+        ; two call sites of it and nothing else (slice 158, §3.5eo).
+        this.report_wrong_full_signature_arity(node)
         let mark this.unported_mark()
         set fn_pin_arm: 0
         set fn_pin_ctxsig: 0
@@ -83408,6 +83981,30 @@ define Checker
             return null
         this.record_unported("get-intersected-signatures", AstNode.kind_of(node))
         null
+    }
+
+    ; The two identical `FullSignature` blocks of checkFunctionOrMethodDeclaration
+    ; and checkFunctionExpressionOrObjectLiteralMethod, as one routine because the
+    ; reference's two copies are the same five lines. ★The report sits on the
+    ; FULLSIGNATURE node and not on the function, which is why no other caller can
+    ; produce it: a JSDoc `@type` tag is the only thing that puts one there.
+    procedure report_wrong_full_signature_arity(this, node: ref[AstNode])
+    {
+        let full AstNode.full_signature_of(node)
+        if full = null
+            return
+        let fs full as ref[AstNode]
+        let mark this.unported_mark()
+        let t this.get_type_from_type_node(fs)
+        if this.unported_mark() <> mark
+            return
+        if t = null
+            return
+        let signature this.get_contextual_call_signature(t as ref[Type], node)
+        if this.unported_mark() <> mark
+            return
+        if signature = null
+            this.error_on_node(fs, DiagA_JSDoc_type_tag_on_a_function_must_have_a_signature_with_the_correct_number_of_arguments)
     }
 
     ; isAritySmaller: "If the contextual signature has fewer parameters than the
@@ -83955,9 +84552,74 @@ define Checker
         let name AstNode.name_of(declaration as ref[AstNode])
         if Checker.kind_or_unknown(name) = KindIdentifier
             return
+        if name = null
+            return
         ; "if inference didn't come up with anything but unknown, fall back to the
-        ; binding pattern if present" — then assignBindingElementTypes.
-        this.record_unported("assign-binding-element-types", Checker.kind_or_unknown(name))
+        ; binding pattern if present."
+        var resolved: ref[Type]? links.resolved_type
+        if resolved <> null
+        {
+            if (resolved as ref[Type]) = unknown_type
+            {
+                let from_pattern this.get_type_from_binding_pattern(name as ref[AstNode], false, false)
+                if this.unported_mark() <> mark
+                    return
+                set links.resolved_type: from_pattern
+                set resolved: from_pattern
+            }
+        }
+        if resolved = null
+            return
+        this.assign_binding_element_types(name as ref[AstNode], resolved as ref[Type])
+    }
+
+    ; assignBindingElementTypes. "When contextual typing assigns a type to a
+    ; parameter that contains a binding pattern, we also need to push the
+    ; destructured type into the contained binding elements."
+    ;
+    ; ★★★ IT WRITES `resolvedType` DIRECTLY AND DOES NOT GO THROUGH
+    ; get_type_of_symbol: the element's type is being IMPOSED by the context, so
+    ; asking the symbol for its own type here would either re-derive it from the
+    ; declaration — which is what the contextual type is overriding — or reenter
+    ; this very routine. ★A nested pattern recurses with the element's own type,
+    ; which is why the write happens only at an IDENTIFIER leaf.
+    procedure assign_binding_element_types(this, pattern: ref[AstNode], parent_type: ref[Type])
+    {
+        let elements AstNode.elements_of(pattern)
+        if elements = null
+            return
+        let list elements as ref[Array[ref[AstNode]?]]
+        let n list.get_length() as int
+        let mark this.unported_mark()
+        var i 0
+        while i < n
+        {
+            let row list[i]
+            set i: i + 1
+            if row = null
+                continue
+            let element row as ref[AstNode]
+            let name AstNode.name_of(element)
+            if name = null
+                continue
+            let nm name as ref[AstNode]
+            let t this.get_binding_element_type_from_parent_type(element, parent_type, false)
+            if this.unported_mark() <> mark
+                return
+            if AstNode.kind_of(nm) = KindIdentifier
+            {
+                let symbol this.get_symbol_of_declaration(element)
+                if this.unported_mark() <> mark
+                    return
+                if symbol = null
+                    continue
+                set this.value_symbol_link_of(symbol as ref[Symbol]).resolved_type: t
+                continue
+            }
+            if t = null
+                continue
+            this.assign_binding_element_types(nm, t as ref[Type])
+        }
     }
 
     ; checkFunctionExpressionOrObjectLiteralMethodDeferred, whole.
@@ -84100,15 +84762,7 @@ define Checker
         let return_type this.get_return_type_from_annotation(node)
         if this.unported_mark() = ret_mark
             this.check_all_code_paths_in_non_void_function_return_or_throw(node, return_type)
-        if AstNode.full_signature_of(node) <> null
-        {
-            ; getContextualCallSignature(getTypeFromTypeNode(FullSignature), node) —
-            ; the SIGNATURES dimension. The report behind it (a JSDoc `@type` tag whose
-            ; signature has the wrong number of arguments) is on the FullSignature
-            ; node rather than on the function, which is why it cannot be recovered
-            ; from any other caller.
-            this.record_unported("get-contextual-call-signature", AstNode.kind_of(node))
-        }
+        this.report_wrong_full_signature_arity(node)
         ; ★★★ TS7010 IS A LIVE REPORT AND ITS ARM HAS BEEN PORTED SINCE SLICE 69 WITH
         ; NOTHING TO FEED IT. report_implicit_any's function-like label answers for
         ; seven kinds; its only call site until now was the PARAMETER of a signature,
@@ -89452,6 +90106,66 @@ define Checker
             let mapped this.type_mapper_map(cm, tpl[i])
             if this.unported_mark() <> mark
                 return null
+            ; ★★★ AND SINCE SLICE 158 THE DIVERGENCE ABOVE IS SAID AND NOT ONLY
+            ; COMMENTED. `combineTypeMappers(m1, m2).Map(tp)` is
+            ; `instantiateType(m1.Map(tp), m2)`; the merged mapper answers
+            ; `m1.Map(tp)` and stops there, so wherever `m` would still change that
+            ; answer this port keeps a type variable the reference substitutes —
+            ; `Partial<T extends string ? 1 : 2>` inside a generic alias, asked at
+            ; `SF<number>`, answers the uninstantiated mapped type where upstream
+            ; answers `2`, at rc 0 and with a TS2322 the reference does not have.
+            ; It stood unsaid for seven slices because a comment is invisible to the
+            ; stop census.
+            ;
+            ; ★★★ THE GUARD IS A CONSERVATIVE ONE AND IT HAS TO BE: the exact test
+            ; is whether `instantiate_type(mapped, m)` differs, and computing THAT
+            ; is the very thing that dies — measured this slice, the reference
+            ; spelling takes `compiler/cyclicGenericTypeInstantiation` and its
+            ; `…Inference` sibling to SIGSEGV on all six artifacts of both, exactly
+            ; as slice 151 recorded. So the report fires on the SUFFICIENT
+            ; condition: the enclosing type is a MAPPED one and its own mapper
+            ; answered a DEFERRED CONDITIONAL — the shape whose wrong answer is
+            ; measured above.
+            ;
+            ; ★★★ THE SCOPE IS THE DIVERGENT SHAPE AND IT WAS PRICED, NOT GUESSED
+            ; (slice 157's discipline). Reported on the wider sufficient condition —
+            ; any answer that still `could_contain_type_variables` — it takes
+            ; **23 units of stage 2 from MATCH to UNPORTED**, and their reported
+            ; flags say why: 19 answer a bare TypeParameter, 3 an Object and 1 an
+            ; IndexedAccess, all shapes on which the two spellings agree over this
+            ; corpus. Only the CONDITIONAL answer is a measured wrong answer, and
+            ; scoping to it brings the price down to **four** units of stage 2 —
+            ; `omitTypeTestErrors01`, `objectRestNegative`, `staticIndexSignature5`
+            ; and `inlineMappedTypeModifierDeclarationEmit@other.ts`, each of which
+            ; the merge spelling happens to answer correctly even for a conditional.
+            ; ★Stage 1 prices this guard at ZERO, and that is the trap: the four are
+            ; visible only in the stage-2 verdict TRANSITION, never in the totals.
+            ; Four correct answers making no claim is the price of the divergence
+            ; being visible in the stop census at all, which is what it lacked for
+            ; seven slices. A second divergent shape would be one of the other three
+            ; flags turning out to diverge on a later unit; the flags ride in the
+            ; report so the next reader can tell which.
+            if (t.object_flags & ObjectFlagsMapped) <> 0
+            {
+                let own Checker.mapper_of(t)
+                if own <> null
+                {
+                    let raw this.type_mapper_map(own as ref[TypeMapper], tpl[i])
+                    if this.unported_mark() <> mark
+                        return null
+                    if raw <> tpl[i]
+                    {
+                        if raw <> null
+                        {
+                            if ((raw as ref[Type]).flags & TypeFlagsConditional) <> 0
+                            {
+                                this.record_unported("merged-mapper-not-combined", (raw as ref[Type]).flags)
+                                return null
+                            }
+                        }
+                    }
+                }
+            }
             type_arguments.add(mapped)
             set i: i + 1
         }
@@ -89885,6 +90599,17 @@ define Checker
             if (t = (empty_object_type as ref[Type])) = false
                 return t
             return this.create_object_literal_type(args.objlit_node as ref[AstNode], args.objlit_state as ref[ObjectLiteralState], 6)
+        }
+        if mk = MapTypeKindThisTypeFromContextual
+            return this.this_type_from_contextual_constituent(t)
+        if mk = MapTypeKindJsxChildElement
+        {
+            if a = null
+                return t
+            let args a as ref[MapTypeArgs]
+            if this.is_array_like_type(t) = false
+                return t
+            return this.get_indexed_access_type(t, this.get_number_literal_type(jsnum_from_int(args.index)))
         }
         if mk = MapTypeKindContextualIndexInfoValue
         {
@@ -90793,6 +91518,22 @@ define Checker
                 return this.map_type_with_alias(reduced as ref[Type], MapTypeKindMappedConstituent, a, alias)
             }
         }
+        ; ★★★ SLICE 158 SAYS THE FALL-THROUGH FOR AN ALREADY-INSTANTIATED MAPPED
+        ; TYPE, because the answer it gives there is WRONG and was invisible until
+        ; the contextual-property chapter routed a real question into it. The shape
+        ; is `{ [P in keyof X]: … }` instantiated ONCE with a type that still holds
+        ; an outer type variable — `Partial<T extends string ? 1 : 2>` inside a
+        ; generic alias — and then instantiated AGAIN when the outer alias is:
+        ; `getHomomorphicTypeVariable` no longer finds a type parameter to map, so
+        ; this routine instantiates the mapped type anonymously and the reference
+        ; answers the mapped type's PRIMITIVE short-circuit instead. Measured in
+        ; three lines: `type SF<T> = { args: Partial<T extends string ? 1 : 2> }`
+        ; with `SF<number>` answers `2` upstream and the uninstantiated
+        ; `Partial<T extends string ? 1 : 2>` here — at rc 0, with a TS2322 the
+        ; reference does not have. The mechanism is in the mapped-type chapter, not
+        ; in this one; the guard is the OBSERVED shape (an already-instantiated
+        ; mapped type reaching the non-homomorphic fall-through) rather than a
+        ; guess at the cause.
         ; If the constraint of the instantiation is the wildcard, so is the answer.
         let ct this.get_constraint_type_from_mapped_type(t)
         if this.unported_mark() <> mark
@@ -111742,15 +112483,79 @@ define Checker
         if AstNode.is_jsx_attribute_like(parent)
             return this.get_contextual_type(node, context_flags)
         if Checker.kind_or_unknown(parent) = KindJsxElement
-        {
-            ; getContextualTypeForChildJsxExpression — the `children` property of the
-            ; contextual attributes type, indexed by this child's position among the
-            ; SEMANTIC children. It needs getTypeOfPropertyOfContextualType and
-            ; mapTypeEx, neither of which is here.
-            this.record_unported("jsx-contextual-child-expression", KindJsxElement)
-            return null
-        }
+            return this.get_contextual_type_for_child_jsx_expression(parent as ref[AstNode], node, context_flags)
         null
+    }
+
+    ; getContextualTypeForChildJsxExpression. ★★★ THE NOTE THAT DEFERRED IT NAMED
+    ; TWO CALLEES THAT WERE BOTH HERE (slice 158, §3.5eo): it read *it needs
+    ; getTypeOfPropertyOfContextualType and mapTypeEx, neither of which is here* —
+    ; slice 120 ported the first and slice 125 the second, and the row stood for
+    ; thirty-eight slices after the later of the two.
+    ;
+    ; ★★★ THE INDEX IS AMONG THE SEMANTIC CHILDREN AND THE COUNT DECIDES WHETHER
+    ; IT IS USED AT ALL: with ONE child the `children` property type IS the child's
+    ; contextual type, and only with several does the child take the ELEMENT at its
+    ; own index — which is why an array-like `children` type behaves differently in
+    ; `<E>{a}</E>` and in `<E>{a}{b}</E>`.
+    function get_contextual_type_for_child_jsx_expression(this, node: ref[AstNode], child: ref[AstNode], context_flags: int) returns ref[Type]?
+    {
+        let opening AstNode.jsx_element_opening_of(node)
+        if opening = null
+            return null
+        let attributes AstNode.jsx_attributes_of(opening as ref[AstNode])
+        if attributes = null
+            return null
+        let mark this.unported_mark()
+        let attributes_type this.get_apparent_type_of_contextual_type(attributes as ref[AstNode], context_flags)
+        if this.unported_mark() <> mark
+            return null
+        let ns this.get_jsx_namespace_at(node)
+        if this.unported_mark() <> mark
+            return null
+        var children_stopped false
+        var children_data Slice[char]()
+        let children_name_found this.get_jsx_element_children_property_name(ns, &children_data, &children_stopped)
+        if children_stopped
+            return null
+        if children_name_found = false
+            return null
+        if children_data.length = 0
+            return null
+        if attributes_type = null
+            return null
+        let at attributes_type as ref[Type]
+        if Checker.is_type_any(at)
+            return null
+        let children AstNode.jsx_children_of(node)
+        let real_count AstNode.semantic_jsx_child_count(children)
+        var child_index 0 - 1
+        var i 0
+        while i < real_count
+        {
+            let row AstNode.semantic_jsx_child_at(children, i)
+            if row <> null
+            {
+                if (row as ref[AstNode]) = child
+                {
+                    set child_index: i
+                    set i: real_count
+                    continue
+                }
+            }
+            set i: i + 1
+        }
+        let child_field_type this.get_type_of_property_of_contextual_type(at, children_data)
+        if this.unported_mark() <> mark
+            return null
+        if child_field_type = null
+            return null
+        if real_count = 1
+            return child_field_type
+        if child_index < 0
+            return child_field_type
+        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, child_index, 0, 0, 0, 0, 0, null, null, null, null, null, null) as ref[MapTypeArgs]?
+        this.map_type_ex(child_field_type as ref[Type], MapTypeKindJsxChildElement, a, true)
     }
 
     function get_contextual_type_for_jsx_attribute(this, attribute: ref[AstNode], context_flags: int) returns ref[Type]?
@@ -111768,10 +112573,27 @@ define Checker
                 return null
             if Checker.is_type_any(attributes_type)
                 return null
-            ; getTypeOfPropertyOfContextualType — the contextual-type chapter's own
-            ; head, which stops for every object literal in this corpus.
-            this.record_unported("get-type-of-property-of-contextual-type", KindJsxAttribute)
-            return null
+            ; ★The note that stood here — *getTypeOfPropertyOfContextualType, the
+            ; contextual-type chapter's own head, which stops for every object
+            ; literal in this corpus* — described slice 119's tree; slice 120 ported
+            ; that function the next day and nothing came back to this arm.
+            let name AstNode.name_of(attribute)
+            if name = null
+                return null
+            let nm name as ref[AstNode]
+            ; ★`attribute.Name().Text()` is Node.Text(), and for a
+            ; JsxNamespacedName that is `namespace + ":" + name` — a two-part
+            ; string this port has no builder for (get_literal_type_from_property_
+            ; name reports the same shape at its own line, and
+            ; property_name_text_of deliberately does not carry the arm). Saying it
+            ; rather than passing `identifier_text_of`'s EMPTY slice, which would
+            ; look up the property named "" and answer nil for `xlink:href`.
+            if AstNode.kind_of(nm) <> KindIdentifier
+            {
+                this.record_unported("jsx-attribute-namespaced-name", AstNode.kind_of(nm))
+                return null
+            }
+            return this.get_type_of_property_of_contextual_type(attributes_type as ref[Type], AstNode.identifier_text_of(nm))
         }
         this.get_contextual_type(parent as ref[AstNode], context_flags)
     }
