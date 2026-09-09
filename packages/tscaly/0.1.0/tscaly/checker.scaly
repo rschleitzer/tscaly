@@ -6456,6 +6456,12 @@ define Checker
     instantiation_depth: int
     instantiation_count: int
 
+    ; c.conditionalConstraintDepth — computeBaseConstraint's own limiter, and it is
+    ; a SEPARATE budget from instantiation_depth because the recursion it bounds is
+    ; a different one: a conditional's constraint is another conditional's input,
+    ; and the walk can be unbounded without instantiating anything.
+    conditional_constraint_depth: int
+
     ; c.currentNode — the node checkSourceElement, checkDeferredNode and
     ; checkExpressionEx save, set and restore around their work.
     ;
@@ -6794,6 +6800,7 @@ define Checker
         set c.in_variance_computation: false
         set c.instantiation_depth: 0
         set c.instantiation_count: 0
+        set c.conditional_constraint_depth: 0
         set c.current_node: null
         let ml &Array[ref[MemberEvent]?]^host()
         set c.member_log: ml
@@ -26030,21 +26037,65 @@ define Checker
             this.record_unported("compute-base-constraint-string-mapping", t.flags)
             return null
         }
+        ; ★★★ THE FORK'S CONDITION HAS BEEN ASKABLE SINCE SLICE 136 — the note here
+        ; named isMappedTypeGenericIndexedAccess and getMappedTypeModifiers as the
+        ; two missing pieces and both landed with the constraint family; §3.5dk.
+        ; Only substituteIndexedMappedType was genuinely absent, and it is written
+        ; below.
         if (t.flags & TypeFlagsIndexedAccess) <> 0
         {
-            ; isMappedTypeGenericIndexedAccess decides between two whole paths and
-            ; needs getMappedTypeModifiers plus substituteIndexedMappedType; the
-            ; general path below it is portable, but a fork whose CONDITION cannot
-            ; be asked is not a fork one half of which can be taken.
-            this.record_unported("compute-base-constraint-indexed-access", t.flags)
-            return null
+            let object_type Checker.indexed_access_object_type_of(t)
+            let index_type Checker.indexed_access_index_type_of(t)
+            if object_type = null
+                return null
+            if index_type = null
+                return null
+            let ot object_type as ref[Type]
+            let it index_type as ref[Type]
+            ; "For indexed access types of the form { [P in K]: E }[X], where K is
+            ; non-generic and X is generic, we substitute an instantiation of E
+            ; where P is replaced with X."
+            if this.is_mapped_type_generic_indexed_access(t)
+            {
+                let mark this.unported_mark()
+                let sub this.substitute_indexed_mapped_type(ot, it)
+                if this.unported_mark() <> mark
+                    return null
+                return this.get_next_base_constraint(sub)
+            }
+            let mark this.unported_mark()
+            let base_object_type this.get_next_base_constraint(ot)
+            if this.unported_mark() <> mark
+                return null
+            let base_index_type this.get_next_base_constraint(it)
+            if this.unported_mark() <> mark
+                return null
+            if base_object_type = null
+                return null
+            if base_index_type = null
+                return null
+            let access this.get_indexed_access_type_or_undefined(base_object_type as ref[Type], base_index_type as ref[Type], Checker.indexed_access_flags_of(t), null, null)
+            if this.unported_mark() <> mark
+                return null
+            return this.get_next_base_constraint(access)
         }
+        ; ★★★ THE CONDITIONAL ARM'S NOTE NAMED getConstraintFromConditionalType AS
+        ; *a chapter of its own*, and that chapter landed with the distributive
+        ; constraint; §3.5dk. What the arm adds is the LIMITER, and it is the whole
+        ; reason the arm cannot be four lines: a conditional's constraint is
+        ; another conditional's input, so the walk needs a budget of its own that
+        ; is DECREMENTED on every path out — including the one that answers null.
         if (t.flags & TypeFlagsConditional) <> 0
         {
-            ; getConstraintFromConditionalType — the distributive constraint and
-            ; the default constraint, a chapter of its own.
-            this.record_unported("compute-base-constraint-conditional", t.flags)
-            return null
+            if conditional_constraint_depth >= 100
+                return null
+            set conditional_constraint_depth: conditional_constraint_depth + 1
+            let mark this.unported_mark()
+            let constraint this.get_constraint_from_conditional_type(t)
+            set conditional_constraint_depth: conditional_constraint_depth - 1
+            if this.unported_mark() <> mark
+                return null
+            return this.get_next_base_constraint(constraint)
         }
         if (t.flags & TypeFlagsSubstitution) <> 0
             return this.get_next_base_constraint(this.get_substitution_intersection(t))
@@ -26609,6 +26660,174 @@ define Checker
         if decl = null
             return false
         AstNode.mapped_type_name_type_of(decl as ref[AstNode]) = null
+    }
+
+    ; substituteIndexedMappedType — *"Given an indexed access on a mapped type of
+    ; the form { [P in K]: E }[X], return an instantiation of E where P is replaced
+    ; with X. Since this simplification doesn't account for mapped type modifiers,
+    ; add 'undefined' to the resulting type if the mapped type includes a '?'
+    ; modifier or if the modifiers type indicates that some properties are
+    ; optional. If the modifiers type is generic, conservatively estimate
+    ; optionality by recursively looking for mapped types that include '?'
+    ; modifiers."*
+    ;
+    ; ★★ THE OPTIONALITY FORK IS A CONSERVATIVE/EXACT PAIR and the test between
+    ; them is `isGenericType(objectType)`: a GENERIC mapped type is estimated by
+    ; walking its modifiers type, a concrete one is decided exactly by asking
+    ; whether any property the index can name is optional. Taking either half
+    ; alone is a wrong answer rather than a coarse one, in opposite directions.
+    ;
+    ; ★ `core.OrElse(target, objectType)` — the template comes from the mapped
+    ; type's TARGET when it has one (an instantiated mapped type keeps the
+    ; original there) and from the type itself otherwise.
+    function substitute_indexed_mapped_type(this, object_type: ref[Type], index: ref[Type]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let tp this.get_type_parameter_from_mapped_type(object_type)
+        if this.unported_mark() <> mark
+            return null
+        let mapper this.new_simple_type_mapper(tp, index)
+        let template_mapper this.combine_type_mappers(Checker.mapper_of(object_type), mapper)
+        var template_source object_type
+        let tgt Checker.target_of(object_type)
+        if tgt <> null
+            set template_source: tgt as ref[Type]
+        let template this.get_template_type_from_mapped_type(template_source)
+        if this.unported_mark() <> mark
+            return null
+        let instantiated this.instantiate_type(template, template_mapper)
+        if this.unported_mark() <> mark
+            return null
+        if instantiated = null
+            return null
+        var is_optional false
+        if this.get_mapped_type_optionality(object_type) > 0
+            set is_optional: true
+        if is_optional = false
+        {
+            if this.is_generic_type(object_type)
+            {
+                let modifiers this.get_modifiers_type_from_mapped_type(object_type)
+                if this.unported_mark() <> mark
+                    return null
+                if modifiers <> null
+                {
+                    if this.get_combined_mapped_type_optionality(modifiers as ref[Type]) > 0
+                        set is_optional: true
+                }
+            }
+            else
+            {
+                if this.could_access_optional_property(object_type, index)
+                    set is_optional: true
+                if this.unported_mark() <> mark
+                    return null
+            }
+        }
+        this.add_optionality_ex(instantiated as ref[Type], true, is_optional)
+    }
+
+    ; getMappedTypeOptionality — -1, 0 or 1 for stripped, unchanged and added.
+    ; ★It is a FREE function upstream and reads only the modifiers, but this port
+    ; spells it as a method because its recursive twin below needs `this`.
+    function get_mapped_type_optionality(this, t: ref[Type]) returns int
+    {
+        let modifiers Checker.get_mapped_type_modifiers(t)
+        if (modifiers & MappedTypeModifiersExcludeOptional) <> 0
+            return 0 - 1
+        if (modifiers & MappedTypeModifiersIncludeOptional) <> 0
+            return 1
+        0
+    }
+
+    ; getCombinedMappedTypeOptionality — *"When a homomorphic mapped type doesn't
+    ; modify optionality, recursively consult the optionality of the type being
+    ; mapped over to see if it strips or adds optionality. For intersections,
+    ; return -1 or 1 when all constituents strip or add optionality, otherwise
+    ; return 0."*
+    function get_combined_mapped_type_optionality(this, t: ref[Type]) returns int
+    {
+        if (t.object_flags & ObjectFlagsMapped) <> 0
+        {
+            let optionality this.get_mapped_type_optionality(t)
+            if optionality <> 0
+                return optionality
+            let modifiers this.get_modifiers_type_from_mapped_type(t)
+            if modifiers = null
+                return 0
+            return this.get_combined_mapped_type_optionality(modifiers as ref[Type])
+        }
+        if (t.flags & TypeFlagsIntersection) <> 0
+        {
+            let types Checker.union_or_intersection_types_of(t)
+            if types = null
+                return 0
+            let list types as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            if n = 0
+                return 0
+            let head list[0]
+            if head = null
+                return 0
+            let optionality this.get_combined_mapped_type_optionality(head as ref[Type])
+            var i 1
+            while i < n
+            {
+                let row list[i]
+                if row = null
+                    return 0
+                if this.get_combined_mapped_type_optionality(row as ref[Type]) <> optionality
+                    return 0
+                set i: i + 1
+            }
+            return optionality
+        }
+        0
+    }
+
+    ; couldAccessOptionalProperty — the EXACT half of the fork above: is there a
+    ; property of the object type that is optional AND whose literal name the index
+    ; constraint admits.
+    function could_access_optional_property(this, object_type: ref[Type], index_type: ref[Type]) returns bool
+    {
+        let mark this.unported_mark()
+        let index_constraint this.get_base_constraint_of_type(index_type)
+        if this.unported_mark() <> mark
+            return false
+        if index_constraint = null
+            return false
+        let ic index_constraint as ref[Type]
+        let props this.get_properties_of_type(object_type)
+        if this.unported_mark() <> mark
+            return false
+        if props = null
+            return false
+        let list props as ref[Array[ref[Symbol]?]]
+        let n list.get_length() as int
+        var i 0
+        while i < n
+        {
+            let row list[i]
+            if row <> null
+            {
+                let p row as ref[Symbol]
+                if (Symbol.flags_of(p) & SymbolFlagsOptional) <> 0
+                {
+                    let literal this.get_literal_type_from_property(p, TypeFlagsStringOrNumberLiteralOrUnique, false)
+                    if this.unported_mark() <> mark
+                        return false
+                    if literal <> null
+                    {
+                        if this.is_type_assignable_to(literal as ref[Type], ic)
+                            return true
+                        if this.unported_mark() <> mark
+                            return false
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        false
     }
 
     ; getConstraintOfConditionalType, getConstraintFromConditionalType and the two
@@ -101655,13 +101874,16 @@ define Checker
     ; same kind of type."* The four tests below are therefore a CHAIN and not a
     ; switch, and re-ordering any two of them is a different function.
     ;
-    ; ★★★ THE THREE INTERSECTION ARMS HAVE NO INPUT, AND IT IS A FACT ABOUT `Type`
-    ; RATHER THAN ABOUT THE CORPUS: `TypeData` has no Intersection arm, so nothing
-    ; this checker can mint carries TypeFlagsIntersection and `source.Types()` has
-    ; no reading for one. Each is written where the reference forks and reports
-    ; there, so the slice that adds the arm finds the three call sites already in
-    ; place. ★The same sentence covers the COMPARABLE arms twice over: only
-    ; RelationAssignable is ever passed (see the relation table's own note).
+    ; ★★★ THE THREE INTERSECTION ARMS WERE STOPPED UNDER A PRODUCER PREMISE THAT
+    ; HAD EXPIRED — *"`TypeData` has no Intersection arm, so nothing this checker
+    ; can mint carries TypeFlagsIntersection"* — which stopped being true at slice
+    ; 121, and the arms' own tag counts had been the counter-example for a month
+    ; (142 and 87 units at slice 155's stage 2). They are ported here; §3.5gk.
+    ; ★The COMPARABLE hoist keeps an argument of its own and it is about the
+    ; RELATION rather than about the type: only RelationAssignable is ever passed
+    ; today (see the relation table's own note), so the hoist is written for
+    ; fidelity and has no input — which is a claim about a CALLER and expires the
+    ; day one passes the comparable relation, not a claim about what can be minted.
     ;
     ; ★★ `branch_out` is the FORKPIN's second column and it is an out-cell rather
     ; than a return, because the answer is a bool and the arm that produced it is
@@ -101739,37 +101961,122 @@ define Checker
                 return false
             return this.type_related_to_some_type(reg as ref[Type], target, relation, en, intersection_state)
         }
+        ; ★★ The intersection state passed on is `IntersectionStateTarget` and NOT
+        ; the caller's — the reference writes the constant here, because what the
+        ; callee needs to know is that ITS target is a constituent of an
+        ; intersection, which is a fact this arm establishes rather than inherits.
         if (target.flags & TypeFlagsIntersection) <> 0
         {
             set branch_out: 3
-            this.record_unported("type-related-to-each-type", source.flags)
-            return false
+            return this.type_related_to_each_type(source, target, relation, error_node, IntersectionStateTarget)
         }
-        ; "Source is an intersection." The comparable hoist needs
-        ; getBaseConstraintOfType over the constituents and getIntersectionType to
-        ; put them back together; the tail needs `source.Types()` on an
-        ; intersection. Both are the missing arm, and both are written where the
-        ; reference forks.
+        ; "Source is an intersection. For the comparable relation, if the target is
+        ; a primitive type we hoist the constraints of all non-primitive types in
+        ; the source into a new intersection. We do this because the intersection
+        ; may further constrain the constraints of the non-primitive types. For
+        ; example, given a type parameter 'T extends 1 | 2', the intersection
+        ; 'T & 1' should be reduced to '1' such that it doesn't appear to be
+        ; comparable to '2'."
+        ;
+        ; ★★★ `core.SameMap` IS THE WHOLE HOIST: it answers the INPUT LIST back
+        ; when no element moved, and `core.Same` then compares by identity — so
+        ; `different` is not a flag to keep but the identity of the list itself.
+        ; This port has no SameMap, so the fold carries the flag and the `Same`
+        ; test reads it; the two are the same predicate and the flag is the
+        ; cheaper half.
+        var src source
         if relation = RelationComparable
         {
             if (target.flags & TypeFlagsPrimitive) <> 0
             {
-                set branch_out: 4
-                this.record_unported("intersection-constraint-hoist", source.flags)
-                return false
+                let types Checker.union_or_intersection_types_of(source)
+                if types = null
+                {
+                    set branch_out: 4
+                    this.record_unported("intersection-constraint-hoist-no-list", source.flags)
+                    return false
+                }
+                let list types as ref[Array[ref[Type]?]]
+                let n list.get_length() as int
+                var different false
+                let constraints this.new_type_list(null)
+                var i 0
+                while i < n
+                {
+                    let row list[i]
+                    if row = null
+                    {
+                        set branch_out: 4
+                        this.record_unported("intersection-constraint-hoist-null-member", source.flags)
+                        return false
+                    }
+                    let t row as ref[Type]
+                    var mapped t
+                    if (t.flags & TypeFlagsInstantiable) <> 0
+                    {
+                        let mark this.unported_mark()
+                        let constraint this.get_base_constraint_of_type(t)
+                        if this.unported_mark() <> mark
+                            return false
+                        if constraint = null
+                            set mapped: unknown_type
+                        else
+                            set mapped: constraint as ref[Type]
+                    }
+                    if mapped <> t
+                        set different: true
+                    constraints.add(mapped)
+                    set i: i + 1
+                }
+                if different
+                {
+                    let mark this.unported_mark()
+                    let hoisted this.get_intersection_type(constraints)
+                    if this.unported_mark() <> mark
+                        return false
+                    if hoisted = null
+                        return false
+                    let h hoisted as ref[Type]
+                    if (h.flags & TypeFlagsNever) <> 0
+                    {
+                        set branch_out: 4
+                        return false
+                    }
+                    if (h.flags & TypeFlagsIntersection) = 0
+                    {
+                        set branch_out: 4
+                        ; ★ BOTH directions are asked and NEITHER reports: the
+                        ; reference passes `false` for reportErrors twice over,
+                        ; because a message about the hoisted intersection names a
+                        ; type the program never wrote.
+                        if this.is_related_to_ex(h, target, relation, null, IntersectionStateNone, RecursionFlagsSource)
+                            return true
+                        return this.is_related_to_ex(target, h, relation, null, IntersectionStateNone, RecursionFlagsSource)
+                    }
+                    set src: h
+                }
             }
         }
+        ; "Check to see if any constituents of the intersection are immediately
+        ; related to the target. Don't report errors though. Elaborating on whether
+        ; a source constituent is related to the target is not actually useful and
+        ; leads to some confusing error messages. Instead, we rely on the caller
+        ; checking whether the full intersection viewed as an object is related to
+        ; the target."
         set branch_out: 5
-        this.record_unported("some-type-related-to-type-intersection", source.flags)
-        false
+        this.some_type_related_to_type(src, target, relation, null, IntersectionStateSource)
     }
 
-    ; someTypeRelatedToType, whole. ★Its first line is `source.Types()`, which for
-    ; the one shape that reaches it here is the union's list; the intersection
-    ; caller is the stop above, so the null answer cannot be the intersection case.
+    ; someTypeRelatedToType, whole. ★★★Its first line is `source.Types()`, and the
+    ; accessor is the one that answers for BOTH payloads: since slice 156 the
+    ; INTERSECTION tail of unionOrIntersectionRelatedTo calls this, and the
+    ; union-only accessor answers null for one — which is a stop where the
+    ; reference has an answer. The note that stood here (*"the intersection caller
+    ; is the stop above"*) was true only while that stop was there; it is §3.5gk's
+    ; shape read at the moment the producer arrives.
     function some_type_related_to_type(this, source: ref[Type], target: ref[Type], relation: int, error_node: ref[AstNode]?, intersection_state: int) returns bool
     {
-        let st Checker.union_types_of(source)
+        let st Checker.union_or_intersection_types_of(source)
         if st = null
         {
             this.record_unported("some-type-related-to-type-no-list", source.flags)
