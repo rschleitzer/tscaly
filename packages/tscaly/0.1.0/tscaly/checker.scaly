@@ -3027,6 +3027,11 @@ define CheckFlagsIsDiscriminant: int 1 << 22
 ; The two disjuncts that stood dead in the printer are written with them.
 define CheckFlagsOptionalParameter: int 1 << 14
 define CheckFlagsRestParameter: int 1 << 15
+; CheckFlagsIndexSymbol — the bit a SYNTHESIZED property standing in for an index
+; signature carries. Its writer is getApplicableIndexSymbol (slice 162); its
+; readers are the printer and the symbol-declaration accessors, which use it to
+; tell such a property from one a declaration actually names.
+define CheckFlagsIndexSymbol: int 1 << 23
 
 define CheckFlagsLate: int 1 << 12
 ; CheckFlagsStripOptional — *strip optionality in mapped property*, slice 125. It
@@ -3519,6 +3524,13 @@ define IndexInfo
     value_type: ref[Type]?
     is_readonly: bool
     declaration: ref[AstNode]?
+    ; ★★★ getApplicableIndexSymbol's MEMO, and it is a slot on the info rather
+    ; than a table because upstream writes it back through the info pointer it was
+    ; handed (`info.indexSymbol = symbol`). The symbol it holds is SYNTHESIZED — a
+    ; property named `__index` standing in for the signature — so a second ask must
+    ; answer the same one or a caller comparing symbols gets two different answers
+    ; for one index signature.
+    index_symbol: ref[Symbol]?
 )
 
 ; ── the resolved members of a structured type (slice 85) ────────────────────
@@ -4359,6 +4371,33 @@ define ObjectLiteralState
 ; `parentHasSemanticJsxChildren`) capture them; Scaly has no closure over a
 ; caller's locals, so the capture becomes a parameter (§3.5g's shape, one
 ; dimension over).
+; ── the JSX elaboration element (slice 162) ─────────────────────────────────
+;
+; The reference's `JsxElaborationElement`, minus its fourth field: `createDiagnostic
+; func(prop) *ast.Diagnostic` is a CODE here, for the reason elaborate_element's
+; header gives — a diagnostic in this port is a code and a span, so the closure's
+; three interpolation captures have no reader.
+;
+; ★ An EMPTY element is one whose `error_node` is null (a whitespace-only JsxText),
+; and generate_jsx_children never puts one in its list — it counts a member offset
+; instead, which is what keeps the tuple positions contiguous.
+define JsxElaborationElement
+(
+    error_node: ref[AstNode]?
+    inner_expression: ref[AstNode]?
+    name_type: ref[Type]?
+    text_child_code: int
+)
+
+; The four fixed predicates filter_type_by_jsx_children_kind stands for — §3.18's
+; tag, because upstream passes each as a closure and a predicate cannot travel as a
+; value here. The pair a caller uses is chosen by whether a global `Iterable` exists
+; (see elaborate_jsx_components), never mixed.
+define JsxChildFilterAssignable: int 0
+define JsxChildFilterNotAssignable: int 1
+define JsxChildFilterArrayLike: int 2
+define JsxChildFilterNotArrayLike: int 3
+
 define JsxAttributesState
 (
     attributes_table: ref[SymbolTable]
@@ -4370,6 +4409,13 @@ define JsxAttributesState
     explicitly_specify_children_attribute: bool
     contextual_type: ref[Type]?
     object_flags: int
+    ; ★★★ THE ACCUMULATOR OF THE INVALID SPREADS, AND IT IS NOT A SECOND `spread`.
+    ; A spread whose type is not a valid spread type is REPORTED and then folded
+    ; into this slot instead, and the tail intersects it with the ordinary spread
+    ; result — so an `{...notAnObject}` attribute contributes its own type to the
+    ; attributes type rather than being dropped. Nil means *no invalid spread was
+    ; seen*, which is a third state neither `spread` nor the any-flag can carry.
+    type_to_intersect: ref[Type]?
 )
 {
     init()
@@ -4380,6 +4426,7 @@ define JsxAttributesState
         set attribute_parent: null
         set spread: null
         set has_spread_any_type: false
+        set type_to_intersect: null
         set explicitly_specify_children_attribute: false
         set contextual_type: null
         set object_flags: ObjectFlagsNone
@@ -13853,8 +13900,13 @@ define Checker
     ; ★★ THE `ast.IsExpression(name)` FALL-THROUGH IS A STOP AND ITS POPULATION IS
     ; NAMED: GetPropertyNameForPropertyNameNode answers MISSING only for a computed
     ; name whose expression is not a literal — and the arm above already took every
-    ; computed name — so what is left is a JsxNamespacedName, the one arm
+    ; computed name — so what is left was a JsxNamespacedName, the one arm
     ; property_name_text_of deliberately does not carry (its own note says so).
+    ; ★★★Since slice 162 that name is BUILT here instead: jsx_tag_name_text is the
+    ; `namespace:name` concatenation the reference's own `Text()` performs, so the
+    ; arm answers a string literal type and the remaining population of the stop is
+    ; EMPTY — which is why it is kept rather than deleted: an arm set this function
+    ; cannot enumerate is exactly what a stop is for.
     function get_literal_type_from_property_name(this, name: ref[AstNode]) returns ref[Type]?
     {
         let mark this.unported_mark()
@@ -13887,6 +13939,12 @@ define Checker
         let d AstNode.property_name_text_of(name)
         if d.data <> null
             return this.get_string_literal_type(d)
+        if k = KindJsxNamespacedName
+        {
+            var nd Slice[char]()
+            if Checker.jsx_tag_name_text(this.host, name, &nd)
+                return this.get_string_literal_type(nd)
+        }
         this.record_unported("literal-type-from-property-name", k)
         null
     }
@@ -14245,6 +14303,82 @@ define Checker
     function get_applicable_index_info(this, t: ref[Type], key_type: ref[Type]) returns ref[IndexInfo]?
         this.find_applicable_index_info(this.get_index_infos_of_type(t), key_type)
 
+    ; getApplicableIndexSymbol — the SYNTHESIZED property that stands in for an
+    ; index signature, so a caller which wants a Symbol (getIntrinsicTagSymbol's
+    ; string-indexer arm) has one to hand back.
+    ;
+    ; ★★★ THE DECLARATION LIST IS THE WHOLE CONDITION: an info with no declaration
+    ; behind it mints nothing, and the answer stays nil. Where the applicable info
+    ; carries one, that is the list; where it does not, EVERY info of the type whose
+    ; key the lookup applies to contributes its own — which is how an intersection's
+    ; several signatures end up on one symbol.
+    ;
+    ; ★★ THE `anyBaseTypeIndexInfo` EXCLUSION IS NOT AN OPTIMISATION. That info is
+    ; the SHARED one the base-constructor fork installs, so writing a memo onto it
+    ; would attach one type's synthesized symbol to every type that borrows it.
+    function get_applicable_index_symbol(this, t: ref[Type], key_type: ref[Type]) returns ref[Symbol]?
+    {
+        let mark this.unported_mark()
+        let info this.get_applicable_index_info(t, key_type)
+        if this.unported_mark() <> mark
+            return null
+        if info = null
+            return null
+        let inf info as ref[IndexInfo]
+        if any_base_type_index_info <> null
+        {
+            if inf = any_base_type_index_info as ref[IndexInfo]
+                return null
+        }
+        if inf.index_symbol <> null
+            return inf.index_symbol
+        let declarations &Array[ref[AstNode]?]^host()
+        if inf.declaration <> null
+            declarations.add(inf.declaration)
+        else
+        {
+            let infos this.get_index_infos_of_type(t)
+            if this.unported_mark() <> mark
+                return null
+            if infos <> null
+            {
+                let list infos as ref[Array[ref[IndexInfo]?]]
+                let n list.get_length() as int
+                var i 0
+                while i < n
+                {
+                    let row list[i]
+                    if row <> null
+                    {
+                        let r row as ref[IndexInfo]
+                        if r.declaration <> null
+                        {
+                            if r.key_type <> null
+                            {
+                                if this.is_applicable_index_type(key_type, r.key_type as ref[Type])
+                                    declarations.add(r.declaration)
+                                if this.unported_mark() <> mark
+                                    return null
+                            }
+                        }
+                    }
+                    set i: i + 1
+                }
+            }
+        }
+        if declarations.get_length() = 0
+            return inf.index_symbol
+        var nd Slice[char]()
+        set nd: Binder.internal_name(host, "index")
+        let symbol this.new_symbol_ex(SymbolFlagsProperty, nd, CheckFlagsIndexSymbol)
+        Symbol.set_declarations(symbol, declarations)
+        Symbol.set_value_declaration(symbol, declarations[0])
+        Symbol.set_parent(symbol, t.symbol)
+        set this.value_symbol_link_of(symbol).resolved_type: inf.value_type
+        set inf.index_symbol: symbol
+        symbol
+    }
+
     ; isStringIndexSignatureOnlyType — the shortcut getIndexedAccessTypeOrUndefined
     ; takes before it looks at anything else.
     function is_string_index_signature_only_type(this, t: ref[Type]) returns bool
@@ -14266,9 +14400,14 @@ define Checker
                 return false
             return this.get_index_info_of_type(t, string_type) <> null
         }
-        if (t.flags & TypeFlagsUnion) <> 0
+        ; ★★★ ONE ARM FOR BOTH, WHICH IS WHAT THE REFERENCE WRITES — the disjunct is
+        ; `t.flags&TypeFlagsUnionOrIntersection != 0 && core.Every(t.Types(), …)`,
+        ; so the intersection is not a second case with a rule of its own. The stop
+        ; that stood under it (36 units at stage 2, the frontier's head by ROW) was
+        ; a union-only arm plus a report, and closing it is a flag and an accessor.
+        if (t.flags & TypeFlagsUnionOrIntersection) <> 0
         {
-            let types Checker.union_types_of(t)
+            let types Checker.union_or_intersection_types_of(t)
             if types = null
                 return false
             let list types as ref[Array[ref[Type]?]]
@@ -14284,11 +14423,6 @@ define Checker
                 set i: i + 1
             }
             return true
-        }
-        if (t.flags & TypeFlagsIntersection) <> 0
-        {
-            this.record_unported("string-index-signature-only-intersection", 0)
-            return false
         }
         false
     }
@@ -68565,11 +68699,11 @@ define Checker
             return Checker.literal_property_name(name, out_name)
         if k = KindBigIntLiteral
             return Checker.literal_property_name(name, out_name)
+        ; ★The reference lists KindJsxNamespacedName in the SAME case arm as the
+        ; four literals and answers `name.Text()` for all five — the constructed
+        ; `namespace:name`, which jsx_tag_name_text builds since slice 162.
         if k = KindJsxNamespacedName
-        {
-            this.record_unported("property-name-jsx-namespaced", k)
-            return false
-        }
+            return Checker.jsx_tag_name_text(this.host, name, out_name)
         if k = KindComputedPropertyName
         {
             ; ★★★ THIS FUNCTION IS TWO OF THE REFERENCE'S, AND THE STOP THAT STOOD
@@ -88784,7 +88918,7 @@ define Checker
     ; record's header for the two writers that would fill it.
     function new_index_info(this, key_type: ref[Type]?, value_type: ref[Type]?, is_readonly: bool, declaration: ref[AstNode]?) returns ref[IndexInfo]
     {
-        let p &IndexInfo^host(key_type, value_type, is_readonly, declaration)
+        let p &IndexInfo^host(key_type, value_type, is_readonly, declaration, null)
         p
     }
 
@@ -91595,11 +91729,46 @@ define Checker
             }
             if (t.object_flags & ObjectFlagsReverseMapped) <> 0
             {
-                ; instantiateReverseMappedType, whose one step is
-                ; inferTypeForHomomorphicMappedType — the reverse-mapping half of
-                ; the inference, which has no producer here either.
-                this.record_unported("instantiate-reverse-mapped-type", t.object_flags)
-                return null
+                ; instantiateReverseMappedType. ★The note that stood here called its
+                ; one step *inferTypeForHomomorphicMappedType — the reverse-mapping
+                ; half of the inference, which has no producer here either*; slice
+                ; 160 ported that function and the three slots this reads, and
+                ; `tools/expiredstops.py` named it by the callee.
+                ;
+                ; ★★ THE TWO EARLY RETURNS ARE THE IDENTITY AND NOT A FAILURE: an
+                ; instantiated mapped type that is no longer Mapped, or an index
+                ; type that is no longer an Index, means the mapper has taken the
+                ; shape apart and the reverse-mapped type stands as it is. So does
+                ; a null from the inference — upstream's own trailing comment says
+                ; *nested invocation … or the `source` instantiated into something
+                ; unmappable* — which is why none of the three reports.
+                let inner_mapped this.instantiate_type(Checker.reverse_mapped_type_of(t), m)
+                if this.unported_mark() <> mark
+                    return null
+                if inner_mapped = null
+                    return t
+                let im inner_mapped as ref[Type]
+                if (im.object_flags & ObjectFlagsMapped) = 0
+                    return t
+                let inner_index this.instantiate_type(Checker.reverse_constraint_type_of(t), m)
+                if this.unported_mark() <> mark
+                    return null
+                if inner_index = null
+                    return t
+                let ii inner_index as ref[Type]
+                if (ii.flags & TypeFlagsIndex) = 0
+                    return t
+                let inner_source this.instantiate_type(Checker.reverse_source_of(t), m)
+                if this.unported_mark() <> mark
+                    return null
+                if inner_source = null
+                    return t
+                let instantiated this.infer_type_for_homomorphic_mapped_type(inner_source as ref[Type], im, ii)
+                if this.unported_mark() <> mark
+                    return null
+                if instantiated <> null
+                    return instantiated
+                return t
             }
             return this.get_object_type_instantiation(t, m, alias)
         }
@@ -112056,7 +112225,7 @@ define Checker
             if pk = KindShorthandPropertyAssignment
                 set handled: true
             if handled
-                set elaborated: this.elaborate_element(source, target, relation, prop_name as ref[AstNode], null, nt, 0)
+                set elaborated: this.elaborate_element(source, target, relation, prop_name as ref[AstNode], null, nt, 0, 0)
             if pk = KindPropertyAssignment
             {
                 ; The computed-name message, which replaces the relation's own
@@ -112064,7 +112233,7 @@ define Checker
                 var message 0
                 if Checker.is_computed_non_literal_name(prop_name as ref[AstNode])
                     set message: DiagType_of_computed_property_s_value_is_0_which_is_not_assignable_to_type_1
-                set elaborated: this.elaborate_element(source, target, relation, prop_name as ref[AstNode], AstNode.initializer_of(prop), nt, message)
+                set elaborated: this.elaborate_element(source, target, relation, prop_name as ref[AstNode], AstNode.initializer_of(prop), nt, message, 0)
                 set handled: true
             }
             if elaborated
@@ -112133,7 +112302,7 @@ define Checker
             }
             let name_type this.get_number_literal_type(Checker.number_bits_from_int(index))
             let check_node this.get_effective_check_node(element)
-            if this.elaborate_element(src, target, relation, check_node, check_node, name_type, 0)
+            if this.elaborate_element(src, target, relation, check_node, check_node, name_type, 0, 0)
                 set reported: true
             if this.unported_mark() <> mark
                 return reported
@@ -112194,7 +112363,16 @@ define Checker
     ; ★ The `diagnosticFactory` parameter has one caller upstream (the JSX text
     ; child's dynamic message) and that chapter is elsewhere; it is not a
     ; parameter here for §3.5be's reason.
-    function elaborate_element(this, source: ref[Type], target: ref[Type], relation: int, prop: ref[AstNode], next: ref[AstNode]?, name_type: ref[Type], error_code: int) returns bool
+    ; ★★★ `text_child_code` IS THE REFERENCE'S `createDiagnostic` FUNC VALUE, AND IT
+    ; COLLAPSES TO A CODE BECAUSE OF WHAT A DIAGNOSTIC IS HERE. Upstream the field
+    ; is `func(prop *ast.Node) *ast.Diagnostic`, and its ONE producer builds
+    ; `NewDiagnosticForNode(prop, <message>, tagName, childrenPropName,
+    ; typeToString(childrenTargetType))` — a closure over three INTERPOLATION
+    ; arguments and nothing else. This port's diagnostics carry a code and a span
+    ; (the yardstick's own `C pos end code`), so the three captures have no reader
+    ; and the func value is a code plus the `prop` the caller already passes:
+    ; §3.18's tag with the tag left implicit, 0 meaning *no custom diagnostic*.
+    function elaborate_element(this, source: ref[Type], target: ref[Type], relation: int, prop: ref[AstNode], next: ref[AstNode]?, name_type: ref[Type], error_code: int, text_child_code: int) returns bool
     {
         let mark this.unported_mark()
         let target_prop_type this.get_best_match_indexed_access_type_or_undefined(source, target, name_type)
@@ -112232,6 +112410,14 @@ define Checker
             if checked = null
                 return false
             set specific_source: checked as ref[Type]
+        }
+        ; "Use the custom diagnostic factory if provided (e.g., for JSX text
+        ; children with dynamic error messages)" — and it comes FIRST, ahead of the
+        ; exactOptional fork and of the general report below.
+        if text_child_code <> 0
+        {
+            this.error_on_node(prop, text_child_code)
+            return true
         }
         ; The exactOptionalPropertyTypes fork — its own message, and the option is
         ; unset in this harness, so the arm is written and constant-false.
@@ -112505,12 +112691,595 @@ define Checker
         if k = KindArrowFunction
             return this.elaborate_arrow_function(n, source, target, relation)
         if k = KindJsxAttributes
+            return this.elaborate_jsx_components(n, source, target, relation)
+        false
+    }
+
+    ; ── elaborateJsxComponents and the CHILDREN elaboration (slice 162) ──────
+    ;
+    ; jsx.go's own elaborator, and it is the only arm of `elaborateError` whose
+    ; input is not an expression: a JsxAttributes node's PROPERTIES elaborate like
+    ; an object literal's, and then the containing element's CHILDREN elaborate
+    ; against whatever the children property's type turned out to be.
+    ;
+    ; ★★★ THE TWO HALVES ANSWER DIFFERENT QUESTIONS AND ONLY THE SECOND IS JSX-
+    ; SPECIFIC. The attribute half is `elaborate_element` per property, skipping a
+    ; spread and a hyphenated name (neither can be a property of the target); the
+    ; children half asks whether the target's children slot wants ONE child or a
+    ; sequence, and reports an ARITY message where the source cannot be related at
+    ; all. That second question is why the row was 38 units: nothing else in the
+    ; checker produces TS2745 or TS2746.
+    function elaborate_jsx_components(this, node: ref[AstNode], source: ref[Type], target: ref[Type], relation: int) returns bool
+    {
+        let mark this.unported_mark()
+        var reported false
+        let props AstNode.properties_of(node)
+        if props <> null
         {
-            ; No input: a JsxAttributes node is a child of a JSX opening element
-            ; and reaches the elaborator only through jsx.go's own call, which
-            ; this slice does not wire. Written for the slice that does.
-            this.record_unported("elaborate-jsx-components", k)
+            let list props as ref[Array[ref[AstNode]?]]
+            let n list.get_length() as int
+            var i 0
+            while i < n
+            {
+                let prop list[i]
+                set i: i + 1
+                if prop = null
+                    continue
+                let pn prop as ref[AstNode]
+                if AstNode.kind_of(pn) = KindJsxSpreadAttribute
+                    continue
+                let name AstNode.name_of(pn)
+                if name = null
+                    continue
+                var nd Slice[char]()
+                if Checker.jsx_tag_name_text(this.host, name as ref[AstNode], &nd) = false
+                    continue
+                if Checker.is_hyphenated_jsx_name(nd)
+                    continue
+                let name_type this.get_string_literal_type(nd)
+                if (name_type.flags & TypeFlagsNever) <> 0
+                    continue
+                if this.elaborate_element(source, target, relation, name as ref[AstNode], AstNode.initializer_of(pn), name_type, 0, 0)
+                    set reported: true
+                if this.unported_mark() <> mark
+                    return reported
+            }
+        }
+        ; The children half runs only for an OPENING element inside a JsxElement —
+        ; a self-closing element has no children and a fragment is not this shape.
+        let parent AstNode.parent_node_of(node)
+        if Checker.kind_or_unknown(parent) <> KindJsxOpeningElement
+            return reported
+        let containing AstNode.parent_node_of(parent as ref[AstNode])
+        if Checker.kind_or_unknown(containing) <> KindJsxElement
+            return reported
+        let element containing as ref[AstNode]
+        let ns this.get_jsx_namespace_at(node)
+        if this.unported_mark() <> mark
+            return reported
+        var children_prop Slice[char]()
+        var stopped false
+        let has_children_name this.get_jsx_element_children_property_name(ns, &children_prop, &stopped)
+        if stopped
+            return reported
+        ; "if childrenPropName == InternalSymbolNameMissing { childrenPropName =
+        ; \"children\" }" — the DEFAULT, and the empty-string state keeps its own
+        ; meaning: only MISSING falls back.
+        if has_children_name = false
+            set children_prop: "children"
+        let children_name_type this.get_string_literal_type(children_prop)
+        let children_target_type this.get_indexed_access_type(target, children_name_type)
+        if this.unported_mark() <> mark
+            return reported
+        if children_target_type = null
+            return reported
+        let ctt children_target_type as ref[Type]
+        let kids AstNode.jsx_children_of(element)
+        let valid_count AstNode.semantic_jsx_child_count(kids)
+        if valid_count = 0
+            return reported
+        ; ★★★ THE PREDICATE PAIR IS CHOSEN BY WHETHER `Iterable` EXISTS AT ALL, and
+        ; the two choices are not interchangeable: with a global Iterable the split
+        ; is *assignable to Iterable<any>* / *not*, without one it is *array or
+        ; tuple like* / *not*. `filter_type_by_jsx_children_kind` is §3.18's tag
+        ; over the four, because a predicate cannot travel as a value here.
+        let iterable_type this.get_global_iterable_type()
+        if this.unported_mark() <> mark
+            return reported
+        var array_like: ref[Type]? null
+        var non_array_like: ref[Type]? null
+        var have_iterable false
+        if iterable_type <> null
+        {
+            if empty_generic_type = null
+                set have_iterable: true
+            else
+            {
+                if (iterable_type as ref[Type]) <> empty_generic_type as ref[Type]
+                    set have_iterable: true
+            }
+        }
+        if have_iterable
+        {
+            let any_iterable this.create_iterable_type(any_type)
+            if this.unported_mark() <> mark
+                return reported
+            if any_iterable = null
+                return reported
+            set array_like: this.filter_type_by_jsx_children_kind(ctt, JsxChildFilterAssignable, any_iterable)
+            if this.unported_mark() <> mark
+                return reported
+            set non_array_like: this.filter_type_by_jsx_children_kind(ctt, JsxChildFilterNotAssignable, any_iterable)
+            if this.unported_mark() <> mark
+                return reported
+        }
+        else
+        {
+            set array_like: this.filter_type_by_jsx_children_kind(ctt, JsxChildFilterArrayLike, null)
+            if this.unported_mark() <> mark
+                return reported
+            set non_array_like: this.filter_type_by_jsx_children_kind(ctt, JsxChildFilterNotArrayLike, null)
+            if this.unported_mark() <> mark
+                return reported
+        }
+        if array_like = null
+            return reported
+        if non_array_like = null
+            return reported
+        let alp array_like as ref[Type]
+        let nalp non_array_like as ref[Type]
+        ; getInvalidTextualChildDiagnostic is a memoised CLOSURE upstream; here its
+        ; whole product is a code (see elaborate_element's own note), so the memo
+        ; has nothing to hold and the code is passed straight down.
+        let opening AstNode.jsx_element_opening_of(element)
+        let tag_for_error AstNode.jsx_tag_name_of(opening)
+        if valid_count > 1
+        {
+            if alp <> never_type
+            {
+                let child_types this.check_jsx_children(element, CheckModeNormal)
+                if this.unported_mark() <> mark
+                    return reported
+                let real_source this.create_tuple_type(child_types)
+                if this.unported_mark() <> mark
+                    return reported
+                if real_source = null
+                    return reported
+                let elements this.generate_jsx_children(element)
+                if this.elaborate_iterable_or_array_like_target_elementwise(elements, real_source as ref[Type], alp, relation)
+                    set reported: true
+                if this.unported_mark() <> mark
+                    return reported
+                return reported
+            }
+            ; "arity mismatch"
+            let src_children this.get_indexed_access_type(source, children_name_type)
+            if this.unported_mark() <> mark
+                return reported
+            if src_children = null
+                return reported
+            ; ★★★ THIS GUARD IS WHERE THE THIRTEEN REVEALED FAILURES ENTER, AND THE
+            ; DIVERGENCE IS NOT IN THIS FUNCTION — probed 2026-09-09 on
+            ; `compiler/jsxChildrenIndividualErrorElaborations`. With no `children`
+            ; attribute on the element, `source` has no such property, so this
+            ; indexed access answers `error_type` (TypeFlagsAny) and
+            ; `is_type_related_to` answers TRUE under RelationAssignable — the
+            ; source-Any arm of `is_simple_type_related_to`, which is the
+            ; reference's own line. The report is therefore skipped and the caller's
+            ; general TS2741 comes out, where the reference emits TS2746 TWICE.
+            ; ★A probe confirmed the branch SELECTION is right (valid_count and the
+            ; never-ness of both filtered parts are what the reference's conditions
+            ; compute); what is not established is why the reference's guard answers
+            ; the other way with an Any source. **The double emission is the lead**:
+            ; §3.5gh(5)'s shape, one visit at check time and one at walk time, which
+            ; would mean the reference reaches this line twice and at least once
+            ; under a relation whose source-Any arm does not fire.
+            if this.is_type_related_to(src_children as ref[Type], ctt, relation) = false
+            {
+                this.error_on_node_or_null(tag_for_error, DiagThis_JSX_tag_s_0_prop_expects_a_single_child_of_type_1_but_multiple_children_were_provided)
+                set reported: true
+            }
+            if this.unported_mark() <> mark
+                return reported
+            return reported
+        }
+        if nalp <> never_type
+        {
+            let child AstNode.semantic_jsx_child_at(kids, 0)
+            if child = null
+                return reported
+            var error_node: ref[AstNode]? null
+            var inner: ref[AstNode]? null
+            var text_code 0
+            Checker.elaboration_element_for_jsx_child(child as ref[AstNode], &error_node, &inner, &text_code)
+            if error_node <> null
+            {
+                if this.elaborate_element(source, target, relation, error_node as ref[AstNode], inner, children_name_type, 0, text_code)
+                    set reported: true
+                if this.unported_mark() <> mark
+                    return reported
+            }
+            return reported
+        }
+        ; "arity mismatch", the other direction
+        let src_children this.get_indexed_access_type(source, children_name_type)
+        if this.unported_mark() <> mark
+            return reported
+        if src_children = null
+            return reported
+        if this.is_type_related_to(src_children as ref[Type], ctt, relation) = false
+        {
+            this.error_on_node_or_null(tag_for_error, DiagThis_JSX_tag_s_0_prop_expects_type_1_which_requires_multiple_children_but_only_a_single_child_was_provided)
+            set reported: true
+        }
+        reported
+    }
+
+    ; filterType at the four predicates elaborateJsxComponents needs — §3.18's tag
+    ; beside the twenty other fixed-predicate filters of this file. ★The `origin`
+    ; branch is not written, for filter_type_outside_flags' reason (read its note
+    ; before "fixing" any of them).
+    function filter_type_by_jsx_children_kind(this, t: ref[Type], kind: int, any_iterable: ref[Type]?) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        if (t.flags & TypeFlagsUnion) = 0
+        {
+            ; ★The `Never` disjunct comes FIRST, as it does upstream
+            ; (`t.flags&TypeFlagsNever != 0 || f(t)`): `never` is its own answer
+            ; without asking the predicate.
+            if (t.flags & TypeFlagsNever) <> 0
+                return t
+            let keep this.jsx_children_filter_admits(t, kind, any_iterable)
+            if this.unported_mark() <> mark
+                return null
+            if keep
+                return t
+            return never_type
+        }
+        let types Checker.union_types_of(t)
+        if types = null
+            return t
+        let list types as ref[Array[ref[Type]?]]
+        let n list.get_length() as int
+        let out this.new_type_list(null)
+        var changed false
+        var i 0
+        while i < n
+        {
+            let u list[i]
+            if u <> null
+            {
+                let keep this.jsx_children_filter_admits(u as ref[Type], kind, any_iterable)
+                if this.unported_mark() <> mark
+                    return null
+                if keep
+                    out.add(u)
+                else
+                    set changed: true
+            }
+            set i: i + 1
+        }
+        if changed = false
+            return t
+        ; ★★getUnionTypeFromSortedList and NOT get_union_type_ex — the surviving
+        ; constituents are a SUBSET of a sorted list and are therefore still
+        ; sorted, so there is nothing to reduce, and this spelling is the one that
+        ; forwards the two object-flag hints upstream forwards here (the comment
+        ; there notes `ContainsIntersections` may be forwarded "incorrectly" and
+        ; that this is harmless, being only a hint).
+        this.get_union_type_from_sorted_list(out, t.object_flags & (ObjectFlagsPrimitiveUnion | ObjectFlagsContainsIntersections), null, null)
+    }
+
+    function jsx_children_filter_admits(this, t: ref[Type], kind: int, any_iterable: ref[Type]?) returns bool
+    {
+        if kind = JsxChildFilterAssignable
+        {
+            if any_iterable = null
+                return false
+            return this.is_type_assignable_to(t, any_iterable as ref[Type])
+        }
+        if kind = JsxChildFilterNotAssignable
+        {
+            if any_iterable = null
+                return true
+            return this.is_type_assignable_to(t, any_iterable as ref[Type]) = false
+        }
+        if kind = JsxChildFilterArrayLike
+            return this.is_array_or_tuple_like(t)
+        this.is_array_or_tuple_like(t) = false
+    }
+
+    ; generateJsxChildren — upstream an `iter.Seq` yielded lazily; here the LIST,
+    ; which is exact rather than a convenience: its one consumer walks it to the end
+    ; with no break, so the generator's early-exit path (`if !yield(e) { return }`)
+    ; is unreachable and the two spellings observe the same elements in the same
+    ; order.
+    ;
+    ; ★★★ `memberOffset` IS THE WHOLE REASON THE INDEX IS NOT THE LOOP VARIABLE. A
+    ; whitespace-only JsxText yields NOTHING and does not consume a position, so the
+    ; children `["a", <ws>, "b"]` elaborate against tuple slots 0 and 1 rather than
+    ; 0 and 2 — and the name type is built from the ADJUSTED index.
+    function generate_jsx_children(this, node: ref[AstNode]) returns ref[Array[ref[JsxElaborationElement]?]]
+    {
+        let out &Array[ref[JsxElaborationElement]?]^host()
+        let kids AstNode.jsx_children_of(node)
+        let n AstNode.list_count(kids)
+        var member_offset 0
+        var i 0
+        while i < n
+        {
+            let child AstNode.child_in_list(kids, i)
+            if child <> null
+            {
+                let name_type this.get_number_literal_type(Checker.number_bits_from_int(i - member_offset))
+                var error_node: ref[AstNode]? null
+                var inner: ref[AstNode]? null
+                var text_code 0
+                Checker.elaboration_element_for_jsx_child(child as ref[AstNode], &error_node, &inner, &text_code)
+                if error_node <> null
+                    out.add(&JsxElaborationElement^host(error_node, inner, name_type, text_code))
+                else
+                    set member_offset: member_offset + 1
+            }
+            set i: i + 1
+        }
+        out
+    }
+
+    ; getElaborationElementForJsxChild. ★It is the out-parameter shape rather than a
+    ; returned record because two of its three callers want only the error node and
+    ; the inner expression, and the third is the list builder above; a whitespace-
+    ; only JsxText answers the EMPTY element, which is a null error node.
+    procedure elaboration_element_for_jsx_child(child: ref[AstNode], out_error_node: ref[ref[AstNode]?], out_inner: ref[ref[AstNode]?], out_text_code: ref[int])
+    {
+        set out_error_node: null
+        set out_inner: null
+        set out_text_code: 0
+        let k AstNode.kind_of(child)
+        if k = KindJsxExpression
+        {
+            ; "child is of the type of the expression"
+            set out_error_node: child
+            set out_inner: AstNode.expression_of(child)
+            return
+        }
+        if k = KindJsxText
+        {
+            ; "Whitespace only jsx text isn't real jsx text"
+            if AstNode.jsx_text_is_whitespace_only(child)
+                return
+            ; "child is a string" — and the custom diagnostic is what makes this arm
+            ; different from the other two.
+            set out_error_node: child
+            set out_text_code: DiagX_0_components_don_t_accept_text_as_child_elements_Text_in_JSX_has_the_type_string_but_the_expected_type_of_1_is_2
+            return
+        }
+        if k = KindJsxElement
+        {
+            set out_error_node: child
+            set out_inner: child
+            return
+        }
+        if k = KindJsxSelfClosingElement
+        {
+            set out_error_node: child
+            set out_inner: child
+            return
+        }
+        if k = KindJsxFragment
+        {
+            set out_error_node: child
+            set out_inner: child
+            return
+        }
+    }
+
+    ; elaborateIterableOrArrayLikeTargetElementwise — the MULTI-child branch's
+    ; worker, and it re-splits the target the way its caller split the children
+    ; type, because the target it is handed may still be a union.
+    ;
+    ; ★★★ THE TARGET PROPERTY TYPE IS A UNION OF TWO SOURCES AND EITHER MAY BE
+    ; ABSENT: the ITERATION type of the non-array-like parts (one value for every
+    ; element) and the INDEXED type of the array-like parts (one per position). With
+    ; both present the element is compared against their union; with neither the
+    ; element is SKIPPED, which is the `continue` and not a report.
+    function elaborate_iterable_or_array_like_target_elementwise(this, elements: ref[Array[ref[JsxElaborationElement]?]], source: ref[Type], target: ref[Type], relation: int) returns bool
+    {
+        let mark this.unported_mark()
+        let tuple_parts this.filter_type_by_jsx_children_kind(target, JsxChildFilterArrayLike, null)
+        if this.unported_mark() <> mark
             return false
+        let non_tuple_parts this.filter_type_by_jsx_children_kind(target, JsxChildFilterNotArrayLike, null)
+        if this.unported_mark() <> mark
+            return false
+        if tuple_parts = null
+            return false
+        if non_tuple_parts = null
+            return false
+        let tp tuple_parts as ref[Type]
+        let ntp non_tuple_parts as ref[Type]
+        ; "If `nonTupleOrArrayLikeTargetParts` is not `never`, then that should mean
+        ; `Iterable` is defined."
+        var iteration_type: ref[Type]? null
+        if ntp <> never_type
+        {
+            set iteration_type: this.get_iteration_type_of_iterable(IterationUseForOf, IterationTypeKindYield, ntp, null)
+            if this.unported_mark() <> mark
+                return false
+        }
+        var reported false
+        let n elements.get_length() as int
+        var i 0
+        while i < n
+        {
+            let e elements[i]
+            set i: i + 1
+            if e = null
+                continue
+            let el e as ref[JsxElaborationElement]
+            if el.error_node = null
+                continue
+            if el.name_type = null
+                continue
+            let prop el.error_node as ref[AstNode]
+            let name_type el.name_type as ref[Type]
+            var target_prop_type iteration_type
+            if tp <> never_type
+            {
+                let indexed this.get_best_match_indexed_access_type_or_undefined(source, tp, name_type)
+                if this.unported_mark() <> mark
+                    return reported
+                if indexed <> null
+                {
+                    let ix indexed as ref[Type]
+                    if (ix.flags & TypeFlagsIndexedAccess) = 0
+                    {
+                        if iteration_type = null
+                            set target_prop_type: ix
+                        else
+                        {
+                            let pair this.new_type_list(null)
+                            pair.add(iteration_type)
+                            pair.add(ix)
+                            set target_prop_type: this.get_union_type_ex(pair, UnionReductionLiteral, null, null)
+                            if this.unported_mark() <> mark
+                                return reported
+                        }
+                    }
+                }
+            }
+            if target_prop_type = null
+                continue
+            let source_prop_type this.get_indexed_access_type_or_undefined(source, name_type, AccessFlagsNone, null, null)
+            if this.unported_mark() <> mark
+                return reported
+            if source_prop_type = null
+                continue
+            ; ★★★ THE ELEMENT IS ELABORATED THROUGH `elaborate_element` RATHER THAN
+            ; RE-DERIVED HERE, which is a DIVERGENCE IN SPELLING AND NOT IN
+            ; BEHAVIOUR — and it is said because a reader comparing the two files
+            ; will see forty lines upstream against one here. Upstream inlines the
+            ; whole of elaborateElement's tail (the relation test, the recursive
+            ; elaborateError, the specificSource re-check, the createDiagnostic fork,
+            ; the exactOptional fork and the two removeMissingType calls) with ONE
+            ; difference: its target property type is the union computed above, not
+            ; `getBestMatchIndexedAccessTypeOrUndefined`'s answer. So the faithful
+            ; call is elaborate_element with that type ALREADY chosen — which is
+            ; what the source/target pair below is.
+            let tpt target_prop_type as ref[Type]
+            let spt source_prop_type as ref[Type]
+            if this.check_type_related_to(spt, tpt, relation, null) = false
+            {
+                ; ★`reportedError = true` is upstream's UNCONDITIONAL line here —
+                ; set before the `if !elaborated` fork — so the helper's answer is
+                ; not read: a failed relation is a reported element whether the
+                ; recursion narrowed the span or the tail issued the message.
+                let ignored this.elaborate_iterable_element_report(source, tp, relation, prop, el.inner_expression, name_type, spt, tpt, el.text_child_code)
+                set reported: true
+            }
+            if this.unported_mark() <> mark
+                return reported
+        }
+        reported
+    }
+
+    ; The tail elaborateIterableOrArrayLikeTargetElementwise runs once the relation
+    ; has already failed — elaborateElement's own tail with the target type fixed by
+    ; the caller. ★`reportedError` is set by the CALLER unconditionally at this
+    ; point (upstream: `reportedError = true` before the `if !elaborated`), so this
+    ; function's answer says only whether the recursion reported, not whether
+    ; anything did.
+    function elaborate_iterable_element_report(this, source: ref[Type], tuple_parts: ref[Type], relation: int, prop: ref[AstNode], next: ref[AstNode]?, name_type: ref[Type], source_prop_type: ref[Type], target_prop_type: ref[Type], text_child_code: int) returns bool
+    {
+        let mark this.unported_mark()
+        var spt source_prop_type
+        var tpt target_prop_type
+        if next <> null
+        {
+            if this.elaborate_error(next as ref[AstNode], spt, tpt, relation, 0)
+                return true
+            if this.unported_mark() <> mark
+                return false
+        }
+        ; "Issue error on the prop itself, since the prop couldn't elaborate the
+        ; error. Use the expression type, if available."
+        var specific_source spt
+        if next <> null
+        {
+            let checked this.check_expression_for_mutable_location_with_contextual_type(next as ref[AstNode], spt)
+            if this.unported_mark() <> mark
+                return false
+            if checked = null
+                return false
+            set specific_source: checked as ref[Type]
+        }
+        if text_child_code <> 0
+        {
+            this.error_on_node(prop, text_child_code)
+            return false
+        }
+        if Checker.exact_optional_property_types()
+        {
+            if this.is_exact_optional_property_mismatch(specific_source, tpt)
+            {
+                this.error_on_node(prop, DiagType_0_is_not_assignable_to_type_1_with_exactOptionalPropertyTypes_Colon_true_Consider_adding_undefined_to_the_type_of_the_target)
+                return false
+            }
+            if this.unported_mark() <> mark
+                return false
+        }
+        ; ★The two optionality reads are asked on the TUPLE parts and on the source,
+        ; not on the whole target — the caller's split is what upstream passes here.
+        var name_buf u8[64]
+        let name_data this.get_property_name_from_index(name_type, null, Slice[char](64 as size_t, &name_buf[0] as pointer[char]))
+        if this.unported_mark() <> mark
+            return false
+        var target_is_optional false
+        var source_is_optional false
+        if name_data.data <> null
+        {
+            let tprop this.get_property_of_type(tuple_parts, name_data)
+            if this.unported_mark() <> mark
+                return false
+            if tprop <> null
+            {
+                if (Symbol.flags_of(tprop as ref[Symbol]) & SymbolFlagsOptional) <> 0
+                    set target_is_optional: true
+            }
+            let sprop this.get_property_of_type(source, name_data)
+            if this.unported_mark() <> mark
+                return false
+            if sprop <> null
+            {
+                if (Symbol.flags_of(sprop as ref[Symbol]) & SymbolFlagsOptional) <> 0
+                    set source_is_optional: true
+            }
+        }
+        let tpt2 this.remove_missing_type(tpt, target_is_optional)
+        if tpt2 = null
+            return false
+        set tpt: tpt2 as ref[Type]
+        var both_optional false
+        if target_is_optional
+        {
+            if source_is_optional
+                set both_optional: true
+        }
+        let spt2 this.remove_missing_type(spt, both_optional)
+        if spt2 = null
+            return false
+        set spt: spt2 as ref[Type]
+        let result this.check_type_related_to_ex(specific_source, tpt, relation, prop, 0)
+        if this.unported_mark() <> mark
+            return false
+        if result
+        {
+            if specific_source <> spt
+            {
+                let ignored this.check_type_related_to_ex(spt, tpt, relation, prop, 0)
+                if this.unported_mark() <> mark
+                    return false
+            }
         }
         false
     }
@@ -112667,34 +113436,29 @@ define Checker
             if (global_jsx as ref[Symbol]) <> unknown_symbol
                 return global_jsx
         }
-        ; ★★★ A MISS IN THE GLOBALS TABLE IS NOT PROOF OF ABSENCE HERE, AND THE
-        ; DIFFERENCE IS A REPORT. This port's globals are slice 104's *buildable
-        ; half*: a `declare global { namespace JSX { … } }` inside a module is a
-        ; GLOBAL AUGMENTATION, and merging one stops (`merge-module-augmentation`).
-        ; So on a unit that has already stopped, answering *there is no JSX
-        ; namespace* would make `getIntrinsicTagSymbol` emit TS7026 for a namespace
-        ; the reference found — which `diagcheck` caught as the one disagreeing unit
-        ; of 1 649, `compiler_jsxHexEntityUppercaseMarker.tsx`, with four of the
-        ; reference's lines against eleven of ours.
+        ; ★★★ THE UNIT-WIDE LATCH THAT STOOD HERE WAS A CLAIM ABOUT ONE STOP, AND
+        ; THAT STOP NO LONGER EXISTS. It read: *a `declare global { namespace JSX
+        ; { … } }` inside a module is a GLOBAL AUGMENTATION, and merging one stops
+        ; (`merge-module-augmentation`) … so on a unit that has already stopped,
+        ; answering “there is no JSX namespace” would make `getIntrinsicTagSymbol`
+        ; emit TS7026 for a namespace the reference found* — and it guarded on
+        ; `is_unported()`, the whole unit's latch, because *no delta taken across
+        ; this call can see* a stop from `initialize_checker`.
         ;
-        ; ★★ THE GUARD IS THE UNIT'S LATCH AND NOT A MARK DELTA, deliberately: what
-        ; makes the table incomplete is a stop that happened EARLIER — during
-        ; `initialize_checker`, before a single statement was walked — and no delta
-        ; taken across this call can see it. It costs the units where a JSX
-        ; namespace is genuinely absent AND something unrelated stopped first, and
-        ; it cannot invent.
+        ; The premise expired: `merge_module_augmentation` is whole, and its
+        ; global-scope arm merges the augmentation's exports into `globals` — so
+        ; `record_unported("merge-module-augmentation", …)` is not in this file any
+        ; more. What the latch cost meanwhile is the frontier's LARGEST row, 111
+        ; units at stage 2, because it fires wherever a JSX file met ANY unrelated
+        ; wall first.
         ;
-        ; ★★★ AND IT HAS TO RECORD, NOT MERELY RETURN. `null` is this function's
-        ; ORDINARY answer — *there is no JSX namespace* — so a guard that returns it
-        ; is the identity, which is what the first version of this line was: both
-        ; branches answered null and the report came out anyway. **A stop is a thing
-        ; you SAY, not a value you return, wherever the null already means
-        ; something.**
-        if this.is_unported()
-        {
-            this.record_unported("jsx-namespace-in-incomplete-globals", SymbolFlagsNamespace)
-            return null
-        }
+        ; ★★★ THE WIDTH IS WHY IT COULD NOT BE RE-JUDGED BY READING. A latch on the
+        ; unit is a claim about every stop in the checker, so its correctness is not
+        ; a property of this function and no reading of this function can settle it;
+        ; only the two instruments that see the whole unit can — `diagcheck` over
+        ; the corpus and the stage-2 verdict transition. Both are what retired it,
+        ; and `compiler_jsxHexEntityUppercaseMarker.tsx`, the unit named in the old
+        ; note as the witness FOR the guard, is the control: it must stay clean.
         null
     }
 
@@ -113178,7 +113942,7 @@ define Checker
             if Checker.is_jsx_intrinsic_tag_name(tag_name)
             {
                 var td Slice[char]()
-                if Checker.jsx_tag_name_text(tag_name as ref[AstNode], &td) = false
+                if Checker.jsx_tag_name_text(this.host, tag_name as ref[AstNode], &td) = false
                 {
                     this.record_unported("jsx-namespaced-tag-text", AstNode.kind_of(tag_name as ref[AstNode]))
                     return
@@ -113401,18 +114165,51 @@ define Checker
         false
     }
 
-    ; `tagName.Text()` for the two kinds a tag name can have here. ★A
-    ; JsxNamespacedName's text is CONSTRUCTED upstream — `namespace:name` — and this
-    ; port stores no such buffer (ast.scaly's `text_is` says so at its own line), so
-    ; the namespaced case answers FALSE and its caller reports. It is the honest
-    ; shape: the bytes do not exist, and inventing them would put a wrong property
-    ; name into a lookup that reports on a miss.
-    function jsx_tag_name_text(tag_name: ref[AstNode], out_name: ref[Slice[char]]) returns bool
+    ; `tagName.Text()` for the two kinds a tag name can have here.
+    ;
+    ; ★★★ THE NAMESPACED HALF IS BUILT, AND THE NOTE THAT SAID IT COULD NOT BE
+    ; NAMED THE WRONG OBSTACLE. It read *this port stores no such buffer … the bytes
+    ; do not exist, and inventing them would put a wrong property name into a lookup
+    ; that reports on a miss*. The first clause is true and the conclusion does not
+    ; follow: upstream stores no buffer either — `Text()` CONCATENATES on every ask
+    ; — and `Binder.get_declaration_name` had been building exactly these bytes into
+    ; exactly this shape since slice 26, for the attribute name `xlink:href`. What
+    ; would have been an invention is a DIFFERENT spelling; this is the reference's.
+    ;
+    ; ★ Both halves are Identifiers by grammar, so the two texts are IdentifierData
+    ; reads and neither can be a literal needing a decode.
+    function jsx_tag_name_text(host: ref[Page], tag_name: ref[AstNode], out_name: ref[Slice[char]]) returns bool
     {
         if AstNode.kind_of(tag_name) = KindIdentifier
         {
             set out_name.data: AstNode.identifier_text_of(tag_name).data
             set out_name.length: AstNode.identifier_text_length_of(tag_name)
+            return true
+        }
+        if AstNode.kind_of(tag_name) = KindJsxNamespacedName
+        {
+            let ns AstNode.namespaced_namespace_of(tag_name)
+            let nm AstNode.namespaced_name_of(tag_name)
+            let nsd AstNode.identifier_text_of(ns)
+            let nsl AstNode.identifier_text_length_of(ns)
+            let nmd AstNode.identifier_text_of(nm)
+            let nml AstNode.identifier_text_length_of(nm)
+            let buf host.allocate((nsl + nml + 1) as size_t, 1) as pointer[char]
+            var i 0
+            while i < nsl
+            {
+                set *(buf + i): nsd[i]
+                set i: i + 1
+            }
+            set *(buf + nsl): ":" as char
+            set i: 0
+            while i < nml
+            {
+                set *(buf + nsl + 1 + i): nmd[i]
+                set i: i + 1
+            }
+            set out_name.data: buf
+            set out_name.length: nsl + nml + 1
             return true
         }
         set out_name.data: null
@@ -113456,7 +114253,7 @@ define Checker
         {
             let tag_name AstNode.jsx_tag_name_of(node)
             var pd Slice[char]()
-            if Checker.jsx_tag_name_text(tag_name as ref[AstNode], &pd) = false
+            if Checker.jsx_tag_name_text(this.host, tag_name as ref[AstNode], &pd) = false
             {
                 ; `panic("Invalid tag name")` guards the kind; what stops here is the
                 ; namespaced name's CONSTRUCTED text — see jsx_tag_name_text.
@@ -113478,23 +114275,37 @@ define Checker
                 return links.resolved_symbol
             }
             ; "Intrinsic string indexer case" and the
-            ; getTypeOfPropertyOrIndexSignatureOfType case under it. Both need
-            ; `getApplicableIndexSymbol`, which mints a symbol onto an IndexInfo slot
-            ; this port's IndexInfo does not have — the INDEX SIGNATURE dimension.
-            ; The guard is written so the row fires only where the index signature
-            ; could answer: with none on the type, upstream falls through to the
-            ; report below and so does this.
-            let info this.get_applicable_index_info_for_name(iet, pd)
+            ; getTypeOfPropertyOrIndexSignatureOfType case under it. ★★★The note
+            ; that stood here said `getApplicableIndexSymbol` *mints a symbol onto an
+            ; IndexInfo slot this port's IndexInfo does not have*, and that was a
+            ; hole rather than a wall: the slot is one field, every other piece
+            ; (new_symbol_ex, the value link, isApplicableIndexType) was in the file.
+            let key_lit this.get_string_literal_type(pd)
+            let index_symbol this.get_applicable_index_symbol(iet, key_lit)
             if this.unported_mark() <> mark
             {
                 set stopped: true
                 return null
             }
-            if info <> null
+            if index_symbol <> null
             {
-                this.record_unported("jsx-intrinsic-index-symbol", KindIndexSignature)
+                let el this.jsx_element_link_of(node)
+                set el.jsx_flags: el.jsx_flags | JsxFlagsIntrinsicIndexedElement
+                set links.resolved_symbol: index_symbol
+                return links.resolved_symbol
+            }
+            let sig_type this.get_type_of_property_or_index_signature_of_type(iet, pd)
+            if this.unported_mark() <> mark
+            {
                 set stopped: true
                 return null
+            }
+            if sig_type <> null
+            {
+                let el this.jsx_element_link_of(node)
+                set el.jsx_flags: el.jsx_flags | JsxFlagsIntrinsicIndexedElement
+                set links.resolved_symbol: iet.symbol
+                return links.resolved_symbol
             }
             ; "Wasn't found"
             this.error_on_node(node, DiagProperty_0_does_not_exist_on_type_1)
@@ -114039,12 +114850,26 @@ define Checker
                             {
                                 if this.is_context_sensitive(attribute_decl)
                                 {
-                                    ; getInferenceContext and
-                                    ; addIntraExpressionInferenceSite — the
+                                    ; ★The note that stood here called this *the
                                     ; INFERENCE dimension, which no part of this
-                                    ; port has.
-                                    this.record_unported("jsx-intra-expression-inference-site", KindJsxAttribute)
-                                    return null
+                                    ; port has*; both callees have been in the file
+                                    ; since the inference chapter landed. ★★The
+                                    ; reference asserts the context is non-nil ("In
+                                    ; CheckMode.Inferential we should always have an
+                                    ; inference context") — a null here is that
+                                    ; assertion, so it reports rather than skipping.
+                                    let ctx this.get_inference_context(attributes)
+                                    if this.unported_mark() <> mark
+                                        return null
+                                    if ctx = null
+                                    {
+                                        this.record_unported("jsx-intra-expression-inference-site", KindJsxAttribute)
+                                        return null
+                                    }
+                                    let node_init AstNode.initializer_of(attribute_decl)
+                                    this.add_intra_expression_inference_site(ctx as ref[InferenceContext], AstNode.expression_of(node_init), expr_type)
+                                    if this.unported_mark() <> mark
+                                        return null
                                 }
                             }
                         }
@@ -114078,15 +114903,48 @@ define Checker
                     return null
                 if expr_type = null
                     return null
+                ; ★★★ THE `any` FLAG DOES NOT SHORT-CIRCUIT THE ARM, AND THE FIRST
+                ; VERSION OF THIS LINE `continue`d ON IT. Upstream sets the flag and
+                ; FALLS THROUGH to the validity test, so an `any` spread still goes
+                ; through getSpreadType and still runs checkSpreadPropOverrides —
+                ; whose reports are what the skip would have lost, since the tail
+                ; answers anyType either way and no type dump could see it.
                 if Checker.is_type_any(expr_type)
-                {
                     set st.has_spread_any_type: true
-                    continue
+                let et expr_type as ref[Type]
+                if this.is_valid_spread_type(et)
+                {
+                    let s3 this.get_spread_type(st.spread as ref[Type], et, st.attributes_symbol, st.object_flags, false)
+                    if this.unported_mark() <> mark
+                        return null
+                    if s3 = null
+                        return null
+                    set st.spread: s3
+                    if st.all_attributes_table <> null
+                    {
+                        this.check_spread_prop_overrides(et, st.all_attributes_table as ref[SymbolTable], attribute_decl)
+                        if this.unported_mark() <> mark
+                            return null
+                    }
                 }
-                ; isValidSpreadType, checkSpreadPropOverrides and getIntersectionType
-                ; — the three the object literal's own spread arm waits on as well.
-                this.record_unported("jsx-spread-attribute-value", KindJsxSpreadAttribute)
-                return null
+                else
+                {
+                    this.error_on_node(spread_expr as ref[AstNode], DiagSpread_types_may_only_be_created_from_object_types)
+                    if st.type_to_intersect = null
+                        set st.type_to_intersect: et
+                    else
+                    {
+                        let pair &Array[ref[Type]?]^host()
+                        pair.add(st.type_to_intersect)
+                        pair.add(et)
+                        let folded this.get_intersection_type(pair)
+                        if this.unported_mark() <> mark
+                            return null
+                        if folded = null
+                            return null
+                        set st.type_to_intersect: folded
+                    }
+                }
             }
             if st.has_spread_any_type = false
             {
@@ -114139,6 +114997,17 @@ define Checker
 
         if st.has_spread_any_type
             return any_type
+        if st.type_to_intersect <> null
+        {
+            if st.spread <> empty_jsx_object_type
+            {
+                let pair &Array[ref[Type]?]^host()
+                pair.add(st.type_to_intersect)
+                pair.add(st.spread)
+                return this.get_intersection_type(pair)
+            }
+            return st.type_to_intersect
+        }
         if st.spread = empty_jsx_object_type
             return this.create_jsx_attributes_type(st)
         st.spread
@@ -114235,9 +115104,10 @@ define Checker
     }
 
     ; A JSX attribute's NAME compared against the children property name. ★The
-    ; namespaced form has no stored text (jsx_tag_name_text's note) and cannot equal
-    ; a property name, so it answers false rather than reporting: this is a
-    ; comparison, not a lookup.
+    ; namespaced form answers FALSE without building its text, and that is faithful
+    ; rather than a shortcut: upstream compares the CONSTRUCTED `namespace:name`,
+    ; which carries a colon, against a property name, which cannot — so the two are
+    ; unequal for every input and the concatenation would be work with no reader.
     function jsx_attribute_name_is(name: ref[AstNode], d: Slice[char]) returns bool
     {
         if AstNode.kind_of(name) <> KindIdentifier
@@ -114421,10 +115291,34 @@ define Checker
         {
             if (ap.flags & TypeFlagsUnion) <> 0
             {
-                ; getUnionSignatures over the constituents — the union CALL chapter,
-                ; whose head is resolveCall's own multi-candidate arm.
-                this.record_unported("jsx-union-signatures", TypeFlagsUnion)
-                return null
+                ; "If each member has some combination of new/call signatures; make
+                ; a union signature list for those" — getUnionSignatures over the
+                ; constituents, each asked through THIS function recursively. ★The
+                ; note that stood here called it *the union CALL chapter, whose head
+                ; is resolveCall's own multi-candidate arm*; getUnionSignatures
+                ; landed WHOLE in slice 155 and the recursion is the only thing this
+                ; row ever needed.
+                let types Checker.union_types_of(ap)
+                if types = null
+                    return null
+                let list types as ref[Array[ref[Type]?]]
+                let cn list.get_length() as int
+                let per &Array[ref[Array[ref[Signature]?]]?]^host()
+                var ci 0
+                while ci < cn
+                {
+                    let row list[ci]
+                    if row = null
+                        return null
+                    let sub this.get_uninstantiated_jsx_signatures_of_type(row as ref[Type], caller)
+                    if this.unported_mark() <> mark
+                        return null
+                    per.add(sub)
+                    set ci: ci + 1
+                }
+                set signatures: this.get_union_signatures(per)
+                if this.unported_mark() <> mark
+                    return null
             }
         }
         signatures
@@ -114433,22 +115327,260 @@ define Checker
     ; getEffectiveFirstArgumentForJsxSignature and the two props-type functions
     ; under it.
     ;
-    ; ★★★ THE CLASS ARM IS A ROW AND THE FUNCTION ARM IS NOT, which is a statement
-    ; about what each needs rather than about which is likelier. The call-signature
-    ; form needs `getTypeOfFirstParameterOfSignatureWithFallback` and the managed-
-    ; attributes wrapper; the CLASS form needs `getLocalTypeParametersOfClassOr
-    ; InterfaceOrTypeAlias`, `instantiateType` under a fresh mapper and
-    ; `intersectTypes` — three pieces of the instantiation chapter — and it is
-    ; reached only when `JSX.ElementAttributesProperty` names a property, which no
-    ; unit of this corpus declares.
+    ; ★★★ THE CLASS ARM WAS A ROW ON A CALLEE LIST THAT HAD STOPPED BEING TRUE,
+    ; AND IT IS THE NINETEENTH §3.5eo HARVEST. The note that stood here named the
+    ; three pieces the class form needs — *`getLocalTypeParametersOfClassOrInterface
+    ; OrTypeAlias`, `instantiateType` under a fresh mapper and `intersectTypes`* —
+    ; and closed with *reached only when `JSX.ElementAttributesProperty` names a
+    ; property, which no unit of this corpus declares*. Two of the three had been in
+    ; the file for slices (`instantiate_type` at 88 call sites, `intersect_types`
+    ; since 157), the third is the seven-line fold below, and the reachability half
+    ; was a claim about the corpus the port could SEE: the row is 63 units at stage
+    ; 2, which is the counter-example §3.5gh says no instrument reads.
+    ; inferJsxTypeArguments — the whole of inferTypeArguments for a JSX opening-like
+    ; element, and it is five lines because the ATTRIBUTES object is the single
+    ; argument: the parameter type comes from the props side, the attributes are
+    ; checked against it under the caller's context, and the inference runs from the
+    ; one to the other. ★It was a row worth 40 units for one reason — the parameter
+    ; type is `get_effective_first_argument_for_jsx_signature`, whose class arm was
+    ; the stop above.
+    function infer_jsx_type_arguments(this, node: ref[AstNode], signature: ref[Signature], check_mode: int, context: ref[InferenceContext]) returns ref[Array[ref[Type]?]]?
+    {
+        let mark this.unported_mark()
+        let param_type this.get_effective_first_argument_for_jsx_signature(signature, node)
+        if this.unported_mark() <> mark
+            return null
+        if param_type = null
+            return null
+        let attributes AstNode.jsx_attributes_of(node)
+        if attributes = null
+            return null
+        let check_attr_type this.check_expression_with_contextual_type_ex(attributes as ref[AstNode], param_type as ref[Type], context, check_mode)
+        if this.unported_mark() <> mark
+            return null
+        if check_attr_type = null
+            return null
+        this.infer_types(context.inferences, check_attr_type, param_type, InferencePriorityNone, false)
+        if this.unported_mark() <> mark
+            return null
+        this.get_inferred_types(context)
+    }
+
     function get_effective_first_argument_for_jsx_signature(this, signature: ref[Signature], node: ref[AstNode]) returns ref[Type]?
     {
         if AstNode.kind_of(node) = KindJsxOpeningFragment
             return this.get_jsx_props_type_from_call_signature(signature, node)
-        if this.get_jsx_reference_kind(node) <> JsxReferenceKindComponent
+        let mark this.unported_mark()
+        let rk this.get_jsx_reference_kind(node)
+        if this.unported_mark() <> mark
+            return null
+        if rk <> JsxReferenceKindComponent
             return this.get_jsx_props_type_from_call_signature(signature, node)
-        this.record_unported("jsx-props-type-from-class-type", JsxReferenceKindComponent)
-        null
+        this.get_jsx_props_type_from_class_type(signature, node)
+    }
+
+    ; getJsxPropsTypeFromClassType.
+    ;
+    ; ★★★ THE THREE-STATE ANSWER OF getJsxElementPropertiesName IS THE WHOLE
+    ; SHAPE OF THE HEAD, and this port already spells it as a pair (verdict + out
+    ; name, that function's own header). MISSING takes the first parameter of the
+    ; signature, an EMPTY name takes the signature's return type, and a real name
+    ; goes through the member lookup — whose null answer is a REPORT rather than a
+    ; fallback, because upstream errors there and then returns unknownType.
+    function get_jsx_props_type_from_class_type(this, sig: ref[Signature], context: ref[AstNode]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let ns this.get_jsx_namespace_at(context)
+        if this.unported_mark() <> mark
+            return null
+        var forced Slice[char]()
+        var stopped false
+        let has_name this.get_jsx_element_properties_name(ns, &forced, &stopped)
+        if stopped
+            return null
+        var attributes_type: ref[Type]? null
+        if has_name = false
+            set attributes_type: this.get_type_of_first_parameter_of_signature_with_fallback(sig, unknown_type)
+        else
+        {
+            if forced.length = 0
+                set attributes_type: this.get_return_type_of_signature(sig)
+            else
+            {
+                set attributes_type: this.get_jsx_props_type_for_signature_from_member(sig, forced)
+                if this.unported_mark() <> mark
+                    return null
+                if attributes_type = null
+                {
+                    ; "There is no property named 'props' on this instance type" —
+                    ; the report is asked only where the element carries attributes.
+                    if AstNode.list_count(AstNode.properties_of(AstNode.jsx_attributes_of(context))) <> 0
+                        this.error_on_node(context, DiagJSX_element_class_does_not_support_attributes_because_it_does_not_have_a_0_property)
+                }
+            }
+        }
+        if this.unported_mark() <> mark
+            return null
+        if attributes_type = null
+            return unknown_type
+        set attributes_type: this.get_jsx_managed_attributes_from_located_attributes(context, ns, attributes_type as ref[Type])
+        if this.unported_mark() <> mark
+            return null
+        if attributes_type = null
+            return null
+        let at attributes_type as ref[Type]
+        if Checker.is_type_any(at)
+            return at
+        ; "Normal case -- add in IntrinsicClassAttributes<T> and IntrinsicAttributes"
+        var apparent at
+        let icl this.get_jsx_type("IntrinsicClassAttributes", context)
+        if this.unported_mark() <> mark
+            return null
+        if icl = null
+            return null
+        let ic icl as ref[Type]
+        if this.is_error_type(ic) = false
+        {
+            var managed ic
+            if ic.symbol <> null
+            {
+                let type_params this.get_local_type_parameters_of_class_or_interface_or_type_alias(ic.symbol as ref[Symbol])
+                if this.unported_mark() <> mark
+                    return null
+                if type_params <> null
+                {
+                    let tps type_params as ref[Array[ref[Type]?]]
+                    if tps.get_length() <> 0
+                    {
+                        ; "apply JSX.IntrinsicClassAttributes<hostClassType, ...>"
+                        let host_class this.get_return_type_of_signature(sig)
+                        if this.unported_mark() <> mark
+                            return null
+                        if host_class = null
+                            return null
+                        let one &Array[ref[Type]?]^host()
+                        one.add(host_class)
+                        let inferred this.fill_missing_type_arguments(one, tps, this.get_min_type_argument_count(tps), Parser.is_in_js_file(context))
+                        if this.unported_mark() <> mark
+                            return null
+                        let inst this.instantiate_type(ic, this.new_type_mapper(tps, inferred))
+                        if this.unported_mark() <> mark
+                            return null
+                        if inst = null
+                            return null
+                        set managed: inst as ref[Type]
+                    }
+                }
+            }
+            let folded this.intersect_types(managed, apparent)
+            if this.unported_mark() <> mark
+                return null
+            if folded = null
+                return null
+            set apparent: folded as ref[Type]
+        }
+        let ia this.get_jsx_type("IntrinsicAttributes", context)
+        if this.unported_mark() <> mark
+            return null
+        if ia = null
+            return null
+        if this.is_error_type(ia as ref[Type])
+            return apparent
+        let folded2 this.intersect_types(ia as ref[Type], apparent)
+        if this.unported_mark() <> mark
+            return null
+        folded2
+    }
+
+    ; getJsxPropsTypeForSignatureFromMember. ★★★ THE COMPOSITE FORK INTERSECTS
+    ; WHERE THE ORDINARY UNION SIGNATURE WOULD UNION, and upstream's own comment
+    ; says why: the `props` member is read out of the signature's OUTPUT position
+    ; while it is being used as an INPUT, so the union of the return types is the
+    ; wrong direction. It goes back to the composite's own signatures and folds
+    ; their `props` types with getIntersectionType. ★An `any` instance short-circuits
+    ; the whole fold, and a MISSING member answers null for the caller to report.
+    function get_jsx_props_type_for_signature_from_member(this, sig: ref[Signature], forced_lookup_location: Slice[char]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        if sig.composite <> null
+        {
+            let comp sig.composite as ref[CompositeSignature]
+            if comp.signatures = null
+                return null
+            let list comp.signatures as ref[Array[ref[Signature]?]]
+            let n list.get_length() as int
+            let results &Array[ref[Type]?]^host()
+            var i 0
+            while i < n
+            {
+                let row list[i]
+                if row = null
+                    return null
+                let instance this.get_return_type_of_signature(row as ref[Signature])
+                if this.unported_mark() <> mark
+                    return null
+                if instance = null
+                    return null
+                let inst instance as ref[Type]
+                if Checker.is_type_any(inst)
+                    return inst
+                let prop_type this.get_type_of_property_of_type(inst, forced_lookup_location)
+                if this.unported_mark() <> mark
+                    return null
+                if prop_type = null
+                    return null
+                results.add(prop_type)
+                set i: i + 1
+            }
+            ; "Same result for both union and intersection signatures"
+            return this.get_intersection_type(results)
+        }
+        let instance_type this.get_return_type_of_signature(sig)
+        if this.unported_mark() <> mark
+            return null
+        if instance_type = null
+            return null
+        let it instance_type as ref[Type]
+        if Checker.is_type_any(it)
+            return it
+        this.get_type_of_property_of_type(it, forced_lookup_location)
+    }
+
+    ; getLocalTypeParametersOfClassOrInterfaceOrTypeAlias and its append twin —
+    ; checker.go, and they belong to the declared-type chapter; they are written
+    ; here because getJsxPropsTypeFromClassType is the first caller this port has.
+    function get_local_type_parameters_of_class_or_interface_or_type_alias(this, symbol: ref[Symbol]) returns ref[Array[ref[Type]?]]?
+    {
+        let mark this.unported_mark()
+        var acc: ref[Array[ref[Type]?]]? null
+        let n Symbol.declaration_count(symbol)
+        var i 0
+        while i < n
+        {
+            let d Symbol.declaration_at(symbol, i)
+            if d <> null
+            {
+                let node d as ref[AstNode]
+                let k AstNode.kind_of(node)
+                var takes false
+                if k = KindInterfaceDeclaration
+                    set takes: true
+                if k = KindClassDeclaration
+                    set takes: true
+                if k = KindClassExpression
+                    set takes: true
+                if Checker.is_type_alias(node)
+                    set takes: true
+                if takes
+                {
+                    set acc: this.append_type_parameters(acc, AstNode.type_parameters_of(node))
+                    if this.unported_mark() <> mark
+                        return null
+                }
+            }
+            set i: i + 1
+        }
+        acc
     }
 
     function get_jsx_props_type_from_call_signature(this, sig: ref[Signature], context: ref[AstNode]) returns ref[Type]?
@@ -114505,11 +115637,78 @@ define Checker
             return null
         if managed_sym = null
             return attributes_type
-        ; getStaticTypeOfReferencedJsxConstructor and then
-        ; instantiateAliasOrInterfaceWithDefaults over a TWO-argument list, whose
-        ; second half is `createTypeReference` on an interface with type parameters.
-        this.record_unported("jsx-library-managed-attributes", SymbolFlagsType)
-        null
+        let mark this.unported_mark()
+        let ctor_type this.get_static_type_of_referenced_jsx_constructor(context)
+        if this.unported_mark() <> mark
+            return null
+        if ctor_type = null
+            return null
+        let args &Array[ref[Type]?]^host()
+        args.add(ctor_type)
+        args.add(attributes_type)
+        let result this.instantiate_alias_or_interface_with_defaults(managed_sym as ref[Symbol], args, Parser.is_in_js_file(context))
+        if this.unported_mark() <> mark
+            return null
+        ; ★A null here is upstream's own fall-through and not a stop: the managed
+        ; symbol exists but declares FEWER parameters than the two arguments, and
+        ; then the located attributes type is the answer unchanged.
+        if result = null
+            return attributes_type
+        result
+    }
+
+    ; getStaticTypeOfReferencedJsxConstructor — the CONSTRUCTOR side of the tag,
+    ; which is what LibraryManagedAttributes takes as its first argument. Three
+    ; forks: an opening fragment answers the fragment type, an intrinsic tag name
+    ; answers a type built from a FAKE signature over the intrinsic attributes, and
+    ; a tag whose expression types as a string literal takes the same fake route
+    ; through the string-literal lookup. Everything else is the tag's own type.
+    function get_static_type_of_referenced_jsx_constructor(this, context: ref[AstNode]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        if AstNode.kind_of(context) = KindJsxOpeningFragment
+            return this.get_jsx_fragment_type(context)
+        let tag_name AstNode.jsx_tag_name_of(context)
+        if tag_name = null
+            return null
+        if Checker.is_jsx_intrinsic_tag_name(tag_name)
+        {
+            let result this.get_intrinsic_attributes_type_from_jsx_opening_like_element(context)
+            if this.unported_mark() <> mark
+                return null
+            if result = null
+                return null
+            let fake this.create_signature_for_jsx_intrinsic(context, result as ref[Type])
+            if this.unported_mark() <> mark
+                return null
+            if fake = null
+                return null
+            return this.get_or_create_type_from_signature(fake as ref[Signature])
+        }
+        let tag_type this.check_expression_cached(tag_name as ref[AstNode])
+        if this.unported_mark() <> mark
+            return null
+        if tag_type = null
+            return null
+        let tt tag_type as ref[Type]
+        if (tt.flags & TypeFlagsStringLiteral) <> 0
+        {
+            var stopped false
+            let result this.get_intrinsic_attributes_type_from_string_literal_type(tt, context, &stopped)
+            if stopped
+                return null
+            if this.unported_mark() <> mark
+                return null
+            if result = null
+                return error_type
+            let fake this.create_signature_for_jsx_intrinsic(context, result as ref[Type])
+            if this.unported_mark() <> mark
+                return null
+            if fake = null
+                return null
+            return this.get_or_create_type_from_signature(fake as ref[Signature])
+        }
+        tt
     }
 
     ; instantiateAliasOrInterfaceWithDefaults, at the ZERO-argument arity
@@ -114526,22 +115725,51 @@ define Checker
         if declared = null
             return null
         let d declared as ref[Type]
+        ; ★The argument count is the whole condition on both arms: a declaration
+        ; with FEWER parameters than the caller has arguments is skipped, and the
+        ; null that falls out is the caller's cue to keep what it had.
+        var arg_count 0
+        if type_arguments <> null
+            set arg_count: (type_arguments as ref[Array[ref[Type]?]]).get_length() as int
         if (Symbol.flags_of(managed_sym) & SymbolFlagsTypeAlias) <> 0
         {
-            if type_arguments = null
-                return d
-            this.record_unported("jsx-alias-instantiation", SymbolFlagsTypeAlias)
-            return null
+            let params this.type_alias_link_of(managed_sym).type_parameters
+            var param_count 0
+            if params <> null
+                set param_count: (params as ref[Array[ref[Type]?]]).get_length() as int
+            if param_count >= arg_count
+            {
+                if type_arguments = null
+                    return d
+                if params = null
+                    return d
+                let args this.fill_missing_type_arguments(type_arguments as ref[Array[ref[Type]?]], params as ref[Array[ref[Type]?]], arg_count, in_java_script)
+                if this.unported_mark() <> mark
+                    return null
+                if args = null
+                    return d
+                if (args as ref[Array[ref[Type]?]]).get_length() = 0
+                    return d
+                return this.get_type_alias_instantiation(managed_sym, args, null)
+            }
         }
         if (d.object_flags & ObjectFlagsClassOrInterface) <> 0
         {
-            if type_arguments = null
+            let tps this.interface_type_parameters_of(d)
+            var tp_count 0
+            if tps <> null
+                set tp_count: (tps as ref[Array[ref[Type]?]]).get_length() as int
+            if tp_count >= arg_count
             {
-                if Checker.type_parameter_count_of(d) = 0
+                if type_arguments = null
                     return this.create_type_reference(d, null, ObjectFlagsNone)
+                if tps = null
+                    return this.create_type_reference(d, null, ObjectFlagsNone)
+                let args this.fill_missing_type_arguments(type_arguments as ref[Array[ref[Type]?]], tps as ref[Array[ref[Type]?]], arg_count, in_java_script)
+                if this.unported_mark() <> mark
+                    return null
+                return this.create_type_reference(d, args, ObjectFlagsNone)
             }
-            this.record_unported("jsx-interface-instantiation", ObjectFlagsClassOrInterface)
-            return null
         }
         null
     }
@@ -114655,18 +115883,16 @@ define Checker
                 return null
             let nm name as ref[AstNode]
             ; ★`attribute.Name().Text()` is Node.Text(), and for a
-            ; JsxNamespacedName that is `namespace + ":" + name` — a two-part
-            ; string this port has no builder for (get_literal_type_from_property_
-            ; name reports the same shape at its own line, and
-            ; property_name_text_of deliberately does not carry the arm). Saying it
-            ; rather than passing `identifier_text_of`'s EMPTY slice, which would
-            ; look up the property named "" and answer nil for `xlink:href`.
-            if AstNode.kind_of(nm) <> KindIdentifier
-            {
-                this.record_unported("jsx-attribute-namespaced-name", AstNode.kind_of(nm))
+            ; JsxNamespacedName that is `namespace + ":" + name`. The note that
+            ; stood here called that *a two-part string this port has no builder
+            ; for* and stopped rather than passing `identifier_text_of`'s EMPTY
+            ; slice — the second half of which is still the right instinct and the
+            ; first is no longer true: `jsx_tag_name_text` builds exactly these
+            ; bytes as of slice 162, so the lookup gets the name it needs.
+            var nd Slice[char]()
+            if Checker.jsx_tag_name_text(this.host, nm, &nd) = false
                 return null
-            }
-            return this.get_type_of_property_of_contextual_type(attributes_type as ref[Type], AstNode.identifier_text_of(nm))
+            return this.get_type_of_property_of_contextual_type(attributes_type as ref[Type], nd)
         }
         this.get_contextual_type(parent as ref[AstNode], context_flags)
     }
@@ -114886,12 +116112,11 @@ define Checker
             if name = null
                 continue
             var nd Slice[char]()
-            if Checker.jsx_tag_name_text(name as ref[AstNode], &nd) = false
+            if Checker.jsx_tag_name_text(this.host, name as ref[AstNode], &nd) = false
             {
-                ; A namespaced ATTRIBUTE name — `xlink:href` — whose text upstream
-                ; is constructed. It cannot collide with an identifier name and can
-                ; only collide with another namespaced one, which is the case this
-                ; port cannot see; see jsx_tag_name_text.
+                ; Neither kind — nothing else can be an attribute name by grammar,
+                ; so this is the unreachable arm rather than the namespaced one it
+                ; used to be (jsx_tag_name_text builds those since slice 162).
                 continue
             }
             if SymbolTable.get(seen, nd) <> null
@@ -120813,15 +122038,9 @@ define Checker
         let mark this.unported_mark()
         let nk AstNode.kind_of(node)
         if nk = KindJsxOpeningElement
-        {
-            this.record_unported("infer-jsx-type-arguments", nk)
-            return null
-        }
+            return this.infer_jsx_type_arguments(node, signature, check_mode, context)
         if nk = KindJsxSelfClosingElement
-        {
-            this.record_unported("infer-jsx-type-arguments", nk)
-            return null
-        }
+            return this.infer_jsx_type_arguments(node, signature, check_mode, context)
         var contextual_pass true
         if nk = KindDecorator
             set contextual_pass: false
