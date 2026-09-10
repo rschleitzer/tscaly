@@ -328,6 +328,25 @@ if [ -n "$DUPES" ]; then
   exit 2
 fi
 
+# ★★★ A DEBUG PROBE ON STDERR IS INVISIBLE TO EVERY OTHER INSTRUMENT HERE, so
+# this is the only place that can see one. Slice 164 committed three
+# `scaly_eputs("PROBE gi …")` into checker.scaly and they survived five gates,
+# diagcheck, walkcheck and two stage-2 runs: every yardstick reads the port's
+# STDOUT and compares it, and nothing reads stderr at all. Slice 166 found them
+# by eye while running one unit by hand.
+#
+# ★ A grep, because there is nothing subtler to be: this package writes its
+# artifacts through the dump programs and has no legitimate use for the
+# runtime's stderr printers. If one ever appears, it belongs behind an
+# environment switch and this line gets the exception with a reason.
+PROBES=$(grep -ln 'scaly_eput' "$PKG"/0.1.0/*.scaly "$PKG"/0.1.0/tscaly/*.scaly 2>/dev/null)
+if [ -n "$PROBES" ]; then
+  red "a debug probe writes to stderr in the ported sources — no yardstick reads it:"
+  echo "$PROBES" | sed 's/^/    /'
+  echo "  Remove it, or put it behind an environment switch and exempt the file here."
+  exit 2
+fi
+
 # ── build our side ───────────────────────────────────────────────────────────
 #
 # Two objects per program, the way the opensp drop-in is built: the package

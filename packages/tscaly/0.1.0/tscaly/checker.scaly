@@ -915,6 +915,13 @@ define MapTypeKindThisTypeFromContextual: int 16
 ; — the two kinds never share a call.
 define MapTypeKindJsxChildElement: int 17
 
+; MapTypeKindSimplified (slice 166) — getSimplifiedIndexedAccessTypeWorker's
+; mapped-object closure, whose one capture is the `writing` flag. ★It gets a
+; field of its own rather than borrowing `for_constraint`: that one is the
+; conditional distribution's `forConstraint` and the two kinds are asked from the
+; same chapter, so a shared slot would read as one flag with two meanings.
+define MapTypeKindSimplified: int 18
+
 define MapTypeArgs
 (
     mapped: ref[Type]?
@@ -950,6 +957,9 @@ define MapTypeArgs
 
     ; MapTypeKindContextualIndexInfoValue's one (slice 151).
     key_name_type: ref[Type]?
+
+    ; MapTypeKindSimplified's one (slice 166).
+    simplify_writing: bool
 )
 
 ; addSpans' captured state (slice 126) — §3.21. The builder is a SLOT because the
@@ -1644,6 +1654,41 @@ define InstantiationCacheLink
         set permissive: null
         set restrictive: null
         set restrictive_type_parameter: null
+    }
+}
+
+; TWO rows of c.cachedTypes on ONE record (slice 166) —
+; CachedTypeKindIndexedAccessForReading and CachedTypeKindIndexedAccessForWriting,
+; both keyed on the same type id, which is InstantiationCacheLink's argument at a
+; smaller key: upstream reads the pair out of one map under two kinds, and one
+; linear scan answering both is the same association rather than a merge.
+;
+; ★★★ THE MEMO IS OBSERVABLE AND IT IS ALSO THE RECURSION BRAKE. The reference
+; writes `t` into the slot BEFORE calling the worker and only overwrites it when
+; the worker answered something else, so a simplification that re-enters itself
+; on the same type sees the identity and terminates — `{ [P in T]: { [Q in U]:
+; number } }[T][U]` is the reference's own example of a nested access and the
+; worker simplifies the inner one first.
+;
+; ★★★ AND THE SLOT IS CLEARED WHEN THE WORKER STOPS, which is a deliberate
+; divergence and the only one in this chapter. Upstream a worker always answers,
+; so the in-progress `t` either stays (nothing simplified) or is overwritten; here
+; a stop answers null and would LEAVE the `t` behind — and the next ask of that
+; same type would then read the identity out of the cache and record no stop at
+; all. That is a silent wrong answer standing in for a wall, which is the one
+; thing this port may not trade a memo for.
+define SimplifiedIndexedAccessLink
+(
+    source: ref[Type]?
+    for_reading: ref[Type]?
+    for_writing: ref[Type]?
+)
+{
+    init(s: ref[Type]?)
+    {
+        set source: s
+        set for_reading: null
+        set for_writing: null
     }
 }
 
@@ -3471,17 +3516,21 @@ define ReliabilityTypeMapperData
 ; POINTER comparison — so a freshly built permissive mapper would erase no type
 ; parameter and the erasure would be silently absent.
 ;
-; ★ The three workers this port does NOT have are named rather than declared, per
-; §3.5be: `getUniqueLiteralTypeForTypeParameter` (union reduction's marker) and the
-; two reliability workers, which already have an arm of their own.
+; ★ The two workers this port does NOT have are the reliability pair, which
+; already has an arm of its own. The THIRD name that stood here —
+; `getUniqueLiteralTypeForTypeParameter` — landed in slice 166 as the mapper
+; behind isReducibleIntersection, which is why the slot is a kind and not a bool.
+define FunctionMapperRestrictive: int 0
+define FunctionMapperPermissive: int 1
+define FunctionMapperUniqueLiteral: int 2
+
 define FunctionTypeMapperData
 (
-    ; true = restrictiveMapperWorker, false = permissiveMapperWorker.
-    restrictive: bool
+    worker: int
 )
 {
-    init(r: bool)
-        set restrictive: r
+    init(w: int)
+        set worker: w
 }
 
 define TypeMapperData union
@@ -4702,6 +4751,13 @@ define IntersectionTypeData
     ; memo for the `t == thisArgument` case, where the reference stores the answer
     ; on the type rather than in cachedTypes.
     resolved_apparent_type: ref[Type]?
+
+    ; The reference's `uniqueLiteralFilledInstantiation` (slice 166) —
+    ; isReducibleIntersection's one memo. ★It is on the TYPE and not in a side
+    ; table because upstream put it there, and the distinction matters for once:
+    ; the slot holds an instantiation of THIS intersection through the unique
+    ; literal mapper, so its lifetime is the intersection's.
+    unique_literal_filled_instantiation: ref[Type]?
 )
 {
     init(ts: ref[Array[ref[Type]?]]?)
@@ -4712,6 +4768,7 @@ define IntersectionTypeData
         set resolved_properties: null
         set resolved: null
         set resolved_apparent_type: null
+        set unique_literal_filled_instantiation: null
     }
 }
 
@@ -6295,6 +6352,12 @@ define Checker
     ; The same idiom at the kind get_apparent_type_of_intersection_type reads.
     apparent_type_links: ref[Array[ref[ApparentTypeLink]?]]
 
+    ; ── c.cachedTypes at the two indexed-access simplification kinds (slice 166)
+    ;
+    ; The same idiom at the pair get_simplified_indexed_access_type reads — see
+    ; SimplifiedIndexedAccessLink for why both kinds sit on one row.
+    simplified_indexed_access_links: ref[Array[ref[SimplifiedIndexedAccessLink]?]]
+
     ; ── c.cachedTypes at the three instantiation kinds (slice 151) ───────────
     ;
     ; See InstantiationCacheLink for why the three share a row.
@@ -6308,6 +6371,14 @@ define Checker
     ; erase nothing and say nothing about it.
     restrictive_mapper: ref[TypeMapper]?
     permissive_mapper: ref[TypeMapper]?
+
+    ; ── c.uniqueLiteralMapper (slice 166) ───────────────────────────────────
+    ;
+    ; The third FunctionTypeMapper. ★Unlike the pair above its identity is NOT
+    ; read anywhere — it is a field because the reference makes it once in
+    ; NewChecker and a mapper minted per ask would be a fresh object on every
+    ; reducible-intersection question.
+    unique_literal_mapper: ref[TypeMapper]?
 
     ; ── c.discriminatedContextualTypes (slice 146) ───────────────────────────
     ;
@@ -6686,6 +6757,17 @@ define Checker
     rel_unmatched_source: ref[Type]?
     rel_unmatched_target: ref[Type]?
 
+    ; ★★★ WHETHER THE LEVEL THAT REPORTED TOOK THE UNMATCHED-PROPERTY BRANCH
+    ; (slice 166) — the one bit `rel_reported`'s latch needs to know whether it is
+    ; standing where the reference would have printed something ELSE. See
+    ; report_error_results' `relation-error-outer-level-message` stop.
+    rel_reported_unmatched: bool
+
+    ; The LENGTH of the diagnostic list just before the level that reported did
+    ; so (slice 166) — what `truncate` needs to take the line back when an outer
+    ; level turns out to be one this port cannot speak for.
+    rel_reported_mark: int
+
     ; ★★★ THE COMPARER'S CAPTURES, SLICE 126. `signatureRelatedTo` hands
     ; compareSignaturesRelated a closure over the relation and over its own
     ; `intersectionState`; a flag carries neither, so the two travel here and the
@@ -6994,6 +7076,8 @@ define Checker
         set c.regular_object_literal_type_links: roltl
         let atl &Array[ref[ApparentTypeLink]?]^host()
         set c.apparent_type_links: atl
+        let sial &Array[ref[SimplifiedIndexedAccessLink]?]^host()
+        set c.simplified_indexed_access_links: sial
         let dctl &Array[ref[DiscriminatedContextualTypeLink]?]^host()
         set c.discriminated_contextual_type_links: dctl
         let altl &Array[ref[ArrayLiteralTypeLink]?]^host()
@@ -7136,6 +7220,8 @@ define Checker
         set c.rel_reported: false
         set c.rel_head_code: 0
         set c.rel_unmatched_code: 0
+        set c.rel_reported_unmatched: false
+        set c.rel_reported_mark: 0
         set c.rel_unmatched_source: null
         set c.rel_unmatched_target: null
         set c.rel_cur_relation: RelationAssignable
@@ -7226,6 +7312,7 @@ define Checker
         set c.instantiation_cache_links: icl
         set c.restrictive_mapper: null
         set c.permissive_mapper: null
+        set c.unique_literal_mapper: null
         ; c.tupleTypes, and the two global-type memos (slice 115). The memos start
         ; null and mean *not asked yet*; get_global_array_type answers
         ; empty_generic_type where the table has no Array, so the memo can never
@@ -8503,6 +8590,27 @@ define Checker
             }
     }
 
+    ; ── the reference's uniqueLiteralFilledInstantiation (slice 166) ─────────
+
+    function unique_literal_filled_instantiation_of(t: ref[Type]) returns ref[Type]?
+    {
+        choose t.data
+            when d: Intersection
+                return d.unique_literal_filled_instantiation
+        null
+    }
+
+    procedure set_unique_literal_filled_instantiation(t: ref[Type], v: ref[Type]?)
+    {
+        choose t.data
+            when d: Intersection
+            {
+                var w d
+                set w.unique_literal_filled_instantiation: v
+                set t.data: TypeData.Intersection(w)
+            }
+    }
+
     ; ★The slot's first READER arrives with the printer's guard below — until then
     ; the comment on MappedTypeData called it a writer without one, which §3.5be
     ; admits and this retires.
@@ -8695,6 +8803,28 @@ define Checker
         }
         let fresh &ApparentTypeLink^host(t)
         apparent_type_links.add(fresh)
+        fresh
+    }
+
+    ; ── c.cachedTypes at CachedTypeKindIndexedAccessFor{Reading,Writing} (166) ─
+
+    function simplified_indexed_access_link_of(this, t: ref[Type]) returns ref[SimplifiedIndexedAccessLink]
+    {
+        let len simplified_indexed_access_links.get_length() as int
+        var i 0
+        while i < len
+        {
+            let row simplified_indexed_access_links[i]
+            if row <> null
+            {
+                let r row as ref[SimplifiedIndexedAccessLink]
+                if r.source = t
+                    return r
+            }
+            set i: i + 1
+        }
+        let fresh &SimplifiedIndexedAccessLink^host(t)
+        simplified_indexed_access_links.add(fresh)
         fresh
     }
 
@@ -14266,10 +14396,9 @@ define Checker
     function is_generic_index_type(this, t: ref[Type]) returns bool
         (this.get_generic_object_flags(t) & ObjectFlagsIsGenericIndexType) <> 0
 
-    ; isGenericReducibleType. ★Its intersection half is isReducibleIntersection,
-    ; which instantiates through the uniqueLiteralMapper this port has no
-    ; equivalent of, so that arm is a stop; the union arm's own guard is
-    ; ContainsIntersections, which cannot be set without an intersection either.
+    ; isGenericReducibleType. Its intersection half is isReducibleIntersection,
+    ; ported in slice 166 together with the uniqueLiteralMapper the note that
+    ; stood here said this port had no equivalent of.
     function is_generic_reducible_type(this, t: ref[Type]) returns bool
     {
         if (t.flags & TypeFlagsUnion) <> 0
@@ -14296,11 +14425,46 @@ define Checker
             }
         }
         if (t.flags & TypeFlagsIntersection) <> 0
-        {
-            this.record_unported("is-reducible-intersection", 0)
-            return false
-        }
+            return this.is_reducible_intersection(t)
         false
+    }
+
+    ; isReducibleIntersection — "a union type which is reducible upon
+    ; instantiation must be kept generic, as that instantiation information needs
+    ; to flow through the type system."
+    ;
+    ; ★★★ IT ASKS THE QUESTION BY ANSWERING A DIFFERENT ONE. Filling every type
+    ; parameter with `uniqueLiteralType` — the `never` intrinsic that
+    ; getReducedType treats as a LITERAL — turns *could this intersection reduce
+    ; under some instantiation* into *does this ONE instantiation reduce*, which
+    ; is decidable here and now. The reference's own comment says why that is
+    ; sound: only intersections with conflicting literal-typed properties are
+    ; reducible at all.
+    ;
+    ; ★ false on a stop, like every other predicate in this file; the mark the
+    ; caller took is what separates it from a measured `no`.
+    function is_reducible_intersection(this, t: ref[Type]) returns bool
+    {
+        let mark this.unported_mark()
+        var filled Checker.unique_literal_filled_instantiation_of(t)
+        if filled = null
+        {
+            if unique_literal_mapper = null
+                return false
+            set filled: this.instantiate_type(t, unique_literal_mapper)
+            if this.unported_mark() <> mark
+                return false
+            if filled = null
+                return false
+            Checker.set_unique_literal_filled_instantiation(t, filled)
+        }
+        let inst filled as ref[Type]
+        let reduced this.get_reduced_type(inst)
+        if this.unported_mark() <> mark
+            return false
+        if reduced = null
+            return false
+        (reduced as ref[Type]) <> inst
     }
 
     ; indexTypeLessThan — EVERY constituent of the index is a numeric literal name
@@ -15778,7 +15942,7 @@ define Checker
             return empty_object_type
         if (source.flags & TypeFlagsUnion) <> 0
         {
-            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, properties, symbol, null, null, null) as ref[MapTypeArgs]?
+            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, properties, symbol, null, null, null, false) as ref[MapTypeArgs]?
             return this.map_type(source, MapTypeKindRestType, a)
         }
         ; `getUnionType(core.Map(properties, c.getLiteralTypeFromPropertyName))` —
@@ -26746,11 +26910,27 @@ define Checker
         {
             let mark this.unported_mark()
             this.push_recursion_identity(identity)
-            ; getSimplifiedType is the identity here — see the chapter header.
-            set constraint: this.compute_base_constraint(t)
-            this.pop_recursion_identity()
+            ; ★ The reference asks computeBaseConstraint about the SIMPLIFIED type
+            ; and takes the recursion identity off the original. The note that
+            ; stood here — *getSimplifiedType is the identity* — was the type
+            ; factory's own measurement in the era when nothing could mint an
+            ; IndexedAccess or a Conditional, and it expired long before slice 166
+            ; gave the function a body.
+            let simplified this.get_simplified_type(t, false)
             if this.unported_mark() <> mark
                 set stopped: true
+            if stopped = false
+            {
+                if simplified = null
+                    set stopped: true
+                else
+                {
+                    set constraint: this.compute_base_constraint(simplified as ref[Type])
+                    if this.unported_mark() <> mark
+                        set stopped: true
+                }
+            }
+            this.pop_recursion_identity()
         }
         ; ★★★ THE POP MUST HAPPEN ON EVERY PATH, WHICH IS WHY THE STOP TEST IS
         ; BELOW IT AND NOT BESIDE THE CALL: returning early with a frame still on
@@ -30344,13 +30524,82 @@ define Checker
             set applies: true
         if applies = false
             return null
+        let mark this.unported_mark()
         let constraint this.get_base_constraint_of_type(type_variable)
+        if this.unported_mark() <> mark
+            return null
         if constraint = null
             return null
-        if this.every_type_is_primitive_or_object_or_empty(constraint as ref[Type]) = false
+        let c constraint as ref[Type]
+        if this.every_type_is_primitive_or_object_or_empty(c) = false
             return null
-        this.record_unported("is-type-strict-subtype-of", type_variable.flags)
+        ; "If T's constraint is a subtype of P, simply return T. For example,
+        ; given `T extends \"a\" | \"b\"`, the intersection `T & string` reduces to
+        ; just T."
+        if this.is_type_strict_subtype_of(c, primitive_type)
+            return type_variable
+        if this.unported_mark() <> mark
+            return null
+        ; "No constituent of T's constraint is a subtype of P. If P is also not a
+        ; subtype of T's constraint, then the constraint and P are unrelated, and
+        ; the intersection reduces to never."
+        var some_constituent false
+        if (c.flags & TypeFlagsUnion) <> 0
+        {
+            if this.some_type_is_strict_subtype_of(c, primitive_type)
+                set some_constituent: true
+            if this.unported_mark() <> mark
+                return null
+        }
+        if some_constituent = false
+        {
+            if this.is_type_strict_subtype_of(primitive_type, c) = false
+            {
+                if this.unported_mark() <> mark
+                    return null
+                return never_type
+            }
+            if this.unported_mark() <> mark
+                return null
+        }
+        ; "Some constituent of T's constraint is a subtype of P, or P is a
+        ; subtype of T's constraint. Thus, the intersection further constrains
+        ; the type variable." ★★★ THE FLAG IS THE THIRD ANSWER AND IT IS NOT A
+        ; TYPE: the reduction concludes NOTHING here and the intersection is
+        ; still minted, but it is minted CONSTRAINED, which is what
+        ; ObjectFlagsIsConstrainedTypeVariable's own note two hundred lines up is
+        ; about. Answering null while writing the out-cell is the only way to say
+        ; that in this port's return convention.
+        set out_object_flags: ObjectFlagsIsConstrainedTypeVariable
         null
+    }
+
+    ; someType with the *strict subtype of this target* predicate — §3.18, one
+    ; function per predicate. ★Its caller has already asked the union flag, so the
+    ; non-union fall-through the reference's someType has is unreachable from
+    ; there; it is written anyway because someType is a general helper and a
+    ; special-cased copy of one is how the two drift apart.
+    function some_type_is_strict_subtype_of(this, t: ref[Type], target: ref[Type]) returns bool
+    {
+        if (t.flags & TypeFlagsUnion) = 0
+            return this.is_type_strict_subtype_of(t, target)
+        let types Checker.union_types_of(t)
+        if types = null
+            return false
+        let list types as ref[Array[ref[Type]?]]
+        let n list.get_length() as int
+        var i 0
+        while i < n
+        {
+            let e list[i]
+            if e <> null
+            {
+                if this.is_type_strict_subtype_of(e as ref[Type], target)
+                    return true
+            }
+            set i: i + 1
+        }
+        false
     }
 
     ; The four branches for an intersection that CONTAINS a union — the distributive
@@ -32046,7 +32295,7 @@ define Checker
             let subject types[union_index]
             if subject = null
                 return null
-            let a &MapTypeArgs^host(null, null, null, null, null, false, texts, types, union_index, 0, 0, 0, 0, 0, null, null, null, null, null, null)
+            let a &MapTypeArgs^host(null, null, null, null, null, false, texts, types, union_index, 0, 0, 0, 0, 0, null, null, null, null, null, null, false)
             return this.map_type(subject as ref[Type], MapTypeKindTemplateLiteralSpan, a)
         }
         ; slices.Contains(types, wildcardType).
@@ -34189,8 +34438,9 @@ define Checker
         ; own position — after uniqueLiteralType and before emptyObjectType. ★They
         ; take no type id, so nothing below moves either way; the position is the
         ; reference's because there is no reason for it to be anything else.
-        set restrictive_mapper: this.new_function_type_mapper(true)
-        set permissive_mapper: this.new_function_type_mapper(false)
+        set restrictive_mapper: this.new_function_type_mapper(FunctionMapperRestrictive)
+        set permissive_mapper: this.new_function_type_mapper(FunctionMapperPermissive)
+        set unique_literal_mapper: this.new_function_type_mapper(FunctionMapperUniqueLiteral)
 
         ; ★★ c.emptyTypeLiteralType, slice 80, and it stands where the reference
         ; puts it — between the marker types it is the only one of, so the ids of
@@ -54460,7 +54710,7 @@ define Checker
         var t: ref[Type]? null
         if this.every_type_is_tuple(source_type)
         {
-            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, element_index, 0, 0, 0, 0, 0, null, null, null, null, null, null) as ref[MapTypeArgs]?
+            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, element_index, 0, 0, 0, 0, 0, null, null, null, null, null, null, false) as ref[MapTypeArgs]?
             set t: this.map_type(source_type, MapTypeKindSliceTuple, a)
         }
         else
@@ -57220,7 +57470,7 @@ define Checker
     {
         if t = null
             return null
-        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, index, length, first_spread_index, last_spread_index, 0, null, null, null, null, null, null) as ref[MapTypeArgs]?
+        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, index, length, first_spread_index, last_spread_index, 0, null, null, null, null, null, null, false) as ref[MapTypeArgs]?
         this.map_type_ex(t as ref[Type], MapTypeKindContextualElement, a, true)
     }
 
@@ -67239,7 +67489,7 @@ define Checker
             return null
         ; "We avoid calling getApplicableIndexInfo here because it performs
         ; potentially expensive intersection reduction."
-        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, name_type) as ref[MapTypeArgs]?
+        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, name_type, false) as ref[MapTypeArgs]?
         this.map_type_ex(ct, MapTypeKindContextualIndexInfoValue, a, true)
     }
 
@@ -68246,7 +68496,7 @@ define Checker
                 set st.has_computed_string_property: false
                 set st.has_computed_number_property: false
             }
-            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, node, st, null) as ref[MapTypeArgs]?
+            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, node, st, null, false) as ref[MapTypeArgs]?
             return this.map_type(spread, MapTypeKindEmptyObjectLiteralRemap, a)
         }
         this.create_object_literal_type(node, st, 0)
@@ -92262,8 +92512,17 @@ define Checker
                 let tt t as ref[Type]
                 if (tt.flags & TypeFlagsTypeParameter) = 0
                     return t
-                if fn.restrictive
+                if fn.worker = FunctionMapperRestrictive
                     return this.get_restrictive_type_parameter(tt)
+                ; getUniqueLiteralTypeForTypeParameter (slice 166) — the marker a
+                ; union reduction can see through. ★It is the `never` intrinsic
+                ; under another name, and getReducedType treats it as a LITERAL,
+                ; which is the whole trick: only intersections with conflicting
+                ; literal-typed properties reduce, so filling every type parameter
+                ; with one asks *would this intersection reduce under SOME
+                ; instantiation*.
+                if fn.worker = FunctionMapperUniqueLiteral
+                    return unique_literal_type
                 return wildcard_type
             }
             when rel: Reliability
@@ -93733,6 +93992,13 @@ define Checker
         }
         if mk = MapTypeKindThisTypeFromContextual
             return this.this_type_from_contextual_constituent(t)
+        if mk = MapTypeKindSimplified
+        {
+            if a = null
+                return null
+            let args a as ref[MapTypeArgs]
+            return this.get_simplified_type(t, args.simplify_writing)
+        }
         if mk = MapTypeKindJsxChildElement
         {
             if a = null
@@ -93837,7 +94103,7 @@ define Checker
     ; flag becomes, so a nullable capture is the honest carrier and not a bool.
     function get_tuple_element_type_out_of_start_count(this, t: ref[Type], index: u64, undefined_like: ref[Type]?) returns ref[Type]?
     {
-        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, index, undefined_like, null, null, null, null, null) as ref[MapTypeArgs]?
+        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, index, undefined_like, null, null, null, null, null, false) as ref[MapTypeArgs]?
         this.map_type(t, MapTypeKindTupleElementOutOfStartCount, a)
     }
 
@@ -94048,7 +94314,7 @@ define Checker
         }
         if distribute
         {
-            let a &MapTypeArgs^host(null, null, new_mapper as ref[TypeMapper]?, root, check_type, for_constraint, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null)
+            let a &MapTypeArgs^host(null, null, new_mapper as ref[TypeMapper]?, root, check_type, for_constraint, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false)
             set result: this.map_type_with_alias(distribution_type as ref[Type], MapTypeKindConditionalDistribution, a, alias)
         }
         if distribute = false
@@ -94645,7 +94911,7 @@ define Checker
                     return null
                 if reduced = null
                     return null
-                let a &MapTypeArgs^host(t, type_variable, m, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null)
+                let a &MapTypeArgs^host(t, type_variable, m, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false)
                 return this.map_type_with_alias(reduced as ref[Type], MapTypeKindMappedConstituent, a, alias)
             }
         }
@@ -105436,13 +105702,19 @@ define Checker
         set rel_target_depth: 0
         set rel_expanding_flags: ExpandingFlagsNone
         let save_reported rel_reported
+        let save_reported_um rel_reported_unmatched
+        let save_reported_mark rel_reported_mark
         set rel_reported: false
+        set rel_reported_unmatched: false
+        set rel_reported_mark: 0
         let answer this.is_related_to_ex(source, target, relation, error_node, IntersectionStateNone, RecursionFlagsBoth)
         set rel_head_code: save_head
         set rel_unmatched_code: save_um_code
         set rel_unmatched_source: save_um_source
         set rel_unmatched_target: save_um_target
         set rel_reported: save_reported
+        set rel_reported_unmatched: save_reported_um
+        set rel_reported_mark: save_reported_mark
         set rel_overflow: save_overflow
         set rel_maybe_depth: save_maybe
         set rel_source_depth: save_source
@@ -105451,23 +105723,108 @@ define Checker
         answer
     }
 
+    ; getNormalizedType — the FIXPOINT, at the three of its six arms this port can
+    ; take (slice 166). It replaces the two hand-inlined blocks that stood at
+    ; is_related_to_ex's head, and it is what closes §3.5gm.
+    ;
+    ; ★★★ THE `writing` FLAG IS THE WHOLE ASYMMETRY AND IT IS THE REFERENCE'S OWN:
+    ; the SOURCE is normalized with false and the TARGET with true. The reference's
+    ; comment at the call names the reason for the substitution arm — *resolve
+    ; substitution types to either the substitution (on the source side) or the
+    ; type variable (on the target side)* — and the same flag now steers every
+    ; distribution inside get_simplified_type, where reading a `T[A | B]` yields a
+    ; union and writing to one yields an intersection.
+    ;
+    ; ★★★ THE LOOP IS NOT DECORATION. The three arms feed each other — a
+    ; simplification can answer a substitution and a substitution's intersection
+    ; can be simplifiable — and upstream runs them to a fixpoint. The straight-line
+    ; pair this replaces took each arm at most once, which was the identity on
+    ; everything the port could then mint and is not any more.
+    ;
+    ; ★ The three arms that stay the IDENTITY are the generic tuple
+    ; (getNormalizedTupleType), the deferred reference
+    ; (createTypeReference / getSingleBaseForNonAugmentingSubtype) and the
+    ; union/intersection normalization (getNormalizedUnionOrIntersectionType).
+    ; They are left out rather than stopped, for §3.5gm (4)'s reason: a new stop
+    ; here would turn units that answer correctly today into UNPORTED, and each is
+    ; a chapter with its own frontier row.
+    function normalize_relation_operand(this, t: ref[Type], writing: bool) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        var cur t
+        var moving true
+        while moving
+        {
+            set moving: false
+            var next: ref[Type]? null
+            if Checker.is_fresh_literal_type(cur)
+                set next: Checker.literal_regular_type_of(cur)
+            if next = null
+            {
+                if (cur.flags & TypeFlagsSubstitution) <> 0
+                {
+                    if writing
+                        set next: Checker.substitution_base_type_of(cur)
+                    else
+                    {
+                        set next: this.get_substitution_intersection(cur)
+                        if this.unported_mark() <> mark
+                            return null
+                    }
+                }
+            }
+            ; ★★★ THE SIMPLIFIABLE ARM IS WRITTEN AND HELD BACK, AND WHAT HOLDS
+            ; IT IS MEASURED RATHER THAN SUSPECTED. Taking the answer here makes
+            ; the relation see the simplified type, and on this corpus that
+            ; reaches two PRE-EXISTING wrong answers whose cause is nowhere in
+            ; this chapter — `diagcheck` names both:
+            ;   • `varianceComputationNoCrash` — an invented TS2322 on a mapped
+            ;     type's `as` clause whose name type is a DISTRIBUTIVE conditional
+            ;     over the iteration variable. Three lines reproduce it and they
+            ;     reproduce on the PARENT TREE with no stop at all:
+            ;     `type E<O, S> = {[K in keyof S as K extends keyof O ? K : K]: S[K]}`.
+            ;     It is the constraint of that conditional, not the simplification.
+            ;   • `distributiveConditionalBaseConstraint` — an invented TS2344,
+            ;     where the ONE simplification that fires is the reference's own
+            ;     `(T | U)[K] -> T[K] | U[K]` (printed and read), and the relation
+            ;     over the resulting union is what answers false.
+            ; ★So the arm reports where the answer would CHANGE the type, which
+            ; is exactly the population the wall stood in front of before slice
+            ; 166 — the other five call sites of get_simplified_type answer.
+            ; ★★★It is the row `simplified-indexed-access-mapped-object` carried
+            ; from slice 157, now under a tag that says which half is missing:
+            ; the simplification is here, the relation over its result is not.
+            if next = null
+            {
+                if (cur.flags & TypeFlagsSimplifiable) <> 0
+                {
+                    let simplified this.get_simplified_type(cur, writing)
+                    if this.unported_mark() <> mark
+                        return null
+                    if simplified = null
+                        return null
+                    if (simplified as ref[Type]) <> cur
+                    {
+                        this.record_unported("relation-over-simplified-type", cur.flags)
+                        return null
+                    }
+                }
+            }
+            if next <> null
+            {
+                let n next as ref[Type]
+                if n <> cur
+                {
+                    set cur: n
+                    set moving: true
+                }
+            }
+        }
+        cur
+    }
+
     ; Relater.isRelatedToEx — its head, up to the point where the reference decides
     ; between `unionOrIntersectionRelatedTo` and `recursiveTypeRelatedTo`.
-    ;
-    ; ★★★ getNormalizedType IS THE FRESH-LITERAL ARM AND NOTHING ELSE HERE, and
-    ; the PROOF that stood over it EXPIRED — §3.5gm. It read: every other arm's
-    ; flag is inside TypeFlagsStructuredOrInstantiable, this function stops on that
-    ; word two arms further down, so *a type this port fails to normalize is a type
-    ; it does not answer about* and normalization *can only turn a stop into a
-    ; TRUE, never a TRUE into a stop*. Slice 136 ported the source TYPE-VARIABLE
-    ; arm, which ANSWERS about an instantiable source through its constraint, and
-    ; from that day the stop the argument named was unreachable for an IndexedAccess
-    ; source: `{[K in keyof O]: K}[keyof O]` against `keyof any` answered FALSE
-    ; where the reference simplifies the access to `keyof O` and answers true.
-    ; ★It is said rather than answered at that arm's own false exit now (see
-    ; `simplified-indexed-access-mapped-object` below). The argument's SHAPE is the
-    ; lesson: a safety claim resting on a downstream STOP expires the day that stop
-    ; is ported, and unlike an expired wall nothing moves when it does.
     function is_related_to_ex(this, original_source: ref[Type], original_target: ref[Type], relation: int, error_node: ref[AstNode]?, intersection_state: int, recursion_flags: int) returns bool
     {
         let mark this.unported_mark()
@@ -105495,57 +105852,24 @@ define Checker
                 return false
             }
         }
-        var source: ref[Type] original_source
-        if Checker.is_fresh_literal_type(source)
-        {
-            let sr Checker.literal_regular_type_of(source)
-            if sr <> null
-                set source: sr as ref[Type]
-        }
-        var target: ref[Type] original_target
-        if Checker.is_fresh_literal_type(target)
-        {
-            let tr Checker.literal_regular_type_of(target)
-            if tr <> null
-                set target: tr as ref[Type]
-        }
-        ; ★★★ getNormalizedType's SUBSTITUTION ARM, SLICE 136, AND IT IS ASYMMETRIC
-        ; BY DESIGN. The reference's comment over these two lines names all of it:
-        ; *"resolve substitution types to either the substitution (on the source
-        ; side) or the type variable (on the target side)"* — reading a substitution
-        ; is knowing MORE about the value (its base intersected with its constraint),
-        ; writing to one is knowing only that it is the type variable, and `writing`
-        ; is exactly what distinguishes the two call sites.
-        ;
-        ; ★★★ WITHOUT IT, THE TYPE THIS SLICE MINTS IS INERT IN THE RELATION, and
-        ; the corpus said so the same afternoon: in `TRec extends MyRecord ?
-        ; MySet<TRec> : TRec[]` the true branch's `TRec` IS the substitution, so
-        ; `MySet<TRec>`'s constraint check must see `TRec & MyRecord` — and seeing
-        ; the bare type parameter instead reported a TS2344 the reference does not
-        ; have. It was invisible until check_type_argument_constraints was CALLED in
-        ; this same slice, which is the second time in one afternoon that removing a
-        ; wall turned a dormant gap into a wrong answer.
-        ;
-        ; ★ The other four arms of getNormalizedType — the generic tuple, the
-        ; deferred reference, the union/intersection normalization and
-        ; getSimplifiedType — are NOT here, and neither is its fixpoint LOOP; each
-        ; is its own chapter and the fresh-literal arm above was already inlined
-        ; alone. What this adds is the arm whose input this slice created.
-        let mark_norm this.unported_mark()
-        if (source.flags & TypeFlagsSubstitution) <> 0
-        {
-            let si this.get_substitution_intersection(source)
-            if this.unported_mark() <> mark_norm
-                return false
-            if si <> null
-                set source: si as ref[Type]
-        }
-        if (target.flags & TypeFlagsSubstitution) <> 0
-        {
-            let tb Checker.substitution_base_type_of(target)
-            if tb <> null
-                set target: tb as ref[Type]
-        }
+        ; "Normalize the source and target types: turn fresh literal types into
+        ; regular literal types, turn deferred type references into regular type
+        ; references, simplify indexed access and conditional types, and resolve
+        ; substitution types to either the substitution (on the source side) or
+        ; the type variable (on the target side)." ★The flag is the reference's:
+        ; false for the source, TRUE for the target.
+        let normalized_source this.normalize_relation_operand(original_source, false)
+        if this.unported_mark() <> mark
+            return false
+        if normalized_source = null
+            return false
+        let normalized_target this.normalize_relation_operand(original_target, true)
+        if this.unported_mark() <> mark
+            return false
+        if normalized_target = null
+            return false
+        let source normalized_source as ref[Type]
+        var target: ref[Type] normalized_target as ref[Type]
         if source = target
             return true
         ; ★★★ THE IDENTITY RELATION GOES STRAIGHT INTO THE RECURSION, and this is
@@ -105619,15 +105943,14 @@ define Checker
                         let c candidate as ref[Type]
                         if (c.flags & TypeFlagsNullable) = 0
                         {
-                            ; getNormalizedType again, and again the fresh-literal
-                            ; arm is the whole of it here.
-                            set target: c
-                            if Checker.is_fresh_literal_type(target)
-                            {
-                                let cr Checker.literal_regular_type_of(target)
-                                if cr <> null
-                                    set target: cr as ref[Type]
-                            }
+                            ; getNormalizedType again, at the same three arms
+                            ; and the same WRITING polarity as the head (166).
+                            let renormalized this.normalize_relation_operand(c, true)
+                            if this.unported_mark() <> mark
+                                return false
+                            if renormalized = null
+                                return false
+                            set target: renormalized as ref[Type]
                             if source = target
                                 return true
                         }
@@ -108857,31 +109180,12 @@ define Checker
                     }
                 }
             }
-            ; ★★★ getSimplifiedType IS NOT IN is_related_to_ex — its own chapter,
-            ; and the header there argues the omission can only cost a STOP. For
-            ; ONE source shape it costs a WRONG ANSWER instead, which slice 157
-            ; measured in four lines: `{[K in keyof O]: K}[keyof O]` against
-            ; `keyof any` simplifies to `keyof O` upstream and is then related
-            ; through string|number|symbol, while unsimplified it has no
-            ; constraint either — so the arm above answers FALSE and
-            ; check_type_argument_constraints reports a TS2344 the reference does
-            ; not have. Said rather than answered, here at the arm's own false
-            ; exit: the shape is exactly the one
-            ; getSimplifiedIndexedAccessTypeWorker's mapped arm would have
-            ; substituted, and a stop is what *I cannot simplify this* means.
-            ; ★It was DORMANT until this slice ported the source CONDITIONAL arm,
-            ; whose default-constraint route is what reaches it — the fourth time
-            ; in this file that removing a wall turned a dormant gap into a wrong
-            ; answer (§3.5eq).
-            if (src.flags & TypeFlagsIndexedAccess) <> 0
-            {
-                let simplify_object Checker.indexed_access_object_type_of(src)
-                if simplify_object <> null
-                {
-                    if this.is_generic_mapped_type(simplify_object as ref[Type])
-                        this.record_unported("simplified-indexed-access-mapped-object", src.flags)
-                }
-            }
+            ; ★ Slice 157's `simplified-indexed-access-mapped-object` stood here
+            ; and is GONE (166): it named the one source shape whose wrong answer
+            ; came from the missing simplification — `{[K in keyof O]: K}[keyof O]`
+            ; against `keyof any` — and normalize_relation_operand now simplifies
+            ; the source before this arm is ever reached, so an access arriving
+            ; here is one the chapter could not reduce.
             return false
         }
         ; ── the source INSTANTIABLE arms, slice 157 ──────────────────────────
@@ -112489,12 +112793,72 @@ define Checker
         if this.unported_mark() <> mark
             return
         ; The chain's stand-in — see `rel_reported`. The FIRST level to reach here
-        ; is the innermost one, which is also the level whose message the
-        ; reference's chain puts first, so latching on entry keeps the message
-        ; this port would have printed anyway and drops the enclosing repeat.
+        ; is the innermost one, and for every shape this port could reach until
+        ; slice 166 that was also the level whose message the reference's chain
+        ; puts first, so latching on entry kept the message this port would have
+        ; printed anyway and dropped the enclosing repeat.
+        ;
+        ; ★★★ AND THAT PREMISE IS FALSE IN GENERAL — THE REFERENCE PRINTS THE
+        ; OUTERMOST LEVEL'S MESSAGE, NOT THE INNERMOST. `reportError` PREPENDS to
+        ; the chain and `createDiagnosticChainFromErrorChain` reads the HEAD, so
+        ; the code that survives is the last one added, i.e. the outermost level's
+        ; — unless THAT level suppresses itself, which `reportRelationError`'s
+        ; `switch r.getChainMessage(0)` does exactly when the chain already holds
+        ; a missing-property message for the SAME pair. Where the outer level's
+        ; pair differs, the reference prints its TS2322 over the inner TS2741, and
+        ; this port has already printed the TS2741.
+        ;
+        ; ★★★ IT WAS WALLED UNTIL THIS SLICE AND THE WALL WAS SOMEWHERE ELSE
+        ; ENTIRELY: a target INTERSECTION is the shape that puts a second level
+        ; between the two, and `is-reducible-intersection` stopped every one of
+        ; them before the report was reached. Four lines measure it —
+        ; `type B = {children: string} & {locale: string}` with
+        ; `const q: B = {locale: 'en'}` is TS2322 upstream and was TS2741 here,
+        ; while the same target spelled as ONE object literal type is TS2741 on
+        ; both sides. ★The fix is the error CHAIN — emit at the relation's entry
+        ; from a cell every level overwrites unless it suppresses — and that is a
+        ; chapter of its own, because moving the emission makes every outer level
+        ; run report_relation_error's `type_to_string` fork, whose two stops the
+        ; latch is currently what avoids.
+        ;
+        ; ★ Said rather than answered, and narrowed to the exact shape: the stop
+        ; fires only where the inner level printed a MISSING-PROPERTY message for
+        ; a pair that is not this level's, which is the only configuration in
+        ; which the two codes can differ. Where the inner printed TS2322 the outer
+        ; would print TS2322 too, and the dump compares codes.
         if rel_reported
+        {
+            if rel_reported_unmatched
+            {
+                var same_pair false
+                if rel_unmatched_source <> null
+                {
+                    if rel_unmatched_target <> null
+                    {
+                        if (rel_unmatched_source as ref[Type]) = source
+                        {
+                            if (rel_unmatched_target as ref[Type]) = target
+                                set same_pair: true
+                        }
+                    }
+                }
+                if same_pair = false
+                {
+                    ; ★★★ AND THE LINE ALREADY EMITTED IS TAKEN BACK. A stop makes
+                    ; the UNIT unported, which the checker yardstick honours; the
+                    ; DIAGNOSTIC subsequence gate does not — it reads the list —
+                    ; and an invented line there is the one thing this port may
+                    ; not leave standing. `truncate` is the reference's own rewind
+                    ; and the relation is the only writer since the mark, so the
+                    ; entry it removes is the one the inner level added.
+                    diagnostics.truncate(rel_reported_mark)
+                    this.record_unported("relation-error-outer-level-message", target.flags)
+                }
+            }
             return
+        }
         set rel_reported: true
+        set rel_reported_unmatched: false
         ; ★★★ THE ERROR TYPE IS THAT GUARD ONE LEVEL UP, AND IT COST TWO INVENTED
         ; LINES TO FIND. The mark says *nothing stopped inside this comparison*; it
         ; cannot say *the types handed in are the ones the reference would have
@@ -112709,6 +113073,8 @@ define Checker
                 {
                     if Checker.is_conversion_or_interface_implementation_message(rel_head_code) = false
                     {
+                        set rel_reported_unmatched: true
+                        set rel_reported_mark: diagnostics.length()
                         this.error_on_node(error_node, rel_unmatched_code)
                         return
                     }
@@ -116885,7 +117251,7 @@ define Checker
             return child_field_type
         if child_index < 0
             return child_field_type
-        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, child_index, 0, 0, 0, 0, 0, null, null, null, null, null, null) as ref[MapTypeArgs]?
+        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, child_index, 0, 0, 0, 0, 0, null, null, null, null, null, null, false) as ref[MapTypeArgs]?
         this.map_type_ex(child_field_type as ref[Type], MapTypeKindJsxChildElement, a, true)
     }
 
@@ -117474,9 +117840,9 @@ define Checker
     ; newFunctionTypeMapper, slice 151. ★Called exactly twice, from the intrinsic
     ; init — see the field's note on why the two answers are kept rather than
     ; re-made.
-    function new_function_type_mapper(this, restrictive: bool) returns ref[TypeMapper]
+    function new_function_type_mapper(this, worker: int) returns ref[TypeMapper]
     {
-        let p &TypeMapper^host(TypeMapperData.Function(FunctionTypeMapperData(restrictive)))
+        let p &TypeMapper^host(TypeMapperData.Function(FunctionTypeMapperData(worker)))
         p
     }
 
@@ -117902,23 +118268,425 @@ define Checker
     function is_type_strict_subtype_of(this, source: ref[Type], target: ref[Type]) returns bool
         this.is_type_related_to(source, target, RelationStrictSubtype)
 
-    ; getSimplifiedType. The two arms that DO work are the indexed access and the
-    ; conditional, and both are the simplification chapter; everything else is
-    ; the identity, which is the answer at every call this chapter makes on a bare
-    ; type parameter.
+    ; ── THE SIMPLIFICATION CHAPTER (slice 166) ───────────────────────────────
+    ;
+    ; getSimplifiedType and the six functions under it. The two arms that DO work
+    ; are the indexed access and the conditional; everything else is the identity.
+    ;
+    ; ★★★ IT IS THE `writing` FLAG THAT MAKES THE CHAPTER TWO CHAPTERS, and the
+    ; reference says why at the head of the indexed access: the flag *indicates
+    ; that the type is the target of an assignment*, and every distribution in
+    ; here flips between a UNION and an INTERSECTION on it. `T[A | B]` read is
+    ; `T[A] | T[B]` — the value is one of them; written it is `T[A] & T[B]` —
+    ; the slot must accept either. A port that carried one polarity would be
+    ; right on every read and silently wrong on every assignment target.
     function get_simplified_type(this, t: ref[Type], writing: bool) returns ref[Type]?
     {
         if (t.flags & TypeFlagsIndexedAccess) <> 0
+            return this.get_simplified_indexed_access_type(t, writing)
+        if (t.flags & TypeFlagsConditional) <> 0
+            return this.get_simplified_conditional_type(t, writing)
+        t
+    }
+
+    ; getSimplifiedIndexedAccessType — the memo around the worker.
+    ;
+    ; ★★★ THE `t`-INTO-THE-SLOT BEFORE THE CALL IS THE RECURSION BRAKE AND NOT AN
+    ; OPTIMISATION, and the worker's own first two lines are what need it: it
+    ; simplifies the object type and the index type, either of which can be this
+    ; access again. See SimplifiedIndexedAccessLink for the one divergence — the
+    ; slot is CLEARED when the worker stops, because an in-progress `t` left
+    ; behind would answer the identity at the next ask with no stop recorded.
+    ;
+    ; ★ `removeType(result, t)` is the reference's own line and its comment says
+    ; what it is for: *if the simplification is a union type that includes t,
+    ; remove t from the type* — a distribution over an index union can hand back
+    ; a union one of whose constituents is the access we started from.
+    function get_simplified_indexed_access_type(this, t: ref[Type], writing: bool) returns ref[Type]?
+    {
+        let link this.simplified_indexed_access_link_of(t)
+        var cached: ref[Type]? link.for_reading
+        if writing
+            set cached: link.for_writing
+        if cached <> null
         {
-            this.record_unported("get-simplified-indexed-access-type", t.flags)
+            if (cached as ref[Type]) = circular_constraint_type
+                return t
+            return cached
+        }
+        if writing
+            set link.for_writing: t
+        else
+            set link.for_reading: t
+        let mark this.unported_mark()
+        let worked this.get_simplified_indexed_access_type_worker(t, writing)
+        if this.unported_mark() <> mark
+        {
+            if writing
+                set link.for_writing: null
+            else
+                set link.for_reading: null
             return null
         }
-        if (t.flags & TypeFlagsConditional) <> 0
-        {
-            this.record_unported("get-simplified-conditional-type", t.flags)
+        if worked = null
             return null
+        let result worked as ref[Type]
+        if result = t
+            return result
+        let stripped this.remove_type(result, t)
+        if this.unported_mark() <> mark
+        {
+            if writing
+                set link.for_writing: null
+            else
+                set link.for_reading: null
+            return null
+        }
+        if stripped = null
+            return null
+        if writing
+            set link.for_writing: stripped
+        else
+            set link.for_reading: stripped
+        stripped
+    }
+
+    ; getSimplifiedIndexedAccessTypeWorker — four transformations, tried in the
+    ; reference's own order, and the fall-through is the access as it stands.
+    ;
+    ; ★★★ THE GUARD IN FRONT OF THE SECOND DISTRIBUTION IS LOAD-BEARING AND THE
+    ; REFERENCE STATES IT: *only do the inner distributions if the index can no
+    ; longer be instantiated to cause index distribution again*. Distributing the
+    ; object over an index that is still instantiable would re-enter through the
+    ; substituted index and the memo above would be answering an access that is
+    ; not the one asked about.
+    function get_simplified_indexed_access_type_worker(this, t: ref[Type], writing: bool) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let object_source Checker.indexed_access_object_type_of(t)
+        let index_source Checker.indexed_access_index_type_of(t)
+        if object_source = null
+            return null
+        if index_source = null
+            return null
+        let simplified_object this.get_simplified_type(object_source as ref[Type], writing)
+        if this.unported_mark() <> mark
+            return null
+        if simplified_object = null
+            return null
+        let object_type simplified_object as ref[Type]
+        let simplified_index this.get_simplified_type(index_source as ref[Type], writing)
+        if this.unported_mark() <> mark
+            return null
+        if simplified_index = null
+            return null
+        let index_type simplified_index as ref[Type]
+        ; T[A | B] -> T[A] | T[B] (reading), T[A] & T[B] (writing).
+        let over_index this.distribute_object_over_index_type(object_type, index_type, writing)
+        if this.unported_mark() <> mark
+            return null
+        if over_index <> null
+            return over_index
+        if (index_type.flags & TypeFlagsInstantiable) = 0
+        {
+            ; (T | U)[K] -> T[K] | U[K] (reading), and & for the writing and the
+            ; intersection cases.
+            let over_object this.distribute_index_over_object_type(object_type, index_type, writing)
+            if this.unported_mark() <> mark
+                return null
+            if over_object <> null
+                return over_object
+        }
+        ; "A generic tuple type indexed by a number exists only when the index
+        ; type doesn't select a fixed element." The whole number type takes every
+        ; element; a narrower number-like index takes the non-fixed tail.
+        if Checker.is_generic_tuple_type(object_type)
+        {
+            if (index_type.flags & TypeFlagsNumberLike) <> 0
+            {
+                var start 0
+                if (index_type.flags & TypeFlagsNumber) = 0
+                {
+                    let tuple_target Checker.target_of(object_type)
+                    if tuple_target = null
+                        return null
+                    set start: Checker.tuple_fixed_length_of(tuple_target as ref[Type])
+                }
+                let element this.get_element_type_of_slice_of_tuple_type(object_type, start, 0, writing, false)
+                if this.unported_mark() <> mark
+                    return null
+                if element <> null
+                    return element
+            }
+        }
+        ; "If the object type is a mapped type { [P in K]: E }, where K is
+        ; generic … instantiate E using a mapper that substitutes the index type
+        ; for P." ★The index passed is the UNSIMPLIFIED one — the reference reads
+        ; `t.AsIndexedAccessType().indexType` here and not the local, because the
+        ; substitution is into the mapped type's own parameter and must carry the
+        ; index the author wrote.
+        ; ★ Both predicates can STOP and answer false, so each is bound and the
+        ; mark asked before the answer is used — a stop that reads as *not a
+        ; generic mapped type* would fall through to the identity below and
+        ; record the wall nowhere.
+        let generic_mapped this.is_generic_mapped_type(object_type)
+        if this.unported_mark() <> mark
+            return null
+        if generic_mapped
+        {
+            let name_kind this.get_mapped_type_name_type_kind(object_type)
+            if this.unported_mark() <> mark
+                return null
+            if name_kind <> MappedTypeNameTypeKindRemapping
+            {
+                let substituted this.substitute_indexed_mapped_type(object_type, index_source as ref[Type])
+                if this.unported_mark() <> mark
+                    return null
+                if substituted = null
+                    return null
+                let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, writing) as ref[MapTypeArgs]?
+                return this.map_type(substituted as ref[Type], MapTypeKindSimplified, a)
+            }
         }
         t
+    }
+
+    ; distributeObjectOverIndexType — T[A | B] over the index union. ★null here
+    ; means NOT APPLICABLE and not a stop; every caller asks the mark first,
+    ; which is what separates the two in this file.
+    function distribute_object_over_index_type(this, object_type: ref[Type], index_type: ref[Type], writing: bool) returns ref[Type]?
+    {
+        if (index_type.flags & TypeFlagsUnion) = 0
+            return null
+        let mark this.unported_mark()
+        let members Checker.union_types_of(index_type)
+        if members = null
+            return null
+        let list members as ref[Array[ref[Type]?]]
+        let n list.get_length() as int
+        let out this.new_type_list(null)
+        var i 0
+        while i < n
+        {
+            let row list[i]
+            set i: i + 1
+            if row = null
+                continue
+            let access this.get_indexed_access_type(object_type, row as ref[Type])
+            if this.unported_mark() <> mark
+                return null
+            if access = null
+                return null
+            let simplified this.get_simplified_type(access as ref[Type], writing)
+            if this.unported_mark() <> mark
+                return null
+            if simplified = null
+                return null
+            out.add(simplified)
+        }
+        if writing
+            return this.get_intersection_type(out)
+        this.get_union_type(out)
+    }
+
+    ; distributeIndexOverObjectType — (T | U)[K] and (T & U)[K].
+    ;
+    ; ★ The INTERSECTION half carries a guard the union half does not:
+    ; shouldDeferIndexType. An intersection whose index type is deferred is one
+    ; whose `keyof` cannot be resolved yet, and distributing it would decide the
+    ; question the deferral exists to postpone.
+    function distribute_index_over_object_type(this, object_type: ref[Type], index_type: ref[Type], writing: bool) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        var applies false
+        if (object_type.flags & TypeFlagsUnion) <> 0
+            set applies: true
+        if (object_type.flags & TypeFlagsIntersection) <> 0
+        {
+            if this.should_defer_index_type(object_type, IndexFlagsNone) = false
+                set applies: true
+            if this.unported_mark() <> mark
+                return null
+        }
+        if applies = false
+            return null
+        ; ★ `Types()` upstream is the UnionOrIntersection accessor, and this arm
+        ; is reached from both — union_types_of alone answers null on every
+        ; intersection, which would silently read as *not applicable*.
+        let members Checker.union_or_intersection_types_of(object_type)
+        if members = null
+            return null
+        let list members as ref[Array[ref[Type]?]]
+        let n list.get_length() as int
+        let out this.new_type_list(null)
+        var i 0
+        while i < n
+        {
+            let row list[i]
+            set i: i + 1
+            if row = null
+                continue
+            let access this.get_indexed_access_type(row as ref[Type], index_type)
+            if this.unported_mark() <> mark
+                return null
+            if access = null
+                return null
+            let simplified this.get_simplified_type(access as ref[Type], writing)
+            if this.unported_mark() <> mark
+                return null
+            if simplified = null
+                return null
+            out.add(simplified)
+        }
+        if (object_type.flags & TypeFlagsIntersection) <> 0
+            return this.get_intersection_type(out)
+        if writing
+            return this.get_intersection_type(out)
+        this.get_union_type(out)
+    }
+
+    ; getSimplifiedConditionalType — the two shapes `T extends U ? T : never` and
+    ; `T extends U ? never : T`, and nothing else.
+    ;
+    ; ★★★ THE RELATION IT ASKS IS THE RESTRICTIVE ONE ON BOTH SIDES, and that is
+    ; the whole reason the simplification is sound: a restrictive instantiation
+    ; replaces every type parameter's constraint with `unknown`, so an assignable
+    ; answer holds for EVERY instantiation of the conditional rather than for the
+    ; one in hand. Asking `isTypeAssignableTo(checkType, extendsType)` directly
+    ; would simplify a conditional whose branch depends on a type argument nobody
+    ; has supplied yet.
+    function get_simplified_conditional_type(this, t: ref[Type], writing: bool) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        let check_source Checker.conditional_check_type_of(t)
+        let extends_source Checker.conditional_extends_type_of(t)
+        if check_source = null
+            return null
+        if extends_source = null
+            return null
+        let check_type check_source as ref[Type]
+        let extends_type extends_source as ref[Type]
+        let true_source this.get_true_type_from_conditional_type(t)
+        if this.unported_mark() <> mark
+            return null
+        if true_source = null
+            return null
+        let false_source this.get_false_type_from_conditional_type(t)
+        if this.unported_mark() <> mark
+            return null
+        if false_source = null
+            return null
+        let true_type true_source as ref[Type]
+        let false_type false_source as ref[Type]
+        ; ★ getActualTypeVariable always answers upstream; here it can be null
+        ; without a stop (a substitution whose base is missing), and TWO nulls
+        ; would compare EQUAL and simplify a conditional that must not be
+        ; simplified — so the identity is asked between unwrapped references.
+        let check_variable this.get_actual_type_variable(check_type)
+        if this.unported_mark() <> mark
+            return null
+        if check_variable = null
+            return null
+        let check_var check_variable as ref[Type]
+        if (false_type.flags & TypeFlagsNever) <> 0
+        {
+            let true_variable this.get_actual_type_variable(true_type)
+            if this.unported_mark() <> mark
+                return null
+            if true_variable = null
+                return null
+            if (true_variable as ref[Type]) = check_var
+            {
+                if (check_type.flags & TypeFlagsAny) <> 0
+                    return this.get_simplified_type(true_type, writing)
+                if this.restrictively_assignable(check_type, extends_type)
+                {
+                    if this.unported_mark() <> mark
+                        return null
+                    return this.get_simplified_type(true_type, writing)
+                }
+                if this.unported_mark() <> mark
+                    return null
+                if this.is_intersection_empty(check_type, extends_type)
+                    return never_type
+                if this.unported_mark() <> mark
+                    return null
+                return t
+            }
+        }
+        if (true_type.flags & TypeFlagsNever) <> 0
+        {
+            let false_variable this.get_actual_type_variable(false_type)
+            if this.unported_mark() <> mark
+                return null
+            if false_variable = null
+                return null
+            if (false_variable as ref[Type]) = check_var
+            {
+                if (check_type.flags & TypeFlagsAny) = 0
+                {
+                    if this.restrictively_assignable(check_type, extends_type)
+                        return never_type
+                    if this.unported_mark() <> mark
+                        return null
+                }
+                var falls false
+                if (check_type.flags & TypeFlagsAny) <> 0
+                    set falls: true
+                if falls = false
+                {
+                    if this.is_intersection_empty(check_type, extends_type)
+                        set falls: true
+                    if this.unported_mark() <> mark
+                        return null
+                }
+                if falls
+                    return this.get_simplified_type(false_type, writing)
+                return t
+            }
+        }
+        t
+    }
+
+    ; The `isTypeAssignableTo(getRestrictiveInstantiation(a), getRestrictiveInstantiation(b))`
+    ; pair, written once because getSimplifiedConditionalType asks it twice.
+    function restrictively_assignable(this, source: ref[Type], target: ref[Type]) returns bool
+    {
+        let mark this.unported_mark()
+        let rs this.get_restrictive_instantiation(source)
+        if this.unported_mark() <> mark
+            return false
+        if rs = null
+            return false
+        let rt this.get_restrictive_instantiation(target)
+        if this.unported_mark() <> mark
+            return false
+        if rt = null
+            return false
+        this.is_type_assignable_to(rs as ref[Type], rt as ref[Type])
+    }
+
+    ; isIntersectionEmpty — "invokes union simplification logic to determine if an
+    ; intersection is considered empty as a union constituent". ★The union of the
+    ; intersection with `never` is the whole test: getUnionType reduces it away
+    ; unless the intersection itself is never.
+    function is_intersection_empty(this, type1: ref[Type], type2: ref[Type]) returns bool
+    {
+        let mark this.unported_mark()
+        let both this.intersect_types(type1, type2)
+        if this.unported_mark() <> mark
+            return false
+        if both = null
+            return false
+        let pair this.new_type_list(null)
+        pair.add(both)
+        pair.add(never_type)
+        let u this.get_union_type(pair)
+        if this.unported_mark() <> mark
+            return false
+        if u = null
+            return false
+        ((u as ref[Type]).flags & TypeFlagsNever) <> 0
     }
 
     ; getVariances, at the arm that needs no measurement: an array, a readonly
@@ -119057,25 +119825,73 @@ define Checker
                     set n.inference_priority: n.priority
                 return
             }
-            ; Not one of ours: try to expose more bare type parameters by
-            ; simplifying the target.
+            ; "Infer to the simplified version of an indexed access, if
+            ; possible, to (hopefully) expose more bare type parameters to the
+            ; inference engine."
+            ;
+            ; ★★★ NEITHER RECURSION RETURNS, AND THE `return` THAT USED TO STAND
+            ; HERE WAS A DIVERGENCE NOBODY COULD SEE. Upstream this block is the
+            ; tail of the type-variable arm and FALLS THROUGH into the switch
+            ; below, so a target that simplifies is inferred from twice — once
+            ; simplified, once by its own structure. It was invisible while
+            ; get_simplified_type was a stop: the mark check above returned
+            ; first on every input that could reach the difference.
             let simplified this.get_simplified_type(target, false)
             if this.unported_mark() <> mark
                 return
+            var took_simplified false
             if simplified <> null
             {
                 if simplified <> target
                 {
                     this.infer_from_types(n, source, simplified as ref[Type])
-                    return
+                    if this.unported_mark() <> mark
+                        return
+                    set took_simplified: true
                 }
             }
-            if (target.flags & TypeFlagsIndexedAccess) <> 0
+            if took_simplified = false
             {
-                ; distributeIndexOverObjectType over the simplified halves — the
-                ; second half of the simplification chapter.
-                this.record_unported("distribute-index-over-object-type", target.flags)
-                return
+                if (target.flags & TypeFlagsIndexedAccess) <> 0
+                {
+                    ; "Generally simplifications of instantiable indexes are
+                    ; avoided to keep relationship checking correct, however if
+                    ; our target is an access, we can consider that key of that
+                    ; access to be 'instantiated', since we're looking to find
+                    ; the inference goal in any way we can."
+                    let index_source Checker.indexed_access_index_type_of(target)
+                    let object_source Checker.indexed_access_object_type_of(target)
+                    if index_source = null
+                        return
+                    if object_source = null
+                        return
+                    let index_type this.get_simplified_type(index_source as ref[Type], false)
+                    if this.unported_mark() <> mark
+                        return
+                    if index_type = null
+                        return
+                    let it index_type as ref[Type]
+                    if (it.flags & TypeFlagsInstantiable) <> 0
+                    {
+                        let object_type this.get_simplified_type(object_source as ref[Type], false)
+                        if this.unported_mark() <> mark
+                            return
+                        if object_type = null
+                            return
+                        let distributed this.distribute_index_over_object_type(object_type as ref[Type], it, false)
+                        if this.unported_mark() <> mark
+                            return
+                        if distributed <> null
+                        {
+                            if distributed <> target
+                            {
+                                this.infer_from_types(n, source, distributed as ref[Type])
+                                if this.unported_mark() <> mark
+                                    return
+                            }
+                        }
+                    }
+                }
             }
         }
         ; ── the switch ──────────────────────────────────────────────────────
@@ -122668,15 +123484,6 @@ define Checker
             if this.unported_mark() <> mark
                 return null
         }
-        scaly_eputs("PROBE gi cand=")
-        scaly_eputi((inference.candidates.get_length() as int) as i64)
-        scaly_eputs(" contra=")
-        scaly_eputi((inference.contra_candidates.get_length() as int) as i64)
-        if inferred = null
-            scaly_eputs(" inferred=NULL")
-        else
-            scaly_eputs(" inferred=SOME")
-        scaly_eputnl()
         set inference.inferred_type: inferred
         if inference.inferred_type = null
         {
@@ -122688,10 +123495,6 @@ define Checker
         let constraint this.get_constraint_of_type_parameter(tp)
         if this.unported_mark() <> mark
             return null
-        if constraint = null
-            scaly_eputs("PROBE gi constraint NULL\n")
-        else
-            scaly_eputs("PROBE gi constraint SOME\n")
         if constraint <> null
         {
             let instantiated this.instantiate_type(constraint, n.non_fixing_mapper)
