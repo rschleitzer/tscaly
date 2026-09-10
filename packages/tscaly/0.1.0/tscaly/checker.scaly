@@ -950,6 +950,14 @@ define MapTypeKindStringMapping: int 21
 ; conditional's own check type at the arm two above.
 define MapTypeKindConstraintFilter: int 22
 
+; MapTypeKindInstantiationExpression (slice 181) — getInstantiationExpressionType's
+; UNION arm, `c.mapType(t, getInstantiatedType)`. ★It re-enters the OUTER of the
+; two closures, not the part-wise one, which is what gives every constituent a
+; FRESH `hasSignatures`/`hasApplicableSignature` pair while the two
+; `hasSomeApplicableSignature`/`nonApplicableType` slots stay shared. That
+; asymmetry is the whole reason the state is split across two records here.
+define MapTypeKindInstantiationExpression: int 23
+
 ; IntrinsicTypeKind — the five names `type X<T> = intrinsic` is legal for. ★A
 ; TABLE upstream (`intrinsicTypeKinds`, a map from name to kind); five names
 ; here, for the reason type_alias_intrinsic_is_legal's header gives: the VALUE
@@ -1015,6 +1023,28 @@ define MapTypeArgs
     ; MapTypeKindConstraintFilter's two (slice 179).
     filter_constraint: ref[Type]?
     filter_comparer: int
+
+    ; MapTypeKindInstantiationExpression's two (slice 181).
+    inst_expr_node: ref[AstNode]?
+    inst_expr_state: ref[InstantiationExpressionState]?
+)
+
+; getInstantiationExpressionType's SHARED captures — the two the reference's two
+; nested closures both write. §3.21's shape.
+define InstantiationExpressionState
+(
+    type_arguments: ref[Array[ref[AstNode]?]]?
+    has_some_applicable: bool
+    non_applicable: ref[Type]?
+)
+
+; …and its PER-CALL captures: `hasSignatures` and `hasApplicableSignature` are
+; declared inside getInstantiatedType, so each constituent of a union gets its
+; own pair while the record above is threaded through unchanged.
+define InstantiationExpressionPart
+(
+    has_signatures: bool
+    has_applicable_signature: bool
 )
 
 ; addSpans' captured state (slice 126) — §3.21. The builder is a SLOT because the
@@ -3371,6 +3401,20 @@ define CachedSignature
     instantiation: ref[Signature]?
 )
 
+; c.instantiationExpressionTypes' row (slice 181). ★Upstream keys the map on
+; `InstantiationExpressionKey{nodeId, typeId}`; here the NODE and the TYPE are
+; borrowed references and `=` on either is an identity test, so the pair is the
+; key without a counter in between. The cache is not decoration: without it a
+; second visit to the same `typeof f<T>` mints a SECOND object type, and every
+; identity comparison downstream — and the printer's own alias search — then sees
+; two types where the reference has one.
+define InstantiationExpressionCacheRow
+(
+    node: ref[AstNode]?
+    source: ref[Type]?
+    result: ref[Type]?
+)
+
 ; The reference's CachedSignatureKey.key — either a rendering of the type
 ; argument list or one of two SENTINEL strings. Here the list is the key for the
 ; instantiation rows and the two sentinels are their own kinds, so a base
@@ -5094,6 +5138,32 @@ define EvolvingArrayTypeData
     final_array_type: ref[Type]?
 )
 
+; ── InstantiationExpressionType (slice 181) ────────────────────────────────
+;
+; The reference's `InstantiationExpressionType` is an ObjectType with ONE extra
+; slot, the `typeof X<A>` node the type was minted from. ★It is written as its own
+; arm rather than folded into Anonymous because getInstantiationExpressionType
+; sets the flag ANONYMOUS|INSTANTIATION_EXPRESSION and newObjectType's switch
+; tests the second bit FIRST — the two arms are distinguishable only by order, and
+; a fold would make the node slot unreachable for exactly the types that carry it.
+;
+; ★★★ THE FOUR ObjectType SLOTS ARE NOT DECORATION AND LEAVING THEM OUT COST AN
+; `exit 21` ON THE FIRST UNIT THAT BUILT ONE. Upstream EMBEDS ObjectType, so an
+; instantiation-expression type has `resolved`, `target`, `mapper` and
+; `instantiations` like any other; a one-slot arm here made
+; attach_structured_members fall through every `when`, and the very next line —
+; `structured_members_of(t) as ref[StructuredMembers]` — met the null it had just
+; failed to write. **A new TypeData arm owes an arm to every accessor that
+; switches over the union, and the ones that matter are the ones that WRITE.**
+define InstantiationExpressionTypeData
+(
+    resolved: ref[StructuredMembers]?
+    target: ref[Type]?
+    mapper: ref[TypeMapper]?
+    instantiations: ref[Array[ref[ObjectInstantiation]?]]?
+    node: ref[AstNode]?
+)
+
 ; ── UniqueESSymbolType (slice 146) ─────────────────────────────────────────
 ;
 ; The reference's `UniqueESSymbolType`, whose whole content is a NAME:
@@ -5155,6 +5225,7 @@ define TypeData union
     Conditional: ConditionalTypeData
     EvolvingArray: EvolvingArrayTypeData
     UniqueESSymbol: UniqueESSymbolTypeData
+    InstantiationExpression: InstantiationExpressionTypeData
 )
 
 ; ── Type ────────────────────────────────────────────────────────────────────
@@ -7182,6 +7253,9 @@ define Checker
     inference_context_infos: ref[Array[ref[InferenceContextInfo]?]]
     cached_signatures: ref[Array[ref[CachedSignature]?]]
 
+    ; c.instantiationExpressionTypes (slice 181) — see InstantiationExpressionCacheRow.
+    instantiation_expression_types: ref[Array[ref[InstantiationExpressionCacheRow]?]]
+
     ; ── the stop log (slice 75) ─────────────────────────────────────────────
     ;
     ; Every stop in the order it happened, where `unported_tag` is the first and
@@ -7479,6 +7553,8 @@ define Checker
         set c.inference_context_infos: ici
         let csig &Array[ref[CachedSignature]?]^host()
         set c.cached_signatures: csig
+        let iext &Array[ref[InstantiationExpressionCacheRow]?]^host()
+        set c.instantiation_expression_types: iext
         let stops &Array[ref[StopEvent]?]^host()
         set c.stop_log: stops
         var args_data Slice[char]()
@@ -8304,10 +8380,13 @@ define Checker
         ; the two §3.14 setters below fill them.
         if (object_flags & ObjectFlagsEvolvingArray) <> 0
             return this.new_type(TypeFlagsObject, object_flags, sym, TypeData.EvolvingArray(EvolvingArrayTypeData(null, null)))
-        ; ObjectFlagsInstantiationExpressionType is `1 << 24`, one of the REUSED
-        ; positions the flags table above deliberately does not name — so this arm
-        ; is written by the slice that declares the bit, beside its reader.
-        ;
+        ; ★★ Slice 181 fills this arm, and its POSITION is the whole of it:
+        ; getInstantiationExpressionType asks for `Anonymous|InstantiationExpression`
+        ; and the reference's switch tests the second bit FIRST, so an arm written
+        ; after the anonymous one below would never be reached and the node slot
+        ; would be unreachable for every type that has one.
+        if (object_flags & ObjectFlagsInstantiationExpressionType) <> 0
+            return this.new_type(TypeFlagsObject, object_flags, sym, TypeData.InstantiationExpression(InstantiationExpressionTypeData(null, null, null, null, null)))
         ; ★ Slice 67 fills the anonymous arm, which used to report here. Its
         ; caller is getTypeOfFuncClassEnumModuleWorker and the first thing this
         ; port makes with it is the STATIC SIDE of a class.
@@ -8577,6 +8656,8 @@ define Checker
                 return a.target
             when m: Mapped
                 return m.target
+            when ie: InstantiationExpression
+                return ie.target
         null
     }
 
@@ -8592,6 +8673,8 @@ define Checker
                 return m.mapper
             when r: Reference
                 return r.mapper
+            when ie: InstantiationExpression
+                return ie.mapper
         null
     }
 
@@ -8606,6 +8689,13 @@ define Checker
                 set d.target: target
                 set d.mapper: m
                 set t.data: TypeData.Anonymous(d)
+            }
+            when ie: InstantiationExpression
+            {
+                var d ie
+                set d.target: target
+                set d.mapper: m
+                set t.data: TypeData.InstantiationExpression(d)
             }
             when m2: Mapped
             {
@@ -10687,6 +10777,8 @@ define Checker
                 return a.instantiations
             when m: Mapped
                 return m.instantiations
+            when ie: InstantiationExpression
+                return ie.instantiations
         null
     }
 
@@ -10698,6 +10790,12 @@ define Checker
                 var d a
                 set d.instantiations: list
                 set t.data: TypeData.Anonymous(d)
+            }
+            when ie: InstantiationExpression
+            {
+                var d ie
+                set d.instantiations: list
+                set t.data: TypeData.InstantiationExpression(d)
             }
             when m: Mapped
             {
@@ -16216,7 +16314,7 @@ define Checker
             return empty_object_type
         if (source.flags & TypeFlagsUnion) <> 0
         {
-            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, properties, symbol, null, null, null, false, null, null, 0, false, null, null, 0) as ref[MapTypeArgs]?
+            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, properties, symbol, null, null, null, false, null, null, 0, false, null, null, 0, null, null) as ref[MapTypeArgs]?
             return this.map_type(source, MapTypeKindRestType, a)
         }
         ; `getUnionType(core.Map(properties, c.getLiteralTypeFromPropertyName))` —
@@ -25078,30 +25176,6 @@ define Checker
         null
     }
 
-    function type_lists_equal(a: ref[Array[ref[Type]?]]?, bl: ref[Array[ref[Type]?]]?) returns bool
-    {
-        var an 0
-        if a <> null
-            set an: (a as ref[Array[ref[Type]?]]).get_length() as int
-        var bn 0
-        if bl <> null
-            set bn: (bl as ref[Array[ref[Type]?]]).get_length() as int
-        if an <> bn
-            return false
-        if an = 0
-            return true
-        let al a as ref[Array[ref[Type]?]]
-        let bll bl as ref[Array[ref[Type]?]]
-        var i 0
-        while i < an
-        {
-            if al[i] <> bll[i]
-                return false
-            set i: i + 1
-        }
-        true
-    }
-
     ; `core.Map(node.TypeArguments(), c.getTypeFromTypeNode)`. ★It answers null
     ; for a node with no type arguments, which is the reference's nil slice and
     ; what makes `Widget` and `Widget<T>` two different cache keys.
@@ -28043,6 +28117,8 @@ define Checker
                 return true
             when a: Anonymous
                 return true
+            when ie: InstantiationExpression
+                return true
             when u: Union
                 return true
             when x: Intersection
@@ -29683,6 +29759,29 @@ define Checker
                 var d e
                 set d.final_array_type: v
                 set t.data: TypeData.EvolvingArray(d)
+            }
+    }
+
+    ; `t.AsInstantiationExpressionType().node`, and its §3.14 setter. ★The write
+    ; happens one line after the type is minted, exactly as the evolving array's
+    ; does, which is why the arm starts null rather than taking the node through
+    ; new_object_type: that function's signature is the reference's.
+    function instantiation_expression_node_of(t: ref[Type]) returns ref[AstNode]?
+    {
+        choose t.data
+            when d: InstantiationExpression
+                return d.node
+        null
+    }
+
+    procedure set_instantiation_expression_node(t: ref[Type], v: ref[AstNode]?)
+    {
+        choose t.data
+            when e: InstantiationExpression
+            {
+                var d e
+                set d.node: v
+                set t.data: TypeData.InstantiationExpression(d)
             }
     }
 
@@ -33211,7 +33310,7 @@ define Checker
             let subject types[union_index]
             if subject = null
                 return null
-            let a &MapTypeArgs^host(null, null, null, null, null, false, texts, types, union_index, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false, null, null, 0)
+            let a &MapTypeArgs^host(null, null, null, null, null, false, texts, types, union_index, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false, null, null, 0, null, null)
             return this.map_type(subject as ref[Type], MapTypeKindTemplateLiteralSpan, a)
         }
         ; slices.Contains(types, wildcardType).
@@ -33756,7 +33855,7 @@ define Checker
         let kind Checker.intrinsic_type_kind(Symbol.name_of(symbol))
         if (t.flags & (TypeFlagsUnion | TypeFlagsNever)) <> 0
         {
-            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false, symbol, null, 0) as ref[MapTypeArgs]?
+            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false, symbol, null, 0, null, null) as ref[MapTypeArgs]?
             return this.map_type(t, MapTypeKindStringMapping, a)
         }
         if (t.flags & TypeFlagsStringLiteral) <> 0
@@ -34252,9 +34351,18 @@ define Checker
         true
     }
 
-    ; inferTypesFromTemplateLiteralType — the two source shapes. ★A source
-    ; template whose texts are EXACTLY the target's contributes its own types
-    ; unchanged; anything else goes through the matcher.
+    ; inferTypesFromTemplateLiteralType — the two source shapes.
+    ;
+    ; ★★★ THE EQUAL-TEXTS ARM IS A MAP AND NOT A PASS-THROUGH, AND THE LINE THAT
+    ; STOOD HERE CERTIFIED THE PASS-THROUGH (*a source template whose texts are
+    ; EXACTLY the target's contributes its own types unchanged*, slice 181). The
+    ; reference's `core.MapIndex` asks, per position, whether the source's
+    ; constituent is assignable to the target's under both base constraints; only
+    ; then does it contribute ITSELF. Where it is not, the inference contributes
+    ; `` `${T}` `` — getStringLikeTypeForType — which is what keeps a placeholder
+    ; constrained to `string` from inferring a type its constraint refuses. That
+    ; helper had been written since slice 126 and this was its only caller, so it
+    ; sat in the file with no call site at all (`tools/nocaller.py`).
     function infer_types_from_template_literal_type(this, source: ref[Type], target: ref[Type]) returns ref[Array[ref[Type]?]]?
     {
         if (source.flags & TypeFlagsStringLiteral) <> 0
@@ -34267,7 +34375,7 @@ define Checker
         if (source.flags & TypeFlagsTemplateLiteral) <> 0
         {
             if Checker.template_texts_equal(source, target)
-                return Checker.template_literal_types_of(source)
+                return this.map_template_source_types(source, target)
             let stx Checker.template_literal_texts_of(source)
             let sty Checker.template_literal_types_of(source)
             if stx = null
@@ -34275,6 +34383,66 @@ define Checker
             return this.infer_from_literal_parts_to_template_literal(stx as ref[Array[ref[String]?]], sty, target)
         }
         null
+    }
+
+    ; The equal-texts arm's `core.MapIndex`. ★The index is the point: the source's
+    ; i-th constituent is compared against the TARGET's i-th, so this cannot be
+    ; written as a plain map over the source alone.
+    function map_template_source_types(this, source: ref[Type], target: ref[Type]) returns ref[Array[ref[Type]?]]?
+    {
+        let mark this.unported_mark()
+        let sty Checker.template_literal_types_of(source)
+        let tty Checker.template_literal_types_of(target)
+        if sty = null
+            return sty
+        let st sty as ref[Array[ref[Type]?]]
+        let n st.get_length() as int
+        let out this.new_type_list(null)
+        var i 0
+        while i < n
+        {
+            let row st[i]
+            if row = null
+            {
+                out.add(null)
+                set i: i + 1
+                continue
+            }
+            let s row as ref[Type]
+            var contributed: ref[Type]? null
+            var tgt: ref[Type]? null
+            if tty <> null
+            {
+                let tt tty as ref[Array[ref[Type]?]]
+                if i < (tt.get_length() as int)
+                    set tgt: tt[i]
+            }
+            if tgt <> null
+            {
+                let sb this.get_base_constraint_or_type(s)
+                if this.unported_mark() <> mark
+                    return null
+                let tb this.get_base_constraint_or_type(tgt as ref[Type])
+                if this.unported_mark() <> mark
+                    return null
+                if (sb <> null) and (tb <> null)
+                {
+                    if this.is_type_assignable_to(sb as ref[Type], tb as ref[Type])
+                        set contributed: s
+                }
+                if this.unported_mark() <> mark
+                    return null
+            }
+            if contributed = null
+            {
+                set contributed: this.get_string_like_type_for_type(s)
+                if this.unported_mark() <> mark
+                    return null
+            }
+            out.add(contributed)
+            set i: i + 1
+        }
+        out
     }
 
     ; The source text at `index` — the trailing segment is the END text with the
@@ -37722,18 +37890,76 @@ define Checker
             ; needs no visited-types bracket.
             return this.create_type_node_from_object_type(t, out)
         let sym t.symbol as ref[Symbol]
+        let mark this.unported_mark()
+        ; ── the instantiation expression's own arm (slice 181) ───────────────
+        ;
+        ; ★★★ IT REUSES THE SOURCE NODE, and that is not a shortcut — it is the
+        ; only answer that is RIGHT. `var xs4: typeof Array<typeof x>` prints
+        ; `typeof Array<typeof x>` in the reference's baseline, where printing the
+        ; type ARGUMENTS would give `typeof Array<number>` and lose the distinction
+        ; from the line above it. Upstream reaches that through
+        ; tryReuseExistingNonParameterTypeNode, which re-emits the existing node;
+        ; this printer already produces TEXT, so re-emitting it is the node's own
+        ; source range.
+        ;
+        ; ★★★ THE `getTypeFromTypeNode(existing) == t` GUARD IS THE REFERENCE'S AND
+        ; ITS COMMENT SAYS WHY: the node is unreliable for a constituent of a union
+        ; or an intersection, because every constituent of `typeof Err<number>`
+        ; carries that same node and printing `typeof ErrImpl` from it is a lie.
+        ; The identity test is what separates the type the node DENOTES from the
+        ; ones that merely came out of it.
+        ;
+        ; ★★ THE VISITED BRACKET AROUND THE REUSE IS ALSO THE REFERENCE'S, for the
+        ; recursion its own comment describes: a reuse that fails falls back into
+        ; typeToTypeNode with the same instantiation type, which would try the same
+        ; node again. It matters MORE here than upstream, because this port's
+        ; write_reused_node never declines — where upstream answers nil it answers
+        ; `type_to_string(t)`, which is the re-entry the bracket bottoms out.
+        ;
+        ; ★★★ THE REUSE IS SLICE 158's `write_possibly_reused_type_node` FAMILY AND
+        ; NOT A WRITER OF ITS OWN. This slice wrote one — nine lines that printed
+        ; the node's SOURCE RANGE — and it collided with `write_reused_type_node`
+        ; 1 700 lines down, same name, same parameter list, so the emitter kept the
+        ; NEW one and every existing caller of the real visitor silently got the
+        ; naive one: five stage-1 units went red printing `{ a: string; b?: number }`
+        ; where the reference prints `{ a: string; b?: number; }`. `dupmethods.py`,
+        ; written the slice before, named it in one call. §3.5gc.
         if (t.object_flags & ObjectFlagsInstantiationExpressionType) <> 0
         {
-            ; The reuse of the ORIGINAL `typeof X<A>` node, through
-            ; tryReuseExistingNonParameterTypeNode — a printer that reads the
-            ; source tree back, which is a dimension of its own.
-            this.record_unported("type-to-string-instantiation-expression", t.object_flags)
-            return false
+            let existing Checker.instantiation_expression_node_of(t)
+            if existing <> null
+            {
+                let ex existing as ref[AstNode]
+                if AstNode.kind_of(ex) = KindTypeQuery
+                {
+                    let denoted this.get_type_from_type_node(ex)
+                    if this.unported_mark() <> mark
+                        return false
+                    if denoted <> null
+                    {
+                        if (denoted as ref[Type]) = t
+                        {
+                            if this.visited_type(t.id)
+                                return Checker.write_elided_information_placeholder(out)
+                            this.push_visited_type(t.id)
+                            let reused this.write_reused_node(ex, out)
+                            this.pop_visited_type()
+                            if reused
+                                return true
+                        }
+                    }
+                }
+            }
+            if this.visited_type(t.id)
+                return Checker.write_elided_information_placeholder(out)
+            this.push_visited_type(t.id)
+            let ok this.create_type_node_from_object_type(t, out)
+            this.pop_visited_type()
+            return ok
         }
         ; isClassInstanceSide picks the MASK, and the mask IS the `typeof`: upstream
         ; `isTypeOf := mask == SymbolFlagsValue`, so the instance side of a class
         ; prints `C` and the static side prints `typeof C`.
-        let mark this.unported_mark()
         let instance_side this.is_class_instance_side(t, sym)
         if this.unported_mark() <> mark
             return false
@@ -53989,29 +54215,6 @@ define Checker
         this.narrow_type_by_discriminant(cur, access as ref[AstNode], NarrowKindNarrowedType, pt, null, KindUnknown, assume_true, null)
     }
 
-    ; everyType(t, c.IsNullableType).
-    function every_type_is_nullable(this, t: ref[Type]) returns bool
-    {
-        if (t.flags & TypeFlagsUnion) = 0
-            return this.is_nullable_type(t)
-        let types Checker.union_types_of(t)
-        if types = null
-            return false
-        let list types as ref[Array[ref[Type]?]]
-        let n list.get_length() as int
-        var i 0
-        while i < n
-        {
-            let row list[i]
-            set i: i + 1
-            if row = null
-                continue
-            if this.is_nullable_type(row as ref[Type]) = false
-                return false
-        }
-        true
-    }
-
     ; narrowTypeByAssertion — `assert(cond)`, whose argument is a CONDITION rather
     ; than a reference, so the whole conditional engine runs on it.
     function narrow_type_by_assertion(this, f: ref[FlowState], t: ref[Type], expr: ref[AstNode]) returns ref[Type]?
@@ -57832,7 +58035,7 @@ define Checker
         var t: ref[Type]? null
         if this.every_type_is_tuple(source_type)
         {
-            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, element_index, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false, null, null, 0) as ref[MapTypeArgs]?
+            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, element_index, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false, null, null, 0, null, null) as ref[MapTypeArgs]?
             set t: this.map_type(source_type, MapTypeKindSliceTuple, a)
         }
         else
@@ -60614,7 +60817,7 @@ define Checker
     {
         if t = null
             return null
-        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, index, length, first_spread_index, last_spread_index, 0, null, null, null, null, null, null, false, null, null, 0, false, null, null, 0) as ref[MapTypeArgs]?
+        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, index, length, first_spread_index, last_spread_index, 0, null, null, null, null, null, null, false, null, null, 0, false, null, null, 0, null, null) as ref[MapTypeArgs]?
         this.map_type_ex(t as ref[Type], MapTypeKindContextualElement, a, true)
     }
 
@@ -66878,15 +67081,24 @@ define Checker
         this.get_instantiation_expression_type(expr_type as ref[Type], node)
     }
 
-    ; getInstantiationExpressionType, its ANSWER-WITHOUT-TYPE-ARGUMENTS half.
+    ; ── getInstantiationExpressionType, WHOLE (slice 181) ───────────────────
     ;
-    ; ★★★ THE EARLY RETURN IS THE WHOLE OF THE TYPE QUERY'S PATH AND THAT IS WHY
-    ; THE HALF IS WORTH WRITING: `typeof x` carries no type argument list, so the
-    ; three tests at the top answer the node and the instantiation machinery below
-    ; them never runs. What that machinery does — filter each call and construct
-    ; signature by type-argument arity, instantiate the applicable ones, rebuild
-    ; the object type around them, and report TS2635 at a span the type argument
-    ; LIST owns — is the instantiation-expression chapter and stops as one.
+    ; ★★★ THE EARLY RETURNS ARE THE TYPE QUERY'S WHOLE PATH and the rest is the
+    ; instantiation expression's: `typeof x` carries no type argument list, so the
+    ; three tests at the top answer the node; `typeof f<string>` carries one, and
+    ; what follows filters each call and construct signature by type-argument
+    ; arity, instantiates the applicable ones, rebuilds the object type around
+    ; them and reports TS2635 where NOTHING was applicable. The stop that stood
+    ; here named exactly that and was the frontier's head at +17 units.
+    ;
+    ; ★★★ THE TWO NESTED CLOSURES ARE SPLIT ACROSS TWO RECORDS, and the split is
+    ; not a convenience — it is the semantics. `hasSomeApplicableSignature` and
+    ; `nonApplicableType` are declared in THIS function and written by the inner
+    ; closure, so they are shared across every constituent of a union;
+    ; `hasSignatures` and `hasApplicableSignature` are declared inside
+    ; getInstantiatedType and are therefore FRESH per constituent. Folding all four
+    ; into one record would make a union whose first constituent has no applicable
+    ; signature report against the whole union rather than against that one part.
     function get_instantiation_expression_type(this, expr_type: ref[Type], node: ref[AstNode]) returns ref[Type]?
     {
         let type_arguments AstNode.type_arguments_of(node)
@@ -66898,8 +67110,274 @@ define Checker
             return expr_type
         if AstNode.list_count(type_arguments) = 0
             return expr_type
-        this.record_unported("get-instantiation-expression-type", AstNode.kind_of(node))
+        let targs type_arguments as ref[Array[ref[AstNode]?]]
+        let cached this.cached_instantiation_expression_type(node, expr_type)
+        if cached <> null
+            return cached
+        let mark this.unported_mark()
+        let state &InstantiationExpressionState^host(targs, false, null)
+        let result this.get_instantiated_expression_type(expr_type, node, state)
+        if this.unported_mark() <> mark
+            return null
+        if result = null
+            return null
+        let row &InstantiationExpressionCacheRow^host(node, expr_type, result)
+        instantiation_expression_types.add(row as ref[InstantiationExpressionCacheRow]?)
+        ; `errorType` is the NON-APPLICABLE part where something WAS applicable and
+        ; the whole expression type where nothing was — so a union with one usable
+        ; signature still reports, and it reports against the constituent that has
+        ; none.
+        var error_target: ref[Type]? expr_type
+        if state.has_some_applicable
+            set error_target: state.non_applicable
+        if error_target <> null
+            this.report_no_applicable_signatures(node, targs, error_target as ref[Type])
+        result
+    }
+
+    ; The (node, type) intern table. ★A linear scan, like cached_signatures beside
+    ; it: the reference's map is keyed on two ids and this port compares the two
+    ; REFERENCES, which is the same question one indirection earlier.
+    function cached_instantiation_expression_type(this, node: ref[AstNode], expr_type: ref[Type]) returns ref[Type]?
+    {
+        let n instantiation_expression_types.get_length() as int
+        var i 0
+        while i < n
+        {
+            let row instantiation_expression_types[i]
+            set i: i + 1
+            if row = null
+                continue
+            let r row as ref[InstantiationExpressionCacheRow]
+            if r.node = null
+                continue
+            if r.source = null
+                continue
+            if (r.node as ref[AstNode]) <> node
+                continue
+            if (r.source as ref[Type]) <> expr_type
+                continue
+            return r.result
+        }
         null
+    }
+
+    ; `getInstantiatedType` — the OUTER closure. It is what the union arm re-enters
+    ; through map_type, which is why the per-call pair is allocated here.
+    function get_instantiated_expression_type(this, t: ref[Type], node: ref[AstNode], state: ref[InstantiationExpressionState]) returns ref[Type]?
+    {
+        let part &InstantiationExpressionPart^host(false, false)
+        let result this.get_instantiated_expression_type_part(t, node, state, part)
+        if part.has_applicable_signature
+            set state.has_some_applicable: true
+        if part.has_signatures
+        {
+            if part.has_applicable_signature = false
+            {
+                if state.non_applicable = null
+                    set state.non_applicable: t
+            }
+        }
+        result
+    }
+
+    ; `getInstantiatedTypePart` — the INNER closure, and the four shapes it forks
+    ; on are the reference's own. ★The INTERSECTION arm recurses into THIS function
+    ; and the UNION arm into the one above; swapping them would share one
+    ; `hasApplicableSignature` across a union's constituents.
+    function get_instantiated_expression_type_part(this, t: ref[Type], node: ref[AstNode], state: ref[InstantiationExpressionState], part: ref[InstantiationExpressionPart]) returns ref[Type]?
+    {
+        let mark this.unported_mark()
+        if (t.flags & TypeFlagsObject) <> 0
+        {
+            let resolved this.resolve_structured_type_members(t)
+            if this.unported_mark() <> mark
+                return null
+            if resolved = null
+                return t
+            let sm resolved as ref[StructuredMembers]
+            let src_calls this.get_signatures_of_structured_type(t, SignatureKindCall)
+            let src_ctors this.get_signatures_of_structured_type(t, SignatureKindConstruct)
+            if this.unported_mark() <> mark
+                return null
+            var calls_changed false
+            var ctors_changed false
+            let calls this.instantiated_expression_signatures(src_calls, state, &calls_changed)
+            if this.unported_mark() <> mark
+                return null
+            let ctors this.instantiated_expression_signatures(src_ctors, state, &ctors_changed)
+            if this.unported_mark() <> mark
+                return null
+            if Checker.signature_count(src_calls) <> 0
+                set part.has_signatures: true
+            if Checker.signature_count(src_ctors) <> 0
+                set part.has_signatures: true
+            if Checker.signature_count(calls) <> 0
+                set part.has_applicable_signature: true
+            if Checker.signature_count(ctors) <> 0
+                set part.has_applicable_signature: true
+            if calls_changed or ctors_changed
+            {
+                var nd Slice[char]()
+                set nd: Binder.internal_name(host, "instantiationExpression")
+                let sym this.new_symbol(SymbolFlagsNone, nd)
+                let made this.new_object_type(ObjectFlagsAnonymous | ObjectFlagsInstantiationExpressionType, sym)
+                if made = null
+                    return t
+                let result made as ref[Type]
+                this.set_structured_type_members(result, sm.members, calls, ctors, sm.index_infos)
+                Checker.set_instantiation_expression_node(result, node)
+                return result
+            }
+            return t
+        }
+        if (t.flags & TypeFlagsInstantiableNonPrimitive) <> 0
+        {
+            let constraint this.get_base_constraint_of_type(t)
+            if this.unported_mark() <> mark
+                return null
+            if constraint <> null
+            {
+                let c constraint as ref[Type]
+                let instantiated this.get_instantiated_expression_type_part(c, node, state, part)
+                if this.unported_mark() <> mark
+                    return null
+                if instantiated <> constraint
+                    return instantiated
+            }
+            return t
+        }
+        if (t.flags & TypeFlagsUnion) <> 0
+        {
+            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false, null, null, 0, node, state) as ref[MapTypeArgs]?
+            return this.map_type(t, MapTypeKindInstantiationExpression, a)
+        }
+        if (t.flags & TypeFlagsIntersection) <> 0
+        {
+            let types Checker.intersection_types_of(t)
+            if types = null
+                return t
+            let list types as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            let out this.new_type_list(null)
+            var i 0
+            while i < n
+            {
+                let row list[i]
+                if row = null
+                    out.add(null)
+                else
+                {
+                    let mapped this.get_instantiated_expression_type_part(row as ref[Type], node, state, part)
+                    if this.unported_mark() <> mark
+                        return null
+                    out.add(mapped)
+                }
+                set i: i + 1
+            }
+            return this.get_intersection_type(out)
+        }
+        t
+    }
+
+    ; `getInstantiatedSignatures` — the filter and the map, and `changed` is what
+    ; stands in for Go's `core.Same`. ★A slice is the same object upstream when
+    ; Filter dropped nothing AND SameMap replaced nothing; here the two conditions
+    ; are counted and written into the out-cell, because an Array is a fresh value
+    ; either way and identity could not answer the question.
+    function instantiated_expression_signatures(this, signatures: ref[Array[ref[Signature]?]]?, state: ref[InstantiationExpressionState], changed: ref[bool]) returns ref[Array[ref[Signature]?]]
+    {
+        let out this.new_signature_list()
+        if signatures = null
+            return out
+        let mark this.unported_mark()
+        let list signatures as ref[Array[ref[Signature]?]]
+        let n list.get_length() as int
+        var i 0
+        while i < n
+        {
+            let row list[i]
+            set i: i + 1
+            if row = null
+                continue
+            let sig row as ref[Signature]
+            var applicable false
+            if sig.type_parameters <> null
+            {
+                if ((sig.type_parameters as ref[Array[ref[Type]?]]).get_length() as int) <> 0
+                    set applicable: true
+            }
+            if applicable
+            {
+                if this.has_correct_type_argument_arity(sig, state.type_arguments) = false
+                    set applicable: false
+            }
+            if applicable = false
+            {
+                ; core.Filter dropped it, so the answer is a DIFFERENT slice.
+                set changed: true
+                continue
+            }
+            let type_argument_types this.check_type_arguments(sig, state.type_arguments, true, 0)
+            if this.unported_mark() <> mark
+                return out
+            if type_argument_types = null
+            {
+                out.add(row)
+                continue
+            }
+            var is_js false
+            if sig.declaration <> null
+                set is_js: Parser.is_in_js_file(sig.declaration as ref[AstNode])
+            let made this.get_signature_instantiation(sig, type_argument_types, is_js, null)
+            if this.unported_mark() <> mark
+                return out
+            if made = null
+            {
+                out.add(row)
+                continue
+            }
+            if (made as ref[Signature]) <> sig
+                set changed: true
+            out.add(made)
+        }
+        out
+    }
+
+    function signature_count(list: ref[Array[ref[Signature]?]]?) returns int
+    {
+        if list = null
+            return 0
+        (list as ref[Array[ref[Signature]?]]).get_length() as int
+    }
+
+    ; TS2635, at a span the type argument LIST owns.
+    ;
+    ; ★★ THE SPAN IS THE LIST'S, NOT THE NODE'S, and this port has no list node to
+    ; ask: the reference reads `SkipTrivia(text, typeArguments.Pos())` and
+    ; `typeArguments.End()`, where a NodeList's Pos is just after the `<` and its
+    ; End just after the last element. The first element's Pos is the same position
+    ; (a node's Pos runs back to the previous token's end) and the last element's
+    ; End is the list's End, so the pair is recoverable from the elements — except
+    ; behind a TRAILING COMMA, where upstream's End sits after the comma and this
+    ; one before it.
+    procedure report_no_applicable_signatures(this, node: ref[AstNode], type_arguments: ref[Array[ref[AstNode]?]], error_target: ref[Type])
+    {
+        if this.node_is_in_lib(node)
+            return
+        let n type_arguments.get_length() as int
+        if n = 0
+            return
+        let first type_arguments[0]
+        let last type_arguments[n - 1]
+        if first = null
+            return
+        if last = null
+            return
+        let b2 this.binder_of_node(node)
+        let start b2.skip_trivia_at(AstNode.pos_of(first as ref[AstNode]))
+        let stop AstNode.end_of(last as ref[AstNode])
+        diagnostics.add_direct(start, stop, DiagType_0_has_no_signatures_for_which_the_type_argument_list_is_applicable)
     }
 
     ; getTypeFromTypeQueryNode, whole. ★It is the ONE type-node arm whose answer
@@ -70887,7 +71365,7 @@ define Checker
             return null
         ; "We avoid calling getApplicableIndexInfo here because it performs
         ; potentially expensive intersection reduction."
-        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, name_type, false, null, null, 0, false, null, null, 0) as ref[MapTypeArgs]?
+        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, name_type, false, null, null, 0, false, null, null, 0, null, null) as ref[MapTypeArgs]?
         this.map_type_ex(ct, MapTypeKindContextualIndexInfoValue, a, true)
     }
 
@@ -71901,7 +72379,7 @@ define Checker
                 set st.has_computed_string_property: false
                 set st.has_computed_number_property: false
             }
-            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, node, st, null, false, null, null, 0, false, null, null, 0) as ref[MapTypeArgs]?
+            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, node, st, null, false, null, null, 0, false, null, null, 0, null, null) as ref[MapTypeArgs]?
             return this.map_type(spread, MapTypeKindEmptyObjectLiteralRemap, a)
         }
         this.create_object_literal_type(node, st, 0)
@@ -77837,32 +78315,6 @@ define Checker
             }
         }
         false
-    }
-
-    ; allTypesAssignableToKindEx, whole — the every-constituent form of the test
-    ; slice 102 ported.
-    function all_types_assignable_to_kind_ex(this, source: ref[Type], kind: int, strict: bool) returns bool
-    {
-        if (source.flags & TypeFlagsUnion) <> 0
-        {
-            let types Checker.union_types_of(source)
-            if types = null
-                return false
-            let ts types as ref[Array[ref[Type]?]]
-            let n ts.get_length() as int
-            var i 0
-            while i < n
-            {
-                let t ts[i]
-                if t = null
-                    return false
-                if this.all_types_assignable_to_kind_ex(t as ref[Type], kind, strict) = false
-                    return false
-                set i: i + 1
-            }
-            return true
-        }
-        this.is_type_assignable_to_kind_ex(source, kind, strict)
     }
 
     ; maybeMappedType, whole. The walk up is the reference's `for` with its own
@@ -88981,45 +89433,6 @@ define Checker
         false
     }
 
-    ; ast.IsTypeDeclaration. ★The three import/export arms ask `IsTypeOnly` of a
-    ; node two parents up, and they are written because the switch is the
-    ; reference's exhaustive one — an omitted arm here reads as *false* for a shape
-    ; that has an answer.
-    function is_type_declaration(node: ref[AstNode]) returns bool
-    {
-        let k AstNode.kind_of(node)
-        if k = KindTypeParameter
-            return true
-        if k = KindClassDeclaration
-            return true
-        if k = KindInterfaceDeclaration
-            return true
-        if k = KindTypeAliasDeclaration
-            return true
-        if k = KindJSTypeAliasDeclaration
-            return true
-        if k = KindEnumDeclaration
-            return true
-        if k = KindImportClause
-            return AstNode.is_type_only_of(node)
-        if k = KindImportSpecifier
-            return Checker.grandparent_is_type_only(node)
-        if k = KindExportSpecifier
-            return Checker.grandparent_is_type_only(node)
-        false
-    }
-
-    function grandparent_is_type_only(node: ref[AstNode]) returns bool
-    {
-        let p AstNode.parent_node_of(node)
-        if p = null
-            return false
-        let gp AstNode.parent_node_of(p as ref[AstNode])
-        if gp = null
-            return false
-        AstNode.is_type_only_of(gp as ref[AstNode])
-    }
-
     ; ast.IsDeprecatedDeclarationWithCachedFlags. ★The COMBINED flags gate the walk
     ; and the walk then finds the node the JSDoc actually hangs on — a variable
     ; declaration's tag is on its STATEMENT — so the two flag reads are different
@@ -93765,6 +94178,8 @@ define Checker
                 return u.resolved
             when x: Intersection
                 return x.resolved
+            when ie: InstantiationExpression
+                return ie.resolved
         null
     }
 
@@ -93787,6 +94202,12 @@ define Checker
                 var d a
                 set d.resolved: sm
                 set t.data: TypeData.Anonymous(d)
+            }
+            when ie: InstantiationExpression
+            {
+                var d ie
+                set d.resolved: sm
+                set t.data: TypeData.InstantiationExpression(d)
             }
             when m: Mapped
             {
@@ -95674,29 +96095,6 @@ define Checker
         }
     }
 
-    ; maps.Clone over a SymbolTable — the copy resolveObjectTypeMembers makes before
-    ; it folds the base types' members in, so that the DECLARED table it started
-    ; from is not mutated. Written out because a SymbolTable is ours (ast.scaly) and
-    ; has no clone of its own; the entries are re-inserted in their insertion order,
-    ; which is the order a walk over the original produces.
-    function clone_symbol_table(this, src: ref[SymbolTable]?) returns ref[SymbolTable]?
-    {
-        if src = null
-            return null
-        let out SymbolTable.create(host)
-        let n SymbolTable.length(src)
-        var i 0
-        while i < n
-        {
-            let sym SymbolTable.entry_symbol_at(src, i)
-            let nd SymbolTable.entry_name_at(src, i)
-            let nl SymbolTable.entry_name_len_at(src, i)
-            SymbolTable.set_entry(host, out, nd, sym)
-            set i: i + 1
-        }
-        out
-    }
-
     ; addInheritedMembers, whole. It answers the table it was handed — the
     ; reference's `symbols` is an in-out parameter and its `if symbols == nil`
     ; allocation is what the return is for.
@@ -97219,7 +97617,7 @@ define Checker
     ;
     ; The reference's own comment names the four object kinds it handles:
     ; AnonymousType, a MAPPED type, a deferred TypeReference and the instantiation
-    ; expression. The last has no producer here, so three arrive.
+    ; expression. ★All four arrive since slice 181 gave the last a producer.
     ;
     ; ★★★ THE MEMO IS ON THE *TARGET*, NOT ON THE TYPE BEING INSTANTIATED, and that
     ; is what makes `Partial<T>` inside a generic function answer ONE type rather
@@ -97233,20 +97631,22 @@ define Checker
             set declaration: Checker.reference_node_of(t)
         if (t.object_flags & ObjectFlagsReference) = 0
         {
+            ; `declaration = t.AsInstantiationExpressionType().node`. ★The stop that
+            ; stood here read *no producer, so the branch is unreachable rather
+            ; than missing* — true until this slice wrote
+            ; getInstantiationExpressionType, and the arm is the one line it always
+            ; was.
             if (t.object_flags & ObjectFlagsInstantiationExpressionType) <> 0
+                set declaration: Checker.instantiation_expression_node_of(t)
+            else
             {
-                ; ObjectFlagsInstantiationExpressionType has no producer here —
-                ; new_object_type does not mint the arm — so the declaration this
-                ; branch would read is unreachable rather than missing.
-                this.record_unported("object-type-instantiation-expression", t.object_flags)
-                return null
+                if t.symbol = null
+                {
+                    this.record_unported("object-type-instantiation-no-symbol", t.object_flags)
+                    return null
+                }
+                set declaration: Symbol.declaration_at(t.symbol as ref[Symbol], 0)
             }
-            if t.symbol = null
-            {
-                this.record_unported("object-type-instantiation-no-symbol", t.object_flags)
-                return null
-            }
-            set declaration: Symbol.declaration_at(t.symbol as ref[Symbol], 0)
         }
         if declaration = null
         {
@@ -97851,6 +98251,17 @@ define Checker
                 return t
             return never_type
         }
+        if mk = MapTypeKindInstantiationExpression
+        {
+            if a = null
+                return t
+            let args a as ref[MapTypeArgs]
+            if args.inst_expr_node = null
+                return t
+            if args.inst_expr_state = null
+                return t
+            return this.get_instantiated_expression_type(t, args.inst_expr_node as ref[AstNode], args.inst_expr_state as ref[InstantiationExpressionState])
+        }
         if mk = MapTypeKindJsxChildElement
         {
             if a = null
@@ -97960,7 +98371,7 @@ define Checker
     ; flag becomes, so a nullable capture is the honest carrier and not a bool.
     function get_tuple_element_type_out_of_start_count(this, t: ref[Type], index: u64, undefined_like: ref[Type]?) returns ref[Type]?
     {
-        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, index, undefined_like, null, null, null, null, null, false, null, null, 0, false, null, null, 0) as ref[MapTypeArgs]?
+        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, index, undefined_like, null, null, null, null, null, false, null, null, 0, false, null, null, 0, null, null) as ref[MapTypeArgs]?
         this.map_type(t, MapTypeKindTupleElementOutOfStartCount, a)
     }
 
@@ -98171,7 +98582,7 @@ define Checker
         }
         if distribute
         {
-            let a &MapTypeArgs^host(null, null, new_mapper as ref[TypeMapper]?, root, check_type, for_constraint, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false, null, null, 0)
+            let a &MapTypeArgs^host(null, null, new_mapper as ref[TypeMapper]?, root, check_type, for_constraint, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false, null, null, 0, null, null)
             set result: this.map_type_with_alias(distribution_type as ref[Type], MapTypeKindConditionalDistribution, a, alias)
         }
         if distribute = false
@@ -98768,7 +99179,7 @@ define Checker
                     return null
                 if reduced = null
                     return null
-                let a &MapTypeArgs^host(t, type_variable, m, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false, null, null, 0)
+                let a &MapTypeArgs^host(t, type_variable, m, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false, null, null, 0, null, null)
                 return this.map_type_with_alias(reduced as ref[Type], MapTypeKindMappedConstituent, a, alias)
             }
         }
@@ -111331,12 +111742,18 @@ define Checker
         ; reducedTarget — the union half, landed in slice 130 with
         ; find_matching_discriminant_type and filter_primitives_if_contains_non_primitive.
         ;
-        ; ★★★ `checkTypes` (the reduced target's `Distributed()`) HAS NO READER
-        ; HERE, and that is the reference's shape rather than an omission: it is
-        ; consumed only inside `reportExcessPropertyError`'s suggestion arm, which
-        ; is a stop below. The REDUCTION itself is what the loop needs, because
-        ; `isKnownProperty` is asked of the reduced target and not of the union.
+        ; ★★★ THE LINE THAT STOOD HERE SAID `checkTypes` (the reduced target's
+        ; `Distributed()`) *HAS NO READER HERE … it is consumed only inside
+        ; reportExcessPropertyError's suggestion arm* — AND IT IS NOT (slice 181).
+        ; The reference reads it in the loop's SECOND test, sixteen lines below the
+        ; isKnownProperty one and outside the `reportErrors` block: a property the
+        ; reduced target DOES know, whose type is not related to the same property's
+        ; type across the union's constituents, is an excess property too and is
+        ; reported as TS2326. Without it every such unit lost a diagnostic, and the
+        ; helper that answers the second operand — get_type_of_property_in_types —
+        ; sat in this file with no call site at all (`tools/nocaller.py`).
         var reduced_target target
+        var check_types: ref[Array[ref[Type]?]]? null
         if (target.flags & TypeFlagsUnion) <> 0
         {
             let union_mark this.unported_mark()
@@ -111353,6 +111770,23 @@ define Checker
                 if filtered = null
                     return false
                 set reduced_target: filtered as ref[Type]
+            }
+            ; `checkTypes = reducedTarget.Distributed()` — a union answers its
+            ; constituents, `never` answers nothing, anything else answers itself.
+            ; It stays NULL outside the union arm, which is what the reference's
+            ; `checkTypes != nil` guard below tests.
+            if (reduced_target.flags & TypeFlagsNever) <> 0
+                set check_types: this.new_type_list(null)
+            else
+            {
+                if (reduced_target.flags & TypeFlagsUnion) <> 0
+                    set check_types: Checker.union_types_of(reduced_target)
+                else
+                {
+                    let one this.new_type_list(null)
+                    one.add(reduced_target)
+                    set check_types: one
+                }
             }
         }
         let props this.get_properties_of_type(source)
@@ -111394,6 +111828,41 @@ define Checker
                         if error_node <> null
                             this.report_excess_property(source, reduced_target, prop, error_node as ref[AstNode], is_comparing_jsx_attributes)
                         return true
+                    }
+                    ; The loop's SECOND test. ★It is asked only under a UNION
+                    ; target — `checkTypes` is null otherwise — and it is the
+                    ; reference's own reason for distributing: the property is
+                    ; known, so it is not excess by NAME, and what disagrees is its
+                    ; TYPE across the constituents.
+                    if check_types <> null
+                    {
+                        let ct check_types as ref[Array[ref[Type]?]]
+                        let pt this.get_type_of_symbol(prop)
+                        if this.unported_mark() <> known_mark
+                            return false
+                        let across this.get_type_of_property_in_types(ct, pd)
+                        if this.unported_mark() <> known_mark
+                            return false
+                        if (pt <> null) and (across <> null)
+                        {
+                            let related this.is_related_to_ex(pt as ref[Type], across as ref[Type], relation, error_node, IntersectionStateNone, RecursionFlagsBoth)
+                            if this.unported_mark() <> known_mark
+                                return false
+                            ; ★★★ THE REPORT IS NOT WRITTEN AND THAT IS THE
+                            ; DIFFERENCE BETWEEN A CHAIN AND A DIAGNOSTIC. Upstream's
+                            ; `r.reportError(Types_of_property_0_are_incompatible)`
+                            ; PREPENDS to the relater's error chain, so TS2326 comes
+                            ; out as a sub-message under the head TS2322 the caller
+                            ; reports — `mappedTypeIndexedAccess.errors.txt` shows it
+                            ; indented under it, and the yardstick compares
+                            ; `C pos end code` lines, where a chained message has
+                            ; none. Written as a report it was an INVENTION: that
+                            ; unit went MATCH → FAIL with a second `C 292 297 2326`
+                            ; beside the reference's single 2322. What the branch is
+                            ; FOR is the verdict, and the verdict is this `return`.
+                            if related = false
+                                return true
+                        }
                     }
                 }
             }
@@ -121035,7 +121504,7 @@ define Checker
                 return null
             if ok = false
                 return error_type
-            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, right, symbol, object_flags, readonly, null, null, 0) as ref[MapTypeArgs]?
+            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, right, symbol, object_flags, readonly, null, null, 0, null, null) as ref[MapTypeArgs]?
             return this.map_type(l, MapTypeKindSpreadLeft, a)
         }
         var r right
@@ -121055,7 +121524,7 @@ define Checker
                 return null
             if ok = false
                 return error_type
-            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, l, symbol, object_flags, readonly, null, null, 0) as ref[MapTypeArgs]?
+            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, l, symbol, object_flags, readonly, null, null, 0, null, null) as ref[MapTypeArgs]?
             return this.map_type(r, MapTypeKindSpreadRight, a)
         }
         ; "Spreading a primitive adds nothing" — the reference's own line, and the
@@ -122600,7 +123069,7 @@ define Checker
             return child_field_type
         if child_index < 0
             return child_field_type
-        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, child_index, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false, null, null, 0) as ref[MapTypeArgs]?
+        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, child_index, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false, null, null, 0, null, null) as ref[MapTypeArgs]?
         this.map_type_ex(child_field_type as ref[Type], MapTypeKindJsxChildElement, a, true)
     }
 
@@ -122984,30 +123453,6 @@ define Checker
         if (info.candidates.get_length() as int) <> 0
             return true
         (info.contra_candidates.get_length() as int) <> 0
-    }
-
-    function has_type_parameter_default(tp: ref[Type]) returns bool
-    {
-        if tp.symbol = null
-            return false
-        let sym tp.symbol as ref[Symbol]
-        let n Symbol.declaration_count(sym)
-        var i 0
-        while i < n
-        {
-            let d Symbol.declaration_at(sym, i)
-            if d <> null
-            {
-                let node d as ref[AstNode]
-                if AstNode.kind_of(node) = KindTypeParameter
-                {
-                    if AstNode.type_parameter_default_of(node) <> null
-                        return true
-                }
-            }
-            set i: i + 1
-        }
-        false
     }
 
     function has_inference_candidates_or_default(info: ref[InferenceInfo]) returns bool
@@ -123568,10 +124013,6 @@ define Checker
         this.is_empty_anonymous_object_type(base as ref[Type])
     }
 
-    ; isLiteralType and isUnitType.
-    function is_unit_type(t: ref[Type]) returns bool
-        (t.flags & TypeFlagsUnit) <> 0
-
     function is_literal_type(t: ref[Type]) returns bool
     {
         if (t.flags & TypeFlagsBoolean) <> 0
@@ -123789,7 +124230,7 @@ define Checker
                     return null
                 if substituted = null
                     return null
-                let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, writing, null, null, 0, false, null, null, 0) as ref[MapTypeArgs]?
+                let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, writing, null, null, 0, false, null, null, 0, null, null) as ref[MapTypeArgs]?
                 return this.map_type(substituted as ref[Type], MapTypeKindSimplified, a)
             }
         }
@@ -129174,7 +129615,7 @@ define Checker
                     var filtered: ref[Type]? null
                     if inference.priority = InferencePriorityReturnType
                     {
-                        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false, null, cwt, n.compare_kind) as ref[MapTypeArgs]?
+                        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false, null, cwt, n.compare_kind, null, null) as ref[MapTypeArgs]?
                         set filtered: this.map_type(inferred as ref[Type], MapTypeKindConstraintFilter, a)
                         if this.unported_mark() <> mark
                             return null
@@ -129430,30 +129871,6 @@ define Checker
         let row &CachedSignature^host(sig, SignatureCacheKindInstantiation, type_arguments, made)
         cached_signatures.add(row as ref[CachedSignature]?)
         made
-    }
-
-    function type_lists_equal(a: ref[Array[ref[Type]?]]?, b: ref[Array[ref[Type]?]]?) returns bool
-    {
-        var an 0
-        if a <> null
-            set an: (a as ref[Array[ref[Type]?]]).get_length() as int
-        var bn 0
-        if b <> null
-            set bn: (b as ref[Array[ref[Type]?]]).get_length() as int
-        if an <> bn
-            return false
-        if an = 0
-            return true
-        let al a as ref[Array[ref[Type]?]]
-        let bl b as ref[Array[ref[Type]?]]
-        var i 0
-        while i < an
-        {
-            if al[i] <> bl[i]
-                return false
-            set i: i + 1
-        }
-        true
     }
 
     function get_signature_instantiation(this, sig: ref[Signature], type_arguments: ref[Array[ref[Type]?]]?, is_java_script: bool, inferred_type_parameters: ref[Array[ref[Type]?]]?) returns ref[Signature]?

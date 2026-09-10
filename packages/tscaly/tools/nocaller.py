@@ -17,8 +17,18 @@
 #   ENTRY     a program's own entry point (0.1.0/tscaly_*.scaly drive them)
 #   DUMP      an artifact writer selected by a flag rather than called by name
 #   ARM       a helper written for an arm that is not written yet  ← the interesting one
+#   WRAP      a one-line forward to the same name's `_ex`, where every caller took the
+#             `_ex` directly — the reference's own two-name pair, present because the
+#             REFERENCE has two names, not because a call site is missing
 #   DEAD      genuinely nothing
 # Only reading decides which a row is, so the tool prints the definition's line for each.
+#
+# ★★ WRAP IS SEPARATED BECAUSE IT IS THE POPULATION THAT NEVER PAYS (slice 181). Of the
+# 22 rows the first run reported, three were such forwards and re-reading them costs a
+# slice the same minutes every time; two more were the LEGACY-DECORATOR family, whose own
+# header already says it is inert under this harness and written out on purpose. A lead
+# list that keeps re-surfacing the same non-leads trains a reader to skip it, which is the
+# argument dupmethods.py's concept scoping is built on.
 #
 # ★ A CALL IS TEXT HERE, and that is the conservative direction: an over-broad call
 # pattern under-reports (a name that appears anywhere as `name(` counts as called), so a
@@ -34,12 +44,17 @@ files = sorted(glob.glob(os.path.join(root, 'tscaly', '*.scaly')) +
                glob.glob(os.path.join(root, '*.scaly')))
 want = sys.argv[1:]
 
-defs, calls = {}, set()
+defs, calls, wraps = {}, set(), set()
 for p in files:
-    for i, l in enumerate(io.open(p, encoding='utf-8').read().split('\n')):
+    lines = io.open(p, encoding='utf-8').read().split('\n')
+    for i, l in enumerate(lines):
         m = re.match(r'\s*(?:function|procedure)\s+([a-z_][a-z0-9_]*)\(', l)
         if m:
             defs.setdefault(m.group(1), []).append((p, i + 1))
+            # A one-line body that forwards to `<name>_ex` and nothing else.
+            nxt = lines[i + 1] if i + 1 < len(lines) else ''
+            if re.search(r'\b%s_ex\(' % re.escape(m.group(1)), nxt) and nxt.strip():
+                wraps.add((p, i + 1))
             continue
         if l.lstrip().startswith(';'):
             continue
@@ -59,6 +74,8 @@ for n in sorted(defs):
             kind = 'DUMP'
         elif b.startswith('tscaly'):
             kind = 'ENTRY'
+        elif (p, ln) in wraps:
+            kind = 'WRAP'
         rows.append((kind, n, b, ln))
 
 for kind, n, b, ln in sorted(rows):
