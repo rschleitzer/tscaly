@@ -124,6 +124,9 @@ echo "  units we speak on  $speaking   ($lines diagnostics; a green run over an"
 echo "                     all-empty corpus would look the same without this)"
 echo "  no reference list  $skipped   (the oracle could not answer the unit)"
 echo "  not a source unit  $other   (the yardstick does not compare these either)"
+if [ "${slow:-0}" != 0 ]; then
+  echo "  slow               $slow   (terminates, but not in this instrument's budget — slow.txt)"
+fi
 if [ "$failed" != 0 ]; then
   echo
   head -60 "$WORK/failures.txt"

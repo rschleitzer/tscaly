@@ -99,6 +99,23 @@ def load_accepted(path):
     return accepted
 
 
+def load_slow(path):
+    """slow.txt -> {case key: (seconds, reason)} — units that TERMINATE but not
+    inside the gate's budget. Keyed per UNIT, not per artifact: a timeout is a
+    property of the process and all six dumps hit it together."""
+    slow = {}
+    if not os.path.isfile(path):
+        return slow
+    with open(path, "r", errors="surrogateescape") as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 3 and parts[0]:
+                slow[parts[0]] = (parts[1], parts[2])
+    return slow
+
+
 def has_line_prefix(data: bytes, prefix: bytes) -> bool:
     return data.startswith(prefix) or (b"\n" + prefix) in data
 

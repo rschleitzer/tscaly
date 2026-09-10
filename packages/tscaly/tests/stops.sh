@@ -130,6 +130,9 @@ echo "  units with a stop  $speaking"
 echo "  stop events        $lines"
 echo "  parse/bind stop    $other   (the checker never ran, so the log is empty)"
 echo "  no reference dump  $skipped"
+if [ "${slow:-0}" != 0 ]; then
+  echo "  slow               $slow   (terminates, but not in this instrument's budget — slow.txt)"
+fi
 
 if [ "$failed" != 0 ]; then
   echo

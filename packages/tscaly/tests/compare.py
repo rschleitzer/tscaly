@@ -48,6 +48,11 @@ import harness as H  # noqa: E402
 def verdict_of(ctx, key, art, keep, ours_rc, ours_out, ref_rc, ref_out):
     """→ (verdict, message, cut, diff) — the rules of the previous runner, unchanged."""
     if ours_rc == H.TIMED_OUT:
+        # ★ A LISTED unit is SLOW, not UNEXPLAINED — slow.txt's own header has the
+        # argument. It is still not a pass: its own column, named on every run.
+        if key in ctx.slow:
+            secs, _reason = ctx.slow[key]
+            return "SLOW", f"{art}/{key}: listed in slow.txt at {secs}s per artifact", None, None
         return "TIMEOUT", f"{art}/{key}: our dumper fell silent for {ctx.timeout}s", None, None
     if ref_rc == H.TIMED_OUT:
         return "TIMEOUT", (f"{art}/{key}: the ORACLE fell silent for {ctx.timeout}s"
@@ -87,6 +92,7 @@ def main():
     ctx = Ctx()
     out = os.environ["TSCALY_OUT"]
     ctx.accepted = H.load_accepted(os.environ["TSCALY_ACCEPTED"])
+    ctx.slow = H.load_slow(os.environ["TSCALY_SLOW"])
     sub_prefix = os.environ["TSCALY_SUB_PREFIX"]
     pkg_prefix = os.environ["TSCALY_PKG_PREFIX"]
     ts_prefix = os.environ.get("TSCALY_TS_PREFIX", "")
@@ -144,13 +150,16 @@ def main():
 
     counters = {}
     for art in H.ART_NAMES:
-        for k in ("matched", "unported", "failed", "accepted", "stale", "timeout", "refcrash"):
+        for k in ("matched", "unported", "failed", "accepted", "stale", "timeout", "refcrash",
+                  "slow"):
             counters[f"{k}_{art}"] = 0
     for k in ("cases_seen", "skip_jsx", "skip_other", "json_compared", "js_compared",
               "tsx_compared", "jsx_compared", "jsdoc_bearing", "js_diag_units",
               "js_diag_lines", "symbol_bearing", "bind_diag_units", "bind_diag_lines"):
         counters[k] = 0
     failures, stales, refcrashes = [], [], []
+    slows, stale_slows, stale_slow_seen = [], [], set()
+    counters["staleslow"] = 0
 
     # ── phase B: the store, and the list of units our side has to answer ──
     t0 = time.time()
@@ -253,11 +262,22 @@ def main():
             elif verdict == "REFCRASH":
                 counters[f"refcrash_{art}"] += 1
                 refcrashes.append(message)
+            elif verdict == "SLOW":
+                counters[f"slow_{art}"] += 1
+                slows.append(message)
             else:
                 if verdict == "TIMEOUT":
                     counters[f"timeout_{art}"] += 1
                 counters[f"failed_{art}"] += 1
                 failures.append(message)
+            # ★★★ THE ANTI-ROT HALF, and it is what separates this from a
+            # suppression list: an entry the run did NOT need is reported and
+            # fails the run, exactly as a stale accepted.txt entry does.
+            if verdict != "SLOW" and key in ctx.slow:
+                if key not in stale_slow_seen:
+                    stale_slow_seen.add(key)
+                    counters["staleslow"] += 1
+                    stale_slows.append(key)
             if art == "jsdoc":
                 seen_units.append((k[0], k[1]))
         # The corpus-shape counters, read off the REFERENCE dumps as before.
@@ -304,6 +324,12 @@ def main():
             fh.write(s + "\n")
     with open(f"{out}/refcrashes.txt", "w", errors="surrogateescape") as fh:
         for r in refcrashes:
+            fh.write(r + "\n")
+    with open(f"{out}/slows.txt", "w", errors="surrogateescape") as fh:
+        for r in slows:
+            fh.write(r + "\n")
+    with open(f"{out}/staleslows.txt", "w", errors="surrogateescape") as fh:
+        for r in stale_slows:
             fh.write(r + "\n")
     return 0
 

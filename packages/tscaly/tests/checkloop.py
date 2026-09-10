@@ -64,7 +64,23 @@ def main():
         return 2
     types = store.artifacts_of("types")
 
-    jobs = []           # (case_key, idx, path, content, artifact row)
+    # ★ slow.txt is read here too, and with compare.py's OWN key: a unit that
+    # terminates outside the budget is the same fact for every instrument, and an
+    # instrument that called it a failure would keep the gate red for a reason the
+    # runner has already argued.
+    #
+    # ★★★ BUT THE ANTI-ROT HALF IS THE RUNNER'S ALONE, AND `walkcheck` PROVED IT
+    # THE HOUR THIS LANDED. An entry states a cost under ONE budget, and the
+    # instruments do not share one: the runner allows 60 s for a full CHECK per
+    # artifact, this loop allows 10 s, and the WALK is not the same work as the
+    # check — `excessivelyDeepConditionalTypes` walks inside 10 s and does not
+    # check inside 223 s. So an entry this instrument did not need is not a stale
+    # entry, it is an entry about somebody else's budget, and reporting it here
+    # made walkcheck red on a correct list. Only compare.py, which owns the gate
+    # the entry was written for, may call one stale.
+    slow = H.load_slow(os.path.join(os.path.dirname(os.path.abspath(__file__)), "slow.txt"))
+
+    jobs = []           # (case_key, key, idx, path, content, artifact row)
     other = skipped = 0
     for ci, idx, case_key, key, uname, path, content in store.units(compared_only=False, filt=filt):
         if not uname.lower().endswith(H.SUFFIXES):
@@ -74,27 +90,33 @@ def main():
         if a is None or (not a["ref"] and a["ref_err"]):
             skipped += 1
             continue
-        jobs.append((case_key, str(idx), path, content, a))
+        jobs.append((case_key, key, str(idx), path, content, a))
 
     sidecar = {"diags": "diags", "walk": "walk", "stops": None}[mode]
     use_sidecar = (sidecar is not None and tree_bin
                    and os.path.realpath(binary) == os.path.realpath(tree_bin))
     answers = {}
     if use_sidecar:
-        for case_key, idx, path, content, a in jobs:
+        for case_key, key, idx, path, content, a in jobs:
             side = a.get(sidecar)
             answers[path] = (0, side, b"") if side is not None else None
-    todo = [(path, content) for case_key, idx, path, content, a in jobs if answers.get(path) is None]
+    todo = [(path, content) for case_key, key, idx, path, content, a in jobs if answers.get(path) is None]
     if todo:
         got = H.run_batch(binary, flag, todo, os.path.join(work, "chunks"), min(32, os.cpu_count() or 4), UNIT_TIMEOUT)
         answers.update(got)
 
     units = len(jobs)
     matched = failed = speaking = lines = 0
+    slow_units = 0
     report, event_rows, unit_rows = [], [], []
-    for case_key, idx, path, content, a in jobs:
+    for case_key, key, idx, path, content, a in jobs:
         rc, out, err = answers.get(path, (1, b"", b"no answer"))
         if rc != 0:
+            if rc == H.TIMED_OUT and key in slow:
+                slow_units += 1
+                report.append("=== %s[%s] — listed in slow.txt at %ss per artifact"
+                              % (case_key, idx, slow[key][0]))
+                continue
             failed += 1
             what = "our check" if mode == "diags" else "our walk"
             report.append("=== %s[%s] — %s exited %s" % (case_key, idx, what,
@@ -166,6 +188,7 @@ def main():
     print("units %d" % units)
     print("matched %d" % matched)
     print("failed %d" % failed)
+    print("slow %d" % slow_units)
     print("skipped %d" % skipped)
     print("other %d" % other)
     print("speaking %d" % speaking)

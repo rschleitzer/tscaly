@@ -123,6 +123,7 @@ SUB=$PKG/_submodules/typescript-go
 TS=$SUB/_submodules/TypeScript
 OUT=$PKG/tests/out
 ACCEPTED=$PKG/tests/accepted.txt
+SLOW=$PKG/tests/slow.txt
 FILTER=${1:-}
 STAGE=${TSCALY_STAGE:-1}
 
@@ -459,6 +460,7 @@ while IFS= read -r f; do cases+=("$f"); done < <(
 
 TSCALY_OUT=$OUT \
 TSCALY_ACCEPTED=$ACCEPTED \
+  TSCALY_SLOW=$SLOW \
 TSCALY_SUB_PREFIX="$SUB/testdata/tests/cases/" \
 TSCALY_TS_PREFIX="$TS/tests/cases/" \
 TSCALY_STAGE="$STAGE" \
@@ -473,7 +475,7 @@ if [ $? -ne 0 ]; then
   exit 2
 fi
 
-# Nine counters per yardstick plus the coverage counts, written by compare.py as
+# Ten counters per yardstick plus the coverage counts, written by compare.py as
 # plain `name=value` lines. Sourced rather than parsed: a scalar assignment file
 # is the one shape bash 3.2 reads without an associative array.
 . "$OUT/counters.sh"
@@ -484,6 +486,10 @@ stales=()
 while IFS= read -r l; do [ -n "$l" ] && stales+=("$l"); done < "$OUT/stales.txt"
 refcrashes=()
 while IFS= read -r l; do [ -n "$l" ] && refcrashes+=("$l"); done < "$OUT/refcrashes.txt"
+slows=()
+while IFS= read -r l; do [ -n "$l" ] && slows+=("$l"); done < "$OUT/slows.txt"
+staleslows=()
+while IFS= read -r l; do [ -n "$l" ] && staleslows+=("$l"); done < "$OUT/staleslows.txt"
 
 # ── report ───────────────────────────────────────────────────────────────────
 
@@ -501,9 +507,15 @@ fi
 # cannot answer (oracle exit 3, see compare.py) belongs to none of the four
 # columns, so a total of four terms silently loses it. The line only appears when
 # the count is non-zero, and the units are named further down.
+# ★ THE SEVENTH ARGUMENT IS `slow` AND IT GOES INTO THE TOTAL. The header above
+# says why that matters: slice 26's control c4 found a column that could not fail
+# the run because the sums named three yardsticks and there were four. A `slow`
+# unit is not matched, not unported and not failed — it is its own outcome — so
+# leaving it out of the total would make the total disagree with the corpus, which
+# is the same defect one column over.
 report() {
-  local title=$1 m=$2 u=$3 a=$4 f=$5 r=${6:-0}
-  local total=$(( m + u + a + f + r ))
+  local title=$1 m=$2 u=$3 a=$4 f=$5 r=${6:-0} sl=${7:-0}
+  local total=$(( m + u + a + f + r + sl ))
   echo
   echo "$title — $total units (from $cases_seen cases)"
   echo "  matched            $m"
@@ -513,14 +525,17 @@ report() {
   if [ "$r" -ne 0 ]; then
     echo "  no reference answer $r   (the ORACLE could not answer the unit)"
   fi
+  if [ "$sl" -ne 0 ]; then
+    echo "  slow               $sl   (terminates, but not in this gate's budget — slow.txt)"
+  fi
 }
 
-report "scanner yardstick" $matched_tokens $unported_tokens $accepted_tokens $failed_tokens $refcrash_tokens
-report "parser yardstick"  $matched_ast    $unported_ast    $accepted_ast    $failed_ast    $refcrash_ast
-report "jsdoc yardstick"   $matched_jsdoc  $unported_jsdoc  $accepted_jsdoc  $failed_jsdoc  $refcrash_jsdoc
-report "binder yardstick"  $matched_symbols $unported_symbols $accepted_symbols $failed_symbols $refcrash_symbols
-report "flow yardstick"    $matched_flow   $unported_flow   $accepted_flow   $failed_flow   $refcrash_flow
-report "checker yardstick" $matched_types  $unported_types  $accepted_types  $failed_types  $refcrash_types
+report "scanner yardstick" $matched_tokens $unported_tokens $accepted_tokens $failed_tokens $refcrash_tokens $slow_tokens
+report "parser yardstick"  $matched_ast    $unported_ast    $accepted_ast    $failed_ast    $refcrash_ast $slow_ast
+report "jsdoc yardstick"   $matched_jsdoc  $unported_jsdoc  $accepted_jsdoc  $failed_jsdoc  $refcrash_jsdoc $slow_jsdoc
+report "binder yardstick"  $matched_symbols $unported_symbols $accepted_symbols $failed_symbols $refcrash_symbols $slow_symbols
+report "flow yardstick"    $matched_flow   $unported_flow   $accepted_flow   $failed_flow   $refcrash_flow $slow_flow
+report "checker yardstick" $matched_types  $unported_types  $accepted_types  $failed_types  $refcrash_types $slow_types
 
 echo
 echo "  of those, $symbol_bearing units actually CARRY a symbol, and $bind_diag_units carry a BIND"
@@ -636,6 +651,28 @@ if [ $total_timeout -ne 0 ]; then
   echo "  $OUT/failures.txt for the list."
 fi
 
+total_slow=$(( slow_tokens + slow_ast + slow_jsdoc + slow_symbols + slow_flow + slow_types ))
+
+# ★ NAMED ON EVERY RUN, like the reference-crash list and for its reason: a unit
+# that is excused has to be readable, or the excuse is a suppression. Each line
+# carries the MEASURED seconds the entry claims, so a reader can re-measure it.
+if [ $total_slow -ne 0 ]; then
+  echo
+  echo "$total_slow dumps are listed in slow.txt — they TERMINATE, but not inside"
+  echo "  ${TSCALY_TIMEOUT:-60}s. Not a pass and not a failure: the cause is named per entry, and"
+  echo "  the run fails as soon as one of them is no longer needed."
+  printf '    %s\n' "${slows[@]}"
+fi
+
+# ★★★ AND THE HALF THAT KEEPS THE LIST HONEST. An entry the run did not need is a
+# claim that has stopped being true — the same rot accepted.txt's own header
+# describes, one outcome over.
+if [ "${staleslow:-0}" -ne 0 ]; then
+  echo
+  red "$staleslow slow.txt entries finished inside the budget — remove them:"
+  printf '    %s\n' "${staleslows[@]}"
+fi
+
 total_refcrash=$(( refcrash_tokens + refcrash_ast + refcrash_jsdoc + refcrash_symbols + refcrash_flow + refcrash_types ))
 
 # ★ NAMED, ALWAYS, AND NEVER SUMMARISED AWAY. A unit the reference cannot answer
@@ -677,6 +714,10 @@ if [ $total_failed -ne 0 ]; then
 fi
 
 if [ $total_stale -ne 0 ]; then
+  exit 1
+fi
+
+if [ "${staleslow:-0}" -ne 0 ]; then
   exit 1
 fi
 
