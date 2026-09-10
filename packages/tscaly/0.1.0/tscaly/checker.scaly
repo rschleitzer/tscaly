@@ -2715,10 +2715,11 @@ define SignatureFlagsHasRestParameter: int 1 << 0  ; last parameter is a rest pa
 define SignatureFlagsHasLiteralTypes: int 1 << 1   ; the signature is specialized
 define SignatureFlagsConstruct: int 1 << 2         ; a construct signature
 define SignatureFlagsAbstract: int 1 << 3          ; from an abstract class or constructor type
-; The two call-chain bits. Both are READ by get_return_type_of_signature and
-; neither can be set here: their only writer upstream is resolveCallExpression,
-; which is the call-resolution chapter — so the two arms they guard stand in that
-; function with a `false` they can never leave (§3.5be read from the other side).
+; The two call-chain bits. ★★★THE NOTE HERE SAID THEY HAVE NO WRITER, and that
+; stopped being true at slice 139: resolveCallExpression's fork and
+; getOptionalCallSignature's clone are both in this file, so both bits are set on
+; every optional call and the two arms in get_return_type_of_signature are the
+; ones that put the `| undefined` back.
 define SignatureFlagsIsInnerCallChain: int 1 << 4
 define SignatureFlagsIsOuterCallChain: int 1 << 5
 ; Written by getSignatureFromDeclaration upstream and NOT here — see that
@@ -5965,6 +5966,19 @@ define Checker
     global_boolean_type: ref[Type]?
     global_big_int_type: ref[Type]?
     global_es_symbol_type: ref[Type]?
+    ; The node builder's `ctx.inferTypeParameters` — the conditional root's own
+    ; infer parameters, set while the EXTENDS operand is written and nowhere else.
+    ; It is a field rather than a parameter because the printer recurses through
+    ; twenty writers between the conditional and the type-parameter arm that reads
+    ; it, which is exactly what upstream's node-builder CONTEXT is for.
+    printer_infer_type_parameters: ref[Array[ref[Type]?]]?
+
+    ; c.getGlobalImportCallOptionsType's memo — the UNCHECKED resolver of the pair,
+    ; and it is a SECOND slot beside the checked one on purpose: upstream memoises
+    ; the two resolvers separately, and when the lib has no `ImportCallOptions` they
+    ; do not answer the same thing (one reports, the other answers the empty object
+    ; type), so one slot would let whichever ran first decide for both.
+    global_import_call_options_type_unchecked: ref[Type]?
 
     ; c.unknownUnionType and c.unknownEmptyObjectType (slice 123). Upstream both
     ; are minted in initializeChecker; here they are lazy, because the first one's
@@ -7526,6 +7540,8 @@ define Checker
         set c.global_boolean_type: null
         set c.global_big_int_type: null
         set c.global_es_symbol_type: null
+        set c.global_import_call_options_type_unchecked: null
+        set c.printer_infer_type_parameters: null
         set c.global_function_type: null
         set c.global_import_meta_type: null
         set c.global_callable_function_type: null
@@ -9599,6 +9615,22 @@ define Checker
         let outer this.get_outer_type_parameters_of_class_or_interface(symbol)
         if this.unported_mark() <> unported_before
             return t
+        ; ★★★ THE COUNT IS TAKEN BEFORE THE APPEND, AND TAKING IT AFTER WAS A
+        ; SILENT WRONG ANSWER. Upstream is `typeParameters := append(outerTypeParameters,
+        ; localTypeParameters...)` and reads `len(outerTypeParameters)` afterwards —
+        ; a Go slice is a VALUE, so the local variable's length cannot move. This
+        ; port's `append_type_parameters` grows the array IN PLACE and hands the
+        ; same object back, so `outer` had already become outer+local by the time
+        ; the count was read: for `function f<X>(x: X) { class C<Y> {…} }` the
+        ; outer count came out **2** where it is 1, which made
+        ; `outer_type_parameters_of` claim C's own `Y` as one of its container's
+        ; and `local_type_parameters_of` answer an EMPTY local list. Both were
+        ; invisible while the printer's outer-type-parameter branch was a stop —
+        ; it is the only reader that shows the first — and the second silently
+        ; empties a constructor signature's type-parameter list.
+        var outer_count 0
+        if outer <> null
+            set outer_count: (outer as ref[Array[ref[Type]?]]).get_length() as int
         let type_parameters this.append_local_type_parameters_of_class_or_interface_or_type_alias(outer, symbol)
         if this.unported_mark() <> unported_before
             return t
@@ -9628,9 +9660,6 @@ define Checker
             let tps this.new_type_list(type_parameters)
             let all this.new_type_list(tps)
             all.add(this_type)
-            var outer_count 0
-            if outer <> null
-                set outer_count: (outer as ref[Array[ref[Type]?]]).get_length() as int
             let insts &Array[ref[TypeInstantiation]?]^host()
             let seed &TypeInstantiation^host(tps, t)
             insts.add(seed)
@@ -26618,9 +26647,61 @@ define Checker
         let bt base as ref[Type]
         if (bt.flags & TypeFlagsTypeVariable) <> 0
             return bt
+        ; `core.Find(baseConstructorType.Types(), t => t.flags&TypeVariable != 0)`.
+        ; ★★★ THE NOTE THAT STOOD HERE NAMED NO CALLEE AT ALL and the arm is the
+        ; reference's four lines over a constituent list this file has read since
+        ; the intersection chapter — it was the frontier's largest row at both
+        ; granularities (+29 of 30 arrivals) for want of them. The mixin's static
+        ; type is what the two callers want: a class whose base is an INTERSECTION
+        ; containing a type variable is a mixin just as one whose base IS the
+        ; variable is.
+        ;
+        ; ★★★ THE WALL WAS HIDING A LOSS THAT IS NOT IN THIS FUNCTION, AND THE
+        ; LOSS IS NAMED RATHER THAN LEFT FOR THE NEXT READER. `class C extends
+        ; mix(A, B)` — a mixin call returning `T & U` — reaches
+        ; checkClassLikeDeclaration's STATIC SIDE check the moment this stop is
+        ; gone, and that check answers ASSIGNABLE where the reference reports
+        ; TS2417. Thirteen lines reproduce it (the corpus unit is
+        ; `declarationEmitForMixinsWithStaticAccessors1`), and three measurements
+        ; localise it away from the relation's route and onto the type
+        ; `getTypeWithoutSignatures` MINTS:
+        ;
+        ;   typeof C  <=  staticBaseType (`typeof A & typeof B`)   FALSE, correct
+        ;   typeof C  <=  getTypeWithoutSignatures(staticBaseType) TRUE,  wrong
+        ;   typeof C  <=  each stripped constituent, `{prototype: A}`
+        ;                 and `{prototype: B}` separately           TRUE,  wrong
+        ;
+        ; while `typeof C <= typeof B` asked from an ORDINARY expression in the
+        ; same file answers FALSE on both sides, and `C <= A & B` — the prototype
+        ; property's own question — answers FALSE here too. So the stripped
+        ; constituent carries the right property (`prototype: B`, measured) and is
+        ; still satisfied by a source whose prototype is not related to it: what
+        ; get_type_without_signatures builds is not equivalent to what it copied
+        ; from. The relation state at the call is clean (maybe stack empty, no
+        ; cached row, no maybe hit, no overflow), which is what rules the route
+        ; out. **It is a LOSS and not an invention**, so diagcheck stays green and
+        ; the arm is worth its 29 units; the defect belongs to
+        ; get_type_without_signatures and is a row of its own when someone takes
+        ; it.
         if (bt.flags & TypeFlagsIntersection) <> 0
         {
-            this.record_unported("base-type-variable-of-intersection", 0)
+            let ts Checker.intersection_types_of(bt)
+            if ts = null
+                return null
+            let list ts as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            var i 0
+            while i < n
+            {
+                let e list[i]
+                if e <> null
+                {
+                    let s e as ref[Type]
+                    if (s.flags & TypeFlagsTypeVariable) <> 0
+                        return s
+                }
+                set i: i + 1
+            }
             return null
         }
         null
@@ -28789,10 +28870,17 @@ define Checker
     ; type's key makes it `string | number | symbol`. Several declarations of one
     ; `infer T` intersect.
     ;
-    ; ★ `omitTypeReferences` is the reference's second parameter and its only caller
-    ; passes false; it stays unwritten under §3.5ar, and the arm it guards is written
-    ; as if it were false — which is what that caller asks for.
+    ; ★★★ `omitTypeReferences` IS WRITTEN NOW, and the note that said it need not
+    ; be — *the reference's second parameter, and its only caller passes false* —
+    ; expired the moment the printer's InferTypeNode arm landed: that caller passes
+    ; TRUE, and what the flag turns off is the TYPE-REFERENCE arm, so an `infer T`
+    ; inside `Foo<infer T>` does not take Foo's parameter's constraint. The pair is
+    ; a wrapper plus the flagged worker, this file's spelling for a default
+    ; argument everywhere else.
     function get_inferred_type_parameter_constraint(this, t: ref[Type]) returns ref[Type]?
+        this.get_inferred_type_parameter_constraint_ex(t, false)
+
+    function get_inferred_type_parameter_constraint_ex(this, t: ref[Type], omit_type_references: bool) returns ref[Type]?
     {
         if t.symbol = null
             return null
@@ -28832,7 +28920,15 @@ define Checker
             let parent parent_opt as ref[AstNode]
             let pk AstNode.kind_of(parent)
             var inferred: ref[Type]? null
+            ; `case IsTypeReferenceNode(parent) && !omitTypeReferences:` — the
+            ; printer is the caller that turns this arm off.
+            var reference_arm false
             if pk = KindTypeReference
+            {
+                if omit_type_references = false
+                    set reference_arm: true
+            }
+            if reference_arm
             {
                 let type_parameters this.get_type_parameters_for_type_reference_or_import(parent)
                 if this.unported_mark() <> mark
@@ -36400,6 +36496,16 @@ define Checker
         ; `Foo` where the reference prints `Foo<string>`.
         if (t.object_flags & ObjectFlagsReference) <> 0
             return this.type_reference_to_type_node(t, out)
+        ; `t.flags&TypeParameter != 0 && slices.Contains(ctx.inferTypeParameters, t)`
+        ; — the InferTypeNode, and it comes BEFORE the name for the reason the
+        ; reference arm above comes before the class arm: an infer parameter is a
+        ; type parameter, so testing the name first would print `P` where the
+        ; reference prints `infer P`.
+        if (t.flags & TypeFlagsTypeParameter) <> 0
+        {
+            if this.printer_infer_declares(t)
+                return this.write_infer_type(t, out)
+        }
         var names_a_symbol false
         if (t.flags & TypeFlagsTypeParameter) <> 0
             set names_a_symbol: true
@@ -36682,47 +36788,35 @@ define Checker
             this.record_unported("type-to-string-conditional", subject.flags)
             return false
         }
-        ; ★★★ AN `infer` PARAMETER IN THE EXTENDS CLAUSE IS SAID AND NOT
-        ; WRITTEN — slice 158, and the shape is exact. Upstream's
-        ; typeToTypeNodeHelper carries the conditional root's
-        ; inferTypeParameters in the node-builder CONTEXT and emits an
-        ; InferTypeNode for any type parameter it finds there, so `T extends
-        ; (p: infer P) => any ? P : never` prints with the `infer` and — being
-        ; a node the emitter parenthesises by its own rules rather than by this
-        ; printer's — WITHOUT the parentheses this writer adds around a
-        ; function type at union precedence. This printer has no context to
-        ; carry the list in, so a type parameter of the root prints as its bare
-        ; NAME: measured against the oracle, `T extends (p: infer P) => any ? P
-        ; : never` comes out `T extends ((p: P) => any) ? P : never` and
-        ; `T extends Array<infer P> ? P : never` comes out `T extends P[] ? P :
-        ; never`.
+        ; ★★★ THE `infer` KEYWORD IN THE EXTENDS CLAUSE, AND THE STOP THAT STOOD
+        ; HERE NAMED THE MISSING MECHANISM EXACTLY: *this printer has no context
+        ; to carry the list in, so a type parameter of the root prints as its bare
+        ; NAME.* Upstream's typeToTypeNodeHelper puts the root's
+        ; inferTypeParameters into the node-builder CONTEXT for the extends
+        ; operand alone and emits an InferTypeNode for any type parameter it finds
+        ; there; the context is `printer_infer_type_parameters`, saved and restored
+        ; around this one call, and the arm that reads it is the type-parameter arm
+        ; of type_to_string_worker.
         ;
-        ; ★The guard is the ROOT'S OWN LIST and not the appearance of a type
-        ; parameter: a conditional with no infer parameter (`T extends string ?
-        ; 1 : 2`) prints identically on both sides and reporting it would
-        ; unport units this printer answers.
+        ; ★The list is the ROOT'S OWN and not *any type parameter in sight*: a
+        ; conditional with no infer parameter (`T extends string ? 1 : 2`) reaches
+        ; the same writer and must print unchanged.
         ;
-        ; ★★★ AND IT USED TO CLAIM BOTH HALVES — *the missing keyword and the
-        ; surplus parentheses live inside that one guard, which is why they are
-        ; one report and not two.* The second half was never inside it. The
+        ; ★★★ AND THE SECOND HALF OF THE OLD NOTE — *WITHOUT the parentheses this
+        ; writer adds around a function type* — WAS NEVER INSIDE THIS GUARD. The
         ; parentheses came from emitting the extends operand at UNION precedence,
         ; which wraps a function type whether or not an `infer` is anywhere near
         ; it, and `thislessFunctionsNotContextSensitive3` — no infer at all —
-        ; printed `extends ((...args: any) => any)` for it. Fixed at
-        ; write_operand_in_extends; what stays behind the guard is the keyword.
-        let infers root.infer_type_parameters
-        if infers <> null
-        {
-            if ((infers as ref[Array[ref[Type]?]]).get_length() as int) <> 0
-            {
-                this.record_unported("type-to-string-conditional-infer", subject.flags)
-                return false
-            }
-        }
+        ; printed `extends ((...args: any) => any)` for it; fixed at
+        ; write_operand_in_extends two slices before this one.
         if this.write_operand_at_union_precedence(ct, out) = false
             return false
         out.append(" extends ")
-        if this.write_operand_in_extends(et, out) = false
+        let saved_infers printer_infer_type_parameters
+        set this.printer_infer_type_parameters: root.infer_type_parameters
+        let extends_ok this.write_operand_in_extends(et, out)
+        set this.printer_infer_type_parameters: saved_infers
+        if extends_ok = false
             return false
         out.append(" ? ")
         let tt this.get_true_type_from_conditional_type(subject)
@@ -36766,6 +36860,15 @@ define Checker
         ; `T & {} | null` (voidUndefinedReduction) — a DIFFERENT type, the same
         ; class of defect the anonymous-object filter above was added for.
         if (c.flags & TypeFlagsIntersection) <> 0
+            set may_need_parens: true
+        ; ★★★ A CONDITIONAL CONSTITUENT IS THE THIRD FAMILY BELOW TypeOperator, AND
+        ; SLICE 177 IS WHERE ONE BECAME REACHABLE — the same shape slice 135's note
+        ; one line up records, one family over. Until the conditional printer could
+        ; write an `infer` keyword, every union carrying a conditional constituent
+        ; stopped before this test; with the keyword written,
+        ; `T | (T extends readonly (infer I)[] ? … : T)` came out without its
+        ; parentheses, which is a DIFFERENT type and not a cosmetic difference.
+        if (c.flags & TypeFlagsConditional) <> 0
             set may_need_parens: true
         if may_need_parens = false
             return this.type_to_string(ct, out)
@@ -36831,6 +36934,84 @@ define Checker
         out.append("\`" as char)
         set wrote_type_precedence: TypePrecedenceNonArray
         true
+    }
+
+    ; `slices.Contains(b.ctx.inferTypeParameters, t)` — by IDENTITY, which is the
+    ; only equality a type parameter has.
+    function printer_infer_declares(this, t: ref[Type]) returns bool
+    {
+        if printer_infer_type_parameters = null
+            return false
+        let list printer_infer_type_parameters as ref[Array[ref[Type]?]]
+        let n list.get_length() as int
+        var i 0
+        while i < n
+        {
+            if list[i] = t
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    ; The InferTypeNode — `infer P`, and `infer P extends C` when the DECLARED
+    ; constraint is not the one the position would have inferred anyway.
+    ;
+    ; ★★★ THE CONSTRAINT TEST IS THE WHOLE OF THE ARM AND IT ASKS
+    ; getInferredTypeParameterConstraint WITH `omitTypeReferences` TRUE — the
+    ; parameter whose note in that function read *its only caller passes false*,
+    ; which was true until this arm. With the flag on, `Foo<infer T>` does NOT
+    ; take its constraint from Foo's own parameter, so a constraint that came only
+    ; from the position is not printed back: upstream's comment says exactly that —
+    ; *we omit inferred constraints from type references as they may be elided*.
+    ;
+    ; ★ A parameter with NO declared constraint prints as the bare keyword and
+    ; asks nothing, which is every `infer P` in an ordinary conditional.
+    function write_infer_type(this, t: ref[Type], out: ref[StringBuilder]) returns bool
+    {
+        out.append("infer ")
+        if this.write_symbol_name_or_question(t, out) = false
+            return false
+        let mark this.unported_mark()
+        let constraint this.get_constraint_of_type_parameter(t)
+        if this.unported_mark() <> mark
+            return false
+        if constraint <> null
+        {
+            let inferred this.get_inferred_type_parameter_constraint_ex(t, true)
+            if this.unported_mark() <> mark
+                return false
+            var elide false
+            if inferred <> null
+            {
+                if this.is_type_identical_to(constraint as ref[Type], inferred as ref[Type])
+                    set elide: true
+                if this.unported_mark() <> mark
+                    return false
+            }
+            if elide = false
+            {
+                out.append(" extends ")
+                if this.type_to_string(constraint, out) = false
+                    return false
+            }
+        }
+        ; An InferTypeNode is emitted at the same precedence a type operator is —
+        ; `infer P extends C` needs a parenthesis wherever `keyof C` would.
+        set wrote_type_precedence: TypePrecedenceTypeOperator
+        true
+    }
+
+    ; The name half of the type-parameter arm, shared by the infer node and the
+    ; ordinary one: a type parameter with no symbol prints `?`.
+    function write_symbol_name_or_question(this, t: ref[Type], out: ref[StringBuilder]) returns bool
+    {
+        if t.symbol = null
+        {
+            out.append("?" as char)
+            return true
+        }
+        this.write_symbol_name(t.symbol as ref[Symbol], out)
     }
 
     ; An operand emitted at TypePrecedenceUnion — the conditional's check and
@@ -37203,14 +37384,90 @@ define Checker
             return this.write_array_type_reference(t, tgt, out)
         if (tgt.object_flags & ObjectFlagsTuple) <> 0
             return this.write_tuple_type_reference(t, tgt, out)
+        let mark this.unported_mark()
+        let args this.get_type_arguments(t)
+        if this.unported_mark() <> mark
+            return false
+        ; ── the OUTER TYPE PARAMETERS, and the answer is a QUALIFIED NAME ──────
+        ;
+        ; ★★★ WHAT IT PRINTS IS `Outer.createInner.Inner` AND NOT
+        ; `Outer<string>.createInner<number>.Inner` — the group ARGUMENTS ARE
+        ; DROPPED, and that is `appendReferenceToType`'s doing rather than a
+        ; simplification: its TypeReference arm rebuilds the node as
+        ; `UpdateTypeReferenceNode(root, <joined name>, ref.TypeArgumentList())`,
+        ; so each append replaces the accumulated argument list with the newly
+        ; appended one and only the LAST survives. Measured against the oracle on a
+        ; local class inside a generic method of a generic class, which is the
+        ; shape that produces two groups.
+        ;
+        ; ★★★ AND THE FINAL LIST IS A WINDOW, `typeArguments[i:typeParameterCount]`
+        ; where `i` has walked the whole outer list. This is why the branch could
+        ; not be *left out and reported*: with the report gone but the window still
+        ; starting at 0, an inner type would print its container's arguments as its
+        ; own — a wrong answer where the stop was a missing one.
+        ;
+        ; ★ A GROUP whose type ARGUMENTS are its own type PARAMETERS is not shown —
+        ; those are the default outer arguments, and naming the container would say
+        ; nothing. The comparison is by IDENTITY, one type pointer against another.
+        var arg_start 0
         let outer this.outer_type_parameters_of(tgt)
         if outer <> null
         {
-            if (outer as ref[Array[ref[Type]?]]).get_length() <> 0
+            let ol outer as ref[Array[ref[Type]?]]
+            let olen ol.get_length() as int
+            var oi 0
+            while oi < olen
             {
-                this.record_unported("type-to-string-outer-type-parameters", 0)
-                return false
+                let start oi
+                let parent this.parent_symbol_of_type_parameter(ol[oi])
+                if this.unported_mark() <> mark
+                    return false
+                ; The reference's do-while: advance past every parameter declared
+                ; by the same container, starting with this one.
+                set oi: oi + 1
+                var same true
+                while same
+                {
+                    set same: false
+                    if oi < olen
+                    {
+                        let next this.parent_symbol_of_type_parameter(ol[oi])
+                        if this.unported_mark() <> mark
+                            return false
+                        if next = parent
+                        {
+                            set same: true
+                            set oi: oi + 1
+                        }
+                    }
+                }
+                var defaulted true
+                var gi start
+                while gi < oi
+                {
+                    var arg: ref[Type]? null
+                    if args <> null
+                    {
+                        if gi < ((args as ref[Array[ref[Type]?]]).get_length() as int)
+                            set arg: (args as ref[Array[ref[Type]?]])[gi]
+                    }
+                    if arg <> ol[gi]
+                        set defaulted: false
+                    set gi: gi + 1
+                }
+                if defaulted = false
+                {
+                    if parent = null
+                    {
+                        this.record_unported("type-to-string-outer-type-parameters", 0)
+                        return false
+                    }
+                    if this.symbol_to_type_node(parent as ref[Symbol], SymbolFlagsType, out) = false
+                        return false
+                    out.append("." as char)
+                }
             }
+            set arg_start: olen
         }
         if t.symbol = null
         {
@@ -37223,10 +37480,6 @@ define Checker
         ; `min(len(typeParams), len(typeArguments))` and the four Iterable elisions
         ; above it are all `isReferenceToType(t, <a global>)`, which is false for a
         ; nil global — so the count is the min and nothing is elided.
-        let mark this.unported_mark()
-        let args this.get_type_arguments(t)
-        if this.unported_mark() <> mark
-            return false
         if args = null
             return true
         let list args as ref[Array[ref[Type]?]]
@@ -37236,13 +37489,13 @@ define Checker
         var count Checker.type_parameter_count_of(tgt)
         if na < count
             set count: na
-        if count = 0
+        if count <= arg_start
             return true
         out.append("<" as char)
-        var i 0
+        var i arg_start
         while i < count
         {
-            if i > 0
+            if i > arg_start
                 out.append(", ")
             if this.type_to_string(list[i], out) = false
                 return false
@@ -37250,6 +37503,26 @@ define Checker
         }
         out.append(">" as char)
         true
+    }
+
+    ; getParentSymbolOfTypeParameter — the symbol of the CONTAINER a type parameter
+    ; is declared on, which is what names a group in the qualified form above.
+    ; ★The JSDoc template-tag arm is commented out upstream (`!!! JSDoc support`)
+    ; and is therefore not a stop here either.
+    function parent_symbol_of_type_parameter(this, tp: ref[Type]?) returns ref[Symbol]?
+    {
+        if tp = null
+            return null
+        let t tp as ref[Type]
+        if t.symbol = null
+            return null
+        let decl Checker.get_declaration_of_kind(t.symbol as ref[Symbol], KindTypeParameter)
+        if decl = null
+            return null
+        let host_node AstNode.parent_node_of(decl as ref[AstNode])
+        if host_node = null
+            return null
+        this.get_symbol_of_node(host_node)
     }
 
 
@@ -38315,8 +38588,21 @@ define Checker
     ; parameters are what get written.
     function write_signature_form(this, sig: ref[Signature], form: int, name: ref[Symbol]?, out: ref[StringBuilder]) returns bool
     {
+        ; `if kind == KindConstructorType && signature.flags&Abstract != 0` — the
+        ; ONE modifier this writer can emit, and it is the CONSTRUCTOR TYPE's
+        ; alone: a construct SIGNATURE inside an object type carries no modifier
+        ; list upstream. ★★★It was missing until slice 177 and was invisible
+        ; because every unit that reaches it — `T extends abstract new (...args:
+        ; any) => infer U ? U : never`, the shape `SymbolHasInstance` and the mixin
+        ; helpers are written in — stopped at the conditional's `infer` keyword
+        ; first. **A printer's missing KEYWORD is a wrong NAME, not a missing one**,
+        ; which is why it shows up only as a yardstick diff.
         if form = SigFormConstructorType
+        {
+            if (sig.flags & SignatureFlagsAbstract) <> 0
+                out.append("abstract ")
             out.append("new ")
+        }
         if form = SigFormConstructSignature
             out.append("new ")
         if form = SigFormMethodSignature
@@ -64109,17 +64395,47 @@ define Checker
 
     ; ── checkIndexedAccess and the element access ────────────────────────────
     ;
-    ; ★★ THE OPTIONAL CHAIN STAYS A ROW, and it is the property access's row for
-    ; the property access's reason: checkElementAccessChain is
-    ; getOptionalExpressionType plus propagateOptionalTypeMarker, the pair the
-    ; whole optional-chain chapter is gated on, so both heads stop in the same
-    ; place rather than one of them half-answering.
+    ; ★★★ THE OPTIONAL CHAIN WAS A ROW *FOR THE PROPERTY ACCESS'S REASON*, AND THE
+    ; PROPERTY ACCESS STOPPED HAVING IT. The note here named getOptionalExpressionType
+    ; and propagateOptionalTypeMarker as the pair the chapter waits on; both landed
+    ; in slice 133, the property-access head was written off them in the same slice,
+    ; and this one kept quoting a sentence its own sibling had already retired
+    ; (§3.5hd). checkElementAccessChain is the same four lines one head over.
     function check_indexed_access(this, node: ref[AstNode], check_mode: int) returns ref[Type]?
     {
         if (AstNode.flags_of(node) & NodeFlagsOptionalChain) <> 0
         {
-            this.record_unported("check-element-access-chain", AstNode.kind_of(node))
-            return null
+            let ce AstNode.expression_of(node)
+            if ce = null
+                return null
+            let cexpr ce as ref[AstNode]
+            let mark this.unported_mark()
+            let expr_type this.check_expression(cexpr)
+            if this.unported_mark() <> mark
+                return null
+            if expr_type = null
+                return null
+            let xt expr_type as ref[Type]
+            let non_optional this.get_optional_expression_type(xt, cexpr)
+            if this.unported_mark() <> mark
+                return null
+            if non_optional = null
+                return null
+            let no non_optional as ref[Type]
+            let checked this.check_non_null_type(no, cexpr)
+            if this.unported_mark() <> mark
+                return null
+            if checked = null
+                return null
+            let answer this.check_element_access_expression(node, checked as ref[Type], check_mode)
+            if this.unported_mark() <> mark
+                return null
+            if answer = null
+                return null
+            var was_optional false
+            if no <> xt
+                set was_optional: true
+            return this.propagate_optional_type_marker(answer as ref[Type], node, was_optional)
         }
         let expr AstNode.expression_of(node)
         if expr = null
@@ -92556,6 +92872,32 @@ define Checker
     ; through it. That is the inference chapter — checkExpressionCached over every
     ; return statement, then getUnionType over what they answer — so the row it
     ; raises names two dimensions and not one.
+    ; The two call-chain arms of getReturnTypeOfSignature, and what they do is the
+    ; whole of an optional call's `| undefined`: an INNER link carries the marker
+    ; so the chain's outermost link can turn it into the union, and the OUTER link
+    ; IS that union.
+    ;
+    ; ★★★ THE STOP THAT STOOD IN THEIR PLACE READ *both bits are declared and
+    ; neither has a writer in this port* — a premise slice 139 expired when it
+    ; wrote resolveCallExpression's fork and getOptionalCallSignature's clone —
+    ; and slice 176 measured its cost from the other side: five stage-2 units
+    ; whose only difference from the reference was that missing `| undefined`.
+    ;
+    ; ★★★ IT IS A FUNCTION AND NOT THREE COPIES BECAUSE THE REFERENCE'S SWITCH HAS
+    ; ONE TAIL AND THIS PORT'S THREE ARMS RETURN SEPARATELY. Upstream applies the
+    ; two tests AFTER the switch, so they reach the INSTANTIATED and the COMPOSITE
+    ; answer as well as the declaration's — and `cloneSignature` copies `target`,
+    ; so an optional call on an instantiated signature is exactly the shape that
+    ; would have been missed by writing the arms only where the stop was.
+    function apply_call_chain_flags(this, sig: ref[Signature], t: ref[Type]) returns ref[Type]?
+    {
+        if (sig.flags & SignatureFlagsIsInnerCallChain) <> 0
+            return this.add_optional_type_marker(t)
+        if (sig.flags & SignatureFlagsIsOuterCallChain) <> 0
+            return this.get_optional_type(t, false)
+        t
+    }
+
     function get_return_type_of_signature(this, sig: ref[Signature]) returns ref[Type]?
     {
         if sig.resolved_return_type <> null
@@ -92592,13 +92934,29 @@ define Checker
                 this.pop_type_resolution_defensively()
                 return null
             }
+            if mapped = null
+            {
+                this.pop_type_resolution_defensively()
+                return null
+            }
+            let adjusted this.apply_call_chain_flags(sig, mapped as ref[Type])
+            if this.unported_mark() <> mark
+            {
+                this.pop_type_resolution_defensively()
+                return null
+            }
+            if adjusted = null
+            {
+                this.pop_type_resolution_defensively()
+                return null
+            }
             if this.pop_type_resolution() = false
             {
                 this.record_unported("instantiated-return-type-circular", sig.flags)
                 return null
             }
-            set sig.resolved_return_type: mapped
-            return mapped
+            set sig.resolved_return_type: adjusted
+            return adjusted
         }
         ; The COMPOSITE arm — the fold of every member's return type, then the
         ; signature's own mapper. ★The reduction is SUBTYPE here and LITERAL at
@@ -92651,13 +93009,29 @@ define Checker
                 this.pop_type_resolution_defensively()
                 return null
             }
+            if mapped = null
+            {
+                this.pop_type_resolution_defensively()
+                return null
+            }
+            let adjusted this.apply_call_chain_flags(sig, mapped as ref[Type])
+            if this.unported_mark() <> mark
+            {
+                this.pop_type_resolution_defensively()
+                return null
+            }
+            if adjusted = null
+            {
+                this.pop_type_resolution_defensively()
+                return null
+            }
             if this.pop_type_resolution() = false
             {
                 this.record_unported("composite-return-type-circular", sig.flags)
                 return null
             }
-            set sig.resolved_return_type: mapped
-            return mapped
+            set sig.resolved_return_type: adjusted
+            return adjusted
         }
         if sig.declaration = null
         {
@@ -92695,14 +93069,15 @@ define Checker
             else
                 set t: any_type
         }
-        ; The two call-chain arms. Both bits are declared and neither has a writer
-        ; in this port (see SignatureFlags), so the tests stand where the reference
-        ; puts them and the branch behind each one reports rather than being left
-        ; out (§3.5v).
-        if (sig.flags & SignatureFlagsCallChainFlags) <> 0
+        set t: this.apply_call_chain_flags(sig, t as ref[Type])
+        if this.unported_mark() <> mark
         {
             this.pop_type_resolution_defensively()
-            this.record_unported("call-chain-return-type", sig.flags)
+            return null
+        }
+        if t = null
+        {
+            this.pop_type_resolution_defensively()
             return null
         }
         if this.pop_type_resolution() = false
@@ -110075,6 +110450,26 @@ define Checker
         d
     }
 
+    ; getGlobalImportCallOptionsType — `getGlobalTypeResolver("ImportCallOptions",
+    ; 0, false)`, so the NOT-REPORTING half.
+    ;
+    ; ★★★ THE ROW THAT STOOD IN ITS PLACE READ *a lib type this harness's single
+    ; lib does not declare*, and that is true and is not a reason to stop: with
+    ; reportErrors false getGlobalType answers `emptyObjectType` for a name the lib
+    ; has no declaration of, which is a whole answer and the one every unit with an
+    ; `import()` call in it was waiting for. **A global this port cannot find is
+    ; not a global this port cannot ANSWER** — the resolver's own tail says so.
+    function get_global_import_call_options_type(this) returns ref[Type]?
+    {
+        if global_import_call_options_type_unchecked <> null
+            return global_import_call_options_type_unchecked
+        let d this.get_global_type_zero_arity("ImportCallOptions", SymbolFlagsType)
+        if d = null
+            return null
+        set global_import_call_options_type_unchecked: d
+        d
+    }
+
     ; getIndexTypeOfTypeEx.
     function get_index_type_of_type_ex(this, t: ref[Type], key_type: ref[Type], default_type: ref[Type]?) returns ref[Type]?
     {
@@ -110452,10 +110847,15 @@ define Checker
 
     ; The report half of hasExcessProperties.
     ;
-    ; ★★ THE JSX BRANCH HAS NO INPUT — ObjectFlagsJsxAttributes is set by
-    ; `createJsxAttributesType`, which is behind `check-jsx-element` — and it is
-    ; written as one stop because its three reports share the suggester the
-    ; ordinary branch stops on anyway.
+    ; ★★★ THE JSX BRANCH'S NOTE SAID IT HAS NO INPUT, AND SLICE 162 GAVE IT ONE.
+    ; It read *ObjectFlagsJsxAttributes is set by `createJsxAttributesType`, which
+    ; is behind `check-jsx-element`* — true when it was written and false since
+    ; the JSX chapter's remainder landed; `create_jsx_attributes_type` sets that
+    ; flag in this file today, and the suggester the note says the three reports
+    ; share is `getSpellingSuggestionForName`, which the ordinary branch has been
+    ; calling since slice 142. ★★AND THE STOP WAS WIDER THAN THE FORK IT STOOD
+    ; FOR: it fired on `isComparingJsxAttributes`, which upstream reads only in
+    ; `isKnownProperty` — the branch here is decided by the ERROR NODE alone.
     ;
     ; ★★★ `errorTarget` IS `filterType(reducedTarget, isExcessPropertyCheckTarget)`
     ; AND ON A NON-UNION TARGET THAT IS THE IDENTITY OR IT IS `never`. filterType
@@ -110465,16 +110865,20 @@ define Checker
     ; by construction, and the general `filterType` is not written.
     procedure report_excess_property(this, source: ref[Type], target: ref[Type], prop: ref[Symbol], error_node: ref[AstNode], is_comparing_jsx_attributes: bool)
     {
-        if is_comparing_jsx_attributes
-        {
-            this.record_unported("excess-property-jsx-report", target.object_flags)
-            return
-        }
+        ; `IsJsxAttributes(errorNode) || IsJsxOpeningLikeElement(errorNode) ||
+        ; IsJsxOpeningLikeElement(errorNode.Parent)`. ★JsxAttributes has an
+        ; object-literal flag and takes the same assignability check as an ordinary
+        ; object literal — upstream's own comment — so the fork exists for the
+        ; MESSAGE and not for the check.
+        var jsx_report false
         if AstNode.kind_of(error_node) = KindJsxAttributes
-        {
-            this.record_unported("excess-property-jsx-report", AstNode.kind_of(error_node))
-            return
-        }
+            set jsx_report: true
+        if AstNode.is_jsx_opening_like_element(error_node)
+            set jsx_report: true
+        if AstNode.is_jsx_opening_like_element(AstNode.parent_node_of(error_node))
+            set jsx_report: true
+        if jsx_report
+            return this.report_excess_jsx_property(source, target, prop, error_node)
         ; The suggestion's four conditions, in the reference's order. Each one that
         ; is false means the reference asks for no suggestion at all, so TS2353 is
         ; the whole answer and nothing is owed. ★The fourth is
@@ -110536,6 +110940,77 @@ define Checker
             return
         }
         this.report_error(DiagObject_literal_may_only_specify_known_properties_and_0_does_not_exist_in_type_1, source, target)
+    }
+
+    ; The JSX half of reportExcessProperty — TS2339 / TS2551 where the object
+    ; literal's half reports TS2353 / TS2559.
+    ;
+    ; ★ The error node moves to the ATTRIBUTE'S NAME only for a real JsxAttribute
+    ; declaration: *extraneous children (as in `<NoChild>extra</NoChild>`) do not
+    ; pass this check, since `children` is a PropertySignature and not a
+    ; JsxAttribute* — upstream's own comment, and the reason the test is on the
+    ; KIND rather than on the presence of a declaration. The same-file conjunct
+    ; beside it is not written for the reason the object-literal half gives: a
+    ; unit is one file here.
+    procedure report_excess_jsx_property(this, source: ref[Type], target: ref[Type], prop: ref[Symbol], error_node: ref[AstNode])
+    {
+        var report_node error_node
+        let pvd Symbol.value_declaration_of(prop)
+        if pvd <> null
+        {
+            if AstNode.kind_of(pvd as ref[AstNode]) = KindJsxAttribute
+            {
+                let nm AstNode.name_of(pvd as ref[AstNode])
+                if nm <> null
+                    set report_node: nm as ref[AstNode]
+            }
+        }
+        set rel_error_node: report_node
+        let mark this.unported_mark()
+        let suggestion this.get_suggested_symbol_for_nonexistent_jsx_attribute(Symbol.name_of(prop), target)
+        if this.unported_mark() <> mark
+            return
+        if suggestion <> null
+        {
+            this.report_error(DiagProperty_0_does_not_exist_on_type_1_Did_you_mean_2, source, target)
+            return
+        }
+        this.report_error(DiagProperty_0_does_not_exist_on_type_1, source, target)
+    }
+
+    ; getSuggestedSymbolForNonexistentJSXAttribute. ★The two JSX-specific renames
+    ; are a `switch` on the NAME upstream and two tests here, and they come first:
+    ; `for`/`class` are the DOM's reserved-word pair and their answer is exact
+    ; rather than spelled-out.
+    function get_suggested_symbol_for_nonexistent_jsx_attribute(this, name: Slice[char], containing_type: ref[Type]) returns ref[Symbol]?
+    {
+        let mark this.unported_mark()
+        let props this.get_properties_of_type(containing_type)
+        if this.unported_mark() <> mark
+            return null
+        if props = null
+            return null
+        let list props as ref[Array[ref[Symbol]?]]
+        var wanted Slice[char]()
+        if Checker.name_is(name, "for")
+            set wanted: Binder.internal_name_unprefixed(host, "htmlFor")
+        if Checker.name_is(name, "class")
+            set wanted: Binder.internal_name_unprefixed(host, "className")
+        if wanted.length <> 0
+        {
+            let n list.get_length() as int
+            var i 0
+            while i < n
+            {
+                let row list[i]
+                set i: i + 1
+                if row = null
+                    continue
+                if Checker.name_is(Symbol.name_of(row as ref[Symbol]), wanted)
+                    return row
+            }
+        }
+        this.get_spelling_suggestion_for_name(name, list, SymbolFlagsValue)
     }
 
     ; ast.IsObjectLiteralElement — the six kinds, on §3.9b's rule.
@@ -121354,9 +121829,8 @@ define Checker
     ; reference's answer is `anySignature`, whose first parameter type is the
     ; unknown fallback.
     ;
-    ; ★ The IMPORT CALL's second argument is `getGlobalImportCallOptionsType()`, a
-    ; lib type this harness's single lib does not declare — so that ONE index is a
-    ; row while index 0 (`string`) and index ≥ 2 (`any`) are answers.
+    ; ★ The IMPORT CALL's second argument is `getGlobalImportCallOptionsType()`;
+    ; index 0 is `string` and index ≥ 2 is `any`.
     function get_contextual_type_for_argument_at_index(this, call_target: ref[AstNode], arg_index: int) returns ref[Type]?
     {
         if Parser.is_import_call(call_target)
@@ -121364,10 +121838,7 @@ define Checker
             if arg_index = 0
                 return string_type
             if arg_index = 1
-            {
-                this.record_unported("global-import-call-options-type", arg_index)
-                return null
-            }
+                return this.get_global_import_call_options_type()
             return any_type
         }
         let mark this.unported_mark()
