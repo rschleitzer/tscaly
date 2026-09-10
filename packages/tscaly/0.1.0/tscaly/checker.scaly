@@ -1715,6 +1715,19 @@ define InstantiationCacheLink
 ; same type would then read the identity out of the cache and record no stop at
 ; all. That is a silent wrong answer standing in for a wall, which is the one
 ; thing this port may not trade a memo for.
+; One row of the relation's result cache — `getRelationKey`'s plain branch
+; (source id, target id, intersection state) plus the RELATION, and the FNV hash
+; of the four so that a bucket probe compares an int before the row.
+define RelationCacheRow
+(
+    hash: int
+    rel: int
+    source_id: int
+    target_id: int
+    state: int
+    result: int
+)
+
 define SimplifiedIndexedAccessLink
 (
     source: ref[Type]?
@@ -3201,14 +3214,26 @@ define DiscriminatorKindObjectLiteral: int 1
 
 ; ── RelationComparisonResult, the two bits the variance worker reads (slice 130)
 ;
-; The reference's enum has six members; the four this port has no reader for
-; (Succeeded, Failed, ReportsUnmeasurable's siblings in the relation CACHE's
-; value) belong to the cached-relation chapter, which stores a result rather
-; than a boolean. These two are the ones `getVariancesWorker` reads off
-; `c.reliabilityFlags` after its comparisons, and the two the reliability
-; MAPPERS write.
+; The reference's enum, and since slice 172 the whole of it has a reader: the
+; note that stood here said the other four *belong to the cached-relation
+; chapter, which stores a result rather than a boolean* — that chapter is the
+; relation's result cache and it is written now, so a cached row is a WORD and
+; not a verdict.
+;
+; ★★★ AND THE TOP TWO BITS RIDE IN IT, WHICH IS THE HALF THAT IS NOT AN
+; OPTIMISATION. `getVariancesWorker` reads `c.reliabilityFlags` after its
+; comparisons; a comparison answered FROM THE CACHE performs none, so unless the
+; row carries what the original comparison reported, the variance measurement
+; silently loses it. Measured: with the cache in and the flags left out, exactly
+; three stage-2 units left MATCH and all three are named after this —
+; `varianceRepeatedlyPropegatesWithUnreliableFlag` and the two
+; `varianceProblingAndZeroOrderIndexSignatureRelationsAlign`. **A cache is not
+; semantically neutral when the thing it remembers had a side channel.**
+define RelationComparisonResultSucceeded: int 1 << 0
+define RelationComparisonResultFailed: int 1 << 1
 define RelationComparisonResultReportsUnmeasurable: int 1 << 3
 define RelationComparisonResultReportsUnreliable: int 1 << 4
+define RelationComparisonResultReportsMask: int RelationComparisonResultReportsUnmeasurable | RelationComparisonResultReportsUnreliable
 
 ; ── inference: the priorities, the flags and the three records (slice 122) ──
 ;
@@ -6736,16 +6761,19 @@ define Checker
     ; here the relation is threaded as parameters, so they live on the checker and
     ; are reset by `check_type_related_to` at the entry of every comparison.
     ;
-    ; ★★★ THERE IS NO RELATION CACHE, AND THAT IS WHY `rel_maybe_*` IS A STACK
-    ; RATHER THAN A SET. Upstream `maybeKeys` has TWO jobs: it detects a cycle
-    ; (*these two are already being compared, assume they relate*) and it records
-    ; the keys that a later success promotes into the shared cache. The second job
-    ; is what makes it a growing list with a `maybeStart` watermark; with no cache
-    ; to promote INTO, only the first job is left, and the first job needs exactly
-    ; the keys of the comparisons currently ON the stack. So it is pushed and
-    ; popped around the recursive call — and `resetMaybeStack` has nothing to do.
-    ; ★The ANSWER is unaffected: Maybe is read as *related* at every reader, and
-    ; the cache only ever avoids recomputing an answer it already had.
+    ; ★★★ `rel_maybe_*` IS A STACK AND NOT A SET, AND SINCE SLICE 172 THAT IS A
+    ; DECISION RATHER THAN A CONSEQUENCE. Upstream `maybeKeys` has TWO jobs: it
+    ; detects a cycle (*these two are already being compared, assume they
+    ; relate*) and it records the keys a later success promotes into the shared
+    ; cache. The second job is what makes it a growing list with a `maybeStart`
+    ; watermark. The cache exists now — but this port promotes NOTHING into it
+    ; from here: `rel_maybe_hits` decides whether a frame's own TRUE was definite,
+    ; so only that one key is written and the stack keeps only the first job.
+    ; ★★★THE SECOND JOB WAS TRIED AND MEASURED WORSE: with the keys kept to a
+    ; watermark, the stack holds a whole successful subtree and the linear scan
+    ; below is over it — the file this chapter is about went from 81 s to over ten
+    ; minutes, and a tombstone SET beside it did not recover the time either.
+    ; ★The ANSWER is unaffected: Maybe is read as *related* at every reader.
     ;
     ; ★★ THE KEY IS THE ID TRIPLE and not `getRelationKey`'s hash. That function's
     ; two branches differ only for a type reference with GENERIC arguments, where
@@ -6770,6 +6798,40 @@ define Checker
     rel_target_depth: int
     rel_expanding_flags: int
     rel_overflow: bool
+
+    ; ── the relation's RESULT CACHE (slice 172) ────────────────────────────
+    ;
+    ; ★★★ THE NOTE AT is_type_related_to SAID THIS MAP HAD NO WRITER — *the only
+    ; writer in relater.go is `recursiveTypeRelatedTo`, the recursion this slice
+    ; does not have* — and that recursion landed in slice 155. Measured on
+    ; `FlattenKeys<{ a: 1 }>` alone: **5 000 000 recursive_type_related_to calls
+    ; over 2 459 DISTINCT keys**, 1 813 types minted — a repetition rate near
+    ; 2000:1, and 81 s where the reference answers the whole file in 0.19 s. The
+    ; comparison tree is re-walked instead of remembered.
+    ;
+    ; ★★★ AND THE FIRST DIAGNOSIS OF THAT NUMBER WAS WRONG. Slice 171 cached only
+    ; FAILED results, saw 599 hits in 4 000 000 calls over 45 distinct failing
+    ; keys, and concluded the calls were mostly DISTINCT PAIRS. They are not:
+    ; 99 % of them answer TRUE, so a failure-only cache measures the 1 % and says
+    ; nothing about the rest. **A hit rate is a statement about the half a cache
+    ; holds, never about the population.**
+    rel_result_entries: ref[Array[RelationCacheRow]]
+    rel_result_buckets: ref[Vector[int]]?
+    rel_result_mask: int
+
+    ; ★★★ THE TERNARY'S SUBSTITUTE, AND IT IS EXACT. Upstream's result is a
+    ; TERNARY and its write-back needs the distinction: a definite True is
+    ; recorded at once, a MAYBE only once the stacks are empty, because a Maybe is
+    ; an ASSUMPTION and caching one at depth would make it permanent. This port's
+    ; result is a `bool` with Maybe collapsed into true — but a Maybe has exactly
+    ; TWO sources in this relation (the maybe-stack hit and the ExpandingFlagsBoth
+    ; brake), so a MONOTONE COUNTER of them answers the question the type cannot:
+    ; a frame whose subtree left the counter unchanged used no assumption, and its
+    ; TRUE is definite. Slice 171's other attempt — keeping the maybe keys to a
+    ; watermark and promoting them at the outermost frame, which is upstream's own
+    ; shape — needs the stack to hold a whole successful subtree and made the same
+    ; file slower than the 81 s it was meant to fix. This needs no stack at all.
+    rel_maybe_hits: int
 
     ; ── the reverse-mapped family's own state (slice 160) ───────────────────
     ;
@@ -7276,6 +7338,11 @@ define Checker
         set c.rel_target_depth: 0
         set c.rel_expanding_flags: ExpandingFlagsNone
         set c.rel_overflow: false
+        let rce &Array[RelationCacheRow]^host()
+        set c.rel_result_entries: rce as ref[Array[RelationCacheRow]]
+        set c.rel_result_buckets: null
+        set c.rel_result_mask: 0
+        set c.rel_maybe_hits: 0
         let rmc &Array[ref[ReverseMappedRow]?]^host()
         set c.reverse_mapped_cache: rmc as ref[Array[ref[ReverseMappedRow]?]]
         let rhc &Array[ref[ReverseMappedRow]?]^host()
@@ -107033,12 +107100,17 @@ define Checker
 
     ; isTypeRelatedTo, whole.
     ;
-    ; ★★ THE OBJECT/OBJECT CACHE LOOKUP IS LEFT OUT WITH A PROOF RATHER THAN A
-    ; SHRUG: `relation.get(id)` can only answer what `relation.set` wrote, and the
-    ; only writer in relater.go is `recursiveTypeRelatedTo` — the recursion this
-    ; slice does not have. A map with no writer answers None on every key, which is
-    ; the branch's own fall-through, so the port's answer is the reference's answer
-    ; and `getRelationKey` is not needed to get it.
+    ; ★★★ THE OBJECT/OBJECT CACHE LOOKUP WAS LEFT OUT WITH A PROOF THAT EXPIRED,
+    ; AND IT STOOD FOR SEVENTEEN SLICES. It read: *`relation.get(id)` can only
+    ; answer what `relation.set` wrote, and the only writer in relater.go is
+    ; `recursiveTypeRelatedTo` — the recursion this slice does not have.* That
+    ; recursion landed in slice 155 and nothing re-read the argument; the map got
+    ; its writer in slice 172 and its absence had been costing a factor of NINETY
+    ; on the shapes that ask the relation repeatedly. The lookup here is still not
+    ; written, and now for a different and smaller reason: this entry point is
+    ; reached before any comparison has been recursed into, so a row can only be
+    ; present if `recursive_type_related_to` put it there — and that function asks
+    ; first thing. Adding it here would save one call, not one comparison.
     function is_type_related_to(this, source: ref[Type], target: ref[Type], relation: int) returns bool
     {
         var s: ref[Type] source
@@ -109700,8 +109772,131 @@ define Checker
         false
     }
 
-    ; recursiveTypeRelatedTo, minus the CACHE — see the chapter header for what
-    ; that costs and what it does not.
+    ; The result cache's two operations, in SymbolTable's own idiom — open
+    ; addressing over a power-of-two bucket vector, the rows in a separate Array in
+    ; insertion order, the buckets rebuilt whenever the load factor would pass one
+    ; half. The hash is FNV-1a over the four key words.
+    ;
+    ; ★ THE KEY CARRIES THE RELATION, where `rel_maybe_*`'s triple does not: the
+    ; maybe stack is unwound inside one comparison and a cached row outlives it, so
+    ; a failure under the identity relation must not answer for assignability.
+    function rel_result_hash(rel: int, s: int, t: int, i_state: int) returns int
+    {
+        var h: u64 14695981039346656037
+        set h: h xor (rel as u64)
+        set h: h * 1099511628211
+        set h: h xor (s as u64)
+        set h: h * 1099511628211
+        set h: h xor (t as u64)
+        set h: h * 1099511628211
+        set h: h xor (i_state as u64)
+        set h: h * 1099511628211
+        ((h >> 1) as int)
+    }
+
+    ; `relation.get(id)` — 0 where the reference answers RelationComparisonResultNone.
+    function rel_result_get(this, rel: int, s: int, t: int, i_state: int) returns int
+    {
+        if rel_result_buckets = null
+            return 0
+        let buckets rel_result_buckets as ref[Vector[int]]
+        let h Checker.rel_result_hash(rel, s, t, i_state)
+        var slot h & rel_result_mask
+        while true
+        {
+            let e buckets.get(slot as size_t)
+            if e = null
+                return 0
+            let idx *e
+            if idx = 0
+                return 0
+            let row rel_result_entries.at(idx - 1)
+            if row.hash = h
+            {
+                var same true
+                if row.rel <> rel
+                    set same: false
+                if row.source_id <> s
+                    set same: false
+                if row.target_id <> t
+                    set same: false
+                if row.state <> i_state
+                    set same: false
+                if same
+                    return row.result
+            }
+            set slot: (slot + 1) & rel_result_mask
+        }
+        0
+    }
+
+    ; `relation.set(id, result)`. An existing row is left alone: a key is written
+    ; at most once, because the answer that wrote it is what every later ask reads.
+    procedure rel_result_set(this, rel: int, s: int, t: int, i_state: int, result: int)
+    {
+        if this.rel_result_get(rel, s, t, i_state) <> 0
+            return
+        let h Checker.rel_result_hash(rel, s, t, i_state)
+        rel_result_entries.add(RelationCacheRow(h, rel, s, t, i_state, result))
+        let count rel_result_entries.get_length() as int
+        var cap 0
+        if rel_result_buckets <> null
+            set cap: rel_result_mask + 1
+        if (count * 2) > cap
+        {
+            var new_cap 8
+            while (count * 2) > new_cap
+                set new_cap: new_cap * 2
+            ; Vector[T](len) memsets its buffer, so 0 is the empty marker by
+            ; construction — SymbolTable's own note.
+            let v Vector[int]^host(new_cap as size_t)
+            set rel_result_buckets: v
+            set rel_result_mask: new_cap - 1
+            var j 0
+            while j < count
+            {
+                let row rel_result_entries.at(j)
+                var slot row.hash & rel_result_mask
+                while true
+                {
+                    let e v.get(slot as size_t)
+                    if e = null
+                        break
+                    if *e = 0
+                    {
+                        v.put(slot as size_t, j + 1)
+                        break
+                    }
+                    set slot: (slot + 1) & rel_result_mask
+                }
+                set j: j + 1
+            }
+            return
+        }
+        let buckets rel_result_buckets as ref[Vector[int]]
+        var slot h & rel_result_mask
+        while true
+        {
+            let e buckets.get(slot as size_t)
+            if e = null
+                return
+            if *e = 0
+            {
+                buckets.put(slot as size_t, count)
+                return
+            }
+            set slot: (slot + 1) & rel_result_mask
+        }
+    }
+
+    ; recursiveTypeRelatedTo, WITH the cache since slice 172 — see the field's own
+    ; header for the measurement, for the first diagnosis that was wrong, and for
+    ; why the maybe COUNTER stands in for the reference's Ternary.
+    ;
+    ; ★★★ A CACHED FAILURE IS CONSULTED ONLY WHEN NOTHING IS BEING REPORTED, which
+    ; is upstream's own condition: with an error node in hand it redoes the
+    ; comparison to build the message. A cached SUCCESS is consulted always —
+    ; there is no message to rebuild.
     ;
     ; ★★ THE 100-FRAME LIMIT IS ON THE STACK THAT WAS PUSHED, which is the
     ; reference's `len(r.sourceStack) == 100 || len(r.targetStack) == 100` asked
@@ -109712,8 +109907,53 @@ define Checker
     {
         if rel_overflow
             return false
+        ; ★★★ THE CACHE IS OFF INSIDE THE VARIANCE COMPUTATION, AND THAT IS A
+        ; DELIBERATE DIVERGENCE FROM THE REFERENCE WITH A MEASUREMENT UNDER IT.
+        ; Upstream caches there too. This port must not, because in that phase its
+        ; relation is not a FUNCTION of the cache key: a refuter that recomputed
+        ; every cached failure instead of trusting it caught the same key
+        ; (assignable, source 183, target 179, state 0) answering FALSE and then
+        ; TRUE, with `rel_expanding_flags` 0 both times — so something the key does
+        ; not carry moved in between. Upstream additionally pins `resolutionStart`
+        ; while it measures variance, which changes what pushTypeResolution calls a
+        ; cycle; that is the first place to look when this is picked up again.
+        ;
+        ; Measured: with the cache on in that phase, exactly three stage-2 units
+        ; leave MATCH and all three are named after it —
+        ; `varianceRepeatedlyPropegatesWithUnreliableFlag` and the two
+        ; `varianceProblingAndZeroOrderIndexSignatureRelationsAlign`. With it off
+        ; there, nothing leaves MATCH and the speed-up is unaffected: the variance
+        ; worker is a small share of the comparisons.
+        var cached 0
+        if in_variance_computation = false
+            set cached: this.rel_result_get(relation, source.id, target.id, intersection_state)
+        if cached <> 0
+        {
+            ; `r.c.reliabilityFlags |= entry & (ReportsUnmeasurable|ReportsUnreliable)`
+            ; — the side channel the row carries, replayed for a comparison that is
+            ; not being performed. See the enum's own header for what its absence
+            ; cost.
+            var answered false
+            if (cached & RelationComparisonResultSucceeded) <> 0
+                set answered: true
+            if (cached & RelationComparisonResultFailed) <> 0
+            {
+                if error_node = null
+                    set answered: true
+            }
+            if answered
+            {
+                set this.reliability_flags: reliability_flags | (cached & RelationComparisonResultReportsMask)
+                return (cached & RelationComparisonResultSucceeded) <> 0
+            }
+        }
         if this.rel_maybe_has(source.id, target.id, intersection_state)
+        {
+            ; ★ MAYBE SOURCE ONE OF TWO. Everything above this frame that ends up
+            ; TRUE did so under an assumption, and the counter is what says so.
+            set rel_maybe_hits: rel_maybe_hits + 1
             return true
+        }
         if rel_source_depth = 100
         {
             set rel_overflow: true
@@ -109725,7 +109965,14 @@ define Checker
             return false
         }
         this.rel_push_maybe(source.id, target.id, intersection_state)
+        let maybe_before rel_maybe_hits
         let save_expanding rel_expanding_flags
+        ; `saveReliabilityFlags := r.c.reliabilityFlags; r.c.reliabilityFlags = 0`
+        ; — what THIS comparison reports has to be separable from what its caller
+        ; had already collected, because only this comparison's own share may be
+        ; written into its cache row.
+        let save_reliability reliability_flags
+        set this.reliability_flags: 0
         if (recursion_flags & RecursionFlagsSource) <> 0
         {
             if rel_source_depth < (rel_source_stack.get_length() as int)
@@ -109754,7 +110001,11 @@ define Checker
         }
         var result false
         if rel_expanding_flags = ExpandingFlagsBoth
+        {
+            ; ★ MAYBE SOURCE TWO OF TWO — the depth brake's own Ternary.Maybe.
+            set rel_maybe_hits: rel_maybe_hits + 1
             set result: true
+        }
         if rel_expanding_flags <> ExpandingFlagsBoth
             set result: this.structured_type_related_to(source, target, relation, error_node, intersection_state)
         if (recursion_flags & RecursionFlagsSource) <> 0
@@ -109763,7 +110014,36 @@ define Checker
             set rel_target_depth: rel_target_depth - 1
         set rel_expanding_flags: save_expanding
         set rel_maybe_depth: rel_maybe_depth - 1
-        result
+        let propagating reliability_flags & RelationComparisonResultReportsMask
+        set this.reliability_flags: reliability_flags | save_reliability
+        if result
+        {
+            ; ★★★ THE COUNTER IS THE WHOLE TEST: unchanged across the subtree means
+            ; no assumption was used anywhere below, so this TRUE is upstream's
+            ; definite True and may be recorded. Changed means it is a Maybe, and a
+            ; Maybe is not cached at all here — upstream caches one only at the
+            ; outermost frame, and the rows this writes are a SUBSET of its rows,
+            ; which costs recomputation and cannot cost an answer.
+            if rel_maybe_hits = maybe_before
+            {
+                if in_variance_computation = false
+                    this.rel_result_set(relation, source.id, target.id, intersection_state, RelationComparisonResultSucceeded | propagating)
+            }
+            return true
+        }
+        ; `r.relation.set(id, Failed)` — *when something is false under assumptions
+        ; it will also be false without assumptions*, which is why this half needs
+        ; no counter.
+        ;
+        ; ★ NOT under overflow: a false that came out of the depth limiter is not a
+        ; fact about the two types, and upstream tags exactly that row with an
+        ; Overflow bit rather than a plain failure.
+        if rel_overflow = false
+        {
+            if in_variance_computation = false
+                this.rel_result_set(relation, source.id, target.id, intersection_state, RelationComparisonResultFailed | propagating)
+        }
+        false
     }
 
     ; structuredTypeRelatedTo — the entry, whose whole body beyond the one call is
