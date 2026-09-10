@@ -922,6 +922,15 @@ define MapTypeKindJsxChildElement: int 17
 ; same chapter, so a shared slot would read as one flag with two meanings.
 define MapTypeKindSimplified: int 18
 
+; MapTypeKindSpreadLeft / MapTypeKindSpreadRight (slice 170) — getSpreadType's two
+; own distributions, `mapType(left, t => getSpreadType(t, right, …))` and its
+; mirror. ★TWO kinds rather than one plus a side flag: the captured type is the
+; OTHER operand, and which side that is decides the argument ORDER of the
+; recursive call — a bit read at the call site would be a second thing to get
+; right at every reader.
+define MapTypeKindSpreadLeft: int 19
+define MapTypeKindSpreadRight: int 20
+
 define MapTypeArgs
 (
     mapped: ref[Type]?
@@ -960,6 +969,14 @@ define MapTypeArgs
 
     ; MapTypeKindSimplified's one (slice 166).
     simplify_writing: bool
+
+    ; MapTypeKindSpreadLeft / MapTypeKindSpreadRight's four (slice 170) — the
+    ; OTHER operand of the spread plus the three arguments getSpreadType carries
+    ; unchanged through its recursion.
+    spread_other: ref[Type]?
+    spread_symbol: ref[Symbol]?
+    spread_object_flags: int
+    spread_readonly: bool
 )
 
 ; addSpans' captured state (slice 126) — §3.21. The builder is a SLOT because the
@@ -15953,7 +15970,7 @@ define Checker
             return empty_object_type
         if (source.flags & TypeFlagsUnion) <> 0
         {
-            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, properties, symbol, null, null, null, false) as ref[MapTypeArgs]?
+            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, properties, symbol, null, null, null, false, null, null, 0, false) as ref[MapTypeArgs]?
             return this.map_type(source, MapTypeKindRestType, a)
         }
         ; `getUnionType(core.Map(properties, c.getLiteralTypeFromPropertyName))` —
@@ -16064,9 +16081,12 @@ define Checker
             if row = null
                 continue
             let prop row as ref[Symbol]
-            SymbolTable.set_entry(host, members, Symbol.name_of(prop), this.get_spread_symbol(prop, false))
+            let sp this.get_spread_symbol(prop, false)
             if this.unported_mark() <> mark
                 return null
+            if sp = null
+                return null
+            SymbolTable.set_entry(host, members, Symbol.name_of(prop), sp as ref[Symbol])
         }
         let infos this.get_index_infos_of_type(source)
         if this.unported_mark() <> mark
@@ -30070,6 +30090,171 @@ define Checker
         null
     }
 
+    ; insertType — `binary_search_type` plus `insert_type_at`, which is the pair
+    ; add_types_to_union already writes out at its own tail.
+    procedure insert_type_sorted(this, list: ref[Array[ref[Type]?]], t: ref[Type])
+    {
+        var found false
+        let index this.binary_search_type(list, t, &found)
+        if found = false
+            Checker.insert_type_at(list, index, t)
+    }
+
+    ; The type VARIABLE half of a constraining intersection: `types[0]` when that
+    ; one is the type variable, `types[1]` otherwise. The reference computes the
+    ; index three times over the same shape; it is one helper here, and the
+    ; PARTNER (the primitive) is the other index.
+    function constrained_intersection_part(this, t: ref[Type], want_variable: bool) returns ref[Type]?
+    {
+        if (t.flags & TypeFlagsIntersection) = 0
+            return null
+        if (t.object_flags & ObjectFlagsIsConstrainedTypeVariable) = 0
+            return null
+        let its Checker.intersection_types_of(t)
+        if its = null
+            return null
+        let list its as ref[Array[ref[Type]?]]
+        if (list.get_length() as int) <> 2
+            return null
+        var index 0
+        let first list[0]
+        if first = null
+            return null
+        if ((first as ref[Type]).flags & TypeFlagsTypeVariable) = 0
+            set index: 1
+        if want_variable = false
+            set index: 1 - index
+        list[index]
+    }
+
+    ; removeConstrainedTypeVariables — "if every constituent in the type variable's
+    ; constraint is covered by an intersection of the type variable and that
+    ; constituent, remove those intersections and substitute the type variable",
+    ; which is the reference's own comment and the whole of the function.
+    ;
+    ; ★★ THE DELETION IS A REBUILD. Upstream walks the list backwards and
+    ; `slices.Delete`s; Scaly's Array grows and clears and has nothing in between
+    ; (§ the insert_type_at note), so the kept constituents are copied forward in
+    ; order — which is the same list, because the removed ones are removed
+    ; wherever they sat.
+    function remove_constrained_type_variables(this, types: ref[Array[ref[Type]?]]) returns ref[Array[ref[Type]?]]?
+    {
+        var current types
+        let variables this.new_type_list(null)
+        let n current.get_length() as int
+        var i 0
+        while i < n
+        {
+            let row current[i]
+            set i: i + 1
+            if row = null
+                continue
+            let tv this.constrained_intersection_part(row as ref[Type], true)
+            if tv = null
+                continue
+            if Checker.contains_type_identity(variables, tv as ref[Type]) = false
+                variables.add(tv)
+        }
+        let vn variables.get_length() as int
+        var vi 0
+        while vi < vn
+        {
+            let vrow variables[vi]
+            set vi: vi + 1
+            if vrow = null
+                continue
+            let tv vrow as ref[Type]
+            ; The primitive halves of every constraining intersection of THIS type
+            ; variable, in the sorted set `containsType` binary-searches.
+            let primitives this.new_type_list(null)
+            let cn current.get_length() as int
+            var ci 0
+            while ci < cn
+            {
+                let row current[ci]
+                set ci: ci + 1
+                if row = null
+                    continue
+                let owner this.constrained_intersection_part(row as ref[Type], true)
+                if owner = null
+                    continue
+                if (owner as ref[Type]) <> tv
+                    continue
+                let prim this.constrained_intersection_part(row as ref[Type], false)
+                if prim = null
+                    continue
+                this.insert_type_sorted(primitives, prim as ref[Type])
+            }
+            let mark this.unported_mark()
+            let constraint this.get_base_constraint_of_type(tv)
+            if this.unported_mark() <> mark
+                return null
+            if constraint = null
+            {
+                ; The bit is set only where getIntersectionTypeEx found a base
+                ; constraint, so a null here is a disagreement between the two and
+                ; not a shape: reported rather than read as *not covered*, which
+                ; would answer an unreduced union without saying so.
+                this.record_unported("remove-constrained-type-variables-no-constraint", tv.flags)
+                return null
+            }
+            if this.every_type_is_contained_in(constraint as ref[Type], primitives) = false
+                continue
+            let kept this.new_type_list(null)
+            set ci: 0
+            let kn current.get_length() as int
+            while ci < kn
+            {
+                let row current[ci]
+                set ci: ci + 1
+                if row = null
+                    continue
+                let owner this.constrained_intersection_part(row as ref[Type], true)
+                var drop false
+                if owner <> null
+                {
+                    if (owner as ref[Type]) = tv
+                    {
+                        let prim this.constrained_intersection_part(row as ref[Type], false)
+                        if prim <> null
+                        {
+                            if this.contains_type(primitives, prim)
+                                set drop: true
+                        }
+                    }
+                }
+                if drop = false
+                    kept.add(row)
+            }
+            this.insert_type_sorted(kept, tv)
+            set current: kept
+        }
+        current
+    }
+
+    ; `everyType(constraint, func(t) { return containsType(primitives, t) })`.
+    function every_type_is_contained_in(this, t: ref[Type], list: ref[Array[ref[Type]?]]) returns bool
+    {
+        if (t.flags & TypeFlagsUnion) = 0
+            return this.contains_type(list, t)
+        let ts Checker.union_types_of(t)
+        if ts = null
+            return this.contains_type(list, t)
+        let cs ts as ref[Array[ref[Type]?]]
+        let n cs.get_length() as int
+        var i 0
+        while i < n
+        {
+            let row cs[i]
+            set i: i + 1
+            if row = null
+                return false
+            if this.contains_type(list, row) = false
+                return false
+        }
+        true
+    }
+
     function get_union_type_worker(this, types: ref[Array[ref[Type]?]], union_reduction: int, alias: ref[TypeAlias]?, origin: ref[Type]?) returns ref[Type]?
     {
         var type_set this.new_type_list(null)
@@ -30141,11 +30326,18 @@ define Checker
                     return null
                 }
             }
-            ; removeConstrainedTypeVariables, likewise — it needs an intersection.
+            ; removeConstrainedTypeVariables (slice 170). ★★★The note that stood
+            ; here read *likewise — it needs an intersection*, borrowing the
+            ; argument of the row above it, and the bit it guards is set by
+            ; `get_intersection_type_ex`'s own constrained-type-variable arm, which
+            ; this port has had since slice 121: the row was reachable and was
+            ; reached the moment `get_reduced_type` moved into the printer.
             if (includes & TypeFlagsIncludesConstrainedTypeVariable) <> 0
             {
-                this.record_unported("remove-constrained-type-variables", includes)
-                return null
+                let rct this.remove_constrained_type_variables(type_set)
+                if rct = null
+                    return null
+                set type_set: rct as ref[Array[ref[Type]?]]
             }
             ; removeSubtypes — the real one since slice 135; see its own header for
             ; what the stop that stood here was standing on.
@@ -32317,7 +32509,7 @@ define Checker
             let subject types[union_index]
             if subject = null
                 return null
-            let a &MapTypeArgs^host(null, null, null, null, null, false, texts, types, union_index, 0, 0, 0, 0, 0, null, null, null, null, null, null, false)
+            let a &MapTypeArgs^host(null, null, null, null, null, false, texts, types, union_index, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false)
             return this.map_type(subject as ref[Type], MapTypeKindTemplateLiteralSpan, a)
         }
         ; slices.Contains(types, wildcardType).
@@ -34569,7 +34761,61 @@ define Checker
     ; and says so. ★A `String` return would have been the smaller change and the
     ; worse one: the name is appended to a builder either way, so a String would be
     ; an allocation and a copy per node of the walk.
+    ; checkTruncationLength, asked at the four sites the reference asks it (slice
+    ; 170).
+    ;
+    ; ★★★ IT REFUTES A NOTE THAT STOOD IN create_anonymous_type_node SINCE SLICE
+    ; 95: *the truncation cutoff is 1 000 000 characters under NoTruncation, so
+    ; checkTruncationLength is false for every name this corpus can produce.* It
+    ; was true of the corpus REACHABLE THEN, and it stopped being true the moment
+    ; slice 170 opened the object spread in front of it — `nestedSpreadsAndWidening`
+    ; folds ten spreads into one another and the reference prints 1.47 MB where
+    ; this port printed 6.15 MB, the difference being exactly the three elision
+    ; arms. **A budget priced as unreachable is a claim about the corpus a stop
+    ; lets through, not about the budget.**
+    ;
+    ; ★★★ THE MEASURE IS A DIVERGENCE AND IT IS BOUNDED IN ONE DIRECTION. Upstream
+    ; compares `ctx.approximateLength` — a per-arm ESTIMATE (+2 per separator, +15
+    ; for a conditional, a symbol's name length) — against the budget, and this
+    ; port has no such counter: it compares the CHARACTERS ALREADY WRITTEN into the
+    ; name's own scratch builder, which is what that counter approximates. The two
+    ; cannot be made equal without carrying every one of the reference's increments,
+    ; so this asks the honest question and STOPS rather than eliding: a name whose
+    ; budget is spent is one this port does not claim, and the arms below therefore
+    ; report where the reference truncates.
+    function truncation_budget_exceeded(this, out: ref[StringBuilder]) returns bool
+        (out.get_length() as int) > 1000000
+
+    ; typeToTypeNode's own two lines, and the reduction is the reason this is a
+    ; wrapper (slice 170).
+    ;
+    ; ★★★ THE NOTE IN THE WORKER READ *both of those report below, so the call is
+    ; the identity for every type this slice can hold* — TRUE when the union and
+    ; intersection arms were stops, and false since slice 121 wrote them. The
+    ; object spread produced the first intersection that actually reduces:
+    ; `{ a: number; id: boolean } & { c: number; d: string } & { id: string }` is
+    ; `never` to the reference and printed whole here, because `get_reduced_type`
+    ; existed and nothing called it from the printer. **A note saying a call is the
+    ; identity is a claim about the arms AROUND it, and it expires when one of them
+    ; stops reporting.**
+    ;
+    ; ★ It wraps rather than opening the worker's body because the worker recurses
+    ; through this name at ~40 sites and every one of them is a `typeToTypeNode`
+    ; entry upstream, which is exactly where the reduction belongs.
     function type_to_string(this, t: ref[Type]?, out: ref[StringBuilder]) returns bool
+    {
+        if t = null
+            return this.type_to_string_worker(null, out)
+        let mark this.unported_mark()
+        let reduced this.get_reduced_type(t as ref[Type])
+        if this.unported_mark() <> mark
+            return false
+        if reduced = null
+            return false
+        this.type_to_string_worker(reduced, out)
+    }
+
+    function type_to_string_worker(this, t: ref[Type]?, out: ref[StringBuilder]) returns bool
     {
         ; The node this call is about to build needs no parentheses anywhere until an
         ; arm says otherwise — see the field's note for why the writer records it.
@@ -34586,10 +34832,6 @@ define Checker
             return false
         }
 
-        ; getReducedType, which the worker calls when FlagsNoTypeReduction is
-        ; absent — as it is here. It is the identity on everything but a union or
-        ; an intersection with a possibly-never member, and both of those report
-        ; below, so the call is the identity for every type this slice can hold.
         if (t.flags & TypeFlagsAny) <> 0
         {
             ; ★★★ THE ALIAS ARM IS CODE SINCE SLICE 114, and the note that stood
@@ -34949,6 +35191,11 @@ define Checker
             var ii 0
             while ii < inum
             {
+                if this.truncation_budget_exceeded(out)
+                {
+                    this.record_unported("type-to-string-truncation", subject.flags)
+                    return false
+                }
                 if ii > 0
                     out.append(" & ")
                 if this.write_intersection_constituent(ilist[ii], out) = false
@@ -34983,6 +35230,11 @@ define Checker
             var i 0
             while i < n
             {
+                if this.truncation_budget_exceeded(out)
+                {
+                    this.record_unported("type-to-string-truncation", subject.flags)
+                    return false
+                }
                 if i > 0
                     out.append(" | ")
                 if this.write_union_constituent(list[i], out) = false
@@ -35768,10 +36020,13 @@ define Checker
     ; typeof arm would be a fork rather than a return, and the property loop would
     ; carry a prototype filter.
     ;
-    ; ★ The truncation cutoff is 1 000 000 characters under NoTruncation
-    ; (`noTruncationMaximumTruncationLength`), so `checkTruncationLength` is false
-    ; for every name this corpus can produce and the three elision arms are not
-    ; written — the same no-op typeToStringEx's own two already are.
+    ; ★★★ The truncation cutoff is 1 000 000 characters under NoTruncation
+    ; (`noTruncationMaximumTruncationLength`). This line read *so
+    ; `checkTruncationLength` is false for every name this corpus can produce and
+    ; the three elision arms are not written* until slice 170, and the object
+    ; spread's arms produced the counter-example on the first build — see
+    ; truncation_budget_exceeded, which asks the question at the reference's four
+    ; sites and reports rather than eliding.
     function create_anonymous_type_node(this, t: ref[Type], out: ref[StringBuilder]) returns bool
     {
         if t.symbol = null
@@ -36497,6 +36752,14 @@ define Checker
     ; where the source wrote `x` first.
     function write_type_literal(this, sm: ref[StructuredMembers], calls: ref[Array[ref[Signature]?]], ctors: ref[Array[ref[Signature]?]], reverse_mapped: bool, out: ref[StringBuilder]) returns bool
     {
+        ; createTypeNodesFromResolvedType's own checkTruncationLength, which is the
+        ; whole-members arm rather than the per-property one: upstream elides the
+        ; body to a single `...` member here.
+        if this.truncation_budget_exceeded(out)
+        {
+            this.record_unported("type-to-string-truncation", TypeFlagsObject)
+            return false
+        }
         out.append("{ ")
         var i 0
         let nc calls.get_length() as int
@@ -55629,7 +55892,7 @@ define Checker
         var t: ref[Type]? null
         if this.every_type_is_tuple(source_type)
         {
-            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, element_index, 0, 0, 0, 0, 0, null, null, null, null, null, null, false) as ref[MapTypeArgs]?
+            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, element_index, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false) as ref[MapTypeArgs]?
             set t: this.map_type(source_type, MapTypeKindSliceTuple, a)
         }
         else
@@ -58389,7 +58652,7 @@ define Checker
     {
         if t = null
             return null
-        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, index, length, first_spread_index, last_spread_index, 0, null, null, null, null, null, null, false) as ref[MapTypeArgs]?
+        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, index, length, first_spread_index, last_spread_index, 0, null, null, null, null, null, null, false, null, null, 0, false) as ref[MapTypeArgs]?
         this.map_type_ex(t as ref[Type], MapTypeKindContextualElement, a, true)
     }
 
@@ -68408,7 +68671,7 @@ define Checker
             return null
         ; "We avoid calling getApplicableIndexInfo here because it performs
         ; potentially expensive intersection reduction."
-        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, name_type, false) as ref[MapTypeArgs]?
+        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, name_type, false, null, null, 0, false) as ref[MapTypeArgs]?
         this.map_type_ex(ct, MapTypeKindContextualIndexInfoValue, a, true)
     }
 
@@ -69415,7 +69678,7 @@ define Checker
                 set st.has_computed_string_property: false
                 set st.has_computed_number_property: false
             }
-            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, node, st, null, false) as ref[MapTypeArgs]?
+            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, node, st, null, false, null, null, 0, false) as ref[MapTypeArgs]?
             return this.map_type(spread, MapTypeKindEmptyObjectLiteralRemap, a)
         }
         this.create_object_literal_type(node, st, 0)
@@ -69522,7 +69785,12 @@ define Checker
                     if this.unported_mark() <> mark
                         return null
                 }
-                Symbol.copy_declarations_from(result, prop)
+                ; `result.Declarations = prop.Declarations` — ONE slot, which is
+                ; what the reference writes here and what get_spread_symbol writes
+                ; beside it. It was `copy_declarations_from` until slice 170, i.e.
+                ; three slots where upstream sets one: a synthesized optional
+                ; property has no value declaration and no parent of its own.
+                Symbol.share_declarations(result, prop)
                 set links.name_type: this.value_symbol_link_of(prop).name_type
                 set links.synthetic_origin: prop
                 SymbolTable.set_entry(host, members, Symbol.name_of(prop), result)
@@ -92402,17 +92670,42 @@ define Checker
                 if kt = null
                     return null
                 let key_type kt as ref[Type]
+                ; `forEachType(getTypeFromTypeNode(typeNode), …)` — a UNION key type
+                ; contributes one index info per constituent, which is what
+                ; `[key: string | number]: T` means (slice 170).
+                ;
+                ; ★★★ IT WAS A STOP UNTIL THE PRINTER STARTED ASKING. The union arm
+                ; is reached from `lib.es5.d.ts` and nothing in this port had walked
+                ; that far into an index symbol, so the row cost nothing — until
+                ; slice 170 put `get_reduced_type` at the top of `type_to_string`,
+                ; whose property walk resolves members and took SEVEN units out of
+                ; MATCH at once. **A stop is priced by who asks, and a new caller
+                ; re-prices every stop under it.**
+                var keys: ref[Array[ref[Type]?]]? null
                 if (key_type.flags & TypeFlagsUnion) <> 0
+                    set keys: Checker.union_types_of(key_type)
+                if keys = null
                 {
-                    this.record_unported("for-each-type-union", key_type.flags)
-                    return null
+                    set keys: this.new_type_list(null)
+                    (keys as ref[Array[ref[Type]?]]).add(key_type)
                 }
-                if this.is_valid_index_key_type(key_type)
+                let klist keys as ref[Array[ref[Type]?]]
+                let kn klist.get_length() as int
+                var ki 0
+                while ki < kn
                 {
-                    if Checker.find_index_info(infos, key_type) = null
+                    let krow klist[ki]
+                    set ki: ki + 1
+                    if krow = null
+                        continue
+                    let k1 krow as ref[Type]
+                    if this.is_valid_index_key_type(k1)
                     {
-                        let readonly b.has_syntactic_modifier(decl, ModifierFlagsReadonly)
-                        infos.add(this.new_index_info(key_type, value_type, readonly, decl))
+                        if Checker.find_index_info(infos, k1) = null
+                        {
+                            let readonly b.has_syntactic_modifier(decl, ModifierFlagsReadonly)
+                            infos.add(this.new_index_info(k1, value_type, readonly, decl))
+                        }
                     }
                 }
                 continue
@@ -94801,6 +95094,24 @@ define Checker
         }
         if mk = MapTypeKindThisTypeFromContextual
             return this.this_type_from_contextual_constituent(t)
+        if mk = MapTypeKindSpreadLeft
+        {
+            if a = null
+                return null
+            let args a as ref[MapTypeArgs]
+            if args.spread_other = null
+                return null
+            return this.get_spread_type(t, args.spread_other as ref[Type], args.spread_symbol, args.spread_object_flags, args.spread_readonly)
+        }
+        if mk = MapTypeKindSpreadRight
+        {
+            if a = null
+                return null
+            let args a as ref[MapTypeArgs]
+            if args.spread_other = null
+                return null
+            return this.get_spread_type(args.spread_other as ref[Type], t, args.spread_symbol, args.spread_object_flags, args.spread_readonly)
+        }
         if mk = MapTypeKindSimplified
         {
             if a = null
@@ -94912,7 +95223,7 @@ define Checker
     ; flag becomes, so a nullable capture is the honest carrier and not a bool.
     function get_tuple_element_type_out_of_start_count(this, t: ref[Type], index: u64, undefined_like: ref[Type]?) returns ref[Type]?
     {
-        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, index, undefined_like, null, null, null, null, null, false) as ref[MapTypeArgs]?
+        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, index, undefined_like, null, null, null, null, null, false, null, null, 0, false) as ref[MapTypeArgs]?
         this.map_type(t, MapTypeKindTupleElementOutOfStartCount, a)
     }
 
@@ -95123,7 +95434,7 @@ define Checker
         }
         if distribute
         {
-            let a &MapTypeArgs^host(null, null, new_mapper as ref[TypeMapper]?, root, check_type, for_constraint, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false)
+            let a &MapTypeArgs^host(null, null, new_mapper as ref[TypeMapper]?, root, check_type, for_constraint, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false)
             set result: this.map_type_with_alias(distribution_type as ref[Type], MapTypeKindConditionalDistribution, a, alias)
         }
         if distribute = false
@@ -95720,7 +96031,7 @@ define Checker
                     return null
                 if reduced = null
                     return null
-                let a &MapTypeArgs^host(t, type_variable, m, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false)
+                let a &MapTypeArgs^host(t, type_variable, m, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false)
                 return this.map_type_with_alias(reduced as ref[Type], MapTypeKindMappedConstituent, a, alias)
             }
         }
@@ -106606,6 +106917,29 @@ define Checker
                     set next: simplified
                 }
             }
+            ; ★★★ getNormalizedUnionOrIntersectionType's FIRST LINE, taken since
+            ; slice 170 — `if reduced := getReducedType(t); reduced != t { return
+            ; reduced }`. Its whole point is that a REDUCED intersection is `never`
+            ; and never is related to everything, so a relation asked about the
+            ; unreduced type invents a report: `objectSpread`'s TS2739 was exactly
+            ; that, an intersection the printer already answered `never` for. The
+            ; SECOND half — `shouldNormalizeIntersection` and its cross-product —
+            ; stays out and keeps a row of its own
+            ; (`intersectionWithUnionConstraint`), for the reason the header names:
+            ; an identity is left out rather than stopped where a stop would take
+            ; correct answers out of MATCH.
+            if next = null
+            {
+                if (cur.flags & TypeFlagsUnionOrIntersection) <> 0
+                {
+                    let reduced this.get_reduced_type(cur)
+                    if this.unported_mark() <> mark
+                        return null
+                    if reduced = null
+                        return null
+                    set next: reduced
+                }
+            }
             if next <> null
             {
                 let n next as ref[Type]
@@ -117048,23 +117382,31 @@ define Checker
         this.new_signature(SignatureFlagsNone, null, null, null, parameters, element_type, 1)
     }
 
-    ; ── getSpreadType, and the half of it a JSX attributes list reaches ──────
+    ; ── getSpreadType, whole (slice 170) ───────────────────────────
     ;
     ; ★★★ IT IS PORTED HERE AND NOT IN THE OBJECT-LITERAL CHAPTER, because THIS is
     ; the caller that reaches it without a spread in the source: every JSX element
     ; with at least one attribute folds its attributes table through `getSpreadType`
-    ; whether or not a `{...x}` appears — twelve of this slice's thirty-five solo
-    ; units. The object literal's own arm keeps its row, and that row is RETAGGED:
-    ; its wall is no longer this function but `checkSpreadPropOverrides` and
-    ; `isValidSpreadType` in front of it.
+    ; whether or not a `{...x}` appears. The object literal's own arm keeps its row,
+    ; and that row is RETAGGED: its wall is no longer this function but
+    ; `checkSpreadPropOverrides` and `isValidSpreadType` in front of it.
     ;
-    ; ★★★ AND THE SHAPE THE JSX CALLER HANDS IT IS THE EASY ONE, WHICH IS WHY THE
-    ; UNION AND GENERIC ARMS ARE ROWS RATHER THAN CODE. `left` is
-    ; `emptyJsxObjectType` on the first fold — no properties, no index infos — so
-    ; `getUnionIndexInfos` answers empty by construction and the left loop does not
-    ; run. What a `{...x}` adds is a `left` with members, and that is exactly where
-    ; the optional-property merge (whose product is a `spreadLinks` row this port's
-    ; Symbol does not have) starts to matter.
+    ; ★★★ THE THREE ARMS THAT WERE ROWS UNTIL SLICE 170 ARE WHAT A `{...x}` REACHES,
+    ; and the note that priced them was WRONG ABOUT ALL THREE. It read *the union
+    ; and generic arms are rows rather than code* because a JSX attributes list
+    ; hands this function an `emptyJsxObjectType` left — true, and it says nothing
+    ; about what the arms COST: `try_merge_union_of_object_type_and_empty_object`
+    ; had been ported IN FULL since slice 147 for the object literal's own remap
+    ; and this function simply never called it, so the union row's whole content
+    ; was a `map_type` kind; the generic arm is nine lines over three predicates
+    ; that were all here; and the optional-property merge's `spreadLinks` pair —
+    ; the reason the third row named the port's Symbol as the obstacle — has ONE
+    ; reader in the whole reference and it is `services.go`'s `getRootSymbols`,
+    ; which this port does not build. The slot is therefore NOT added, deliberately
+    ; and on the mappedSymbolLinks precedent read the other way round: that table
+    ; was merged into ValueSymbolLink because every ported reader asks the same
+    ; question through `CheckFlagsMapped`, and this one has no ported reader to
+    ; serve at all.
     function get_spread_type(this, left: ref[Type], right: ref[Type], symbol: ref[Symbol]?, object_flags: int, readonly: bool) returns ref[Type]?
     {
         if (left.flags & TypeFlagsAny) <> 0
@@ -117079,44 +117421,136 @@ define Checker
             return right
         if (right.flags & TypeFlagsNever) <> 0
             return left
+        let mark this.unported_mark()
         ; tryMergeUnionOfObjectTypeAndEmptyObject is the IDENTITY on a non-union —
-        ; its first line — and its union body plus the two `checkCrossProductUnion`
-        ; arms below are one chapter: the UNION spread.
-        if (left.flags & TypeFlagsUnion) <> 0
-        {
-            this.record_unported("spread-union-operand", TypeFlagsUnion)
+        ; its first line — and it REPLACES the operand it is asked about, so both
+        ; halves below read the merged type and not the argument.
+        ;
+        ; ★★ THE CROSS-PRODUCT GUARD'S FALSE ARM IS NOT REACHED HERE, and the
+        ; `errorType` beside it is written for the day it is: `check_cross_product_union`
+        ; records a stop of its own before answering false (its report is
+        ; `c.error(c.currentNode, …)` and this port has no current node), so the mark
+        ; test above the branch is what actually fires and the arm below is the
+        ; reference's line kept in place.
+        var l left
+        let merged_left this.try_merge_union_of_object_type_and_empty_object(left, readonly)
+        if this.unported_mark() <> mark
             return null
+        if merged_left = null
+            return null
+        set l: merged_left as ref[Type]
+        if (l.flags & TypeFlagsUnion) <> 0
+        {
+            let pair this.new_type_list(null)
+            pair.add(l)
+            pair.add(right)
+            let ok this.check_cross_product_union(pair)
+            if this.unported_mark() <> mark
+                return null
+            if ok = false
+                return error_type
+            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, right, symbol, object_flags, readonly) as ref[MapTypeArgs]?
+            return this.map_type(l, MapTypeKindSpreadLeft, a)
         }
-        if (right.flags & TypeFlagsUnion) <> 0
-        {
-            this.record_unported("spread-union-operand", TypeFlagsUnion)
+        var r right
+        let merged_right this.try_merge_union_of_object_type_and_empty_object(right, readonly)
+        if this.unported_mark() <> mark
             return null
+        if merged_right = null
+            return null
+        set r: merged_right as ref[Type]
+        if (r.flags & TypeFlagsUnion) <> 0
+        {
+            let pair this.new_type_list(null)
+            pair.add(l)
+            pair.add(r)
+            let ok this.check_cross_product_union(pair)
+            if this.unported_mark() <> mark
+                return null
+            if ok = false
+                return error_type
+            let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, l, symbol, object_flags, readonly) as ref[MapTypeArgs]?
+            return this.map_type(r, MapTypeKindSpreadRight, a)
         }
         ; "Spreading a primitive adds nothing" — the reference's own line, and the
         ; one arm of this function that answers without building anything.
         let primitive_right TypeFlagsBooleanLike | TypeFlagsNumberLike | TypeFlagsBigIntLike | TypeFlagsStringLike | TypeFlagsEnumLike | TypeFlagsNonPrimitive | TypeFlagsIndex
-        if (right.flags & primitive_right) <> 0
-            return left
-        let mark this.unported_mark()
-        if this.is_generic_object_type(left)
-        {
-            this.record_unported("spread-generic-operand", TypeFlagsObject)
-            return null
-        }
-        if this.is_generic_object_type(right)
-        {
-            this.record_unported("spread-generic-operand", TypeFlagsObject)
-            return null
-        }
+        if (r.flags & primitive_right) <> 0
+            return l
+        ; ── the GENERIC arm ────────────────────────────────────────────────
+        ;
+        ; ★★ THE INTERSECTION FORK IS THE REFERENCE'S OWN EXAMPLE: with a left of
+        ; `T & { a: string }` and a right of `{ b: string }` the LAST constituent
+        ; is spread into and the intersection re-formed, so the answer is
+        ; `T & { a: string, b: string }` and not `T & { a: string } & { b: string }`.
+        var generic false
+        if this.is_generic_object_type(l)
+            set generic: true
+        if this.is_generic_object_type(r)
+            set generic: true
         if this.unported_mark() <> mark
             return null
+        if generic
+        {
+            let left_is_empty this.is_empty_object_type(l)
+            if this.unported_mark() <> mark
+                return null
+            if left_is_empty
+                return r
+            if (l.flags & TypeFlagsIntersection) <> 0
+            {
+                let types Checker.intersection_types_of(l)
+                if types <> null
+                {
+                    let list types as ref[Array[ref[Type]?]]
+                    let n list.get_length() as int
+                    if n <> 0
+                    {
+                        let last_left list[n - 1]
+                        if last_left <> null
+                        {
+                            let ll last_left as ref[Type]
+                            var both false
+                            if this.is_non_generic_object_type(ll)
+                            {
+                                if this.is_non_generic_object_type(r)
+                                    set both: true
+                            }
+                            if this.unported_mark() <> mark
+                                return null
+                            if both
+                            {
+                                let spread_last this.get_spread_type(ll, r, symbol, object_flags, readonly)
+                                if this.unported_mark() <> mark
+                                    return null
+                                if spread_last = null
+                                    return null
+                                let new_types this.new_type_list(null)
+                                var ti 0
+                                while ti < n - 1
+                                {
+                                    new_types.add(list[ti])
+                                    set ti: ti + 1
+                                }
+                                new_types.add(spread_last)
+                                return this.get_intersection_type(new_types)
+                            }
+                        }
+                    }
+                }
+            }
+            let pair this.new_type_list(null)
+            pair.add(l)
+            pair.add(r)
+            return this.get_intersection_type(pair)
+        }
         let members SymbolTable.create(host)
         let skipped SymbolTable.create(host)
         var index_infos: ref[Array[ref[IndexInfo]?]]? null
-        if left = empty_object_type
-            set index_infos: this.get_index_infos_of_type(right)
+        if l = empty_object_type
+            set index_infos: this.get_index_infos_of_type(r)
         else
-            set index_infos: this.get_union_index_infos(left, right)
+            set index_infos: this.get_union_index_infos(l, r)
         if this.unported_mark() <> mark
             return null
         ; ★★★ `core.SameMap(indexInfos, getIndexInfoWithReadonly)` WAS MISSING, and
@@ -117129,7 +117563,7 @@ define Checker
         ; function in: **a stop hides a missing LINE in a ported function, not only
         ; a missing arm.**
         set index_infos: this.map_index_infos_with_readonly(index_infos, readonly)
-        let right_props this.get_properties_of_type(right)
+        let right_props this.get_properties_of_type(r)
         if this.unported_mark() <> mark
             return null
         var i 0
@@ -117146,9 +117580,16 @@ define Checker
                 continue
             }
             if this.is_spreadable_property(rp)
-                SymbolTable.set_entry(host, members, Symbol.name_of(rp), this.get_spread_symbol(rp, readonly))
+            {
+                let sp this.get_spread_symbol(rp, readonly)
+                if this.unported_mark() <> mark
+                    return null
+                if sp = null
+                    return null
+                SymbolTable.set_entry(host, members, Symbol.name_of(rp), sp as ref[Symbol])
+            }
         }
-        let left_props this.get_properties_of_type(left)
+        let left_props this.get_properties_of_type(l)
         if this.unported_mark() <> mark
             return null
         set i: 0
@@ -117165,17 +117606,91 @@ define Checker
                 continue
             if this.is_spreadable_property(lp) = false
                 continue
-            if SymbolTable.get(members, nd) <> null
+            let already SymbolTable.get(members, nd)
+            if already <> null
             {
-                ; The optional-property merge. Its product is a symbol carrying a
-                ; `spreadLinks` row — `leftSpread`/`rightSpread`, which this port's
-                ; Symbol has no slot for — and its readers are the excess-property
-                ; report and the declaration emitter. It is reached only when BOTH
-                ; sides declare the same name, i.e. only from a `{...x}`.
-                this.record_unported("spread-overlapping-property", SymbolFlagsProperty)
-                return null
+                ; ── the optional-property merge ─────────────────────────────
+                ;
+                ; ★★★ IT FIRES ONLY WHEN THE RIGHT PROPERTY IS OPTIONAL, and the
+                ; ELSE is *nothing happens*: a non-optional right property has
+                ; already overwritten the left one in `members` and stays. That is
+                ; what makes the whole arm reachable only from a `{...x}` — both
+                ; sides have to declare the same name.
+                ;
+                ; ★★ THE UNION IS SKIPPED WHERE THE TWO SIDES AGREE, which is the
+                ; reference's own optimisation and not an equality it depends on:
+                ; `removeMissingOrUndefinedType` on both, and if the results are the
+                ; SAME OBJECT the left type is taken whole — with its undefined, if
+                ; it had one — rather than reduced through a subtype union.
+                let rp already as ref[Symbol]
+                if (Symbol.flags_of(rp) & SymbolFlagsOptional) <> 0
+                {
+                    let right_type this.get_type_of_symbol(rp)
+                    if this.unported_mark() <> mark
+                        return null
+                    if right_type = null
+                        return null
+                    let left_type this.get_type_of_symbol(lp)
+                    if this.unported_mark() <> mark
+                        return null
+                    if left_type = null
+                        return null
+                    let lt left_type as ref[Type]
+                    let left_bare this.remove_missing_or_undefined_type(lt)
+                    if this.unported_mark() <> mark
+                        return null
+                    let right_bare this.remove_missing_or_undefined_type(right_type as ref[Type])
+                    if this.unported_mark() <> mark
+                        return null
+                    if left_bare = null
+                        return null
+                    if right_bare = null
+                        return null
+                    let result this.new_symbol(SymbolFlagsProperty | (Symbol.flags_of(lp) & SymbolFlagsOptional), nd)
+                    let links this.value_symbol_link_of(result)
+                    if (left_bare as ref[Type]) = (right_bare as ref[Type])
+                        set links.resolved_type: lt
+                    else
+                    {
+                        let pair this.new_type_list(null)
+                        pair.add(lt)
+                        pair.add(right_bare)
+                        let u this.get_union_type_ex(pair, UnionReductionSubtype, null, null)
+                        if this.unported_mark() <> mark
+                            return null
+                        if u = null
+                            return null
+                        set links.resolved_type: u
+                    }
+                    ; `core.Concatenate(leftProp.Declarations, rightProp.Declarations)`
+                    ; — the LEFT's first, which is the order the symbols dump prints.
+                    let decls &Array[ref[AstNode]?]^host() as ref[Array[ref[AstNode]?]]
+                    var di 0
+                    let ln Symbol.declaration_count(lp)
+                    while di < ln
+                    {
+                        decls.add(Symbol.declaration_at(lp, di))
+                        set di: di + 1
+                    }
+                    set di: 0
+                    let rn Symbol.declaration_count(rp)
+                    while di < rn
+                    {
+                        decls.add(Symbol.declaration_at(rp, di))
+                        set di: di + 1
+                    }
+                    Symbol.set_declarations(result, decls)
+                    set links.name_type: this.value_symbol_link_of(lp).name_type
+                    SymbolTable.set_entry(host, members, nd, result)
+                }
+                continue
             }
-            SymbolTable.set_entry(host, members, nd, this.get_spread_symbol(lp, readonly))
+            let sp this.get_spread_symbol(lp, readonly)
+            if this.unported_mark() <> mark
+                return null
+            if sp = null
+                return null
+            SymbolTable.set_entry(host, members, nd, sp as ref[Symbol])
         }
         ; `core.SameMap(indexInfos, getIndexInfoWithReadonly)` — the identity here,
         ; because `readonly` is false at both of this port's call sites and
@@ -117321,11 +117836,38 @@ define Checker
             if readonly = this.is_readonly_symbol(prop)
                 return prop
         }
-        ; The rebuilt symbol — a getter's value type, an index info's, or a readonly
-        ; flip. None of the three is reachable from a JSX attributes list, whose
-        ; every member is a fresh property symbol this file just minted.
-        this.record_unported("spread-symbol-rebuild", Symbol.flags_of(prop))
-        null
+        ; ── the rebuilt symbol (slice 170) ──────────────────────────────────
+        ;
+        ; A set-only accessor's value is `undefined` and every other rebuild carries
+        ; the property's own type across; the flag word keeps only CheckFlagsLate
+        ; and gains CheckFlagsReadonly from the ARGUMENT, which is how a spread into
+        ; a readonly target marks what it produced.
+        ;
+        ; ★It is `try_merge_union_of_object_type_and_empty_object`'s inner block
+        ; without the optionality: same five writes, and the difference is exactly
+        ; that this one does not make the property optional. Kept as two bodies
+        ; because the reference has two and the shared part is five lines.
+        var check_flags Symbol.check_flags_of(prop) & CheckFlagsLate
+        if readonly
+            set check_flags: check_flags | CheckFlagsReadonly
+        let result this.new_symbol_ex(SymbolFlagsProperty | (Symbol.flags_of(prop) & SymbolFlagsOptional), Symbol.name_of(prop), check_flags)
+        let links this.value_symbol_link_of(result)
+        if is_setonly_accessor
+            set links.resolved_type: undefined_type
+        else
+        {
+            let mark this.unported_mark()
+            let pt this.get_type_of_symbol(prop)
+            if this.unported_mark() <> mark
+                return null
+            if pt = null
+                return null
+            set links.resolved_type: pt
+        }
+        Symbol.share_declarations(result, prop)
+        set links.name_type: this.value_symbol_link_of(prop).name_type
+        set links.synthetic_origin: prop
+        result
     }
 
     ; ast.IsClassLike.
@@ -118472,7 +119014,7 @@ define Checker
             return child_field_type
         if child_index < 0
             return child_field_type
-        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, child_index, 0, 0, 0, 0, 0, null, null, null, null, null, null, false) as ref[MapTypeArgs]?
+        let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, child_index, 0, 0, 0, 0, 0, null, null, null, null, null, null, false, null, null, 0, false) as ref[MapTypeArgs]?
         this.map_type_ex(child_field_type as ref[Type], MapTypeKindJsxChildElement, a, true)
     }
 
@@ -119665,7 +120207,7 @@ define Checker
                     return null
                 if substituted = null
                     return null
-                let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, writing) as ref[MapTypeArgs]?
+                let a &MapTypeArgs^host(null, null, null, null, null, false, null, null, 0, 0, 0, 0, 0, 0, null, null, null, null, null, null, writing, null, null, 0, false) as ref[MapTypeArgs]?
                 return this.map_type(substituted as ref[Type], MapTypeKindSimplified, a)
             }
         }
