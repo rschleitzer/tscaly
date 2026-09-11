@@ -37,6 +37,15 @@ import threading
 import time
 import difflib
 
+# ★ A long listing piped into `head` closes the pipe under us; the default Python
+# handler then prints a BrokenPipeError traceback over the output a reader is looking
+# at. `transitions` over a corpus-sized baseline is exactly that listing.
+try:
+    import signal
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+except (ImportError, AttributeError, ValueError):
+    pass
+
 SUFFIXES = (".ts", ".mts", ".cts", ".tsx", ".jsx", ".js", ".cjs", ".mjs", ".json")
 
 # (artifact, `cut -d' ' -f1-<keep>` width; 0 = no cut)

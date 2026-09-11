@@ -63,6 +63,7 @@
 #   tools/errorsites.py apply     patch checker.scaly + binder.scaly, write the site table
 #   tools/errorsites.py run       run the PATCHED binary over the units in run.db, count
 #   tools/errorsites.py report    the zero rows, read off the table and the counts
+#   tools/errorsites.py retire    accept every zero whose code the reference emits nowhere
 #   tools/errorsites.py restore   put both files back
 import os
 import re
@@ -326,9 +327,14 @@ def options_read_by(fname, line_no):
 
 
 def code_witnesses():
-    """→ ({code name: number}, {code: {verdict: units}}) off the run store, or ({}, {}).
+    """→ ({code name: number}, {code: {verdict: units}}, stage) off the run store.
 
     The reference's own `C pos end code` lines over whatever corpus the store holds.
+
+    ★★★ WHATEVER CORPUS THE STORE HOLDS — which is why every caller has to ask what that
+    is. A FILTERED run leaves five units in `run.db`, and *the reference emits this code
+    nowhere* is then true of almost every code in the file. `retire` refuses anything but a
+    full stage-2 store for exactly that reason; `report` prints the stage it read.
     """
     import re as _re
     num = {}
@@ -417,15 +423,73 @@ def report():
     return 0
 
 
+def retire():
+    """Append an accepted row for every dead site whose code the REFERENCE emits nowhere.
+
+    ★★★ THE REASON IS A MEASUREMENT AND IT IS WRITTEN AS ONE, with the corpus it was taken
+    over: *the reference emits TS<n> on no unit of the stage-2 corpus (18 455 units)*. It
+    says the corpus cannot reach the site, NOT that the site is right — which is the only
+    honest thing a zero can say, and exactly why these rows are retired rather than deleted:
+    a corpus that grows can bring one back, and the row then has to be re-established.
+    """
+    if not os.path.isfile(TABLE) or not os.path.isfile(COUNTS):
+        return err("run `apply` and `run` first")
+    counts = {}
+    units = "?"
+    with open(COUNTS, encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("#"):
+                import re as _re
+                m = _re.search(r"units=(\d+)", line)
+                if m:
+                    units = m.group(1)
+                continue
+            a, b = line.split("\t")
+            counts[int(a)] = int(b)
+    num, per_code, stage = code_witnesses()
+    sys.path.insert(0, os.path.join(PKG, "tests"))
+    import harness as H
+    store = H.Store.open(OUT)
+    if store is None or store.meta("stage") != "2" or store.meta("filter"):
+        return err("retire needs a FULL stage-2 store in run.db (this one is stage %s, filter %r) — "
+                   "over a filtered run every code looks unemitted"
+                   % (store.meta("stage", "?") if store else "?", store.meta("filter", "") if store else "?"))
+    acc = load_accepted()
+    add = []
+    with open(TABLE, encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if counts.get(int(f[0]), 0):
+                continue
+            key = (f[3], f[5], f[6])
+            if key in acc:
+                continue
+            code = code_of(f[6], num)
+            if code is None or per_code.get(code):
+                continue
+            acc[key] = 1
+            add.append((f[3], f[5], f[6],
+                        "CORPUS the reference emits TS%d on no unit of the stage-%s corpus (%s units), "
+                        "so nothing here can reach this site. It says the corpus cannot test the site, "
+                        "not that the site is right." % (code, stage, units)))
+    with open(ACCEPTED, "a", encoding="utf-8") as fh:
+        for row in add:
+            fh.write("%s\t%s\t%s\t%s\n" % row)
+    print("retired %d rows into %s" % (len(add), os.path.relpath(ACCEPTED, PKG)))
+    return 0
+
+
 def err(msg):
     print("errorsites.py: " + msg, file=sys.stderr)
     return 2
 
 
 def main(argv):
-    cmds = {"apply": apply, "restore": restore, "run": run, "report": report}
+    cmds = {"apply": apply, "restore": restore, "run": run, "report": report, "retire": retire}
     if len(argv) < 2 or argv[1] not in cmds:
-        return err("usage: errorsites.py apply | run | report | restore")
+        return err("usage: errorsites.py apply | run | report | retire | restore")
     return cmds[argv[1]]()
 
 
