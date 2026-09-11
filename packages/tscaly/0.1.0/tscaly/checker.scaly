@@ -602,8 +602,14 @@ define PredicateSemanticsSometimes: int PredicateSemanticsAlways | PredicateSema
 ; ★ The successor is named: the slice that instantiates generics is the one whose
 ; lists get long enough for the hash to be worth its collision argument, and it is
 ; the slice that must port `getTypeListKey` and `keyBuilder` with it.
+; ★ The leading `hash` is `RelationCacheRow`'s trick and not a key: these lists
+; are PER TARGET and stay association lists, so the hash only lets the scan
+; compare an int before walking two argument lists. Measured on
+; `recursiveReverseMappedType`, where `type_lists_equal` under these two scans was
+; the head of the profile once the union table was indexed.
 define TypeInstantiation
 (
+    hash: int
     arguments: ref[Array[ref[Type]?]]?
     instantiated: ref[Type]?
 )
@@ -1095,6 +1101,7 @@ define ConditionalInstantiation
 ; was built from.
 define ObjectInstantiation
 (
+    hash: int
     arguments: ref[Array[ref[Type]?]]?
     alias_symbol: ref[Symbol]?
     alias_type_arguments: ref[Array[ref[Type]?]]?
@@ -4088,11 +4095,13 @@ define TypeResolution
 ; an interface value compares the dynamic TYPE and the pointer — so two
 ; null-or-pointer slots compare exactly as one `any` does.
 ;
-; ★ The NODE arm is not declared, and its absence is a property of this port's
-; TypeReference rather than of this slice: `asRecursionId(t.AsTypeReference().node)`
-; needs a `node` slot ReferenceTypeData does not carry, whose reader its own header
-; names as getTypeArguments' deferred path. The day that slot lands, this record
-; gains the third one.
+; ★ The NODE arm IS declared and get_recursion_identity reads it first — the
+; deferred type reference, tracked through its AST node. What stood here said the
+; opposite (*the `node` slot ReferenceTypeData does not carry … the day that slot
+; lands, this record gains the third one*); the slot landed with
+; create_deferred_type_reference and the arm came with it, and the line was left
+; behind. A closed limit reads exactly like an open one, which is how the same
+; premise was still being CITED at two other sites forty slices later.
 define RecursionId
 (
     target_symbol: ref[Symbol]?
@@ -6607,6 +6616,25 @@ define Checker
     ; guard upstream is `origin == nil`, so it is a fast path and not the reason.
     union_types: ref[Array[ref[Type]?]]
 
+    ; ★★★ THE INTERN TABLE'S INDEX, AND ITS KEY IS getUnionKey'S OWN FOUR CASES.
+    ; The scan below it is O(unions) per ask and the note under find_union_type
+    ; says what upstream does instead — `c.unionTypes[getUnionKey(...)]`, a map.
+    ; It was never priced because no unit made enough unions;
+    ; `recursiveReverseMappedType` does once the deferred reference stops walling
+    ; the instantiation off, and a `sample` reads 71 % of that run inside
+    ; union_key_matches and the two accessors it calls. ★★★The first version of
+    ; this index hashed the CONSTITUENT LIST and used it only where the ask
+    ; carried no origin — and moved nothing, because every `getUnionType([E, F])`
+    ; mints a FRESH origin (the note under union_key_matches says so) so the
+    ; origin-free ask is the rare one. `union_key_hash` therefore mirrors
+    ; union_key_matches arm for arm: no origin hashes the constituents, a UNION or
+    ; INTERSECTION origin hashes the ORIGIN's constituents under a tag — the
+    ; normalized set is not in that key at all — and an INDEX origin hashes the
+    ; origin's own id and the constituents. The alias stays out and is filtered by
+    ; union_key_matches, which every probe still runs.
+    union_type_buckets: ref[Vector[int]]?
+    union_type_mask: int
+
     ; c.intersectionTypes (slice 121). Its rows are ENTRIES rather than types —
     ; see IntersectionEntry for why two thirds of the key are not on the answer.
     intersection_types: ref[Array[ref[IntersectionEntry]?]]
@@ -6789,6 +6817,21 @@ define Checker
     ; against the base's in checkMembersForOverrideModifier.
     value_symbol_links: ref[Array[ref[ValueSymbolLink]?]]
 
+    ; ★★★ AND IT IS THE ONE LINKS TABLE WITH AN INDEX, MEASURED. Every table in
+    ; this family is a LINEAR SCAN where upstream keeps a map, which is a property
+    ; nobody had to price while no unit filled one — slice 182 measured 86 % of a
+    ; run inside `symbol_node_link_of` and left the shape alone. The deferred
+    ; reference retired in this slice put enough work through both: a `sample` of
+    ; `recursiveReverseMappedType` reads 86 % in THIS function and one of
+    ; `binaryArithmeticControlFlowGraphNotTooLarge` 97 % in symbol_node_link_of,
+    ; both units MATCH before and over the runner's 60 s afterwards. The index is
+    ; `rel_result_buckets`' idiom unchanged — an open-addressed Vector[int] of
+    ; row+1, 0 the empty marker by Vector's memset — keyed on the row's own
+    ; ADDRESS, which is what upstream's map is keyed on too. The row store stays
+    ; the array it was: nothing else reads it, and identity is unaffected.
+    value_symbol_link_buckets: ref[Vector[int]]?
+    value_symbol_link_mask: int
+
     ; ── c.typeNodeLinks (slice 80) ──────────────────────────────────────────
     ;
     ; The same idiom a third time, keyed on the type NODE. Its memo IS
@@ -6879,6 +6922,10 @@ define Checker
     ; the scan is the longest of the six and still linear: see the record's own
     ; note for why the memo is load-bearing rather than a saving.
     symbol_node_links: ref[Array[ref[SymbolNodeLink]?]]
+
+    ; Indexed like value_symbol_links, for the measurement in that field's header.
+    symbol_node_link_buckets: ref[Vector[int]]?
+    symbol_node_link_mask: int
 
     ; c.aliasSymbolLinks and c.moduleSymbolLinks (slice 110) — the same idiom a
     ; SEVENTH and EIGHTH time, both keyed on the SYMBOL pointer. See each record's
@@ -7540,6 +7587,8 @@ define Checker
         set c.type_alias_links: tal
         let vl &Array[ref[ValueSymbolLink]?]^host()
         set c.value_symbol_links: vl
+        set c.value_symbol_link_buckets: null
+        set c.value_symbol_link_mask: 0
         let tnl &Array[ref[TypeNodeLink]?]^host()
         set c.type_node_links: tnl
         let msl &Array[ref[MergedSymbolLink]?]^host()
@@ -7561,6 +7610,8 @@ define Checker
         set c.decorator_context_override_links: dco
         let snl &Array[ref[SymbolNodeLink]?]^host()
         set c.symbol_node_links: snl
+        set c.symbol_node_link_buckets: null
+        set c.symbol_node_link_mask: 0
         let asl &Array[ref[AliasSymbolLink]?]^host()
         set c.alias_symbol_links: asl
         set c.unresolved_symbols: SymbolTable.create(host)
@@ -7754,6 +7805,8 @@ define Checker
         set c.bigint_literal_types: bl
         let ut &Array[ref[Type]?]^host()
         set c.union_types: ut
+        set c.union_type_buckets: null
+        set c.union_type_mask: 0
         let it &Array[ref[IntersectionEntry]?]^host()
         set c.intersection_types: it
         let src &Array[ref[SubtypeReductionRow]?]^host()
@@ -8690,6 +8743,20 @@ define Checker
 
     ; getStringLiteralType. The table is scanned linearly and compared on the
     ; BYTES, which is what a Go map keyed on a string compares.
+    ;
+    ; ★★★ THE MINT COPIES THE TEXT ONTO THE CHECKER'S PAGE, AND THAT IS A FIX AND
+    ; NOT A PRECAUTION. Upstream's key and value are a Go STRING, an immutable
+    ; value; here `text` is a borrowed `Slice[char]` and the row kept it, so a
+    ; caller whose bytes were a stack buffer or a frame that later died left an
+    ; INTERNED type pointing at dead memory — permanently, and for every later ask
+    ; with the same bytes, because the scan above hands that row back. It reads as
+    ; a wrong ANSWER rather than a crash: `destructuringControlFlow` printed
+    ; `"\uFFFD"` where the reference prints `"x"`, and it printed it only in the
+    ; whole unit, never in the five lines around the site, because what the slice
+    ; points at is whatever the arena put there next. Slice 195 met the same class
+    ; one table over (`add_member_for_key_type_worker`) and fixed it at that ONE
+    ; caller; this is the same fix at the table, where it covers all of them.
+    ; The copy is on the MINT path only — one per distinct literal.
     function get_string_literal_type(this, text: Slice[char]) returns ref[Type]
     {
         let len string_literal_types.get_length() as int
@@ -8708,7 +8775,10 @@ define Checker
             }
             set i: i + 1
         }
-        let t this.new_literal_type(TypeFlagsStringLiteral, text, 0 as u64, false, false, null)
+        var owned text
+        if text.length > 0
+            set owned: this.copy_name_to_page(text)
+        let t this.new_literal_type(TypeFlagsStringLiteral, owned, 0 as u64, false, false, null)
         string_literal_types.add(t)
         t
     }
@@ -9923,7 +9993,7 @@ define Checker
             let all this.new_type_list(tps)
             all.add(this_type)
             let insts &Array[ref[TypeInstantiation]?]^host()
-            let seed &TypeInstantiation^host(tps, t)
+            let seed &TypeInstantiation^host(Checker.type_list_hash(tps), tps, t)
             insts.add(seed)
             Checker.fill_interface_data(t, all, tps, insts, outer_count, this_type)
         }
@@ -10626,6 +10696,28 @@ define Checker
     ; unbounded walk in the tuple-element path, not in front of these eight lines**,
     ; and the row cannot be retired until that walk is bounded the way upstream
     ; bounds it.
+    ; slices.Repeat(errorType, len(n.TypeParameters())) — InterfaceType.TypeParameters
+    ; is allTypeParameters without the trailing thisType, and empty for an empty list.
+    function error_type_arguments_of(this, t: ref[Type]) returns ref[Array[ref[Type]?]]?
+    {
+        let out this.new_type_list(null)
+        let tgt Checker.target_of(t)
+        if tgt = null
+            return out
+        let all Checker.all_type_parameters_of(tgt as ref[Type])
+        if all = null
+            return out
+        let list all as ref[Array[ref[Type]?]]
+        let n list.get_length() as int
+        var i 0
+        while i < (n - 1)
+        {
+            out.add(error_type)
+            set i: i + 1
+        }
+        out
+    }
+
     function get_type_arguments(this, t: ref[Type]) returns ref[Array[ref[Type]?]]?
     {
         let args Checker.resolved_type_arguments_of(t)
@@ -10651,11 +10743,7 @@ define Checker
             }
         }
         if this.push_type_resolution(null, t, null, null, TypeSystemPropertyNameResolvedTypeArguments) = false
-        {
-            ; Written and withdrawn in slice 195 — see the header.
-            this.record_unported("get-type-arguments-circular", k)
-            return null
-        }
+            return this.error_type_arguments_of(t)
         let mark this.unported_mark()
         let resolved this.new_type_list(null)
         if k = KindArrayType
@@ -10751,9 +10839,25 @@ define Checker
         }
         if this.pop_type_resolution() = false
         {
-            ; Written and withdrawn in slice 195 — see the header.
-            this.record_unported("get-type-arguments-circular", k)
-            return null
+            if Checker.resolved_type_arguments_of(t) = null
+            {
+                let errs this.error_type_arguments_of(t)
+                if errs = null
+                    return null
+                Checker.set_reference_type_arguments(t, errs as ref[Array[ref[Type]?]])
+            }
+            let tgt2 Checker.target_of(t)
+            if tgt2 <> null
+            {
+                let sym (tgt2 as ref[Type]).symbol
+                if sym <> null
+                    this.error_on_node(n, DiagType_arguments_for_0_circularly_reference_themselves)
+                else
+                    this.error_on_node(n, DiagTuple_type_arguments_circularly_reference_themselves)
+            }
+            else
+                this.error_on_node(n, DiagTuple_type_arguments_circularly_reference_themselves)
+            return Checker.resolved_type_arguments_of(t)
         }
         if this.unported_mark() <> mark
             return null
@@ -10874,6 +10978,7 @@ define Checker
 
     function find_instantiation(target: ref[Type], args: ref[Array[ref[Type]?]]?) returns ref[Type]?
     {
+        let h Checker.type_list_hash(args)
         choose target.data
             when d: Interface
             {
@@ -10888,8 +10993,11 @@ define Checker
                     if row <> null
                     {
                         let r row as ref[TypeInstantiation]
-                        if Checker.type_lists_equal(r.arguments, args)
-                            return r.instantiated
+                        if r.hash = h
+                        {
+                            if Checker.type_lists_equal(r.arguments, args)
+                                return r.instantiated
+                        }
                     }
                     set i: i + 1
                 }
@@ -10926,6 +11034,7 @@ define Checker
             set asym: al.symbol
             set aargs: al.type_arguments
         }
+        let h Checker.type_list_hash(args)
         let n rows.get_length() as int
         var i 0
         while i < n
@@ -10934,14 +11043,17 @@ define Checker
             if row <> null
             {
                 let r row as ref[ObjectInstantiation]
-                if r.single_signature = single_signature
+                if r.hash = h
                 {
-                    if r.alias_symbol = asym
+                    if r.single_signature = single_signature
                     {
-                        if Checker.type_lists_equal(r.arguments, args)
+                        if r.alias_symbol = asym
                         {
-                            if Checker.type_lists_equal(r.alias_type_arguments, aargs)
-                                return r.instantiated
+                            if Checker.type_lists_equal(r.arguments, args)
+                            {
+                                if Checker.type_lists_equal(r.alias_type_arguments, aargs)
+                                    return r.instantiated
+                            }
                         }
                     }
                 }
@@ -11001,7 +11113,7 @@ define Checker
             set aargs: al.type_arguments
         }
         let rows_page Page.get(rows)
-        let row &ObjectInstantiation^rows_page(args, asym, aargs, single_signature, t)
+        let row &ObjectInstantiation^rows_page(Checker.type_list_hash(args), args, asym, aargs, single_signature, t)
         rows.add(row)
     }
 
@@ -11014,7 +11126,7 @@ define Checker
                 {
                     let list d.instantiations as ref[Array[ref[TypeInstantiation]?]]
                     let list_page Page.get(list)
-                    let row &TypeInstantiation^list_page(args, t)
+                    let row &TypeInstantiation^list_page(Checker.type_list_hash(args), args, t)
                     list.add(row)
                 }
             }
@@ -11351,24 +11463,130 @@ define Checker
 
     ; ── c.valueSymbolLinks ──────────────────────────────────────────────────
 
+    ; The address hash the two indexed links tables share. An object address is
+    ; 16-byte aligned at worst, so the low bits carry nothing — the FNV round
+    ; `rel_result_hash` uses spreads them and the final shift clears the sign, for
+    ; that function's own reason.
+    ; The argument list's hash — the ids in order. A null list and an empty one
+    ; hash alike, which is what type_lists_equal answers for them too.
+    function type_list_hash(types: ref[Array[ref[Type]?]]?) returns int
+    {
+        var h: u64 14695981039346656037
+        if types <> null
+        {
+            let list types as ref[Array[ref[Type]?]]
+            let n list.get_length() as int
+            var i 0
+            while i < n
+            {
+                let e list[i]
+                if e <> null
+                {
+                    set h: h xor ((e as ref[Type]).id as u64)
+                    set h: h * 1099511628211
+                }
+                set i: i + 1
+            }
+        }
+        ((h >> 1) as int)
+    }
+
+    function link_address_hash(a: int) returns int
+    {
+        var h: u64 14695981039346656037
+        set h: h xor (a as u64)
+        set h: h * 1099511628211
+        set h: h xor (h >> 29)
+        set h: h * 1099511628211
+        ((h >> 1) as int)
+    }
+
     function value_symbol_link_of(this, sym: ref[Symbol]) returns ref[ValueSymbolLink]
     {
-        let len value_symbol_links.get_length() as int
-        var i 0
-        while i < len
+        let h Checker.link_address_hash(sym as int)
+        if value_symbol_link_buckets <> null
         {
-            let row value_symbol_links[i]
-            if row <> null
+            let buckets value_symbol_link_buckets as ref[Vector[int]]
+            var slot h & value_symbol_link_mask
+            while true
             {
-                let r row as ref[ValueSymbolLink]
-                if r.symbol = sym
-                    return r
+                let e buckets.get(slot as size_t)
+                if e = null
+                    break
+                let idx *e
+                if idx = 0
+                    break
+                let row value_symbol_links[idx - 1]
+                if row <> null
+                {
+                    let r row as ref[ValueSymbolLink]
+                    if r.symbol = sym
+                        return r
+                }
+                set slot: (slot + 1) & value_symbol_link_mask
             }
-            set i: i + 1
         }
         let made &ValueSymbolLink^host(sym)
         value_symbol_links.add(made)
+        this.value_symbol_link_index(h, value_symbol_links.get_length() as int)
         made
+    }
+
+    ; The insert half, `rel_result_set`'s tail with its grow-and-rehash. The row
+    ; is already in the store; `count` is its 1-based index.
+    procedure value_symbol_link_index(this, h: int, count: int)
+    {
+        var cap 0
+        if value_symbol_link_buckets <> null
+            set cap: value_symbol_link_mask + 1
+        if (count * 2) > cap
+        {
+            var new_cap 16
+            while (count * 2) > new_cap
+                set new_cap: new_cap * 2
+            let v Vector[int]^host(new_cap as size_t)
+            set value_symbol_link_buckets: v
+            set value_symbol_link_mask: new_cap - 1
+            var j 0
+            while j < count
+            {
+                let row value_symbol_links[j]
+                if row <> null
+                {
+                    let sy (row as ref[ValueSymbolLink]).symbol as ref[Symbol]
+                    let rh Checker.link_address_hash(sy as int)
+                    var slot rh & value_symbol_link_mask
+                    while true
+                    {
+                        let e v.get(slot as size_t)
+                        if e = null
+                            break
+                        if *e = 0
+                        {
+                            v.put(slot as size_t, j + 1)
+                            break
+                        }
+                        set slot: (slot + 1) & value_symbol_link_mask
+                    }
+                }
+                set j: j + 1
+            }
+            return
+        }
+        let buckets value_symbol_link_buckets as ref[Vector[int]]
+        var slot h & value_symbol_link_mask
+        while true
+        {
+            let e buckets.get(slot as size_t)
+            if e = null
+                return
+            if *e = 0
+            {
+                buckets.put(slot as size_t, count)
+                return
+            }
+            set slot: (slot + 1) & value_symbol_link_mask
+        }
     }
 
     ; ── c.typeNodeLinks (slice 80) ──────────────────────────────────────────
@@ -11420,22 +11638,88 @@ define Checker
     ; (slice 91).
     function symbol_node_link_of(this, node: ref[AstNode]) returns ref[SymbolNodeLink]
     {
-        let len symbol_node_links.get_length() as int
-        var i 0
-        while i < len
+        let h Checker.link_address_hash(node as int)
+        if symbol_node_link_buckets <> null
         {
-            let row symbol_node_links[i]
-            if row <> null
+            let buckets symbol_node_link_buckets as ref[Vector[int]]
+            var slot h & symbol_node_link_mask
+            while true
             {
-                let r row as ref[SymbolNodeLink]
-                if r.node = node
-                    return r
+                let e buckets.get(slot as size_t)
+                if e = null
+                    break
+                let idx *e
+                if idx = 0
+                    break
+                let row symbol_node_links[idx - 1]
+                if row <> null
+                {
+                    let r row as ref[SymbolNodeLink]
+                    if r.node = node
+                        return r
+                }
+                set slot: (slot + 1) & symbol_node_link_mask
             }
-            set i: i + 1
         }
         let made &SymbolNodeLink^host(node)
         symbol_node_links.add(made)
+        this.symbol_node_link_index(h, symbol_node_links.get_length() as int)
         made
+    }
+
+    procedure symbol_node_link_index(this, h: int, count: int)
+    {
+        var cap 0
+        if symbol_node_link_buckets <> null
+            set cap: symbol_node_link_mask + 1
+        if (count * 2) > cap
+        {
+            var new_cap 16
+            while (count * 2) > new_cap
+                set new_cap: new_cap * 2
+            let v Vector[int]^host(new_cap as size_t)
+            set symbol_node_link_buckets: v
+            set symbol_node_link_mask: new_cap - 1
+            var j 0
+            while j < count
+            {
+                let row symbol_node_links[j]
+                if row <> null
+                {
+                    let nd (row as ref[SymbolNodeLink]).node as ref[AstNode]
+                    let rh Checker.link_address_hash(nd as int)
+                    var slot rh & symbol_node_link_mask
+                    while true
+                    {
+                        let e v.get(slot as size_t)
+                        if e = null
+                            break
+                        if *e = 0
+                        {
+                            v.put(slot as size_t, j + 1)
+                            break
+                        }
+                        set slot: (slot + 1) & symbol_node_link_mask
+                    }
+                }
+                set j: j + 1
+            }
+            return
+        }
+        let buckets symbol_node_link_buckets as ref[Vector[int]]
+        var slot h & symbol_node_link_mask
+        while true
+        {
+            let e buckets.get(slot as size_t)
+            if e = null
+                return
+            if *e = 0
+            {
+                buckets.put(slot as size_t, count)
+                return
+            }
+            set slot: (slot + 1) & symbol_node_link_mask
+        }
     }
 
     ; c.aliasSymbolLinks.Get(symbol) — the same mint-on-miss reader a SEVENTH time
@@ -20244,7 +20528,7 @@ define Checker
         let this_arg: ref[Type]? this_type
         all.add(this_arg)
         let insts &Array[ref[TypeInstantiation]?]^host()
-        let seed &TypeInstantiation^host(type_parameters, t)
+        let seed &TypeInstantiation^host(Checker.type_list_hash(type_parameters), type_parameters, t)
         insts.add(seed)
         ; ★ outer_type_parameter_count is 0: a synthesized tuple interface has no
         ; enclosing declaration, so every one of its type parameters is local.
@@ -25901,7 +26185,7 @@ define Checker
             set aargs: al.type_arguments
         }
         let rows_page Page.get(rows)
-        let row &ObjectInstantiation^rows_page(args, asym, aargs, false, t)
+        let row &ObjectInstantiation^rows_page(Checker.type_list_hash(args), args, asym, aargs, false, t)
         rows.add(row)
     }
 
@@ -30889,6 +31173,7 @@ define Checker
             }
         }
         union_types.add(t)
+        this.union_type_index(Checker.union_row_hash(t), union_types.get_length() as int)
         t
     }
 
@@ -30898,6 +31183,29 @@ define Checker
     ; constituent LIST: same length, same types, same order.
     function find_union_type(this, types: ref[Array[ref[Type]?]], alias: ref[TypeAlias]?, origin: ref[Type]?) returns ref[Type]?
     {
+        if union_type_buckets <> null
+        {
+            let buckets union_type_buckets as ref[Vector[int]]
+            let h Checker.union_key_hash(types, origin)
+            var slot h & union_type_mask
+            while true
+            {
+                let e buckets.get(slot as size_t)
+                if e = null
+                    return null
+                let idx *e
+                if idx = 0
+                    return null
+                let row union_types[idx - 1]
+                if row <> null
+                {
+                    let u row as ref[Type]
+                    if this.union_key_matches(u, types, alias, origin)
+                        return u
+                }
+                set slot: (slot + 1) & union_type_mask
+            }
+        }
         let count union_types.get_length() as int
         var i 0
         while i < count
@@ -30912,6 +31220,123 @@ define Checker
             set i: i + 1
         }
         null
+    }
+
+    ; getUnionKey's four cases as a hash, in union_key_matches' own order. The
+    ; accumulator is rel_result_hash's FNV round; the TAG is what keeps the three
+    ; origin cases apart from one another and from the origin-free one, exactly as
+    ; upstream's `'|'` and `'&'` prefixes do. Two keys that collide cost a probe
+    ; and never an answer — union_key_matches decides every hit.
+    function union_key_hash(types: ref[Array[ref[Type]?]]?, origin: ref[Type]?) returns int
+    {
+        var h: u64 14695981039346656037
+        var list: ref[Array[ref[Type]?]]? types
+        var tag 0
+        if origin <> null
+        {
+            let o origin as ref[Type]
+            if (o.flags & TypeFlagsUnion) <> 0
+            {
+                set tag: 1
+                set list: Checker.union_types_of(o)
+            }
+            else
+            {
+                if (o.flags & TypeFlagsIntersection) <> 0
+                {
+                    set tag: 2
+                    set list: Checker.intersection_types_of(o)
+                }
+                else
+                {
+                    ; The INDEX origin, whose key is the origin's own id AND the
+                    ; constituents — *`keyof x` may resolve to multiple WIP values
+                    ; while `x` is still resolving*. A fourth origin kind cannot
+                    ; arrive (getUnionKey panics), and one that did would land here
+                    ; and be told apart by the id.
+                    set tag: 3
+                    set h: h xor (o.id as u64)
+                    set h: h * 1099511628211
+                }
+            }
+        }
+        set h: h xor (tag as u64)
+        set h: h * 1099511628211
+        if list <> null
+        {
+            let l list as ref[Array[ref[Type]?]]
+            let n l.get_length() as int
+            var i 0
+            while i < n
+            {
+                let e l[i]
+                if e <> null
+                {
+                    set h: h xor ((e as ref[Type]).id as u64)
+                    set h: h * 1099511628211
+                }
+                set i: i + 1
+            }
+        }
+        ((h >> 1) as int)
+    }
+
+    ; The same key taken off a STORED union, which is what files it.
+    function union_row_hash(u: ref[Type]) returns int
+        Checker.union_key_hash(Checker.union_types_of(u), Checker.union_origin_of(u))
+
+    procedure union_type_index(this, h: int, count: int)
+    {
+        var cap 0
+        if union_type_buckets <> null
+            set cap: union_type_mask + 1
+        if (count * 2) > cap
+        {
+            var new_cap 16
+            while (count * 2) > new_cap
+                set new_cap: new_cap * 2
+            let v Vector[int]^host(new_cap as size_t)
+            set union_type_buckets: v
+            set union_type_mask: new_cap - 1
+            var j 0
+            while j < count
+            {
+                let row union_types[j]
+                if row <> null
+                {
+                    let rh Checker.union_row_hash(row as ref[Type])
+                    var slot rh & union_type_mask
+                    while true
+                    {
+                        let e v.get(slot as size_t)
+                        if e = null
+                            break
+                        if *e = 0
+                        {
+                            v.put(slot as size_t, j + 1)
+                            break
+                        }
+                        set slot: (slot + 1) & union_type_mask
+                    }
+                }
+                set j: j + 1
+            }
+            return
+        }
+        let buckets union_type_buckets as ref[Vector[int]]
+        var slot h & union_type_mask
+        while true
+        {
+            let e buckets.get(slot as size_t)
+            if e = null
+                return
+            if *e = 0
+            {
+                buckets.put(slot as size_t, count)
+                return
+            }
+            set slot: (slot + 1) & union_type_mask
+        }
     }
 
     ; ★★★ getUnionKey, AND ITS FOUR CASES ARE NOT A REFINEMENT OF ONE — THE ORIGIN
@@ -99554,33 +99979,46 @@ define Checker
                 {
                     if (t.object_flags & ObjectFlagsReference) <> 0
                     {
-                        ; `t.AsTypeReference().node != nil` is the DEFERRED type
-                        ; reference, whose slot this port does not carry — see
-                        ; InterfaceTypeData's header, where `node` is named with
-                        ; getTypeArguments' deferred path as its reader. The
-                        ; disjunct is therefore constant false here and the walk
-                        ; over the arguments is the whole test.
-                        let mark this.unported_mark()
-                        let args this.get_type_arguments(t)
-                        if this.unported_mark() <> mark
-                            return false
-                        if args <> null
+                        ; ★★★ `t.AsTypeReference().node != nil ||` IS A SHORT
+                        ; CIRCUIT AND DROPPING IT IS AN UNBOUNDED WALK. The note
+                        ; that stood here read *the DEFERRED type reference, whose
+                        ; slot this port does not carry … the disjunct is therefore
+                        ; constant false here and the walk over the arguments is
+                        ; the whole test* — the slot is `Reference.node`, read by
+                        ; `reference_node_of` since slice 115, and
+                        ; createDeferredTypeReference fills it. With the disjunct
+                        ; dropped a deferred reference asks get_type_arguments,
+                        ; whose instantiate_types asks instantiate_type, whose
+                        ; FIRST gate is this function again — and the depth counter
+                        ; that bounds the walk upstream is incremented AFTER that
+                        ; gate, so it never leaves zero. `type T1<T> = [number,
+                        ; T1<{ x: T }>]` is six lines and SIGSEGVs.
+                        if Checker.reference_node_of(t) <> null
+                            set result: true
+                        else
                         {
-                            let list args as ref[Array[ref[Type]?]]
-                            let n list.get_length() as int
-                            var i 0
-                            while i < n
+                            let mark this.unported_mark()
+                            let args this.get_type_arguments(t)
+                            if this.unported_mark() <> mark
+                                return false
+                            if args <> null
                             {
-                                let a list[i]
-                                if a <> null
+                                let list args as ref[Array[ref[Type]?]]
+                                let n list.get_length() as int
+                                var i 0
+                                while i < n
                                 {
-                                    let inner this.could_contain_type_variables(a as ref[Type])
-                                    if this.unported_mark() <> mark
-                                        return false
-                                    if inner
-                                        set result: true
+                                    let a list[i]
+                                    if a <> null
+                                    {
+                                        let inner this.could_contain_type_variables(a as ref[Type])
+                                        if this.unported_mark() <> mark
+                                            return false
+                                        if inner
+                                            set result: true
+                                    }
+                                    set i: i + 1
                                 }
-                                set i: i + 1
                             }
                         }
                     }
@@ -128795,11 +129233,33 @@ define Checker
                             set same: true
                     }
                 }
+                ; ★★★ `!(source.node != nil && target.node != nil)` IS THE
+                ; CONJUNCT THAT SENDS TWO DEFERRED REFERENCES THROUGH
+                ; `invoke_once`, AND IT IS WHERE THE WALK IS BOUNDED. The note
+                ; that stood here read *both nodes are nil in this port for
+                ; could_contain_type_variables' own reason, so the conjunct is
+                ; constant true* — it CITED the premise that function carried, and
+                ; that premise was wrong: `Reference.node` is filled by
+                ; create_deferred_type_reference. With the conjunct dropped, a pair
+                ; of deferred references takes this arm and returns, so
+                ; infer_from_object_types — the only route to `invoke_once`, whose
+                ; is_deeply_nested_type is the guard — is never reached, and
+                ; infer_from_types / infer_from_type_arguments /
+                ; infer_from_matching_types recurse until the stack runs out.
+                ; `recursiveTypeReferences1` is the witness.
                 if same
                 {
-                    ; `!(source.node != nil && target.node != nil)` — both nodes
-                    ; are nil in this port for could_contain_type_variables' own
-                    ; reason, so the conjunct is constant true.
+                    var both_deferred false
+                    if Checker.reference_node_of(source) <> null
+                    {
+                        if Checker.reference_node_of(target) <> null
+                            set both_deferred: true
+                    }
+                    if both_deferred
+                        set same: false
+                }
+                if same
+                {
                     if st <> null
                     {
                         let variances this.get_variances(st as ref[Type])
