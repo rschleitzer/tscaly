@@ -6341,6 +6341,78 @@ define Checker
     printer_symbols: ref[Array[ref[PrinterSymbolFrame]?]]?
     printer_symbol_count: int
 
+    ; ── `ctx.flags & UseFullyQualifiedType`, slice 183 ───────────────────────
+    ;
+    ; ★★★ IT IS A FLAG AND NOT A PARAMETER BECAUSE UPSTREAM MAKES IT ONE: the
+    ; collision pass in mapToTypeNodes sets it on the CONTEXT, re-runs
+    ; typeToTypeNode for the colliding entries, and restores it — so every arm
+    ; between the list and the symbol sees it without carrying it. Threading it as
+    ; a parameter would touch the whole printer for a bit that is off almost
+    ; always.
+    ;
+    ; ★★ ITS DEFAULT IS THE ANSWER THAT EXISTED BEFORE IT. With the flag false
+    ; `lookup_symbol_chain` answers the symbol alone, which is exactly what
+    ; write_symbol_name did unconditionally — so no name in the corpus can move
+    ; except inside a list that printed one name twice.
+    printer_fully_qualified: bool
+
+    ; ── `isIdentifierTypeReference(typeNode)`, slice 183 ─────────────────────
+    ;
+    ; The name the arm just wrote, when what it wrote was a TypeReferenceNode
+    ; whose TypeName is a bare IDENTIFIER — an EMPTY slice for everything else.
+    ; The collision pass keys on it, and on nothing else: a qualified name is
+    ; already unambiguous, and a keyword or a composed name has no symbol to
+    ; collide.
+    ;
+    ; ★★ IT IS SET BY THE WRITER for wrote_type_precedence's reason — upstream
+    ; asks the NODE what kind it is, and the only faithful port is for the arm
+    ; that decided the shape to say which shape it decided. Unlike the precedence
+    ; it is CLEARED at the top of the worker rather than seeded with a value: the
+    ; safe default here is *not an identifier type reference*, and an arm that
+    ; forgets therefore under-reports a collision rather than inventing one.
+    wrote_type_reference_name: Slice[char]
+
+    ; The length of the chain write_symbol_chain last wrote — one means the entity
+    ; name is an Identifier, more means a QualifiedName. A field rather than an
+    ; out-parameter because the reader is two frames up, at the arm that knows it
+    ; built a TypeReferenceNode.
+    wrote_chain_length: int
+
+    ; ── the printer's RECURSION DEPTH, and the depth the name was written at ──
+    ;
+    ; ★★★ WITHOUT THESE THE NAME IS THE DEEPEST ARM'S AND NOT THE CONSTITUENT'S,
+    ; AND THAT OVER-QUALIFIES. A type LITERAL writes no name of its own, so after
+    ; `{ foo: M.MyEnum }` the name field still held `MyEnum` — set two levels down
+    ; by the member's type — and the collision pass read two constituents as
+    ; *the same name for different types* and qualified both. The reference cannot
+    ; make that mistake: it asks the NODE it got back, and a TypeLiteralNode is not
+    ; an identifier type reference whatever its members are. Measured on
+    ; `enumAssignmentCompat4`, which printed `({ foo: M.MyEnum; } | { foo: N.MyEnum; })[]`
+    ; where the reference prints the bare `MyEnum` twice.
+    ;
+    ; ★★ THE DEPTH IS THE CHEAP WAY TO ASK *DID THE ARM I CALLED WRITE THIS?* The
+    ; alternative is the precedence field's discipline — every arm states its own
+    ; value — and it is the wrong trade here: the precedence has a meaningful
+    ; answer for EVERY node, so an arm that forgets is a bug in that arm, while the
+    ; name has an answer for three arms out of twenty and the other seventeen would
+    ; carry a line saying *not me*. One counter in the single wrapper every
+    ; recursion passes through says the same thing and cannot be forgotten.
+    printer_depth: int
+    wrote_name_depth: int
+
+    ; ── whether a chain DROPPED a container it could not name (slice 183) ────
+    ;
+    ; `getSymbolChain`'s tail declines to write a parent that is an external
+    ; MODULE — upstream's *"we prefer just `x` vs `\"foo/bar\".x`"* — so a symbol
+    ; exported from a module and a same-named symbol local to a function BOTH come
+    ; back as one element and print the same fully-qualified name. That is fine for
+    ; a NAME and fatal for the one question that compares two of them:
+    ; `getTypeNameForErrorDisplay`'s equality is what picks TS2719 over TS2322, and
+    ; two names equal only because a container was dropped is not evidence that the
+    ; types share one. The flag says *this answer is not a complete qualification*,
+    ; and the TS2719 fork reports instead of deciding on it.
+    printer_chain_dropped_container: bool
+
     ; ── the printed node's PRECEDENCE, slice 111, WIDENED IN SLICE 115 ──────
     ;
     ; The emit printer parenthesizes by precedence — `emitTypeNode(node, prec)`
@@ -7540,6 +7612,13 @@ define Checker
         let pss &Array[ref[PrinterSymbolFrame]?]^host()
         set c.printer_symbols: pss
         set c.printer_symbol_count: 0
+        set c.printer_fully_qualified: false
+        set c.wrote_type_reference_name.data: null
+        set c.wrote_type_reference_name.length: 0
+        set c.wrote_chain_length: 0
+        set c.printer_depth: 0
+        set c.wrote_name_depth: 0 - 1
+        set c.printer_chain_dropped_container: false
         ; Seeded here and immediately overwritten by type_to_string's first line,
         ; so this value is never read; NonArray is the harmless one either way.
         set c.wrote_type_precedence: TypePrecedenceNonArray
@@ -36297,15 +36376,36 @@ define Checker
     ; entry upstream, which is exactly where the reduction belongs.
     function type_to_string(this, t: ref[Type]?, out: ref[StringBuilder]) returns bool
     {
+        ; ★ The ONE place the worker is entered, which is what makes the depth
+        ; counter a counter rather than a discipline — see printer_depth's note.
+        ; Every arm recurses through THIS function and not through the worker.
         if t = null
-            return this.type_to_string_worker(null, out)
+        {
+            set printer_depth: printer_depth + 1
+            let ok0 this.type_to_string_worker(null, out)
+            set printer_depth: printer_depth - 1
+            return ok0
+        }
         let mark this.unported_mark()
         let reduced this.get_reduced_type(t as ref[Type])
         if this.unported_mark() <> mark
             return false
         if reduced = null
             return false
-        this.type_to_string_worker(reduced, out)
+        set printer_depth: printer_depth + 1
+        let ok this.type_to_string_worker(reduced, out)
+        set printer_depth: printer_depth - 1
+        ok
+    }
+
+    ; isIdentifierTypeReference over the node the LAST `type_to_string` at `outer`
+    ; answered — true only when the name was written by that call's OWN arm, and
+    ; not by something it recursed into.
+    function wrote_identifier_type_reference(this, outer: int) returns bool
+    {
+        if wrote_type_reference_name.length = 0
+            return false
+        wrote_name_depth = outer + 1
     }
 
     function type_to_string_worker(this, t: ref[Type]?, out: ref[StringBuilder]) returns bool
@@ -36313,6 +36413,9 @@ define Checker
         ; The node this call is about to build needs no parentheses anywhere until an
         ; arm says otherwise — see the field's note for why the writer records it.
         set wrote_type_precedence: TypePrecedenceNonArray
+        ; …and it is not an identifier type reference until an arm says it is.
+        set wrote_type_reference_name.data: null
+        set wrote_type_reference_name.length: 0
         if t = null
         {
             ; The reference PANICS here ("should always get typenode"), because a
@@ -36433,6 +36536,19 @@ define Checker
             out.append("." as char)
             out.append(Symbol.name_of(sym).data, Symbol.name_of(sym).length)
             set wrote_type_precedence: TypePrecedenceNonArray
+            ; ★★★ THE PARENT'S NAME IS NOT THIS NODE'S NAME, AND THE DEPTH COUNTER
+            ; CANNOT SEE THE DIFFERENCE: `symbol_to_type_node` is called DIRECTLY
+            ; here rather than through `type_to_string`, so it writes `E` at this
+            ; arm's own depth and the reader would take it for the whole node's.
+            ; What this arm builds is a QualifiedName (`E.V2`), which is not an
+            ; identifier type reference at all. Unstated, `E.V2 | E.V3 | E.V4` read
+            ; as three constituents named `E` for three different enum-literal
+            ; types, and the collision pass qualified all three — through the
+            ; `import I = A.B.C.E` alias, so `constEnums` printed
+            ; `I.V2 | I.V3 | I.V4`. **A counter that brackets one CALL cannot speak
+            ; for a name written outside it.**
+            set wrote_type_reference_name.data: null
+            set wrote_type_reference_name.length: 0
             return true
         }
         ; ★★★ THE STRING LITERAL IS THE ONLY ARM WITH AN ESCAPE, and it is a port
@@ -36578,6 +36694,9 @@ define Checker
                 return false
             if na = 0
                 return true
+            ; The arguments below clear the name symbol_to_type_node just recorded,
+            ; so it is carried across them — type_reference_to_type_node's note.
+            let alias_ref_name wrote_type_reference_name
             ; mapToTypeNodes over the alias's own type arguments — the printer's
             ; `<A, B>`.
             let args t.alias_type_arguments as ref[Array[ref[Type]?]]
@@ -36593,6 +36712,8 @@ define Checker
             }
             out.append(">" as char)
             set wrote_type_precedence: TypePrecedenceNonArray
+            set wrote_type_reference_name: alias_ref_name
+            set wrote_name_depth: printer_depth
             return true
         }
         ; ★★★ THE UNION ARM, SLICE 94 — the first arm of this printer that composes
@@ -36697,20 +36818,8 @@ define Checker
                 this.record_unported("type-to-string-empty-intersection", subject.flags)
                 return false
             }
-            var ii 0
-            while ii < inum
-            {
-                if this.truncation_budget_exceeded(out)
-                {
-                    this.record_unported("type-to-string-truncation", subject.flags)
-                    return false
-                }
-                if ii > 0
-                    out.append(" & ")
-                if this.write_intersection_constituent(ilist[ii], out) = false
-                    return false
-                set ii: ii + 1
-            }
+            if this.write_constituent_list(ilist, inum, " & ", 2, out) = false
+                return false
             set wrote_type_precedence: TypePrecedenceIntersection
             return true
         }
@@ -36736,20 +36845,8 @@ define Checker
                 this.record_unported("type-to-string-empty-union", t.flags)
                 return false
             }
-            var i 0
-            while i < n
-            {
-                if this.truncation_budget_exceeded(out)
-                {
-                    this.record_unported("type-to-string-truncation", subject.flags)
-                    return false
-                }
-                if i > 0
-                    out.append(" | ")
-                if this.write_union_constituent(list[i], out) = false
-                    return false
-                set i: i + 1
-            }
+            if this.write_constituent_list(list, n, " | ", 1, out) = false
+                return false
             ; ★★★ A UnionTypeNode IS TypePrecedenceUnion, and this line said
             ; `false` — *no parens* — until slice 115. Nothing read it wrongly while
             ; the only reader was the union arm itself (a union is never a
@@ -36880,7 +36977,12 @@ define Checker
                 out.append("?" as char)
                 return true
             }
-            return this.write_symbol_name(t.symbol as ref[Symbol], out)
+            ; `return b.symbolToTypeNode(t.symbol, SymbolFlagsType, nil)` — the
+            ; CHAIN, not the bare name. This arm wrote the name directly until
+            ; slice 183, for the same reason type_reference_to_type_node did and
+            ; with the same expiry: `Foo.Yep | Bar.Yep` printed `Yep | Yep`
+            ; because an INTERFACE reaches the printer here and nowhere else.
+            return this.symbol_to_type_node(t.symbol as ref[Symbol], SymbolFlagsType, out)
         }
         ; ── slice 111: the anonymous object type ────────────────────────────
         ;
@@ -37512,8 +37614,19 @@ define Checker
     ; emitPostfixTypeOperand — the operand of an array, an optional or an indexed
     ; access. ★★ ITS TypeQuery EXCEPTION IS UNREACHABLE HERE AND THAT IS EXACT: the
     ; guard is `ast.IsParseTreeNode(parent)`, and every node this printer would build
-    ; is SYNTHESIZED, so the operand always goes at Postfix. TypeQuery is NonArray
-    ; anyway, so the two answers coincide for it in any case.
+    ; is SYNTHESIZED, so the operand always goes at Postfix.
+    ;
+    ; ★★★ THE SENTENCE THAT FOLLOWED — *"TypeQuery is NonArray anyway, so the two
+    ; answers coincide for it in any case"* — WAS FALSE, AND IT COST SIX UNITS
+    ; (slice 183). `GetTypeNodePrecedence` answers TypePrecedenceTypeOperator for
+    ; KindTypeQuery, with a comment saying exactly why: it is a NonArrayType that is
+    ; treated as an operator SO THAT this position parenthesizes it. The exception
+    ; above is indeed unreachable, but only because the unguarded path already
+    ; wraps — `TypeOperator < Postfix` — which is the opposite of what the note
+    ; claimed and made `(typeof C)[]` come out as `typeof C[]`. **An unreachability
+    ; argument and the reason a line is harmless are two different claims; this note
+    ; proved the first and asserted the second.** The precedence is set in
+    ; symbol_to_type_node, which is the arm that builds the TypeQuery.
     function write_postfix_type_operand(this, element: ref[Type]?, out: ref[StringBuilder]) returns bool
     {
         let scratch StringBuilder^host()
@@ -37565,12 +37678,29 @@ define Checker
         var arity 0
         if na > 0
             set arity: Checker.get_type_reference_arity(t)
-        out.append("[" as char)
+        ; ★★★ THE COLLISION PASS RUNS OVER THE BARE ELEMENT TYPES AND THE LABELS GO
+        ; ON AFTERWARDS (slice 183), which is upstream's own order:
+        ; `mapToTypeNodes(typeArguments[0:arity], false)` builds the plain nodes and
+        ; the loop under it REPLACES each with a NamedTupleMember, a RestTypeNode or
+        ; an OptionalTypeNode. Asking the collision about the wrapped node would
+        ; answer *not an identifier type reference* for every labelled element, so
+        ; `[c, m.c]` — the shape this was written for — has to be decided before the
+        ; wrappers exist.
+        ;
+        ; ★★ EACH PIECE CARRIES ITS PRECEDENCE, because the wrappers are where the
+        ; parentheses are decided and the piece is already text by then. It is the
+        ; same value write_postfix_type_operand would have read, recorded per
+        ; element instead of read once.
+        let host Page.get(this)
+        let pieces &Array[String]^host()
+        let names &Array[Slice[char]]^host()
+        let marks &Array[int]^host()
+        let precs &Array[int]^host()
+        let types &Array[ref[Type]?]^host()
+        let outer printer_depth
         var i 0
         while i < arity
         {
-            if i > 0
-                out.append(", ")
             let flags Checker.tuple_element_flags_at(tgt, i)
             ; removeMissingType(arg, isOptional) — the missing type is undefined's
             ; twin, and an optional element carries it out of addOptionalityEx.
@@ -37580,7 +37710,45 @@ define Checker
             let arg this.remove_missing_type(raw as ref[Type], (flags & ElementFlagsOptional) <> 0)
             if arg = null
                 return false
-            let labeled Checker.tuple_labeled_declaration_at(tgt, i)
+            let piece StringBuilder^host()
+            if this.type_to_string(arg, &piece) = false
+                return false
+            pieces.add(piece.to_string())
+            if this.wrote_identifier_type_reference(outer)
+                names.add(wrote_type_reference_name)
+            else
+                names.add(Slice[char]())
+            precs.add(wrote_type_precedence)
+            marks.add(0)
+            types.add(arg)
+            set i: i + 1
+        }
+        this.mark_name_collisions(types, names, marks)
+        var r 0
+        while r < arity
+        {
+            if marks[r] <> 0
+            {
+                let saved printer_fully_qualified
+                set printer_fully_qualified: true
+                let piece StringBuilder^host()
+                let ok this.type_to_string(types[r], &piece)
+                set printer_fully_qualified: saved
+                if ok = false
+                    return false
+                pieces.put(r, piece.to_string())
+                precs.put(r, wrote_type_precedence)
+            }
+            set r: r + 1
+        }
+        out.append("[" as char)
+        var k 0
+        while k < arity
+        {
+            if k > 0
+                out.append(", ")
+            let flags Checker.tuple_element_flags_at(tgt, k)
+            let labeled Checker.tuple_labeled_declaration_at(tgt, k)
             if labeled <> null
             {
                 if (flags & ElementFlagsVariable) <> 0
@@ -37599,16 +37767,14 @@ define Checker
                 if (flags & ElementFlagsOptional) <> 0
                     out.append("?" as char)
                 out.append(": ")
-                if this.write_tuple_element_type(arg, (flags & ElementFlagsRest) <> 0, out) = false
-                    return false
+                Checker.write_tuple_piece(pieces.at(k), precs[k], (flags & ElementFlagsRest) <> 0, out)
             }
             else
             {
                 if (flags & ElementFlagsVariable) <> 0
                 {
                     out.append("...")
-                    if this.write_tuple_element_type(arg, (flags & ElementFlagsRest) <> 0, out) = false
-                        return false
+                    Checker.write_tuple_piece(pieces.at(k), precs[k], (flags & ElementFlagsRest) <> 0, out)
                 }
                 else
                 {
@@ -37616,18 +37782,14 @@ define Checker
                     {
                         ; An OptionalTypeNode: its operand is POSTFIX, unlike every
                         ; other element position here.
-                        if this.write_postfix_type_operand(arg, out) = false
-                            return false
+                        Checker.write_parenthesized_piece(pieces.at(k), precs[k], TypePrecedencePostfix, out)
                         out.append("?" as char)
                     }
                     else
-                    {
-                        if this.type_to_string(arg, out) = false
-                            return false
-                    }
+                        out.append(pieces.at(k))
                 }
             }
-            set i: i + 1
+            set k: k + 1
         }
         out.append("]" as char)
         ; A TupleTypeNode is TypePrecedenceNonArray; wrapped in a readonly
@@ -37636,6 +37798,31 @@ define Checker
         if readonly
             set wrote_type_precedence: TypePrecedenceTypeOperator
         true
+    }
+
+    ; write_tuple_element_type over an ALREADY RENDERED piece — the REST wrapper's
+    ; `[]` with its postfix parentheses, or the piece itself.
+    procedure write_tuple_piece(piece: String, prec: int, rest: bool, out: ref[StringBuilder])
+    {
+        if rest = false
+        {
+            out.append(piece)
+            return
+        }
+        Checker.write_parenthesized_piece(piece, prec, TypePrecedencePostfix, out)
+        out.append("[]")
+    }
+
+    ; The emit printer's `emitTypeNode(node, prec)` over a piece whose precedence
+    ; was recorded when it was written.
+    procedure write_parenthesized_piece(piece: String, prec: int, at: int, out: ref[StringBuilder])
+    {
+        let parens prec < at
+        if parens
+            out.append("(" as char)
+        out.append(piece)
+        if parens
+            out.append(")" as char)
     }
 
     ; One tuple element's TYPE, at Lowest precedence, with the extra `[]` a REST
@@ -37704,6 +37891,7 @@ define Checker
         ; those are the default outer arguments, and naming the container would say
         ; nothing. The comparison is by IDENTITY, one type pointer against another.
         var arg_start 0
+        var wrote_qualified_prefix false
         let outer this.outer_type_parameters_of(tgt)
         if outer <> null
         {
@@ -37759,6 +37947,7 @@ define Checker
                     if this.symbol_to_type_node(parent as ref[Symbol], SymbolFlagsType, out) = false
                         return false
                     out.append("." as char)
+                    set wrote_qualified_prefix: true
                 }
             }
             set arg_start: olen
@@ -37768,8 +37957,41 @@ define Checker
             this.record_unported("type-to-string-reference", t.object_flags)
             return false
         }
-        if this.write_symbol_name(t.symbol as ref[Symbol], out) = false
+        ; ★★★ IT IS symbolToTypeNode AND NOT THE BARE NAME (slice 183). Upstream's
+        ; last line here is `b.symbolToTypeNode(t.symbol, SymbolFlagsType,
+        ; typeArgumentNodes)`, and this port wrote `getNameOfSymbolAsWritten`
+        ; directly — which was the same text for as long as the chain could only be
+        ; one element, and stopped being it the moment the collision pass could turn
+        ; the fully-qualified flag on. A shortcut past a function is a claim that the
+        ; function is the identity, and it expires with the function.
+        if this.write_symbol_chain(t.symbol as ref[Symbol], SymbolFlagsType, out) = false
             return false
+        ; The TypeName is an Identifier unless an outer-type-parameter GROUP put a
+        ; qualifier in front of it, in which case it is a QualifiedName. ★It is
+        ; held in a LOCAL and re-stated at each exit for the same reason the
+        ; precedence is: the type-argument list below recurses through
+        ; type_to_string, whose first line clears the field.
+        var ref_name Slice[char]()
+        if wrote_qualified_prefix = false
+        {
+            if wrote_chain_length = 1
+                set ref_name: Symbol.name_of(t.symbol as ref[Symbol])
+        }
+        ; ★★★ A TypeReferenceNode IS TypePrecedenceNonArray, AND THIS ARM SET
+        ; NOTHING UNTIL SLICE 183 — so it answered whatever its LAST TYPE ARGUMENT
+        ; had left, which is the only recursion in it. `TH<A & B> & { z: number; }`
+        ; printed `(TH<A & B>) & { z: number; }` and `TC<string | number>[]`
+        ; printed `(TC<string | number>)[]`: an argument's Intersection or Union
+        ; sits BELOW the operand precedence the caller then compares against, so
+        ; the parentheses are the argument's and not the reference's. The field's
+        ; own note states the rule this broke — *every arm that writes must set
+        ; it* — and a REFERENCE WITH NO ARGUMENTS obeyed it only by accident,
+        ; through the NonArray seed on `type_to_string`'s first line. It is set at
+        ; every exit here rather than at the one that recurses, because an arm that
+        ; is right for the wrong reason reads exactly like one that is wrong.
+        set wrote_type_precedence: TypePrecedenceNonArray
+        set wrote_type_reference_name: ref_name
+        set wrote_name_depth: printer_depth
         ; The type-argument list. ★`typeParameterCount` is
         ; `min(len(typeParams), len(typeArguments))` and the four Iterable elisions
         ; above it are all `isReferenceToType(t, <a global>)`, which is false for a
@@ -37796,6 +38018,9 @@ define Checker
             set i: i + 1
         }
         out.append(">" as char)
+        set wrote_type_precedence: TypePrecedenceNonArray
+        set wrote_type_reference_name: ref_name
+        set wrote_name_depth: printer_depth
         true
     }
 
@@ -40784,6 +41009,16 @@ define Checker
 
     ; The binding pattern as a NAME, recursively — a nested pattern is an element's
     ; name like any other.
+    ;
+    ; ★★★ THE TRAILING COMMA IS THE SOURCE'S AND IT IS NOT DECORATION (slice 183).
+    ; Both pattern lists are emitted with LFAllowTrailingComma, and `emitList`
+    ; writes the separator after the last element when the NodeList HAS one — so
+    ; `function f({ a, })` names its parameter `{ a, }` and `function f({ a })`
+    ; names it `{ a }`. Eleven units printed the comma-less spelling for both.
+    ; It is the LIST's own range that answers, exactly as it does for the grammar
+    ; checks (`list_has_trailing_comma`), and it is asked HERE rather than at the
+    ; elements because a hole writes nothing at all: `[, b,]` is two elements, the
+    ; first an OmittedExpression, and the last comma is the list's.
     function write_binding_pattern_name(this, pattern: ref[AstNode], out: ref[StringBuilder]) returns bool
     {
         let object_form AstNode.kind_of(pattern) = KindObjectBindingPattern
@@ -40815,11 +41050,39 @@ define Checker
             }
             set i: i + 1
         }
+        if this.node_list_has_trailing_comma(pattern, elements)
+            out.append("," as char)
         if object_form
             out.append(" }")
         else
             out.append("]" as char)
         true
+    }
+
+    ; NodeList.HasTrailingComma for a list held by a node of ANY file — the
+    ; printer's twin of `list_has_trailing_comma`, which asks the checker's own
+    ; `file` and therefore answers only about the unit under check. A parameter
+    ; whose type is being printed can be declared in the lib, so the range is
+    ; looked up on the OWNER's source file.
+    ;
+    ; ★ A missing row answers FALSE and reports nothing: every list this printer
+    ; reaches was parsed from a real file, and a pattern whose row is absent is a
+    ; pattern with no trailing comma in every shape the corpus has. It is the same
+    ; polarity `list_has_trailing_comma` chose and for the same reason — the answer
+    ; feeds a decision where false is the quiet side.
+    function node_list_has_trailing_comma(this, owner: ref[AstNode], list: ref[Array[ref[AstNode]?]]?) returns bool
+    {
+        let n AstNode.list_count(list)
+        if n = 0
+            return false
+        let sf Checker.source_file_of_node(owner)
+        if sf = null
+            return false
+        var lpos 0
+        var lend 0
+        if AstNode.list_range_of(sf, list, &lpos, &lend) = false
+            return false
+        AstNode.end_of((AstNode.child_in_list(list, n - 1)) as ref[AstNode]) < lend
     }
 
     ; One element of a pattern. ★An array HOLE is an OmittedExpression and writes
@@ -41499,10 +41762,85 @@ define Checker
             let nt links.name_type as ref[Type]
             if (nt.flags & TypeFlagsUniqueESSymbol) <> 0
             {
-                ; NewComputedPropertyName(symbolToExpression(…)) — the printer's
-                ; expression writer, one dimension over.
-                this.record_unported("property-name-from-unique-symbol", nt.flags)
-                return false
+                ; ★★★ `NewComputedPropertyName(symbolToExpression(nameType.symbol,
+                ; SymbolFlagsValue))` — and the note that stood here called it *the
+                ; printer's expression writer, one dimension over*. Slice 183 puts
+                ; the dimension one step closer: `symbolToExpression` is
+                ; `createExpressionFromSymbolChain` over the SAME chain
+                ; symbolToTypeNode uses, and at index 0 — which is every chain this
+                ; entry point can build — it is the identifier and nothing else.
+                ; The printer writes a ComputedPropertyName as its brackets around
+                ; the expression, so `[sym]` is the whole answer.
+                ;
+                ; ★★★ THE CHAIN CAN BE LONGER THAN ONE HERE AND THAT HALF IS A STOP,
+                ; which is a claim about REACHABILITY rather than about the shape: a
+                ; type literal can be a constituent of a list the collision pass is
+                ; re-rendering fully qualified, and then the symbol is reached
+                ; through its container. What is missing then is
+                ; createExpressionFromSymbolChain's own fork —
+                ; `canUsePropertyAccess` decides `a.b` against `a["b"]`, and an
+                ; ENTITY NAME's dot is not that decision. Reported rather than
+                ; guessed, because the two spellings are different text.
+                if nt.symbol = null
+                {
+                    this.record_unported("property-name-from-unique-symbol", nt.flags)
+                    return false
+                }
+                ; ★★★ THE PROPERTY NAME IS THE ONE PLACE THE PRINTER HAS A REAL
+                ; ENCLOSING DECLARATION, AND THE CHAIN THIS SLICE PORTED CANNOT USE
+                ; IT. `addPropertyToElementList` sets `ctx.enclosingDeclaration =
+                ; propertySymbol.ValueDeclaration` around exactly this call and
+                ; restores it after — so `lookupSymbolChainWorker`'s gate passes
+                ; HERE for every property, where it fails everywhere else in this
+                ; printer, and `someSymbolTableInScope` then walks locals, module
+                ; exports and class member tables up the parent chain instead of
+                ; answering the globals alone (the reduction this chapter's header
+                ; argues for). The measured difference: `{ [OpTypes.equal]: string }`
+                ; and `{ [OpNamespace.equal]: string }`, where the chain reduced to
+                ; the globals answers the bare `[equal]`.
+                ;
+                ; ★★★ SO THE ARM SPLITS ON THE CONTAINER, AND THE HALF THAT NEEDS
+                ; THE WALK REPORTS. The split is the module-exports arm of
+                ; `someSymbolTableInScope`, which is the one arm that decides these
+                ; units: a symbol whose container is an external MODULE is in scope
+                ; by its bare name inside that module — the file's own exports table
+                ; is one of the tables the walk visits — so the chain is one element
+                ; and `[MySymbol]` is the reference's answer too
+                ; (`declarationEmitExportValueSymbolWithTsIgnore`). A symbol whose
+                ; container is an ENUM or a NAMESPACE is reachable only THROUGH the
+                ; container, so the walk returns a two-element chain and the answer
+                ; is `[OpTypes.equal]`.
+                ;
+                ; ★★ THE GUARD IS A CONTAINER TEST AND NOT THE WALK, and it is
+                ; written as the narrower claim it is: it decides the two shapes the
+                ; corpus contains and it is not a port of
+                ; `getAccessibleSymbolChain` under a real enclosing declaration.
+                ; The day a third container shape arrives, this reports instead of
+                ; guessing. **A reduction that is sound for one caller is not sound
+                ; for the caller that supplies the very input the reduction assumed
+                ; away — and narrowing the guard is not the same as closing it.**
+                let us nt.symbol as ref[Symbol]
+                let container Symbol.parent_of(us)
+                if container <> null
+                {
+                    if this.symbol_has_non_global_augmentation_external_module_declaration(container as ref[Symbol]) = false
+                    {
+                        this.record_unported("property-name-unique-symbol-enclosing-chain", nt.flags)
+                        return false
+                    }
+                }
+                let scratch StringBuilder^host()
+                if this.write_symbol_chain(us, SymbolFlagsValue, &scratch) = false
+                    return false
+                if wrote_chain_length <> 1
+                {
+                    this.record_unported("property-name-from-unique-symbol-chain", wrote_chain_length)
+                    return false
+                }
+                out.append("[" as char)
+                out.append(scratch.to_string())
+                out.append("]" as char)
+                return true
             }
             if (nt.flags & TypeFlagsStringOrNumberLiteral) <> 0
             {
@@ -41741,12 +42079,21 @@ define Checker
     {
         let asym t.alias_symbol as ref[Symbol]
         Checker.write_symbol_entity_name(asym, out)
+        ; symbolToEntityNameNode joins the PARENT chain with dots, so the TypeName
+        ; is an Identifier exactly when the alias symbol has no parent. Held in a
+        ; local and re-stated at the exits, for type_reference_to_type_node's
+        ; reason.
+        var ref_name Slice[char]()
+        if Symbol.parent_of(asym) = null
+            set ref_name: Symbol.name_of(asym)
         var na 0
         if t.alias_type_arguments <> null
             set na: (t.alias_type_arguments as ref[Array[ref[Type]?]]).get_length() as int
         if na = 0
         {
             set wrote_type_precedence: TypePrecedenceNonArray
+            set wrote_type_reference_name: ref_name
+            set wrote_name_depth: printer_depth
             return true
         }
         let args t.alias_type_arguments as ref[Array[ref[Type]?]]
@@ -41762,6 +42109,8 @@ define Checker
         }
         out.append(">" as char)
         set wrote_type_precedence: TypePrecedenceNonArray
+        set wrote_type_reference_name: ref_name
+        set wrote_name_depth: printer_depth
         true
     }
 
@@ -41821,6 +42170,705 @@ define Checker
     ; snake_case whole this slice would have invented. StripQuotes is then the
     ; two-byte window `nd + 1` / `nl - 2`, because the pair it accepts in general
     ; (`'`, `"` or a backtick, the two agreeing) is already known to be `"` here.
+    ; ── symbolaccessibility.go: the chain that NAMES a symbol (slice 183) ─────
+    ;
+    ; ★★★ WHY A WHOLE CHAPTER OF AN EXCLUDED FILE IS PORTED HERE. `coverage.sh`
+    ; lists `symbolaccessibility.go` under NOT_A_GOAL beside the declaration
+    ; emitter, and that exclusion is about the DENOMINATOR, not about the exit
+    ; criterion: the yardstick compares the text `TypeToString` produces, and this
+    ; machinery decides that text whenever two constituents of one printed list
+    ; carry the same name. `[c, m.c]` came out `[c, c]` and `Foo.Yep | Bar.Yep`
+    ; came out `Yep | Yep` — a name that says two different types are one. **A file
+    ; excluded from the coverage denominator can still own an answer the criterion
+    ; compares, and the two lists are maintained for different questions.**
+    ;
+    ; ★★★ IT RUNS ONLY UNDER THE FULLY-QUALIFIED FLAG, AND THE FLAG IS SET BY A
+    ; COLLISION. `lookupSymbolChainWorker`'s gate is `enclosingDeclaration != nil ||
+    ; flags&UseFullyQualifiedType != 0`, and `TypeToString` passes a nil enclosing
+    ; declaration — so with the flag off the chain is the symbol alone and nothing
+    ; below this line can change a name. `mapToTypeNodes` turns the flag on for the
+    ; entries of a list whose single-identifier names collided (see
+    ; write_qualified_on_collision), which bounds the blast radius of this chapter
+    ; to exactly the lists that print one name twice.
+    ;
+    ; ★★★ AND THE NIL ENCLOSING DECLARATION COLLAPSES `someSymbolTableInScope` TO
+    ; ONE TABLE. Upstream it walks `location.Parent` from the enclosing declaration
+    ; collecting locals, module exports and class/interface member tables, and ends
+    ; with `callback(c.globals, …)`. With a nil start the loop body never runs, so
+    ; the GLOBALS table is the whole walk. This is written as the reduction rather
+    ; than as the general form with an unreachable loop, and the reduction is a
+    ; claim about the CALLER: this printer has no enclosing declaration to thread
+    ; and no field to hold one. The day one arrives, this function is where the
+    ; walk goes — it is named `some_symbol_table_in_scope_globals` so that a reader
+    ; looking for the general form does not find a half of it wearing the whole
+    ; name.
+
+    ; ── mapToTypeNodes' NAME-COLLISION PASS (slice 183) ──────────────────────
+    ;
+    ; ★★★ THIS IS THE SECOND ENTRY POINT THE PRINTER'S OWN CONTAINMENT PROOF SAID
+    ; WOULD EXPIRE IT, AND IT IS INSIDE THE PRINTER. The note in the three
+    ; name-writing arms reads *"`Checker.TypeToString(t)`, which is the ONLY entry
+    ; point the oracle uses, is `typeToString(t, nil)` … the flag is not in
+    ; `AllowUniqueESSymbolType|UseAliasDefinedOutsideCurrentScope`. So the else
+    ; branch runs for EVERY symbol, the chain is one element long"* — and it ends
+    ; *"the day a second entry point appears, all four collapses expire together."*
+    ; The premise was about the CALLER, and what sets the flag is the printer
+    ; SETTING IT ON ITSELF: `mapToTypeNodes` re-renders the colliding entries of one
+    ; list with `UseFullyQualifiedType` on. **A containment proof that quantifies
+    ; over entry points is not proof about a function that changes its own
+    ; context.**
+    ;
+    ; ★★★ WHAT IT IS FOR, in upstream's own words: *to avoid printing types like
+    ; `[Foo, Foo]` or `Bar & Bar` where occurrences of the same name actually come
+    ; from different namespaces.* `[c, m.c]` printed `[c, c]` here and
+    ; `Foo.Yep | Bar.Yep` printed `Yep | Yep` — a name that claims two types are
+    ; one, which is worse than a long name.
+    ;
+    ; ★★ THE PORT NEEDS TWO PASSES WHERE UPSTREAM NEEDS ONE REWRITE, because
+    ; upstream holds NODES it can replace in place and this printer writes TEXT.
+    ; Each constituent is therefore rendered into a scratch builder of its own, the
+    ; colliding ones are rendered a SECOND time with the flag on, and the pieces are
+    ; joined. The cost is one builder per constituent on a path no measurement has
+    ; ever named; the alternative — a predicate that decides qualification without
+    ; rendering — would be a second copy of the whole naming fork.
+    ;
+    ; ★ `isBareList` is upstream's truncation switch and does not reach this half:
+    ; the truncation budget is asked by the callers, which already report where the
+    ; reference elides.
+
+    ; typesAreSameReference — two occurrences of one name are innocent when they
+    ; name the same thing, and identity is asked three ways: the type, its symbol,
+    ; its alias.
+    function types_are_same_reference(a: ref[Type]?, b: ref[Type]?) returns bool
+    {
+        if a = b
+            return true
+        if a = null
+            return false
+        if b = null
+            return false
+        let x a as ref[Type]
+        let y b as ref[Type]
+        if x.symbol <> null
+        {
+            if x.symbol = y.symbol
+                return true
+        }
+        if x.alias_symbol <> null
+        {
+            if x.alias_symbol = y.alias_symbol
+                return true
+        }
+        false
+    }
+
+    ; The pass itself: given one list's types and the identifier-type-reference
+    ; name each rendered under (an empty slice where it rendered as anything else),
+    ; mark the entries that must be rendered again fully qualified.
+    ;
+    ; ★★ IT IS NOT *"a name that appears twice"* — it is a name that appears twice
+    ; for types that are NOT all the same reference. `A<string> | A<number>` keys
+    ; both constituents on `A` and leaves both alone, because the two share a
+    ; symbol; upstream's `arrayIsHomogeneous` is that test and dropping it would
+    ; qualify every generic union.
+    procedure mark_name_collisions(this, types: ref[Array[ref[Type]?]], names: ref[Array[Slice[char]]], marks: ref[Array[int]])
+    {
+        let n names.get_length() as int
+        var i 0
+        while i < n
+        {
+            let ni names.at(i)
+            if ni.length <> 0
+            {
+                ; The first occurrence of this name decides for all of them, so an
+                ; entry already marked, or one whose name was seen earlier, is
+                ; skipped rather than re-grouped.
+                var first true
+                var j 0
+                while j < i
+                {
+                    if SymbolTable.names_equal(names.at(j), ni)
+                        set first: false
+                    set j: j + 1
+                }
+                if first
+                {
+                    var homogeneous true
+                    var k i + 1
+                    while k < n
+                    {
+                        if SymbolTable.names_equal(names.at(k), ni)
+                        {
+                            if Checker.types_are_same_reference(types[i], types[k]) = false
+                                set homogeneous: false
+                        }
+                        set k: k + 1
+                    }
+                    if homogeneous = false
+                    {
+                        var m i
+                        while m < n
+                        {
+                            if SymbolTable.names_equal(names.at(m), ni)
+                                marks.put(m, 1)
+                            set m: m + 1
+                        }
+                    }
+                }
+            }
+            set i: i + 1
+        }
+    }
+
+    ; The two-pass list writer. `mode` selects the constituent renderer — 1 for a
+    ; union, 2 for an intersection — because Scaly has no closure to hand one in
+    ; and a delegate would put an indirect call on every constituent of every name.
+    ;
+    ; ★★ THE TRUNCATION TEST STAYS AGAINST THE REAL SINK. It asks how much has been
+    ; written so far, and the scratch builders hold the pieces, so the check is made
+    ; on `out` before each piece is appended — which is where the loop this replaces
+    ; made it.
+    function write_constituent_list(this, list: ref[Array[ref[Type]?]], n: int, sep: Slice[char], mode: int, out: ref[StringBuilder]) returns bool
+    {
+        let host Page.get(this)
+        let names &Array[Slice[char]]^host()
+        let marks &Array[int]^host()
+        let pieces &Array[String]^host()
+        ; The depth this loop calls FROM — a name written deeper than one step
+        ; belongs to something the constituent recursed into, not to the
+        ; constituent. See printer_depth.
+        let outer printer_depth
+        var i 0
+        while i < n
+        {
+            let piece StringBuilder^host()
+            if this.write_constituent(list[i], mode, &piece) = false
+                return false
+            pieces.add(piece.to_string())
+            if this.wrote_identifier_type_reference(outer)
+                names.add(wrote_type_reference_name)
+            else
+                names.add(Slice[char]())
+            marks.add(0)
+            set i: i + 1
+        }
+        this.mark_name_collisions(list, names, marks)
+        var j 0
+        while j < n
+        {
+            if marks[j] <> 0
+            {
+                ; The flag is saved and restored around the re-render, as upstream's
+                ; `saveRestoreFlags` does: a list nested inside this one must not
+                ; inherit a qualification decision made about its parent.
+                let saved printer_fully_qualified
+                set printer_fully_qualified: true
+                let piece StringBuilder^host()
+                let ok this.write_constituent(list[j], mode, &piece)
+                set printer_fully_qualified: saved
+                if ok = false
+                    return false
+                pieces.put(j, piece.to_string())
+            }
+            set j: j + 1
+        }
+        var k 0
+        while k < n
+        {
+            if this.truncation_budget_exceeded(out)
+            {
+                this.record_unported("type-to-string-truncation", 0)
+                return false
+            }
+            if k > 0
+                out.append(sep.data, sep.length)
+            out.append(pieces.at(k))
+            set k: k + 1
+        }
+        true
+    }
+
+    function write_constituent(this, ct: ref[Type]?, mode: int, out: ref[StringBuilder]) returns bool
+    {
+        if mode = 2
+            return this.write_intersection_constituent(ct, out)
+        this.write_union_constituent(ct, out)
+    }
+
+    ; getQualifiedLeftMeaning — the meaning a QUALIFIER carries. Value stays Value;
+    ; everything else asks for a namespace, because `A.B` can only be reached
+    ; through an `A` that has members.
+    function qualified_left_meaning(right_meaning: int) returns int
+    {
+        if right_meaning = SymbolFlagsValue
+            return SymbolFlagsValue
+        SymbolFlagsNamespace
+    }
+
+    ; needsQualification over the one table in scope. ★★ THE EARLY `return true` IS
+    ; NOT A QUALIFY — upstream's callback answers *stop walking*, and it answers it
+    ; in two places with opposite verdicts: a table whose entry IS this symbol stops
+    ; with `qualify` still false (the name resolves to us, so the bare name is
+    ; right), and a table whose entry is a DIFFERENT symbol of the same meaning
+    ; stops with qualify TRUE. Folding the two into one boolean answer would lose
+    ; the difference, which is why the walk is spelled out rather than inlined.
+    function needs_qualification(this, symbol: ref[Symbol], meaning: int) returns bool
+    {
+        let res SymbolTable.get(globals, Symbol.name_of(symbol))
+        if res = null
+            return false
+        let merged this.get_merged_symbol(res)
+        if merged = null
+            return false
+        var from_table merged as ref[Symbol]
+        if from_table = symbol
+            return false
+        let should_resolve_alias this.should_resolve_alias_for_qualification(from_table)
+        var flags Symbol.flags_of(from_table)
+        if should_resolve_alias
+        {
+            let resolved this.resolve_alias(from_table)
+            if resolved = null
+                return false
+            set from_table: resolved as ref[Symbol]
+            set flags: this.get_symbol_flags(from_table)
+        }
+        (flags & meaning) <> 0
+    }
+
+    ; `symbolFromSymbolTable.Flags&Alias != 0 && GetDeclarationOfKind(…, ExportSpecifier) == nil`
+    function should_resolve_alias_for_qualification(this, s: ref[Symbol]) returns bool
+    {
+        if (Symbol.flags_of(s) & SymbolFlagsAlias) = 0
+            return false
+        Checker.get_declaration_of_kind(s, KindExportSpecifier) = null
+    }
+
+    ; getAccessibleSymbolChain, reduced to the globals table for the reason the
+    ; chapter header gives. ★★ THE VISITED-TABLE SET IS LOAD-BEARING AND NOT A
+    ; CACHE: `trySymbolTable`'s globalThis fallback asks the globals table AGAIN
+    ; through `getCandidateListForSymbol`, and without the set that is an infinite
+    ; regress. Upstream keys it per SYMBOL (`visitedSymbolTablesMap[symId]`); with
+    ; one table in the walk the set is one bit, and it is passed down rather than
+    ; held on the checker so that a nested query cannot see its parent's.
+    function get_accessible_symbol_chain(this, symbol: ref[Symbol]?, meaning: int, out: ref[Array[ref[Symbol]?]]) returns bool
+    {
+        if symbol = null
+            return false
+        let s symbol as ref[Symbol]
+        if Checker.is_property_or_method_declaration_symbol(s)
+            return false
+        this.try_symbol_table_globals(s, meaning, false, out)
+    }
+
+    ; isPropertyOrMethodDeclarationSymbol — a symbol ALL of whose declarations are
+    ; members. ★An empty declaration list answers FALSE upstream (the loop is
+    ; guarded by `len(symbol.Declarations) > 0`), which is the opposite of what a
+    ; bare `for` would answer, so the guard is written.
+    function is_property_or_method_declaration_symbol(symbol: ref[Symbol]) returns bool
+    {
+        let n Symbol.declaration_count(symbol)
+        if n = 0
+            return false
+        var i 0
+        while i < n
+        {
+            let d Symbol.declaration_at(symbol, i)
+            if d = null
+                return false
+            let k AstNode.kind_of(d as ref[AstNode])
+            var member false
+            if k = KindPropertyDeclaration
+                set member: true
+            if k = KindMethodDeclaration
+                set member: true
+            if k = KindGetAccessor
+                set member: true
+            if k = KindSetAccessor
+                set member: true
+            if member = false
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    ; trySymbolTable over the globals. The three routes upstream takes, in its
+    ; order: the direct name, the table entry's ExportSymbol, and the table's ALIAS
+    ; entries; then the globalThis fallback, which is what makes the visited set
+    ; necessary.
+    ;
+    ; ★ The candidate SORT (`compareSymbolChains`, shortest first then by symbol)
+    ; is not built: every route here answers a chain of length one or none, so a
+    ; list of two candidates cannot arise from the globals table alone. The first
+    ; accepted candidate is therefore the shortest, and this REPORTS rather than
+    ; guesses if a second one ever appears.
+    function try_symbol_table_globals(this, symbol: ref[Symbol], meaning: int, globals_visited: bool, out: ref[Array[ref[Symbol]?]]) returns bool
+    {
+        if globals_visited
+            return false
+        let res SymbolTable.get(globals, Symbol.name_of(symbol))
+        if res <> null
+        {
+            if this.symbol_is_accessible(symbol, meaning, res as ref[Symbol], null)
+            {
+                out.add(symbol)
+                return true
+            }
+            let ex Symbol.export_symbol_of(res as ref[Symbol])
+            if ex <> null
+            {
+                let merged this.get_merged_symbol(ex)
+                if merged <> null
+                {
+                    if this.symbol_is_accessible(symbol, meaning, merged as ref[Symbol], null)
+                    {
+                        out.add(symbol)
+                        return true
+                    }
+                }
+            }
+        }
+        let n SymbolTable.length(globals)
+        var i 0
+        while i < n
+        {
+            let entry SymbolTable.entry_symbol_at(globals, i)
+            if entry <> null
+            {
+                let e entry as ref[Symbol]
+                if this.alias_entry_is_a_candidate(e)
+                {
+                    let resolved this.resolve_alias(e)
+                    if resolved <> null
+                    {
+                        if this.candidate_list_for_symbol(symbol, meaning, e, resolved as ref[Symbol], out)
+                            return true
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        ; globalThis is treated as an alias of last resort. The table it would open
+        ; is the globals table itself, which this query has now visited — so the
+        ; recursion below terminates at its first step rather than not at all.
+        let gt global_this_symbol
+        this.candidate_list_for_symbol(symbol, meaning, gt, gt, out)
+    }
+
+    ; The guard list in front of the alias iteration, with the two conjuncts that
+    ; need an enclosing declaration dropped: `isUMDExportSymbol && IsExternalModule(
+    ; GetSourceFileOfNode(enclosingDeclaration))` is false for a nil enclosing
+    ; declaration, and `useOnlyExternalAliasing` is false at this entry point
+    ; (symbolToTypeNode passes `flags&UseAliasDefinedOutsideCurrentScope == 0`,
+    ; which typeToString SETS, so the argument is false). ★`isLocalNameLookup` is
+    ; true for the globals table, which is what keeps a namespace RE-EXPORT out.
+    function alias_entry_is_a_candidate(this, e: ref[Symbol]) returns bool
+    {
+        if (Symbol.flags_of(e) & SymbolFlagsAlias) = 0
+            return false
+        if Checker.symbol_name_is_export_equals(e)
+            return false
+        if Checker.symbol_name_is_default(e)
+            return false
+        if Checker.has_namespace_reexport_declaration(e)
+            return false
+        Checker.get_declaration_of_kind(e, KindExportSpecifier) = null
+    }
+
+    ; getCandidateListForSymbol — the entry itself when it is accessible, otherwise
+    ; the entry followed by whatever chain its EXPORTS yield.
+    function candidate_list_for_symbol(this, symbol: ref[Symbol], meaning: int, from_table: ref[Symbol], resolved: ref[Symbol], out: ref[Array[ref[Symbol]?]]) returns bool
+    {
+        if this.symbol_is_accessible(symbol, meaning, from_table, resolved)
+        {
+            out.add(from_table)
+            return true
+        }
+        let table this.get_exports_of_symbol(resolved)
+        if table = null
+            return false
+        let host Page.get(out)
+        let inner &Array[ref[Symbol]?]^host()
+        ; The nested lookup runs with the globals table already VISITED — see
+        ; get_accessible_symbol_chain's note.
+        if this.try_symbol_table_globals(symbol, meaning, true, inner) = false
+            return false
+        if this.can_qualify_symbol(from_table, Checker.qualified_left_meaning(meaning)) = false
+            return false
+        out.add(from_table)
+        var i 0
+        while i < (inner.get_length() as int)
+        {
+            out.add(inner[i])
+            set i: i + 1
+        }
+        true
+    }
+
+    ; isAccessible. ★★ `likeSymbols` IS A FOUR-WAY OR AND EVERY ARM IS A DIFFERENT
+    ; IDENTITY QUESTION — the raw symbol against the table entry and against the
+    ; alias target, and the MERGED symbol against each. A single comparison would
+    ; miss a symbol that is only equal after merging, which is the whole reason
+    ; upstream asks four times.
+    function symbol_is_accessible(this, symbol: ref[Symbol], meaning: int, from_table: ref[Symbol], resolved: ref[Symbol]?) returns bool
+    {
+        var like false
+        if resolved <> null
+        {
+            if symbol = (resolved as ref[Symbol])
+                set like: true
+        }
+        if symbol = from_table
+            set like: true
+        let merged this.get_merged_symbol(symbol)
+        if merged <> null
+        {
+            let m merged as ref[Symbol]
+            if resolved <> null
+            {
+                let mr this.get_merged_symbol(resolved)
+                if mr <> null
+                {
+                    if m = (mr as ref[Symbol])
+                        set like: true
+                }
+            }
+            let mt this.get_merged_symbol(from_table)
+            if mt <> null
+            {
+                if m = (mt as ref[Symbol])
+                    set like: true
+            }
+        }
+        if like = false
+            return false
+        if this.symbol_has_non_global_augmentation_external_module_declaration(from_table)
+            return false
+        let mt2 this.get_merged_symbol(from_table)
+        if mt2 = null
+            return false
+        this.can_qualify_symbol(mt2 as ref[Symbol], meaning)
+    }
+
+    ; canQualifySymbol. ★The second disjunct asks about the PARENT and is the
+    ; recursion that makes a dotted chain accessible one level at a time; it runs
+    ; with the globals table already visited, for the reason the fallback does.
+    function can_qualify_symbol(this, from_table: ref[Symbol], meaning: int) returns bool
+    {
+        if this.needs_qualification(from_table, meaning) = false
+            return true
+        let parent Symbol.parent_of(from_table)
+        if parent = null
+            return false
+        let host Page.get(this)
+        let scratch &Array[ref[Symbol]?]^host()
+        this.try_symbol_table_globals(parent as ref[Symbol], Checker.qualified_left_meaning(meaning), true, scratch)
+    }
+
+    ; getContainersOfSymbol, reduced. ★★★ THE REDUCTION IS THE NIL ENCLOSING
+    ; DECLARATION AGAIN, AND IT REMOVES THREE OF THE FOUR SOURCES:
+    ; `getAlternativeContainingModules` is guarded by it, the variable-in-scope
+    ; search walks the same empty scope chain, and the `container is in scope`
+    ; preference fork tests it directly. What is left of getWithAlternativeContainers
+    ; is `additionalContainers ++ [container] ++ objectLiteralContainer`, and the
+    ; first and last are the `export =` file symbol and an object literal's
+    ; variable — neither of which a namespace or class container has. So the answer
+    ; is the PARENT, and the candidate branch below it (a symbol with no parent but
+    ; a module-level declaration) reports instead of guessing.
+    function containers_of_symbol(this, symbol: ref[Symbol], meaning: int) returns ref[Symbol]?
+    {
+        let container this.get_parent_of_symbol(symbol)
+        if container <> null
+        {
+            if (Symbol.flags_of(symbol) & SymbolFlagsTypeParameter) = 0
+                return container
+        }
+        null
+    }
+
+    ; `symbolFromSymbolTable.Name != InternalSymbolNameExportEquals` and the same
+    ; for `default` — two of the four UNPREFIXED internal names (see
+    ; Binder.internal_name_unprefixed for why they carry no 0xFE).
+    function symbol_name_is_export_equals(s: ref[Symbol]) returns bool
+        SymbolTable.names_equal(Symbol.name_of(s), "export=")
+
+    function symbol_name_is_default(s: ref[Symbol]) returns bool
+        SymbolTable.names_equal(Symbol.name_of(s), "default")
+
+    ; isNamespaceReexportDeclaration — `IsNamespaceExport(node) && node.Parent
+    ; .ModuleSpecifier() != nil`, asked over a symbol's declarations.
+    function has_namespace_reexport_declaration(s: ref[Symbol]) returns bool
+    {
+        let n Symbol.declaration_count(s)
+        var i 0
+        while i < n
+        {
+            let d Symbol.declaration_at(s, i)
+            if d <> null
+            {
+                if AstNode.kind_of(d as ref[AstNode]) = KindNamespaceExport
+                {
+                    let p AstNode.parent_node_of(d as ref[AstNode])
+                    if p <> null
+                    {
+                        if AstNode.module_specifier_of(p as ref[AstNode]) <> null
+                            return true
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        false
+    }
+
+    ; `core.Some(symbol.Declarations, hasNonGlobalAugmentationExternalModuleSymbol)`
+    ; — the predicate symbol_to_type_node already asks one declaration at a time.
+    function symbol_has_non_global_augmentation_external_module_declaration(this, s: ref[Symbol]) returns bool
+    {
+        let n Symbol.declaration_count(s)
+        var i 0
+        while i < n
+        {
+            let d Symbol.declaration_at(s, i)
+            if d <> null
+            {
+                if this.is_non_global_augmentation_external_module_symbol(d as ref[AstNode])
+                    return true
+            }
+            set i: i + 1
+        }
+        false
+    }
+
+    ; getSymbolChain, with `yieldModuleSymbol` false — symbolToTypeNode passes
+    ; `flags&UseAliasDefinedOutsideCurrentScope == 0` and typeToString SETS that
+    ; flag, so the argument is false at this entry point and the module guard in
+    ; the tail is live.
+    ;
+    ; ★★ THE PARENT LIST IS ONE ENTRY HERE (see containers_of_symbol), so the
+    ; reference's loop over sorted parents is a single test. Its `export =` fork —
+    ; *the parent's chain root IS this symbol* — is kept, because it is the one
+    ; shape where the loop would otherwise name a symbol as its own container.
+    function get_symbol_chain(this, symbol: ref[Symbol], meaning: int, end_of_chain: bool, out: ref[Array[ref[Symbol]?]]) returns bool
+    {
+        let host Page.get(out)
+        let accessible &Array[ref[Symbol]?]^host()
+        this.get_accessible_symbol_chain(symbol, meaning, accessible)
+        var qualifier_meaning meaning
+        if (accessible.get_length() as int) > 1
+            set qualifier_meaning: Checker.qualified_left_meaning(meaning)
+        var go_up ((accessible.get_length() as int) = 0)
+        if go_up = false
+        {
+            let head accessible[0]
+            if head <> null
+            {
+                if this.needs_qualification(head as ref[Symbol], qualifier_meaning)
+                    set go_up: true
+            }
+        }
+        if go_up
+        {
+            var root symbol
+            if (accessible.get_length() as int) > 0
+            {
+                let head accessible[0]
+                if head <> null
+                    set root: head as ref[Symbol]
+            }
+            let parent this.containers_of_symbol(root, meaning)
+            if parent <> null
+            {
+                let p parent as ref[Symbol]
+                let parent_chain &Array[ref[Symbol]?]^host()
+                this.get_symbol_chain(p, Checker.qualified_left_meaning(meaning), false, parent_chain)
+                if (parent_chain.get_length() as int) > 0
+                {
+                    var took false
+                    let exports this.get_exports_of_symbol(p)
+                    if exports <> null
+                    {
+                        let exported SymbolTable.get(exports, "export=")
+                        if exported <> null
+                        {
+                            if this.get_symbol_if_same_reference(exported as ref[Symbol], symbol) <> null
+                            {
+                                ; The parent's chain root IS this symbol — a module
+                                ; `export =`, which looks like its own container.
+                                Checker.append_symbols(out, parent_chain)
+                                set took: true
+                            }
+                        }
+                    }
+                    if took = false
+                    {
+                        Checker.append_symbols(out, parent_chain)
+                        if (accessible.get_length() as int) > 0
+                            Checker.append_symbols(out, accessible)
+                        else
+                            out.add(symbol)
+                    }
+                    return true
+                }
+            }
+        }
+        if (accessible.get_length() as int) > 0
+        {
+            Checker.append_symbols(out, accessible)
+            return true
+        }
+        ; The tail: output the symbol unless it is a PARENT that upstream declines
+        ; to write — an anonymous type or object literal, or an external module
+        ; (`x` is preferred over `"foo/bar".x`).
+        var write end_of_chain
+        if (Symbol.flags_of(symbol) & (SymbolFlagsTypeLiteral | SymbolFlagsObjectLiteral)) = 0
+            set write: true
+        if write = false
+            return false
+        if end_of_chain = false
+        {
+            if this.symbol_has_non_global_augmentation_external_module_declaration(symbol)
+            {
+                ; The caller asked for a qualifier and is getting none — see
+                ; printer_chain_dropped_container.
+                set printer_chain_dropped_container: true
+                return false
+            }
+        }
+        out.add(symbol)
+        true
+    }
+
+    procedure append_symbols(out: ref[Array[ref[Symbol]?]], src: ref[Array[ref[Symbol]?]])
+    {
+        var i 0
+        while i < (src.get_length() as int)
+        {
+            out.add(src[i])
+            set i: i + 1
+        }
+    }
+
+    ; lookupSymbolChainWorker. ★A TYPE PARAMETER is never qualified — it has no
+    ; container that could name it — and that test is upstream's first conjunct.
+    function lookup_symbol_chain(this, symbol: ref[Symbol], meaning: int, out: ref[Array[ref[Symbol]?]])
+    {
+        if (Symbol.flags_of(symbol) & SymbolFlagsTypeParameter) <> 0
+        {
+            out.add(symbol)
+            return
+        }
+        if printer_fully_qualified = false
+        {
+            out.add(symbol)
+            return
+        }
+        this.get_symbol_chain(symbol, meaning, true, out)
+        if (out.get_length() as int) = 0
+            out.add(symbol)
+    }
+
     function symbol_to_type_node(this, symbol: ref[Symbol], mask: int, out: ref[StringBuilder]) returns bool
     {
         var is_module false
@@ -41853,13 +42901,75 @@ define Checker
             out.append("import(")
             Checker.write_ascii_escaped_literal_name(out, nd.subslice(1, (nl - 1) as size_t))
             out.append(")" as char)
+            ; An ImportTypeNode is TypePrecedenceNonArray — `typeof import("x")`
+            ; included, because the `typeof` is a FIELD of that node and not a
+            ; TypeQuery around it.
+            set wrote_type_precedence: TypePrecedenceNonArray
             return true
         }
         ; `isTypeOf := mask == SymbolFlagsValue` — a TypeQueryNode, which the printer
         ; writes as the keyword, a space, and the entity name.
+        ;
+        ; ★★★ A TypeQueryNode IS TypePrecedenceTypeOperator AND THE REFERENCE SAYS
+        ; WHY IN ITS OWN TABLE: *"TypeQueryNode is actually a NonArrayType, but we
+        ; treat it as TypeOperatorNode precedence so that it is parenthesized when
+        ; used in a PostfixType context (e.g., `(typeof C)[]` instead of `typeof
+        ; C[]`)"*. This arm set nothing until slice 183, so it answered whatever the
+        ; entry seed or a nested call had left — NonArray from `type_to_string`'s
+        ; own first line — and six units printed the second spelling, which is a
+        ; DIFFERENT TYPE. See write_postfix_type_operand, whose note claimed the
+        ; opposite and is corrected there.
         if mask = SymbolFlagsValue
+        {
             out.append("typeof ")
-        this.write_symbol_name(symbol, out)
+            if this.write_symbol_chain(symbol, mask, out) = false
+                return false
+            set wrote_type_precedence: TypePrecedenceTypeOperator
+            return true
+        }
+        if this.write_symbol_chain(symbol, mask, out) = false
+            return false
+        ; A TypeReferenceNode is TypePrecedenceNonArray.
+        set wrote_type_precedence: TypePrecedenceNonArray
+        ; …and its TypeName is an Identifier exactly when the chain had one
+        ; element; a longer chain is a QualifiedName and needs no disambiguating.
+        if wrote_chain_length = 1
+        {
+            set wrote_type_reference_name: Symbol.name_of(symbol)
+            set wrote_name_depth: printer_depth
+        }
+        true
+    }
+
+    ; createAccessFromSymbolChain over the chain lookup_symbol_chain answers — the
+    ; entity name, LEAF LAST, each element named by getNameOfSymbolAsWritten (which
+    ; is what write_symbol_name is).
+    ;
+    ; ★★ WITH THE FLAG OFF THE CHAIN IS ONE ELEMENT AND THIS IS write_symbol_name
+    ; WITH A LOOP AROUND IT — which is why the conversion is emission-neutral for
+    ; every name the corpus printed before slice 183. The loop is not hoisted out
+    ; of the common case: a length-one chain costs one Array and the printer is not
+    ; on any measured path.
+    function write_symbol_chain(this, symbol: ref[Symbol], mask: int, out: ref[StringBuilder]) returns bool
+    {
+        let host Page.get(this)
+        let chain &Array[ref[Symbol]?]^host()
+        this.lookup_symbol_chain(symbol, mask, chain)
+        let n chain.get_length() as int
+        set wrote_chain_length: n
+        var i 0
+        while i < n
+        {
+            if i > 0
+                out.append("." as char)
+            let e chain[i]
+            if e = null
+                return false
+            if this.write_symbol_name(e as ref[Symbol], out) = false
+                return false
+            set i: i + 1
+        }
+        true
     }
 
     ; hasNonGlobalAugmentationExternalModuleSymbol — a module declaration whose name
@@ -100912,6 +102022,18 @@ define Checker
         let result_links this.value_symbol_link_of(result)
         set result_links.target: sym_out
         set result_links.mapper: m_out
+        ; ★★★ `resultLinks.nameType = links.nameType` — upstream's LAST line, and it
+        ; was missing until slice 183. A late-bound member carries its name in the
+        ; nameType slot, not in `Symbol.Name`, so an instantiated one whose slot is
+        ; empty prints the internal `\uFFFD@sym@1` spelling of its name as a QUOTED
+        ; string where the reference prints `[sym]`. It was invisible for as long as
+        ; `property-name-from-unique-symbol` was a stop in front of the only reader;
+        ; retiring the stop in this slice published it, which is §3.5hl's pattern a
+        ; second time. ★It is `links` and not `result_links.target`'s links: the
+        ; already-instantiated branch above may have walked `sym_out` back to the
+        ; ORIGINAL symbol, and upstream reads the slot off the symbol it was CALLED
+        ; with.
+        set result_links.name_type: links.name_type
         result
     }
 
@@ -118959,13 +120081,63 @@ define Checker
             }
             if same_name
             {
-                ; `Type_0_is_not_assignable_to_type_1_Two_different_types_with_this
-                ; _name_exist_but_they_are_unrelated`, TS2719 — but only if the
-                ; FULLY QUALIFIED names are equal too, which is
-                ; getTypeNameForErrorDisplay and a printer flag this port does not
-                ; carry.
-                this.record_unported("get-type-name-for-error-display", target.flags)
-                return
+                ; ★★★ `Type_0_is_not_assignable_to_type_1_Two_different_types_with
+                ; _this_name_exist_but_they_are_unrelated`, TS2719 — and the note
+                ; that stood here read *"only if the FULLY QUALIFIED names are equal
+                ; too, which is getTypeNameForErrorDisplay and a printer flag this
+                ; port does not carry."* Slice 183 carries it:
+                ; getTypeNameForErrorDisplay is `typeToStringEx(t, nil,
+                ; UseFullyQualifiedType)`, and that flag is the one the collision
+                ; pass sets on itself.
+                ;
+                ; ★★★ THE TEST IS THE REPLACEMENT AND NOT AN EXTRA CONDITION.
+                ; `getTypeNamesForErrorDisplay` REPLACES both names with the
+                ; qualified ones whenever the plain ones agree, and TS2719's
+                ; condition upstream is `sourceType == targetType` on the names that
+                ; came out of it. So two types in different namespaces that print
+                ; the same bare name fall THROUGH to the ordinary TS2322 — which is
+                ; the whole point of the message: it exists to say *these two really
+                ; are different types with one name*, and a qualifier that tells
+                ; them apart is the evidence that they are not.
+                let saved printer_fully_qualified
+                set printer_fully_qualified: true
+                set printer_chain_dropped_container: false
+                let qs StringBuilder^host()
+                let ok_s this.type_to_string(source, &qs)
+                let qt StringBuilder^host()
+                var ok_t false
+                if ok_s
+                    set ok_t: this.type_to_string(target, &qt)
+                let dropped printer_chain_dropped_container
+                set printer_fully_qualified: saved
+                if ok_s = false
+                {
+                    this.record_unported("type-to-string-for-error-display", source.flags)
+                    return
+                }
+                if ok_t = false
+                {
+                    this.record_unported("type-to-string-for-error-display", target.flags)
+                    return
+                }
+                if qs.to_string() = qt.to_string()
+                {
+                    ; ★★★ EQUAL QUALIFIED NAMES DECIDE TS2719 ONLY WHERE THE
+                    ; QUALIFICATION WAS COMPLETE. `enumAssignmentCompat6@f.ts` has a
+                    ; module-EXPORTED `DiagnosticCategory` and a second one LOCAL to
+                    ; an arrow function; the chain declines to name an external
+                    ; module container, so both print `DiagnosticCategory` and the
+                    ; equality is an artefact of the drop rather than a fact about
+                    ; the types. The reference emits TS2322 there. **An equality is
+                    ; only evidence when both sides could have differed.**
+                    if dropped
+                    {
+                        this.record_unported("error-display-name-dropped-container", target.flags)
+                        return
+                    }
+                    this.report_error(DiagType_0_is_not_assignable_to_type_1_Two_different_types_with_this_name_exist_but_they_are_unrelated, source, target)
+                    return
+                }
             }
             ; ★★★ THE SUGGESTION IS CONSULTED BEFORE TS2322 AND NOT AFTER IT — the
             ; reference's `default` fork asks it first and RETURNS on a hit, so a
