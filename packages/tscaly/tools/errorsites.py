@@ -39,6 +39,16 @@
 # the copies `apply` took, and drops `tests/out/.built-from-patched-tree` the way ctl.sh
 # does, because a restored source is not a restored binary.
 #
+# ★★★ THE COLUMN THAT DECIDES A ROW IS THE REFERENCE'S OWN OUTPUT, and it is free: for the
+# diagnostic CODE a dead site carries, ask how many corpus units the REFERENCE emits that
+# code on, and with what verdict. **A code the reference never emits anywhere is an honest
+# zero** — the corpus does not contain the construct, and no amount of reading the guard
+# will say more (66 of the first run's 99 rows). A code the reference DOES emit, on units
+# that FAIL, is a lead with NAMED WITNESSES: that is how the JSX child elaboration was found
+# (three units carrying the reference's TS2745/TS2746 where this port emitted the general
+# TS2741). ★It is an attribution and not a proof: many sites pass a `code` VARIABLE, so a
+# code maps to several sites and a MATCH only says some site of ours emits it.
+#
 # ★★ A DEAD SITE IS A LEAD AND MOST LEADS ARE LEGITIMATE, so the report says what it can
 # about WHY. Two things carry that: `tests/errorsites-accepted.txt` retires a row whose
 # reason has been established, keyed by (concept, function, call text) so a line number may
@@ -315,6 +325,44 @@ def options_read_by(fname, line_no):
     return sorted(names)
 
 
+def code_witnesses():
+    """→ ({code name: number}, {code: {verdict: units}}) off the run store, or ({}, {}).
+
+    The reference's own `C pos end code` lines over whatever corpus the store holds.
+    """
+    import re as _re
+    num = {}
+    dc = os.path.join(PKG, "0.1.0", "tscaly", "DiagnosticCodes.scaly")
+    for line in open(dc, encoding="utf-8"):
+        m = _re.match(r"define (Diag\w+):\s+int (\d+)", line.strip())
+        if m:
+            num[m.group(1)] = int(m.group(2))
+    sys.path.insert(0, os.path.join(PKG, "tests"))
+    import harness as H
+    store = H.Store.open(OUT)
+    if store is None:
+        return num, {}, "?"
+    stage = store.meta("stage", "?")
+    per = {}
+    for ci, idx, ref, v in store.db.execute("SELECT ci, idx, ref, verdict FROM artifacts WHERE art='types'"):
+        if not ref:
+            continue
+        for line in ref.split(b"\n"):
+            if line.startswith(b"C "):
+                f = line.split(b" ")
+                if len(f) >= 4 and f[3].isdigit():
+                    per.setdefault(int(f[3]), {}).setdefault(v, set()).add((ci, idx))
+    return num, per, stage
+
+
+def code_of(call, num):
+    import re as _re
+    for m in _re.finditer(r"Diag\w+", call):
+        if m.group(0) in num:
+            return num[m.group(0)]
+    return None
+
+
 def report():
     if not os.path.isfile(TABLE):
         return err("no site table at %s — `apply` writes it" % TABLE)
@@ -335,6 +383,7 @@ def report():
             s, c = line.split("\t")
             counts[int(s)] = int(c)
     acc = load_accepted()
+    num, per_code, wstage = code_witnesses()
     dead = [r for r in rows if counts.get(r[0], 0) == 0]
     retired = [r for r in dead if (r[3], r[5], r[6]) in acc]
     open_rows = [r for r in dead if (r[3], r[5], r[6]) not in acc]
@@ -352,7 +401,19 @@ def report():
         print("%s.%s — %d dead site%s%s"
               % (concept, fn, len(rs), "" if len(rs) == 1 else "s", hint))
         for r in rs:
-            print("    %s:%d  %s" % (r[1], r[2], r[6]))
+            code = code_of(r[6], num)
+            w = per_code.get(code, {})
+            n = sum(len(u) for u in w.values())
+            if not per_code:
+                col = ""
+            elif n == 0:
+                col = "   [the reference emits %s nowhere in the stage-%s corpus]" % (
+                    ("TS%d" % code) if code else "this code", wstage)
+            else:
+                bad = {k: len(u) for k, u in w.items() if k != "MATCH"}
+                col = "   [ref TS%d on %d units%s]" % (
+                    code, n, (", " + ", ".join("%d %s" % (v, k) for k, v in sorted(bad.items()))) if bad else "")
+            print("    %s:%d  %s%s" % (r[1], r[2], r[6], col))
     return 0
 
 
