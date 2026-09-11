@@ -24,13 +24,17 @@
 #             declaration-name list, which is why the arm is not per-kind.
 #
 #   c8        the UNREACHABILITY claim, and it is the row that is supposed to
-#             stay UNGATED. Letting all eight deferred arms fall through to the
+#             stay UNGATED. Letting the deferred arms fall through to the
 #             ordinary path moves nothing, because no binder diagnostic can carry
-#             one of those kinds — the enumeration is in binder.scaly at
-#             error_range_needs_rescan and the reader that earns them is the
-#             CHECKER. A row whose UNGATED verdict is the finding needs its
-#             argument written down beside it (§3.5v's four verdicts), or the next
-#             reader takes it for a missing fixture.
+#             one of those kinds — the enumeration is in binder.scaly below
+#             error_range_for_node and the reader that earns them is the CHECKER.
+#             A row whose UNGATED verdict is the finding needs its argument
+#             written down beside it (§3.5v's four verdicts), or the next reader
+#             takes it for a missing fixture.
+#             ★ RETARGETED IN SLICE 194: seven of the eight arms are ported, so
+#             the guard this row patches is the ONE that is left — the satisfies
+#             arm's Reparsed test, whose false branch is the JSDoc stop. The claim
+#             is unchanged and so is the expected verdict.
 #
 # ★★ c4 PATCHES SLICE 31's LINE, NOT SLICE 45's, and it is here on purpose: the
 # fallback's start is past the leading trivia only because the re-scan skips it,
@@ -153,10 +157,10 @@ SPEC
 
 # ── group 4: the unreachability claim ────────────────────────────────────────
 
-run "c8 no binder diagnostic carries one of the eight deferred kinds" <<SPEC
+run "c8 no binder diagnostic carries one of the deferred kinds" <<SPEC
 FILE $B
 <<<OLD
-        if Binder.error_range_needs_rescan(k)
+                if (AstNode.flags_of(target as ref[AstNode]) & NodeFlagsReparsed) <> 0
 >>>NEW
-        if false
+                if false
 SPEC
