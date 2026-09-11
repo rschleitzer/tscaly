@@ -458,6 +458,42 @@ while IFS= read -r f; do cases+=("$f"); done < <(
 # no 38 000-file tree under $REPO/.tscaly-refcache to scan. Its history is in
 # CLAUDE-history.md under *The runner's history*.
 
+# ── the OUTGOING store's verdicts, written out before it is destroyed ────────
+#
+# ★★★ THE STORE IS RE-CREATED, NOT APPENDED TO, so this run unlinks the previous
+# `run.db` — and with it the only per-unit record of what the PARENT tree
+# answered. Slice 190 lost a stage-2 baseline exactly here: the FAIL set had been
+# clustered from a stage-2 run, the first stage-1 gate run of the slice overwrote
+# it, and the transition set §3.5go calls for could not be taken by name at the
+# end without a second nine-minute run. The rule that lesson states — *dump the
+# parent's verdicts BEFORE the first gate run of a slice* — is something the
+# runner can simply do, so it does.
+#
+# ★ Two files, because they answer two different questions and one would destroy
+# the other: `verdicts-prev.txt` is always the run before this one (a stage-1
+# iteration included), and `verdicts-stage2.txt` is only ever written from a FULL
+# stage-2 store, so it survives any number of stage-1 gate runs and still names
+# the tree the slice was planned against. Neither is read by anything here —
+# `harness.py transitions <file>` is what reads them.
+#
+# ★ Over ROWS and not into a dict: five unit keys occur twice in the corpus. The
+# reason is in harness.py beside write_verdicts.
+if [ -f "$OUT/run.db" ]; then
+  TSCALY_OUT=$OUT python3 "$PKG/tests/harness.py" verdicts "$OUT/verdicts-prev.txt" > /dev/null 2>&1
+  PREV_FULL_STAGE2=$(python3 - "$OUT/run.db" <<'EOF_PREV'
+import sqlite3, sys
+try:
+    m = dict(sqlite3.connect(sys.argv[1]).execute("select key, value from meta").fetchall())
+    print("yes" if m.get("stage") == "2" and not m.get("filter") else "no")
+except Exception:
+    print("no")
+EOF_PREV
+)
+  if [ "$PREV_FULL_STAGE2" = "yes" ] && [ -s "$OUT/verdicts-prev.txt" ]; then
+    cp "$OUT/verdicts-prev.txt" "$OUT/verdicts-stage2.txt"
+  fi
+fi
+
 TSCALY_OUT=$OUT \
 TSCALY_ACCEPTED=$ACCEPTED \
   TSCALY_SLOW=$SLOW \

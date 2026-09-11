@@ -535,6 +535,84 @@ class Store:
         return self.db.execute("SELECT ci, idx, key, name, path FROM units WHERE key=?", (key,)).fetchone()
 
 
+# ───────────────────────── the verdict list, and why it is ROWS ─────────────────────────
+#
+# ★★★ WHY THIS EXISTS (slice 190). `run.sh` writes `tests/out/run.db` and the store is
+# CREATED, i.e. the previous one is unlinked — so the first stage-1 gate run of a slice
+# destroys the stage-2 verdicts the slice was planned from, and with them the only thing
+# that can answer *which units changed verdict*. §3.5go and §3.5hh both say the same
+# sentence from the other end: three totals cannot rule out a MATCH → FAIL, and the
+# transition set is what does. It costs one extra stage-2 run when the baseline is gone
+# and nothing at all when it was written out first.
+#
+# ★★★ AND IT IS TAKEN OVER ROWS, NEVER INTO A DICT KEYED BY THE UNIT KEY. Five unit keys
+# occur twice in the stage-2 corpus — `compare.py` builds `key` as `<case>@<unit name with
+# / → _>`, so two units of one case whose names differ only in a separator collapse — and
+# a `key → verdict` map silently loses those five rows, after which the totals no longer
+# reconcile with `counters.sh` and the reader blames the run. The identity written here is
+# `(case, unit index, artifact)`, which is the store's own primary key and therefore
+# unique by construction; the unit NAME rides along as the fifth column for a human.
+#
+# ★ The verdict is the FIRST column so the file greps: `grep ^FAIL`, `cut -f1 | sort |
+# uniq -c`. The file is sorted by (case index, unit index, artifact order) — the corpus
+# order, the same one the runner reports in — so two baselines diff line by line.
+
+_VERDICT_HEAD = "# verdicts of %s\t stage=%s filter=%r started=%s\n"
+
+
+def verdict_rows(store):
+    """→ [(verdict, case, idx, art, unit name)] in corpus order, one per judged artifact."""
+    order = {a: i for i, a in enumerate(ART_NAMES)}
+    q = ("SELECT a.ci, a.idx, a.art, a.verdict, c.name, u.name FROM artifacts a "
+         "JOIN units u ON u.ci = a.ci AND u.idx = a.idx "
+         "JOIN cases c ON c.ci = a.ci "
+         "WHERE a.verdict IS NOT NULL")
+    rows = store.db.execute(q).fetchall()
+    rows.sort(key=lambda r: (r[0], r[1], order.get(r[2], 99)))
+    return [(r[3], r[4], r[1], r[2], r[5]) for r in rows]
+
+
+def write_verdicts(store, path):
+    rows = verdict_rows(store)
+    with open(path, "w", encoding="utf-8", errors="surrogateescape") as fh:
+        fh.write(_VERDICT_HEAD % (store.path, store.meta("stage", "?"),
+                                  store.meta("filter", ""), store.meta("started", "?")))
+        for verdict, case, idx, art, uname in rows:
+            fh.write("%s\t%s\t%d\t%s\t%s\n" % (verdict, case, idx, art, uname))
+    return len(rows)
+
+
+def read_verdicts(path):
+    """→ [(verdict, case, idx, art, unit name)] — the file above, rows in file order."""
+    out = []
+    with open(path, "r", encoding="utf-8", errors="surrogateescape") as fh:
+        for line in fh:
+            if line.startswith("#") or not line.strip():
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) != 5:
+                raise SystemExit("verdict file %s: not five fields: %r" % (path, line))
+            out.append((f[0], f[1], int(f[2]), f[3], f[4]))
+    return out
+
+
+def transitions(base_rows, now_rows):
+    """→ (moved, gone, fresh) — moved is [(case, idx, art, unit, before, after)].
+
+    ★ The join key is (case, unit index, artifact). A unit the two runs do not share is
+    reported as GONE or FRESH rather than silently dropped: a corpus that grew by a
+    fixture is the normal reason, and a corpus that SHRANK is not, so both are printed.
+    """
+    b = {(r[1], r[2], r[3]): r for r in base_rows}
+    n = {(r[1], r[2], r[3]): r for r in now_rows}
+    moved = [(k[0], k[1], k[2], n[k][4], b[k][0], n[k][0])
+             for k in n if k in b and b[k][0] != n[k][0]]
+    moved.sort(key=lambda m: (m[4], m[5], m[0], m[1]))
+    gone = sorted(k for k in b if k not in n)
+    fresh = sorted(k for k in n if k not in b)
+    return moved, gone, fresh
+
+
 # ───────────────────────── the command line ─────────────────────────
 
 def _export_tree(store, root):
@@ -580,11 +658,13 @@ def _export_tree(store, root):
 
 def main(argv):
     if len(argv) < 2:
-        print("usage: harness.py units | show <key> <art> <ours|ref|cut|diff|walk|diags|message> | export-tree [dir]", file=sys.stderr)
+        print("usage: harness.py units | show <key> <art> <ours|ref|cut|diff|walk|diags|message>\n"
+              "                 | verdicts [file] | transitions <baseline file> | export-tree [dir]", file=sys.stderr)
         return 2
-    store = Store.open()
+    out = os.environ.get("TSCALY_OUT", "packages/tscaly/tests/out")
+    store = Store.open(out)
     if store is None:
-        print("no store at %s — run tests/run.sh first." % store_path(), file=sys.stderr)
+        print("no store at %s — run tests/run.sh first." % store_path(out), file=sys.stderr)
         return 2
     cmd = argv[1]
     if cmd == "units":
@@ -604,8 +684,36 @@ def main(argv):
         v = a[col]
         sys.stdout.buffer.write(v if isinstance(v, bytes) else (str(v) + "\n").encode())
         return 0
+    if cmd == "verdicts":
+        path = argv[2] if len(argv) > 2 else os.path.join(out, "verdicts.txt")
+        n = write_verdicts(store, path)
+        print("wrote %d verdict rows to %s (stage %s, filter %r)"
+              % (n, path, store.meta("stage", "?"), store.meta("filter", "")))
+        return 0
+    if cmd == "transitions":
+        if len(argv) < 3:
+            print("transitions needs the baseline file written by `verdicts`", file=sys.stderr)
+            return 2
+        base = read_verdicts(argv[2])
+        now = verdict_rows(store)
+        moved, gone, fresh = transitions(base, now)
+        counts = {}
+        for m in moved:
+            counts[(m[4], m[5])] = counts.get((m[4], m[5]), 0) + 1
+        print("baseline %s: %d rows;  current store: %d rows" % (argv[2], len(base), len(now)))
+        for (before, after), n in sorted(counts.items(), key=lambda kv: -kv[1]):
+            print("  %-9s -> %-9s  %d" % (before, after, n))
+        if not counts:
+            print("  no verdict moved")
+        for m in moved:
+            print("%s -> %s\t%s\t%d\t%s\t%s" % (m[4], m[5], m[0], m[1], m[2], m[3]))
+        for k in gone:
+            print("GONE\t%s\t%d\t%s" % k)
+        for k in fresh:
+            print("FRESH\t%s\t%d\t%s" % k)
+        return 0
     if cmd == "export-tree":
-        root = argv[2] if len(argv) > 2 else "packages/tscaly/tests/out"
+        root = argv[2] if len(argv) > 2 else out
         n = _export_tree(store, root)
         print("exported %d artifact files under %s/cases" % (n, root))
         return 0
