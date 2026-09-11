@@ -3872,6 +3872,13 @@ define StructuredMembers
     signatures: ref[Array[ref[Signature]?]]?
     call_signature_count: int
     index_infos: ref[Array[ref[IndexInfo]?]]?
+    ; `objectTypeWithoutAbstractConstructSignatures` — upstream's slot on
+    ; StructuredType, and the only memo the PRINTER owns. It holds the copy of
+    ; this object type with the abstract construct signatures filtered out, so
+    ; that `abstract class C { static x: number }` names its static side with one
+    ; intersection rather than a fresh one per visit; the copy carries the memo
+    ; pointing at ITSELF, which is what stops the fork from re-entering.
+    without_abstract_construct_signatures: ref[Type]?
 )
 {
     init()
@@ -3881,6 +3888,7 @@ define StructuredMembers
         set signatures: null
         set call_signature_count: 0
         set index_infos: null
+        set without_abstract_construct_signatures: null
     }
 }
 
@@ -31151,7 +31159,13 @@ define Checker
                     let estimated (count / (length - i)) * length
                     if estimated > 1000000
                     {
-                        this.record_unported("remove-subtypes-depth-limit", estimated)
+                        ; TS2590 at c.currentNode, and the SECOND of its two sites
+                        ; — the cross-product one is check_cross_product_union.
+                        ; ★★★Both stops read *this port has no currentNode*; the
+                        ; field has been on the Checker since slice 154. The null
+                        ; below is the reference's own `return nil`, and the caller
+                        ; turns it into errorType.
+                        this.error_on_node(current_node, DiagExpression_produces_a_union_type_that_is_too_complex_to_represent)
                         return null
                     }
                 }
@@ -31530,9 +31544,21 @@ define Checker
                 var has_object false
                 if (includes & TypeFlagsObject) <> 0
                     set has_object: true
+                ; ★★★ A NULL FROM remove_subtypes MEANS TWO THINGS AND THE MARK
+                ; SEPARATES THEM. Upstream's only nil is the subtype-check limit
+                ; above, and `if typeSet == nil { return c.errorType }` is what the
+                ; caller does with it; here a null may equally be a stop deeper in
+                ; propagating, and answering errorType for one of those would claim
+                ; a diagnostic the walk never made. The mark is the port's own
+                ; discriminator and needs no second channel.
+                let subtype_mark this.unported_mark()
                 let reduced this.remove_subtypes(type_set, has_object)
                 if reduced = null
-                    return null
+                {
+                    if this.unported_mark() <> subtype_mark
+                        return null
+                    return error_type
+                }
                 set type_set: reduced as ref[Array[ref[Type]?]]
             }
             if (type_set.get_length() as int) = 0
@@ -32449,12 +32475,14 @@ define Checker
         let size Checker.get_cross_product_union_size(types)
         if size >= 100000
         {
-            ; ★ THE REPORT IS `c.error(c.currentNode, …)` AND THIS PORT HAS NO
-            ; `currentNode`, so the branch is a stop rather than a report at an
-            ; invented location. It needs a cross product of 100 000 constituents
-            ; to reach, which is not a shape this corpus has — but a stop says so
-            ; and a silent `true` would claim the limit was checked.
-            this.record_unported("check-cross-product-union-limit", size)
+            ; TS2590, at c.currentNode. ★★★The stop that stood here read *this port
+            ; has no currentNode*; the field has been on the Checker since slice
+            ; 154 and two limiters above report through it (the conditional-type
+            ; tail count and instantiate_type's depth). The corpus does reach this
+            ; — a cross product of 100 000 constituents is what
+            ; `templateLiteralTypeTooComplex` and `normalizedIntersectionTooComplex`
+            ; are named after.
+            this.error_on_node(current_node, DiagExpression_produces_a_union_type_that_is_too_complex_to_represent)
             return false
         }
         true
@@ -39307,16 +39335,18 @@ define Checker
         ; The ABSTRACT-constructor fork, which is an INTERSECTION and not a literal:
         ; `abstract class C {}` names its static side `abstract new () => {}`, and
         ; with static members `(abstract new () => {}) & { … }`.
-        ; ★★★ TWO THIRDS OF THE OLD PREMISE HAVE EXPIRED AND THE ROW STANDS ON THE
-        ; THIRD. It read *it needs getOrCreateTypeFromSignature and
-        ; getIntersectionType, neither of which exists here*: both do, and the
-        ; intersection arm of type_to_string writes rather than reports. What is
-        ; genuinely absent is `getResolvedTypeWithoutAbstractConstructSignatures` —
-        ; a copy of the object type with the abstract construct signatures filtered
-        ; out, MEMOISED in a slot (`objectTypeWithoutAbstractConstructSignatures`)
-        ; that StructuredType here does not have. That slot is the work, and naming
-        ; it is what keeps the next reader from re-deriving the two that are done.
-        var abstract_count 0
+        ;
+        ; ★★★ THE PARENTHESES ARE NOT WRITTEN HERE AND MUST NOT BE. The fork hands
+        ; the finished intersection back to `type_to_string`, whose intersection arm
+        ; asks every constituent's precedence; a constructor type writes itself at
+        ; TypePrecedenceFunction, which is below TypePrecedenceIntersection, so the
+        ; parentheses come out of `write_constituent_list` exactly where upstream's
+        ; emitter puts them. A single abstract signature and no other member is one
+        ; constituent, and `get_intersection_type` of one type is that type — which
+        ; is how `abstract new () => {}` comes out unparenthesized from the same
+        ; two lines.
+        let printer_host Page.get(this)
+        let abstract_sigs &Array[ref[Signature]?]^printer_host()
         var i 0
         while i < nk
         {
@@ -39324,14 +39354,43 @@ define Checker
             if s <> null
             {
                 if ((s as ref[Signature]).flags & SignatureFlagsAbstract) <> 0
-                    set abstract_count: abstract_count + 1
+                    abstract_sigs.add(s)
             }
             set i: i + 1
         }
+        let abstract_count abstract_sigs.get_length() as int
         if abstract_count > 0
         {
-            this.record_unported("type-to-string-abstract-construct-signature", t.object_flags)
-            return false
+            let parts &Array[ref[Type]?]^printer_host()
+            set i: 0
+            while i < abstract_count
+            {
+                let s abstract_sigs[i]
+                if s = null
+                    return false
+                let st this.get_or_create_type_from_signature(s as ref[Signature])
+                if st = null
+                    return false
+                parts.add(st)
+                set i: i + 1
+            }
+            ; "count the number of type elements excluding abstract constructors",
+            ; and "don't include an empty object literal if there were no other
+            ; static-side properties to write". ★The property count is the plain
+            ; one: the prototype filter upstream sits behind
+            ; WriteClassExpressionAsTypeLiteral, which typeToString never sets.
+            let type_element_count nc + (nk - abstract_count) + ni + np
+            if type_element_count <> 0
+            {
+                let rest this.get_resolved_type_without_abstract_construct_signatures(t)
+                if rest = null
+                    return false
+                parts.add(rest)
+            }
+            let inter this.get_intersection_type(parts)
+            if inter = null
+                return false
+            return this.type_to_string(inter, out)
         }
         var reverse_mapped false
         if (t.object_flags & ObjectFlagsReverseMapped) <> 0
@@ -39357,6 +39416,64 @@ define Checker
     ; call signatures, then construct signatures, then index signatures, then
     ; properties — so `{ (a: string): void; x: number; }` comes out that way even
     ; where the source wrote `x` first.
+    ; getResolvedTypeWithoutAbstractConstructSignatures — a copy of the object type
+    ; with the abstract construct signatures filtered out, and the one memo the
+    ; printer owns (`without_abstract_construct_signatures` on StructuredMembers).
+    ;
+    ; ★★★ THE COPY MEMOISES ITSELF, AND THAT LINE IS THE TERMINATION ARGUMENT.
+    ; Upstream writes both `t.objectTypeWithoutAbstractConstructSignatures =
+    ; typeCopy` and `typeCopy.objectTypeWithoutAbstractConstructSignatures =
+    ; typeCopy`; the second is what makes asking the copy the identity instead of
+    ; a second copy. Here the abstract fork above never reaches the copy anyway —
+    ; it has no abstract construct signature left — but the slot is written as the
+    ; reference writes it, because the invariant is the reference's and not this
+    ; caller's.
+    ;
+    ; ★ The three early exits are the reference's, in its order: no construct
+    ; signature at all is the type itself, a filled memo is the answer, and a
+    ; filter that removed nothing memoises the type as its own copy.
+    function get_resolved_type_without_abstract_construct_signatures(this, t: ref[Type]) returns ref[Type]?
+    {
+        let resolved this.resolve_structured_type_members(t)
+        if resolved = null
+            return null
+        let sm resolved as ref[StructuredMembers]
+        let ctors this.signature_list_or_empty(this.get_signatures_of_structured_type(t, SignatureKindConstruct))
+        let nk ctors.get_length() as int
+        if nk = 0
+            return t
+        if sm.without_abstract_construct_signatures <> null
+            return sm.without_abstract_construct_signatures
+        let host Page.get(this)
+        let kept &Array[ref[Signature]?]^host()
+        var i 0
+        while i < nk
+        {
+            let sig ctors[i]
+            if sig = null
+                return null
+            if ((sig as ref[Signature]).flags & SignatureFlagsAbstract) = 0
+                kept.add(sig)
+            set i: i + 1
+        }
+        if (kept.get_length() as int) = nk
+        {
+            set sm.without_abstract_construct_signatures: t
+            return t
+        }
+        let calls this.signature_list_or_empty(this.get_signatures_of_structured_type(t, SignatureKindCall))
+        let made this.new_anonymous_type(t.symbol, sm.members, calls, kept, sm.index_infos)
+        if made = null
+            return null
+        let copy made as ref[Type]
+        set sm.without_abstract_construct_signatures: copy
+        let copy_members this.resolve_structured_type_members(copy)
+        if copy_members = null
+            return null
+        set (copy_members as ref[StructuredMembers]).without_abstract_construct_signatures: copy
+        copy
+    }
+
     function write_type_literal(this, sm: ref[StructuredMembers], calls: ref[Array[ref[Signature]?]], ctors: ref[Array[ref[Signature]?]], reverse_mapped: bool, out: ref[StringBuilder]) returns bool
     {
         ; createTypeNodesFromResolvedType's own checkTruncationLength, which is the
@@ -89199,31 +89316,59 @@ define Checker
     ; intersection properties this must be true of ANY of the declarations, for
     ; others of ALL of them*, which is the reference's own comment and the reason
     ; the two functions exist rather than one loop.
+    ; ★★★ THE ABSTRACT HALF IS A CONJUNCTION AND ONLY ITS FIRST CONJUNCT WAS HERE.
+    ; `baseDeclarationFlags&Abstract != 0 && (!IsPropertyDeclaration(d) ||
+    ; d.Initializer() == nil)` — an abstract class's INITIALIZED property
+    ; declaration is not exempt, and reading the flag alone exempted it.
     function is_property_abstract_or_interface(this, declaration: ref[AstNode], base_declaration_flags: int) returns bool
     {
-        if (base_declaration_flags & ModifierFlagsAbstract) <> 0
-            return true
         let parent AstNode.parent_node_of(declaration)
-        if parent = null
+        if parent <> null
+        {
+            if AstNode.kind_of(parent as ref[AstNode]) = KindInterfaceDeclaration
+                return true
+        }
+        if (base_declaration_flags & ModifierFlagsAbstract) = 0
             return false
-        AstNode.kind_of(parent as ref[AstNode]) = KindInterfaceDeclaration
+        if AstNode.kind_of(declaration) <> KindPropertyDeclaration
+            return true
+        AstNode.initializer_of(declaration) = null
     }
 
+    ; ★★★ THE SYNTHETIC FORK IS THE WHOLE POINT OF THERE BEING TWO FUNCTIONS, AND
+    ; THE COMMENT ABOVE QUOTED IT WHILE THE BODY DID NOT: `core.Some` for a
+    ; SYNTHETIC (intersection) property, `core.Every` for every other. A class
+    ; extending a mixin's `TBase & (new (…) => I)` inherits its members as
+    ; synthetic intersection properties whose declarations come from both sides,
+    ; so the ALL reading refused the exemption the interface half grants and the
+    ; accessor override below reported a TS2611 the reference does not
+    ; (`accessorsOverrideProperty9`). ★An empty declaration list is Every's TRUE
+    ; and Some's FALSE, which is the one place the two loops differ past the fork.
     function are_properties_abstract_or_interface(this, base: ref[Symbol], base_declaration_flags: int) returns bool
     {
         let n Symbol.declaration_count(base)
-        if n = 0
-            return false
+        let synthetic (Symbol.check_flags_of(base) & CheckFlagsSynthetic) <> 0
         var i 0
         while i < n
         {
             let d Symbol.declaration_at(base, i)
             if d = null
                 return false
-            if this.is_property_abstract_or_interface(d as ref[AstNode], base_declaration_flags) = false
-                return false
+            let one this.is_property_abstract_or_interface(d as ref[AstNode], base_declaration_flags)
+            if synthetic
+            {
+                if one
+                    return true
+            }
+            else
+            {
+                if one = false
+                    return false
+            }
             set i: i + 1
         }
+        if synthetic
+            return false
         true
     }
 
@@ -104631,6 +104776,12 @@ define Checker
             return null
         let list types as ref[Array[ref[Type]?]]
         let n list.get_length() as int
+        let mark this.unported_mark()
+        ; ★ THE MEMBER NAME IS PART OF THE GUARD, not of the transform: every
+        ; constituent must be an instantiation of the SAME member of the global
+        ; Array or ReadonlyArray. The stop that stood here left the name out
+        ; because nothing past the guard used it.
+        var member_name Slice[char]()
         var i 0
         while i < n
         {
@@ -104646,16 +104797,98 @@ define Checker
             let parent Symbol.parent_of(sym)
             if parent = null
                 return null
-            let mark this.unported_mark()
             let ok this.is_array_or_tuple_symbol(parent as ref[Symbol])
             if this.unported_mark() <> mark
                 return null
             if ok = false
                 return null
+            let nm Symbol.name_of(sym)
+            if i = 0
+                set member_name: nm
+            else
+            {
+                if member_name.length <> nm.length
+                    return null
+                if Checker.bytes_equal(member_name, 0, nm, 0, nm.length as int) = false
+                    return null
+            }
             set i: i + 1
         }
-        this.record_unported("get-array-member-call-signatures", t.flags)
-        null
+        ; "Transform the type from `(A[] | B[])["member"]` to `(A | B)[]["member"]`
+        ; (since we pretend array is covariant anyway)."
+        ;
+        ; ★★★ THE `mapType` IS WRITTEN AS THE LOOP IT IS HERE, AND THE LICENCE IS
+        ; THE ONE CALLER. `resolve_union_type_members` is the only route in, so `t`
+        ; is a UNION and every constituent is an object type the guard above has
+        ; already refused a union for — which is exactly the shape where mapTypeEx
+        ; reduces to *map each constituent, union the results with
+        ; UnionReductionLiteral*. Writing it as a MapTypeKind arm would buy the
+        ; union recursion and the unchanged-identity exit, and neither can be
+        ; reached from here.
+        let element_types this.new_type_list(null)
+        var readonly false
+        set i: 0
+        while i < n
+        {
+            let row list[i]
+            if row = null
+                return null
+            let ct row as ref[Type]
+            if ct.symbol = null
+                return null
+            let parent Symbol.parent_of(ct.symbol as ref[Symbol])
+            var global_type this.get_global_array_type()
+            if this.is_readonly_array_symbol(parent)
+            {
+                set global_type: this.get_global_readonly_array_type()
+                set readonly: true
+            }
+            if this.unported_mark() <> mark
+                return null
+            if global_type = null
+                return null
+            let tps this.interface_type_parameters_of(global_type as ref[Type])
+            if tps = null
+                return null
+            let tp (tps as ref[Array[ref[Type]?]])[0]
+            if tp = null
+                return null
+            let arg this.instantiate_type(tp as ref[Type], Checker.mapper_of(ct))
+            if this.unported_mark() <> mark
+                return null
+            if arg = null
+                return null
+            element_types.add(arg)
+            set i: i + 1
+        }
+        let element this.get_union_type_ex(element_types, UnionReductionLiteral, null, null)
+        if element = null
+            return null
+        let array_type this.create_array_type_ex(element, readonly)
+        if array_type = null
+            return null
+        let member this.get_type_of_property_of_type(array_type as ref[Type], member_name)
+        if this.unported_mark() <> mark
+            return null
+        if member = null
+            return null
+        this.get_signatures_of_type(member as ref[Type], SignatureKindCall)
+    }
+
+    ; isReadonlyArraySymbol — the half of isArrayOrTupleSymbol that decides WHICH
+    ; of the two globals a constituent came from, and therefore whether the array
+    ; the transform builds is readonly.
+    function is_readonly_array_symbol(this, symbol: ref[Symbol]?) returns bool
+    {
+        if symbol = null
+            return false
+        let gr this.get_global_readonly_array_type()
+        if gr = null
+            return false
+        let rsym (gr as ref[Type]).symbol
+        if rsym = null
+            return false
+        this.get_symbol_if_same_reference(symbol as ref[Symbol], rsym as ref[Symbol]) <> null
     }
 
     ; isArrayOrTupleSymbol / isReadonlyArraySymbol. ★The name says *tuple* and the
@@ -113851,39 +114084,23 @@ define Checker
                 }
                 return false
             }
-            ; getMatchingUnionConstituentForType — the DISCRIMINANT map. ★★Its
-            ; three cheap refutations are `computeKeyPropertyNameAndMap`'s own
-            ; first line and they answer the whole corpus: fewer than ten
-            ; constituents, a PRIMITIVE union, or fewer than ten object-or-
-            ; instantiable constituents each make the key property name empty and
-            ; the match nil. Only a union past all three needs the map.
-            var needs_key true
-            if (target_types.get_length() as int) < 10
-                set needs_key: false
-            if (target.object_flags & ObjectFlagsPrimitiveUnion) <> 0
-                set needs_key: false
-            if needs_key
+            ; getMatchingUnionConstituentForType — the DISCRIMINANT map, and it is
+            ; ASKED here rather than refuted. ★★★The stop that stood here enumerated
+            ; `computeKeyPropertyNameAndMap`'s three cheap refutations (fewer than
+            ; ten constituents, a PRIMITIVE union, fewer than ten object-or-
+            ; instantiable constituents) and reported for every union that passed
+            ; them — on the premise that the map itself was not in this port. The
+            ; whole route has been here since the discriminant chapter:
+            ; `get_matching_union_constituent_for_type` is one file-screen below,
+            ; with `get_key_property_name`, `compute_key_property_name_and_map`,
+            ; `map_types_by_key_property` and `get_constituent_type_for_key_type`
+            ; under it, and `find_matching_discriminant_type` already calls it.
+            ; The three refutations are that function's own first lines.
+            let by_key this.get_matching_union_constituent_for_type(target, source)
+            if by_key <> null
             {
-                var objecty 0
-                var k 0
-                let tn target_types.get_length() as int
-                while k < tn
-                {
-                    let tk target_types[k]
-                    if tk <> null
-                    {
-                        if (((tk as ref[Type]).flags) & (TypeFlagsObject | TypeFlagsInstantiableNonPrimitive)) <> 0
-                            set objecty: objecty + 1
-                    }
-                    set k: k + 1
-                }
-                if objecty < 10
-                    set needs_key: false
-            }
-            if needs_key
-            {
-                this.record_unported("get-matching-union-constituent", target.flags)
-                return false
+                if this.is_related_to_ex(source, by_key as ref[Type], relation, null, intersection_state, RecursionFlagsTarget)
+                    return true
             }
         }
         let n target_types.get_length() as int
