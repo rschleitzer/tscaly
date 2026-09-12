@@ -3307,6 +3307,9 @@ define MaxReverseMappedNestingInspectionDepth: int 3
 ; getUnresolvedSymbolForEntityName, which is now here — so the bit is a bit and
 ; the arm is code.
 define CheckFlagsUnresolved: int 1 << 20
+; the scope walk of the accessible symbol chain (slice 221): per table
+define ScopeTableLocalNameLookup: int 1
+define ScopeTableGlobals: int 2
 
 ; ── VarianceFlags (slice 122) ───────────────────────────────────────────────
 ;
@@ -6473,6 +6476,13 @@ define Checker
     ; write_symbol_name did unconditionally — so no name in the corpus can move
     ; except inside a list that printed one name twice.
     printer_fully_qualified: bool
+    ; the node builder's enclosingDeclaration — nil for TypeToString, set to a
+    ; property's declaration while its computed name is written (slice 221)
+    printer_enclosing_declaration: ref[AstNode]?
+    ; visitedSymbolTablesMap of the accessible-chain walk: (symbol, table) pairs
+    chain_visited_symbols: ref[Array[ref[Symbol]?]]?
+    chain_visited_tables: ref[Array[ref[SymbolTable]?]]?
+    chain_visited_count: int
 
     ; ── `isIdentifierTypeReference(typeNode)`, slice 183 ─────────────────────
     ;
@@ -7856,6 +7866,10 @@ define Checker
         set c.printer_symbols: pss
         set c.printer_symbol_count: 0
         set c.printer_fully_qualified: false
+        set c.printer_enclosing_declaration: null
+        set c.chain_visited_symbols: null
+        set c.chain_visited_tables: null
+        set c.chain_visited_count: 0
         set c.wrote_type_reference_name.data: null
         set c.wrote_type_reference_name.length: 0
         set c.wrote_chain_length: 0
@@ -44639,23 +44653,27 @@ define Checker
                 ; for the caller that supplies the very input the reduction assumed
                 ; away — and narrowing the guard is not the same as closing it.**
                 let us nt.symbol as ref[Symbol]
-                let container Symbol.parent_of(us)
-                if container <> null
+                ; addPropertyToElementList sets the enclosing declaration to the
+                ; PROPERTY'S declaration around getPropertyNameNodeForSymbol, and
+                ; symbolToExpression's chain is the accessible chain from there
+                ; (slice 221) — `[OpTypes.equal]`, `[NS.eq]`, `[K.ks]`, `[loc]`
+                let saved_enclosing printer_enclosing_declaration
+                var enclosing Symbol.value_declaration_of(sym)
+                if enclosing = null
                 {
-                    if this.symbol_has_non_global_augmentation_external_module_declaration(container as ref[Symbol]) = false
-                    {
-                        this.record_unported("property-name-unique-symbol-enclosing-chain", nt.flags)
-                        return false
-                    }
+                    if Symbol.declaration_count(sym) > 0
+                        set enclosing: Symbol.declaration_at(sym, 0)
                 }
+                if enclosing <> null
+                    set this.printer_enclosing_declaration: enclosing
                 let scratch StringBuilder^host()
-                if this.write_symbol_chain(us, SymbolFlagsValue, &scratch) = false
+                let chain_mark this.unported_mark()
+                let written this.write_symbol_expression_chain(us, &scratch)
+                set this.printer_enclosing_declaration: saved_enclosing
+                if written = false
                     return false
-                if wrote_chain_length <> 1
-                {
-                    this.record_unported("property-name-from-unique-symbol-chain", wrote_chain_length)
+                if this.unported_mark() <> chain_mark
                     return false
-                }
                 out.append("[" as char)
                 out.append(scratch.to_string())
                 out.append("]" as char)
@@ -45283,31 +45301,76 @@ define Checker
     ; right), and a table whose entry is a DIFFERENT symbol of the same meaning
     ; stops with qualify TRUE. Folding the two into one boolean answer would lose
     ; the difference, which is why the walk is spelled out rather than inlined.
+    ; ── slice 221: THE ACCESSIBLE SYMBOL CHAIN UNDER AN ENCLOSING DECLARATION ──
+    ;
+    ; ★★★ THE PRINTER HAS AN ENCLOSING DECLARATION FOR ONE PURPOSE HERE. The
+    ; checker's TypeToString passes nil, and every reuse arm of the node builder
+    ; is gated on it — but addPropertyToElementList sets it to the PROPERTY'S
+    ; DECLARATION around getPropertyNameNodeForSymbol, and a unique-symbol
+    ; property name is serialized through symbolToExpression → lookupSymbolChain,
+    ; which under an enclosing declaration is the ACCESSIBLE chain from there:
+    ; `{ [Op.equal]: string }` prints `[OpTypes.equal]` (the interface reached
+    ; through the variable declared with its type), `[NS.eq]`, `[K.ks]`, and a
+    ; local `[loc]`. Before this slice the port's chain machinery read the GLOBALS
+    ; table only (the enclosing-declaration-is-nil specialisation), and the
+    ; unique-symbol arm stopped on every container that was not a module.
+    ;
+    ; someSymbolTableInScope is a callback walk upstream; here it is materialised
+    ; once per ask into a table list (`collect_scope_tables`), which the two
+    ; consumers — needsQualification and getAccessibleSymbolChain — iterate. The
+    ; walk: the locals of every container that can have them (a global source
+    ; file's excluded), the exports of a module or module-file, the TYPE members
+    ; of a class or interface, a named class expression's own name, then globals.
+    ; The visited set of (symbol, table) pairs is the reference's
+    ; visitedSymbolTablesMap, shared by the nested asks canQualifySymbol makes.
     function needs_qualification(this, symbol: ref[Symbol], meaning: int) returns bool
     {
-        let res SymbolTable.get(globals, Symbol.name_of(symbol))
-        if res = null
-            return false
-        let merged this.get_merged_symbol(res)
-        if merged = null
-            return false
-        var from_table merged as ref[Symbol]
-        if from_table = symbol
-            return false
-        let should_resolve_alias this.should_resolve_alias_for_qualification(from_table)
-        var flags Symbol.flags_of(from_table)
-        if should_resolve_alias
+        let tables &Array[ref[SymbolTable]?]^host()
+        let kinds &Array[int]^host()
+        this.collect_scope_tables(tables, kinds)
+        let n tables.get_length() as int
+        var i 0
+        while i < n
         {
-            let resolved this.resolve_alias(from_table)
-            if resolved = null
-                return false
-            set from_table: resolved as ref[Symbol]
-            set flags: this.get_symbol_flags(from_table)
+            let t tables[i]
+            set i: i + 1
+            if t <> null
+            {
+                let res SymbolTable.get(t, Symbol.name_of(symbol))
+                if res <> null
+                {
+                    let merged this.get_merged_symbol(res)
+                    if merged <> null
+                    {
+                        var from_table merged as ref[Symbol]
+                        if from_table = symbol
+                            return false
+                        let should_resolve_alias this.should_resolve_alias_for_qualification(from_table)
+                        var flags Symbol.flags_of(from_table)
+                        var usable true
+                        if should_resolve_alias
+                        {
+                            let resolved this.resolve_alias(from_table)
+                            if resolved = null
+                                set usable: false
+                            else
+                            {
+                                set from_table: resolved as ref[Symbol]
+                                set flags: this.get_symbol_flags(from_table)
+                            }
+                        }
+                        if usable
+                        {
+                            if (flags & meaning) <> 0
+                                return true
+                        }
+                    }
+                }
+            }
         }
-        (flags & meaning) <> 0
+        false
     }
 
-    ; `symbolFromSymbolTable.Flags&Alias != 0 && GetDeclarationOfKind(…, ExportSpecifier) == nil`
     function should_resolve_alias_for_qualification(this, s: ref[Symbol]) returns bool
     {
         if (Symbol.flags_of(s) & SymbolFlagsAlias) = 0
@@ -45315,13 +45378,167 @@ define Checker
         Checker.get_declaration_of_kind(s, KindExportSpecifier) = null
     }
 
-    ; getAccessibleSymbolChain, reduced to the globals table for the reason the
-    ; chapter header gives. ★★ THE VISITED-TABLE SET IS LOAD-BEARING AND NOT A
-    ; CACHE: `trySymbolTable`'s globalThis fallback asks the globals table AGAIN
-    ; through `getCandidateListForSymbol`, and without the set that is an infinite
-    ; regress. Upstream keys it per SYMBOL (`visitedSymbolTablesMap[symId]`); with
-    ; one table in the walk the set is one bit, and it is passed down rather than
-    ; held on the checker so that a nested query cannot see its parent's.
+    function can_have_locals(k: int) returns bool
+    {
+        if k = KindArrowFunction
+            return true
+        if k = KindBlock
+            return true
+        if k = KindCallSignature
+            return true
+        if k = KindCaseBlock
+            return true
+        if k = KindCatchClause
+            return true
+        if k = KindClassStaticBlockDeclaration
+            return true
+        if k = KindConditionalType
+            return true
+        if k = KindConstructor
+            return true
+        if k = KindConstructorType
+            return true
+        if k = KindConstructSignature
+            return true
+        if k = KindForStatement
+            return true
+        if k = KindForInStatement
+            return true
+        if k = KindForOfStatement
+            return true
+        if k = KindFunctionDeclaration
+            return true
+        if k = KindFunctionExpression
+            return true
+        if k = KindFunctionType
+            return true
+        if k = KindGetAccessor
+            return true
+        if k = KindIndexSignature
+            return true
+        if k = KindJSDocSignature
+            return true
+        if k = KindMappedType
+            return true
+        if k = KindMethodDeclaration
+            return true
+        if k = KindMethodSignature
+            return true
+        if k = KindModuleDeclaration
+            return true
+        if k = KindSetAccessor
+            return true
+        if k = KindSourceFile
+            return true
+        if k = KindTypeAliasDeclaration
+            return true
+        k = KindJSTypeAliasDeclaration
+    }
+
+    ; someSymbolTableInScope, materialised: `kinds` carries per table whether it
+    ; is a LOCAL-NAME lookup (bit 1) and whether it is the globals table (bit 2).
+    procedure collect_scope_tables(this, tables: ref[Array[ref[SymbolTable]?]], kinds: ref[Array[int]])
+    {
+        var location printer_enclosing_declaration
+        while location <> null
+        {
+            let loc location as ref[AstNode]
+            let k AstNode.kind_of(loc)
+            if Checker.can_have_locals(k)
+            {
+                let locals AstNode.locals_of(loc)
+                if locals <> null
+                {
+                    if Checker.is_global_source_file(b, loc) = false
+                    {
+                        tables.add(locals)
+                        kinds.add(ScopeTableLocalNameLookup)
+                    }
+                }
+            }
+            var module_like false
+            if k = KindSourceFile
+            {
+                if b.is_external_or_common_js_module()
+                    set module_like: true
+            }
+            if k = KindModuleDeclaration
+                set module_like: true
+            if module_like
+            {
+                let sym this.get_symbol_of_declaration(loc)
+                if sym <> null
+                {
+                    let exports Symbol.exports_of(sym as ref[Symbol])
+                    if exports <> null
+                    {
+                        tables.add(exports)
+                        kinds.add(ScopeTableLocalNameLookup)
+                    }
+                }
+            }
+            var class_like false
+            if k = KindClassDeclaration
+                set class_like: true
+            if k = KindClassExpression
+                set class_like: true
+            if k = KindInterfaceDeclaration
+                set class_like: true
+            if class_like
+            {
+                let sym this.get_symbol_of_declaration(loc)
+                if sym <> null
+                {
+                    let s sym as ref[Symbol]
+                    let members Symbol.members_of(s)
+                    if members <> null
+                    {
+                        var table: ref[SymbolTable]? null
+                        let mn SymbolTable.length(members)
+                        var mi 0
+                        while mi < mn
+                        {
+                            let ms SymbolTable.entry_symbol_at(members, mi)
+                            if ms <> null
+                            {
+                                if (Symbol.flags_of(ms as ref[Symbol]) & SymbolFlagsType) <> 0
+                                {
+                                    if table = null
+                                        set table: SymbolTable.create(host)
+                                    SymbolTable.set_entry(host, table as ref[SymbolTable], SymbolTable.entry_name_at(members, mi), ms)
+                                }
+                            }
+                            set mi: mi + 1
+                        }
+                        if table <> null
+                        {
+                            tables.add(table)
+                            kinds.add(0)
+                        }
+                    }
+                    if k = KindClassExpression
+                    {
+                        let name AstNode.name_of(loc)
+                        if name <> null
+                        {
+                            let text AstNode.identifier_text_of(name)
+                            if text.length > 0
+                            {
+                                let nt SymbolTable.create(host)
+                                SymbolTable.set_entry(host, nt, text, s)
+                                tables.add(nt)
+                                kinds.add(ScopeTableLocalNameLookup)
+                            }
+                        }
+                    }
+                }
+            }
+            set location: AstNode.parent_node_of(loc)
+        }
+        tables.add(globals)
+        kinds.add(ScopeTableLocalNameLookup | ScopeTableGlobals)
+    }
+
     function get_accessible_symbol_chain(this, symbol: ref[Symbol]?, meaning: int, out: ref[Array[ref[Symbol]?]]) returns bool
     {
         if symbol = null
@@ -45329,13 +45546,25 @@ define Checker
         let s symbol as ref[Symbol]
         if Checker.is_property_or_method_declaration_symbol(s)
             return false
-        this.try_symbol_table_globals(s, meaning, false, out)
+        let tables &Array[ref[SymbolTable]?]^host()
+        let kinds &Array[int]^host()
+        this.collect_scope_tables(tables, kinds)
+        let n tables.get_length() as int
+        var i 0
+        while i < n
+        {
+            let t tables[i]
+            if t <> null
+            {
+                let kind kinds[i]
+                if this.accessible_chain_from_table(s, meaning, t as ref[SymbolTable], (kind & ScopeTableGlobals) <> 0, false, (kind & ScopeTableLocalNameLookup) <> 0, out)
+                    return true
+            }
+            set i: i + 1
+        }
+        false
     }
 
-    ; isPropertyOrMethodDeclarationSymbol — a symbol ALL of whose declarations are
-    ; members. ★An empty declaration list answers FALSE upstream (the loop is
-    ; guarded by `len(symbol.Declarations) > 0`), which is the opposite of what a
-    ; bare `for` would answer, so the guard is written.
     function is_property_or_method_declaration_symbol(symbol: ref[Symbol]) returns bool
     {
         let n Symbol.declaration_count(symbol)
@@ -45364,77 +45593,185 @@ define Checker
         true
     }
 
-    ; trySymbolTable over the globals. The three routes upstream takes, in its
-    ; order: the direct name, the table entry's ExportSymbol, and the table's ALIAS
-    ; entries; then the globalThis fallback, which is what makes the visited set
-    ; necessary.
-    ;
-    ; ★ The candidate SORT (`compareSymbolChains`, shortest first then by symbol)
-    ; is not built: every route here answers a chain of length one or none, so a
-    ; list of two candidates cannot arise from the globals table alone. The first
-    ; accepted candidate is therefore the shortest, and this REPORTS rather than
-    ; guesses if a second one ever appears.
-    function try_symbol_table_globals(this, symbol: ref[Symbol], meaning: int, globals_visited: bool, out: ref[Array[ref[Symbol]?]]) returns bool
+    ; getAccessibleSymbolChainFromSymbolTable: the (symbol, table) pair already on
+    ; the visited stack answers nothing — the recursion guard of the reference.
+    function accessible_chain_from_table(this, symbol: ref[Symbol], meaning: int, t: ref[SymbolTable], is_globals: bool, ignore_qualification: bool, is_local_name_lookup: bool, out: ref[Array[ref[Symbol]?]]) returns bool
     {
-        if globals_visited
+        if this.chain_visited(symbol, t)
             return false
-        let res SymbolTable.get(globals, Symbol.name_of(symbol))
-        if res <> null
-        {
-            if this.symbol_is_accessible(symbol, meaning, res as ref[Symbol], null)
-            {
-                out.add(symbol)
-                return true
-            }
-            let ex Symbol.export_symbol_of(res as ref[Symbol])
-            if ex <> null
-            {
-                let merged this.get_merged_symbol(ex)
-                if merged <> null
-                {
-                    if this.symbol_is_accessible(symbol, meaning, merged as ref[Symbol], null)
-                    {
-                        out.add(symbol)
-                        return true
-                    }
-                }
-            }
-        }
-        let n SymbolTable.length(globals)
+        this.push_chain_visited(symbol, t)
+        let r this.try_symbol_table(symbol, meaning, t, is_globals, ignore_qualification, is_local_name_lookup, out)
+        this.pop_chain_visited()
+        r
+    }
+
+    function chain_visited(this, symbol: ref[Symbol], t: ref[SymbolTable]) returns bool
+    {
+        if chain_visited_symbols = null
+            return false
+        let syms chain_visited_symbols as ref[Array[ref[Symbol]?]]
+        let tabs chain_visited_tables as ref[Array[ref[SymbolTable]?]]
         var i 0
-        while i < n
+        while i < chain_visited_count
         {
-            let entry SymbolTable.entry_symbol_at(globals, i)
-            if entry <> null
+            let vs syms[i]
+            if vs <> null
             {
-                let e entry as ref[Symbol]
-                if this.alias_entry_is_a_candidate(e)
+                if (vs as ref[Symbol]) = symbol
                 {
-                    let resolved this.resolve_alias(e)
-                    if resolved <> null
+                    let vt tabs[i]
+                    if vt <> null
                     {
-                        if this.candidate_list_for_symbol(symbol, meaning, e, resolved as ref[Symbol], out)
+                        if (vt as ref[SymbolTable]) = t
                             return true
                     }
                 }
             }
             set i: i + 1
         }
-        ; globalThis is treated as an alias of last resort. The table it would open
-        ; is the globals table itself, which this query has now visited — so the
-        ; recursion below terminates at its first step rather than not at all.
-        let gt global_this_symbol
-        this.candidate_list_for_symbol(symbol, meaning, gt, gt, out)
+        false
     }
 
-    ; The guard list in front of the alias iteration, with the two conjuncts that
-    ; need an enclosing declaration dropped: `isUMDExportSymbol && IsExternalModule(
-    ; GetSourceFileOfNode(enclosingDeclaration))` is false for a nil enclosing
-    ; declaration, and `useOnlyExternalAliasing` is false at this entry point
-    ; (symbolToTypeNode passes `flags&UseAliasDefinedOutsideCurrentScope == 0`,
-    ; which typeToString SETS, so the argument is false). ★`isLocalNameLookup` is
-    ; true for the globals table, which is what keeps a namespace RE-EXPORT out.
-    function alias_entry_is_a_candidate(this, e: ref[Symbol]) returns bool
+    procedure push_chain_visited(this, symbol: ref[Symbol], t: ref[SymbolTable])
+    {
+        if chain_visited_symbols = null
+        {
+            set this.chain_visited_symbols: &Array[ref[Symbol]?]^host()
+            set this.chain_visited_tables: &Array[ref[SymbolTable]?]^host()
+        }
+        let syms chain_visited_symbols as ref[Array[ref[Symbol]?]]
+        let tabs chain_visited_tables as ref[Array[ref[SymbolTable]?]]
+        if chain_visited_count < (syms.get_length() as int)
+        {
+            syms.put(chain_visited_count as size_t, symbol)
+            tabs.put(chain_visited_count as size_t, t)
+        }
+        else
+        {
+            syms.add(symbol)
+            tabs.add(t)
+        }
+        set this.chain_visited_count: chain_visited_count + 1
+    }
+
+    procedure pop_chain_visited(this)
+        set this.chain_visited_count: chain_visited_count - 1
+
+    ; trySymbolTable: the symbol itself when the table names it accessibly, else
+    ; the shortest candidate chain through the table's aliases, else (globals only)
+    ; the chain through globalThis.
+    function try_symbol_table(this, symbol: ref[Symbol], meaning: int, t: ref[SymbolTable], is_globals: bool, ignore_qualification: bool, is_local_name_lookup: bool, out: ref[Array[ref[Symbol]?]]) returns bool
+    {
+        let res SymbolTable.get(t, Symbol.name_of(symbol))
+        if res <> null
+        {
+            if this.is_accessible(symbol, meaning, res as ref[Symbol], null, ignore_qualification)
+            {
+                out.add(symbol)
+                return true
+            }
+        }
+        let chains &Array[ref[Array[ref[Symbol]?]]?]^host()
+        if res <> null
+        {
+            let ex Symbol.export_symbol_of(res as ref[Symbol])
+            if ex <> null
+            {
+                let merged this.get_merged_symbol(ex)
+                if merged <> null
+                {
+                    if this.is_accessible(symbol, meaning, merged as ref[Symbol], null, ignore_qualification)
+                    {
+                        let one &Array[ref[Symbol]?]^host()
+                        one.add(symbol)
+                        chains.add(one)
+                    }
+                }
+            }
+        }
+        let n SymbolTable.length(t)
+        var i 0
+        while i < n
+        {
+            let entry SymbolTable.entry_symbol_at(t, i)
+            if entry <> null
+            {
+                let e entry as ref[Symbol]
+                if this.alias_entry_is_a_candidate(e, ignore_qualification, is_local_name_lookup)
+                {
+                    let resolved this.resolve_alias(e)
+                    if resolved <> null
+                    {
+                        let candidate &Array[ref[Symbol]?]^host()
+                        if this.candidate_list_for_symbol(symbol, meaning, e, resolved as ref[Symbol], ignore_qualification, candidate)
+                        {
+                            if (candidate.get_length() as int) > 0
+                                chains.add(candidate)
+                        }
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        let cn chains.get_length() as int
+        if cn > 0
+        {
+            var best chains[0]
+            var j 1
+            while j < cn
+            {
+                let c chains[j]
+                if c <> null
+                {
+                    if best <> null
+                    {
+                        if this.compare_symbol_chains(c as ref[Array[ref[Symbol]?]], best as ref[Array[ref[Symbol]?]]) < 0
+                            set best: c
+                    }
+                }
+                set j: j + 1
+            }
+            if best = null
+                return false
+            Checker.append_symbols(out, best as ref[Array[ref[Symbol]?]])
+            return true
+        }
+        if is_globals
+        {
+            let gt global_this_symbol
+            return this.candidate_list_for_symbol(symbol, meaning, gt, gt, ignore_qualification, out)
+        }
+        false
+    }
+
+    function compare_symbol_chains(this, a: ref[Array[ref[Symbol]?]], b2: ref[Array[ref[Symbol]?]]) returns int
+    {
+        let la a.get_length() as int
+        let lb b2.get_length() as int
+        if la <> lb
+            return la - lb
+        var i 0
+        while i < la
+        {
+            let c this.compare_symbols(a[i], b2[i])
+            if c <> 0
+                return c
+            set i: i + 1
+        }
+        0
+    }
+
+    function is_umd_export_symbol(symbol: ref[Symbol]) returns bool
+    {
+        if Symbol.declaration_count(symbol) = 0
+            return false
+        let d Symbol.declaration_at(symbol, 0)
+        if d = null
+            return false
+        AstNode.kind_of(d as ref[AstNode]) = KindNamespaceExportDeclaration
+    }
+
+    function alias_entry_is_a_candidate(this, e: ref[Symbol], ignore_qualification: bool, is_local_name_lookup: bool) returns bool
     {
         if (Symbol.flags_of(e) & SymbolFlagsAlias) = 0
             return false
@@ -45442,16 +45779,30 @@ define Checker
             return false
         if Checker.symbol_name_is_default(e)
             return false
-        if Checker.has_namespace_reexport_declaration(e)
-            return false
-        Checker.get_declaration_of_kind(e, KindExportSpecifier) = null
+        if Checker.is_umd_export_symbol(e)
+        {
+            if printer_enclosing_declaration <> null
+            {
+                if b.is_external_module_of()
+                    return false
+            }
+        }
+        if is_local_name_lookup
+        {
+            if Checker.has_namespace_reexport_declaration(e)
+                return false
+        }
+        if ignore_qualification = false
+        {
+            if Checker.get_declaration_of_kind(e, KindExportSpecifier) <> null
+                return false
+        }
+        true
     }
 
-    ; getCandidateListForSymbol — the entry itself when it is accessible, otherwise
-    ; the entry followed by whatever chain its EXPORTS yield.
-    function candidate_list_for_symbol(this, symbol: ref[Symbol], meaning: int, from_table: ref[Symbol], resolved: ref[Symbol], out: ref[Array[ref[Symbol]?]]) returns bool
+    function candidate_list_for_symbol(this, symbol: ref[Symbol], meaning: int, from_table: ref[Symbol], resolved: ref[Symbol], ignore_qualification: bool, out: ref[Array[ref[Symbol]?]]) returns bool
     {
-        if this.symbol_is_accessible(symbol, meaning, from_table, resolved)
+        if this.is_accessible(symbol, meaning, from_table, resolved, ignore_qualification)
         {
             out.add(from_table)
             return true
@@ -45459,30 +45810,19 @@ define Checker
         let table this.get_exports_of_symbol(resolved)
         if table = null
             return false
-        let host Page.get(out)
         let inner &Array[ref[Symbol]?]^host()
-        ; The nested lookup runs with the globals table already VISITED — see
-        ; get_accessible_symbol_chain's note.
-        if this.try_symbol_table_globals(symbol, meaning, true, inner) = false
+        if this.accessible_chain_from_table(symbol, meaning, table as ref[SymbolTable], false, true, false, inner) = false
+            return false
+        if (inner.get_length() as int) = 0
             return false
         if this.can_qualify_symbol(from_table, Checker.qualified_left_meaning(meaning)) = false
             return false
         out.add(from_table)
-        var i 0
-        while i < (inner.get_length() as int)
-        {
-            out.add(inner[i])
-            set i: i + 1
-        }
+        Checker.append_symbols(out, inner)
         true
     }
 
-    ; isAccessible. ★★ `likeSymbols` IS A FOUR-WAY OR AND EVERY ARM IS A DIFFERENT
-    ; IDENTITY QUESTION — the raw symbol against the table entry and against the
-    ; alias target, and the MERGED symbol against each. A single comparison would
-    ; miss a symbol that is only equal after merging, which is the whole reason
-    ; upstream asks four times.
-    function symbol_is_accessible(this, symbol: ref[Symbol], meaning: int, from_table: ref[Symbol], resolved: ref[Symbol]?) returns bool
+    function is_accessible(this, symbol: ref[Symbol], meaning: int, from_table: ref[Symbol], resolved: ref[Symbol]?, ignore_qualification: bool) returns bool
     {
         var like false
         if resolved <> null
@@ -45516,15 +45856,14 @@ define Checker
             return false
         if this.symbol_has_non_global_augmentation_external_module_declaration(from_table)
             return false
+        if ignore_qualification
+            return true
         let mt2 this.get_merged_symbol(from_table)
         if mt2 = null
             return false
         this.can_qualify_symbol(mt2 as ref[Symbol], meaning)
     }
 
-    ; canQualifySymbol. ★The second disjunct asks about the PARENT and is the
-    ; recursion that makes a dotted chain accessible one level at a time; it runs
-    ; with the globals table already visited, for the reason the fallback does.
     function can_qualify_symbol(this, from_table: ref[Symbol], meaning: int) returns bool
     {
         if this.needs_qualification(from_table, meaning) = false
@@ -45532,9 +45871,10 @@ define Checker
         let parent Symbol.parent_of(from_table)
         if parent = null
             return false
-        let host Page.get(this)
         let scratch &Array[ref[Symbol]?]^host()
-        this.try_symbol_table_globals(parent as ref[Symbol], Checker.qualified_left_meaning(meaning), true, scratch)
+        if this.get_accessible_symbol_chain(parent, Checker.qualified_left_meaning(meaning), scratch) = false
+            return false
+        (scratch.get_length() as int) > 0
     }
 
     ; getContainersOfSymbol, reduced. ★★★ THE REDUCTION IS THE NIL ENCLOSING
@@ -45547,15 +45887,453 @@ define Checker
     ; variable — neither of which a namespace or class container has. So the answer
     ; is the PARENT, and the candidate branch below it (a symbol with no parent but
     ; a module-level declaration) reports instead of guessing.
-    function containers_of_symbol(this, symbol: ref[Symbol], meaning: int) returns ref[Symbol]?
+    ; getContainersOfSymbol + getWithAlternativeContainers: the containers a chain
+    ; may climb through, best first. A parent symbol is the container when the
+    ; symbol has one (and is not a type parameter); otherwise the candidates come
+    ; from the declarations' module parents.
+    procedure containers_of_symbol(this, symbol: ref[Symbol], meaning: int, out: ref[Array[ref[Symbol]?]])
     {
         let container this.get_parent_of_symbol(symbol)
         if container <> null
         {
             if (Symbol.flags_of(symbol) & SymbolFlagsTypeParameter) = 0
-                return container
+            {
+                this.with_alternative_containers(container as ref[Symbol], symbol, meaning, out)
+                return
+            }
+        }
+        let candidates &Array[ref[Symbol]?]^host()
+        let n Symbol.declaration_count(symbol)
+        var i 0
+        while i < n
+        {
+            let dd Symbol.declaration_at(symbol, i)
+            set i: i + 1
+            if dd <> null
+            {
+                let d dd as ref[AstNode]
+                var handled false
+                let parent AstNode.parent_node_of(d)
+                if parent <> null
+                {
+                    let p parent as ref[AstNode]
+                    if Checker.is_ambient_module_or_null(d) = false
+                    {
+                        if this.is_non_global_augmentation_external_module_symbol(p)
+                        {
+                            let sym this.get_symbol_of_declaration(p)
+                            if sym <> null
+                            {
+                                if Checker.symbol_list_contains(candidates, sym as ref[Symbol]) = false
+                                    candidates.add(sym)
+                            }
+                            set handled: true
+                        }
+                        if handled = false
+                        {
+                            if AstNode.kind_of(p) = KindModuleBlock
+                            {
+                                let pp AstNode.parent_node_of(p)
+                                if pp <> null
+                                {
+                                    let psym this.get_symbol_of_declaration(pp)
+                                    let resolved this.resolve_external_module_symbol(psym, false)
+                                    if resolved <> null
+                                    {
+                                        if (resolved as ref[Symbol]) = symbol
+                                        {
+                                            if psym <> null
+                                            {
+                                                if Checker.symbol_list_contains(candidates, psym as ref[Symbol]) = false
+                                                    candidates.add(psym)
+                                            }
+                                            set handled: true
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if handled = false
+                    {
+                        if AstNode.kind_of(d) = KindClassExpression
+                        {
+                            if AstNode.kind_of(p) = KindBinaryExpression
+                            {
+                                ; a class expression assigned to `module.exports` /
+                                ; `exports.x` (JS): the container is the file or the
+                                ; resolved left operand — not ported
+                                this.record_unported("containers-of-symbol-class-expression-assignment", 0)
+                                return
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let cn candidates.get_length() as int
+        if cn = 0
+            return
+        let bests &Array[ref[Symbol]?]^host()
+        let alternatives &Array[ref[Symbol]?]^host()
+        var ci 0
+        while ci < cn
+        {
+            let co candidates[ci]
+            set ci: ci + 1
+            if co <> null
+            {
+                let c co as ref[Symbol]
+                if this.get_alias_for_symbol_in_container(c, symbol) <> null
+                {
+                    let alts &Array[ref[Symbol]?]^host()
+                    this.with_alternative_containers(c, symbol, meaning, alts)
+                    let an alts.get_length() as int
+                    if an > 0
+                    {
+                        bests.add(alts[0])
+                        var ai 1
+                        while ai < an
+                        {
+                            alternatives.add(alts[ai])
+                            set ai: ai + 1
+                        }
+                    }
+                }
+            }
+        }
+        Checker.append_symbols(out, bests)
+        Checker.append_symbols(out, alternatives)
+    }
+
+    function symbol_list_contains(list: ref[Array[ref[Symbol]?]], s: ref[Symbol]) returns bool
+    {
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            let e list[i]
+            if e <> null
+            {
+                if (e as ref[Symbol]) = s
+                    return true
+            }
+            set i: i + 1
+        }
+        false
+    }
+
+    procedure with_alternative_containers(this, container: ref[Symbol], symbol: ref[Symbol], meaning: int, out: ref[Array[ref[Symbol]?]])
+    {
+        let additional &Array[ref[Symbol]?]^host()
+        let cn Symbol.declaration_count(container)
+        var i 0
+        while i < cn
+        {
+            let dd Symbol.declaration_at(container, i)
+            if dd <> null
+            {
+                let fs this.get_file_symbol_if_file_symbol_export_equals_container(dd as ref[AstNode], container)
+                if fs <> null
+                    additional.add(fs)
+            }
+            set i: i + 1
+        }
+        let reexport &Array[ref[Symbol]?]^host()
+        if printer_enclosing_declaration <> null
+            this.get_alternative_containing_modules(symbol, reexport)
+        let object_literal this.get_variable_declaration_of_object_literal(container, meaning)
+        let left_meaning Checker.qualified_left_meaning(meaning)
+        var container_first false
+        if printer_enclosing_declaration <> null
+        {
+            if (Symbol.flags_of(container) & left_meaning) <> 0
+            {
+                let scratch &Array[ref[Symbol]?]^host()
+                if this.get_accessible_symbol_chain(container, SymbolFlagsNamespace, scratch)
+                {
+                    if (scratch.get_length() as int) > 0
+                        set container_first: true
+                }
+            }
+        }
+        if container_first
+        {
+            out.add(container)
+            Checker.append_symbols(out, additional)
+            Checker.append_symbols(out, reexport)
+            if object_literal <> null
+                out.add(object_literal)
+            return
+        }
+        ; a value-space ask on a TYPE container (an interface) is answered by the
+        ; variables in scope declared WITH that type — `Op: OpTypes` for the
+        ; property `OpTypes.equal`; the first table with a match ends the walk
+        let matches &Array[ref[Symbol]?]^host()
+        var probe_variables false
+        if meaning = SymbolFlagsValue
+        {
+            if (Symbol.flags_of(container) & left_meaning) = 0
+            {
+                if (Symbol.flags_of(container) & SymbolFlagsType) <> 0
+                {
+                    let declared this.get_declared_type_of_symbol(container)
+                    if declared <> null
+                    {
+                        if ((declared as ref[Type]).flags & TypeFlagsObject) <> 0
+                            set probe_variables: true
+                    }
+                }
+            }
+        }
+        if probe_variables
+        {
+            let declared_opt this.get_declared_type_of_symbol(container)
+            if declared_opt <> null
+            {
+                let declared declared_opt as ref[Type]
+                let tables &Array[ref[SymbolTable]?]^host()
+                let kinds &Array[int]^host()
+                this.collect_scope_tables(tables, kinds)
+                let tn tables.get_length() as int
+                var ti 0
+                var stopped false
+                while ti < tn
+                {
+                    if stopped = false
+                    {
+                        let t tables[ti]
+                        if t <> null
+                        {
+                            let en SymbolTable.length(t)
+                            var ei 0
+                            while ei < en
+                            {
+                                let es SymbolTable.entry_symbol_at(t, ei)
+                                if es <> null
+                                {
+                                    let s es as ref[Symbol]
+                                    if (Symbol.flags_of(s) & left_meaning) <> 0
+                                    {
+                                        let ts this.get_type_of_symbol(s)
+                                        if ts <> null
+                                        {
+                                            if (ts as ref[Type]) = declared
+                                            {
+                                                matches.add(s)
+                                                set stopped: true
+                                            }
+                                        }
+                                    }
+                                }
+                                set ei: ei + 1
+                            }
+                        }
+                    }
+                    set ti: ti + 1
+                }
+                this.sort_symbols(matches, 0, matches.get_length() as int)
+            }
+        }
+        Checker.append_symbols(out, matches)
+        Checker.append_symbols(out, additional)
+        out.add(container)
+        if object_literal <> null
+            out.add(object_literal)
+        Checker.append_symbols(out, reexport)
+    }
+
+    function get_external_module_container(this, declaration: ref[AstNode]) returns ref[Symbol]?
+    {
+        var n: ref[AstNode]? declaration
+        while n <> null
+        {
+            let node n as ref[AstNode]
+            var external false
+            if AstNode.kind_of(node) = KindSourceFile
+            {
+                if b.is_external_or_common_js_module()
+                    set external: true
+            }
+            if Checker.is_ambient_module_or_null(node)
+                set external: true
+            if external
+                return this.get_symbol_of_declaration(node)
+            set n: AstNode.parent_node_of(node)
         }
         null
+    }
+
+    function get_file_symbol_if_file_symbol_export_equals_container(this, d: ref[AstNode], container: ref[Symbol]) returns ref[Symbol]?
+    {
+        let file_symbol this.get_external_module_container(d)
+        if file_symbol = null
+            return null
+        let exports Symbol.exports_of(file_symbol as ref[Symbol])
+        if exports = null
+            return null
+        let exported SymbolTable.get(exports, "export=")
+        if exported = null
+            return null
+        if this.get_symbol_if_same_reference(exported, container) = null
+            return null
+        file_symbol
+    }
+
+    ; getAlternativeContainingModules: the modules the enclosing file imports
+    ; that re-export the symbol. The reference reads the parser's import list;
+    ; this port scans the file's top-level import and export declarations (a
+    ; nested `import()` or an import-equals is not scanned — reported).
+    procedure get_alternative_containing_modules(this, symbol: ref[Symbol], out: ref[Array[ref[Symbol]?]])
+    {
+        var n printer_enclosing_declaration
+        var file: ref[AstNode]? null
+        while n <> null
+        {
+            let node n as ref[AstNode]
+            if AstNode.kind_of(node) = KindSourceFile
+            {
+                set file: node
+                set n: null
+            }
+            else
+                set n: AstNode.parent_node_of(node)
+        }
+        if file = null
+            return
+        let stmts AstNode.statements_of(file)
+        if stmts = null
+            return
+        let list stmts as ref[Array[ref[AstNode]?]]
+        let sn list.get_length() as int
+        var i 0
+        while i < sn
+        {
+            let so list[i]
+            set i: i + 1
+            if so <> null
+            {
+                let stmt so as ref[AstNode]
+                let k AstNode.kind_of(stmt)
+                if k = KindImportEqualsDeclaration
+                {
+                    this.record_unported("alternative-containing-modules-import-equals", 0)
+                    return
+                }
+                var has_specifier false
+                if k = KindImportDeclaration
+                    set has_specifier: true
+                if k = KindExportDeclaration
+                    set has_specifier: true
+                if has_specifier
+                {
+                    let spec AstNode.module_specifier_of(stmt)
+                    if spec <> null
+                    {
+                        let resolved this.resolve_external_module_name(printer_enclosing_declaration, spec, true)
+                        if resolved <> null
+                        {
+                            if this.get_alias_for_symbol_in_container(resolved as ref[Symbol], symbol) <> null
+                                out.add(resolved)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    function get_variable_declaration_of_object_literal(this, symbol: ref[Symbol], meaning: int) returns ref[Symbol]?
+    {
+        if (meaning & SymbolFlagsValue) = 0
+            return null
+        if Symbol.declaration_count(symbol) = 0
+            return null
+        let fd Symbol.declaration_at(symbol, 0)
+        if fd = null
+            return null
+        let first fd as ref[AstNode]
+        let parent AstNode.parent_node_of(first)
+        if parent = null
+            return null
+        let p parent as ref[AstNode]
+        if AstNode.kind_of(p) <> KindVariableDeclaration
+            return null
+        var matches false
+        if AstNode.kind_of(first) = KindObjectLiteralExpression
+        {
+            let ini AstNode.initializer_of(p)
+            if ini <> null
+            {
+                if (ini as ref[AstNode]) = first
+                    set matches: true
+            }
+        }
+        if AstNode.kind_of(first) = KindTypeLiteral
+        {
+            let ty AstNode.type_of(p)
+            if ty <> null
+            {
+                if (ty as ref[AstNode]) = first
+                    set matches: true
+            }
+        }
+        if matches
+            return this.get_symbol_of_declaration(p)
+        null
+    }
+
+    function get_alias_for_symbol_in_container(this, container: ref[Symbol], symbol: ref[Symbol]) returns ref[Symbol]?
+    {
+        let parent this.get_parent_of_symbol(symbol)
+        if parent <> null
+        {
+            if (parent as ref[Symbol]) = container
+                return symbol
+        }
+        let cexports Symbol.exports_of(container)
+        if cexports <> null
+        {
+            let ee SymbolTable.get(cexports, "export=")
+            if ee <> null
+            {
+                if this.get_symbol_if_same_reference(ee, symbol) <> null
+                    return container
+            }
+        }
+        let exports this.get_exports_of_symbol(container)
+        if exports = null
+            return null
+        let quick SymbolTable.get(exports, Symbol.name_of(symbol))
+        if quick <> null
+        {
+            if this.get_symbol_if_same_reference(quick, symbol) <> null
+                return quick
+        }
+        var best: ref[Symbol]? null
+        let n SymbolTable.length(exports)
+        var i 0
+        while i < n
+        {
+            let eo SymbolTable.entry_symbol_at(exports, i)
+            if eo <> null
+            {
+                let e eo as ref[Symbol]
+                if this.get_symbol_if_same_reference(e, symbol) <> null
+                {
+                    var take false
+                    if best = null
+                        set take: true
+                    else
+                    {
+                        if this.compare_symbols(e, best) < 0
+                            set take: true
+                    }
+                    if take
+                        set best: e
+                }
+            }
+            set i: i + 1
+        }
+        best
     }
 
     ; `symbolFromSymbolTable.Name != InternalSymbolNameExportEquals` and the same
@@ -45623,9 +46401,11 @@ define Checker
     ; shape where the loop would otherwise name a symbol as its own container.
     function get_symbol_chain(this, symbol: ref[Symbol], meaning: int, end_of_chain: bool, out: ref[Array[ref[Symbol]?]]) returns bool
     {
-        let host Page.get(out)
+        let mark this.unported_mark()
         let accessible &Array[ref[Symbol]?]^host()
         this.get_accessible_symbol_chain(symbol, meaning, accessible)
+        if this.unported_mark() <> mark
+            return false
         var qualifier_meaning meaning
         if (accessible.get_length() as int) > 1
             set qualifier_meaning: Checker.qualified_left_meaning(meaning)
@@ -45639,6 +46419,7 @@ define Checker
                     set go_up: true
             }
         }
+        var chained false
         if go_up
         {
             var root symbol
@@ -45648,50 +46429,93 @@ define Checker
                 if head <> null
                     set root: head as ref[Symbol]
             }
-            let parent this.containers_of_symbol(root, meaning)
-            if parent <> null
+            let parents &Array[ref[Symbol]?]^host()
+            this.containers_of_symbol(root, meaning, parents)
+            if this.unported_mark() <> mark
+                return false
+            let pn parents.get_length() as int
+            ; the reference orders parents by module specifier first (sortByBestName)
+            ; and by compareSymbols among equals; the specifier is a module-resolution
+            ; product this port does not compute, so two or more parents with an
+            ; external module declaration are reported rather than ordered
+            var pi 0
+            var module_parents 0
+            while pi < pn
             {
-                let p parent as ref[Symbol]
-                let parent_chain &Array[ref[Symbol]?]^host()
-                this.get_symbol_chain(p, Checker.qualified_left_meaning(meaning), false, parent_chain)
-                if (parent_chain.get_length() as int) > 0
+                let po parents[pi]
+                if po <> null
                 {
-                    var took false
-                    let exports this.get_exports_of_symbol(p)
-                    if exports <> null
+                    if this.symbol_has_non_global_augmentation_external_module_declaration(po as ref[Symbol])
+                        set module_parents: module_parents + 1
+                }
+                set pi: pi + 1
+            }
+            if module_parents > 1
+            {
+                this.record_unported("symbol-chain-module-specifier-order", module_parents)
+                return false
+            }
+            this.sort_symbols(parents, 0, parents.get_length() as int)
+            set pi: 0
+            var going true
+            if pn = 0
+                set going: false
+            while going
+            {
+                let po parents[pi]
+                set pi: pi + 1
+                if pi >= pn
+                    set going: false
+                if po <> null
+                {
+                    let parent po as ref[Symbol]
+                    let parent_chain &Array[ref[Symbol]?]^host()
+                    this.get_symbol_chain(parent, Checker.qualified_left_meaning(meaning), false, parent_chain)
+                    if this.unported_mark() <> mark
+                        return false
+                    if (parent_chain.get_length() as int) > 0
                     {
-                        let exported SymbolTable.get(exports, "export=")
-                        if exported <> null
+                        var took false
+                        let pexports Symbol.exports_of(parent)
+                        if pexports <> null
                         {
-                            if this.get_symbol_if_same_reference(exported as ref[Symbol], symbol) <> null
+                            let exported SymbolTable.get(pexports, "export=")
+                            if exported <> null
                             {
-                                ; The parent's chain root IS this symbol — a module
-                                ; `export =`, which looks like its own container.
-                                Checker.append_symbols(out, parent_chain)
-                                set took: true
+                                if this.get_symbol_if_same_reference(exported, symbol) <> null
+                                {
+                                    Checker.append_symbols(out, parent_chain)
+                                    set took: true
+                                }
                             }
                         }
+                        if took = false
+                        {
+                            Checker.append_symbols(out, parent_chain)
+                            if (accessible.get_length() as int) > 0
+                                Checker.append_symbols(out, accessible)
+                            else
+                            {
+                                let fallback this.get_alias_for_symbol_in_container(parent, symbol)
+                                if fallback <> null
+                                    out.add(fallback)
+                                else
+                                    out.add(symbol)
+                            }
+                        }
+                        set chained: true
+                        set going: false
                     }
-                    if took = false
-                    {
-                        Checker.append_symbols(out, parent_chain)
-                        if (accessible.get_length() as int) > 0
-                            Checker.append_symbols(out, accessible)
-                        else
-                            out.add(symbol)
-                    }
-                    return true
                 }
             }
         }
+        if chained
+            return true
         if (accessible.get_length() as int) > 0
         {
             Checker.append_symbols(out, accessible)
             return true
         }
-        ; The tail: output the symbol unless it is a PARENT that upstream declines
-        ; to write — an anonymous type or object literal, or an external module
-        ; (`x` is preferred over `"foo/bar".x`).
         var write end_of_chain
         if (Symbol.flags_of(symbol) & (SymbolFlagsTypeLiteral | SymbolFlagsObjectLiteral)) = 0
             set write: true
@@ -45701,8 +46525,6 @@ define Checker
         {
             if this.symbol_has_non_global_augmentation_external_module_declaration(symbol)
             {
-                ; The caller asked for a qualifier and is getting none — see
-                ; printer_chain_dropped_container.
                 set printer_chain_dropped_container: true
                 return false
             }
@@ -45723,14 +46545,20 @@ define Checker
 
     ; lookupSymbolChainWorker. ★A TYPE PARAMETER is never qualified — it has no
     ; container that could name it — and that test is upstream's first conjunct.
-    function lookup_symbol_chain(this, symbol: ref[Symbol], meaning: int, out: ref[Array[ref[Symbol]?]])
+    ; lookupSymbolChainWorker: a type parameter is its own chain; under an
+    ; enclosing declaration (or a fully-qualified ask) the chain is computed;
+    ; otherwise the symbol alone.
+    procedure lookup_symbol_chain(this, symbol: ref[Symbol], meaning: int, out: ref[Array[ref[Symbol]?]])
     {
         if (Symbol.flags_of(symbol) & SymbolFlagsTypeParameter) <> 0
         {
             out.add(symbol)
             return
         }
-        if printer_fully_qualified = false
+        var qualify printer_fully_qualified
+        if printer_enclosing_declaration <> null
+            set qualify: true
+        if qualify = false
         {
             out.add(symbol)
             return
@@ -45738,6 +46566,37 @@ define Checker
         this.get_symbol_chain(symbol, meaning, true, out)
         if (out.get_length() as int) = 0
             out.add(symbol)
+    }
+
+    ; symbolToExpression for a unique-symbol property name: the chain, dotted.
+    ; createExpressionFromSymbolChain writes a property access where the name is
+    ; identifier text and an element access otherwise; only the former is written.
+    function write_symbol_expression_chain(this, symbol: ref[Symbol], out: ref[StringBuilder]) returns bool
+    {
+        let chain &Array[ref[Symbol]?]^host()
+        this.lookup_symbol_chain(symbol, SymbolFlagsValue, chain)
+        let n chain.get_length() as int
+        var i 0
+        while i < n
+        {
+            let e chain[i]
+            if e = null
+                return false
+            let es e as ref[Symbol]
+            if i > 0
+            {
+                if Checker.is_identifier_text(Symbol.name_of(es)) = false
+                {
+                    this.record_unported("property-name-unique-symbol-element-access", i)
+                    return false
+                }
+                out.append("." as char)
+            }
+            if this.write_symbol_name(es, out) = false
+                return false
+            set i: i + 1
+        }
+        true
     }
 
     function symbol_to_type_node(this, symbol: ref[Symbol], mask: int, out: ref[StringBuilder]) returns bool
