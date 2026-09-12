@@ -572,6 +572,7 @@ report "jsdoc yardstick"   $matched_jsdoc  $unported_jsdoc  $accepted_jsdoc  $fa
 report "binder yardstick"  $matched_symbols $unported_symbols $accepted_symbols $failed_symbols $refcrash_symbols $slow_symbols
 report "flow yardstick"    $matched_flow   $unported_flow   $accepted_flow   $failed_flow   $refcrash_flow $slow_flow
 report "checker yardstick" $matched_types  $unported_types  $accepted_types  $failed_types  $refcrash_types $slow_types
+report "emit yardstick"    $matched_emit   $unported_emit   $accepted_emit   $failed_emit   $refcrash_emit $slow_emit
 
 echo
 echo "  of those, $symbol_bearing units actually CARRY a symbol, and $bind_diag_units carry a BIND"
@@ -670,9 +671,9 @@ echo "  silence is the failure mode this suite exists to prevent."
 # that is not measured — the same sentence this suite keeps writing about the
 # `unported` column, one level up. ★Slice 92 added the FIFTH and these are the
 # three lines it had to touch; the control that proves it is s01.
-total_stale=$(( stale_tokens + stale_ast + stale_jsdoc + stale_symbols + stale_flow + stale_types ))
-total_failed=$(( failed_tokens + failed_ast + failed_jsdoc + failed_symbols + failed_flow + failed_types ))
-total_timeout=$(( timeout_tokens + timeout_ast + timeout_jsdoc + timeout_symbols + timeout_flow + timeout_types ))
+total_stale=$(( stale_tokens + stale_ast + stale_jsdoc + stale_symbols + stale_flow + stale_types + stale_emit ))
+total_failed=$(( failed_tokens + failed_ast + failed_jsdoc + failed_symbols + failed_flow + failed_types + failed_emit ))
+total_timeout=$(( timeout_tokens + timeout_ast + timeout_jsdoc + timeout_symbols + timeout_flow + timeout_types + timeout_emit ))
 
 # A timed-out dump is counted in UNEXPLAINED like any other failure — it IS one —
 # but it is also named separately, because "our dumper did not finish" and "our
@@ -687,7 +688,7 @@ if [ $total_timeout -ne 0 ]; then
   echo "  $OUT/failures.txt for the list."
 fi
 
-total_slow=$(( slow_tokens + slow_ast + slow_jsdoc + slow_symbols + slow_flow + slow_types ))
+total_slow=$(( slow_tokens + slow_ast + slow_jsdoc + slow_symbols + slow_flow + slow_types + slow_emit ))
 
 # ★ NAMED ON EVERY RUN, like the reference-crash list and for its reason: a unit
 # that is excused has to be readable, or the excuse is a suppression. Each line
@@ -709,7 +710,7 @@ if [ "${staleslow:-0}" -ne 0 ]; then
   printf '    %s\n' "${staleslows[@]}"
 fi
 
-total_refcrash=$(( refcrash_tokens + refcrash_ast + refcrash_jsdoc + refcrash_symbols + refcrash_flow + refcrash_types ))
+total_refcrash=$(( refcrash_tokens + refcrash_ast + refcrash_jsdoc + refcrash_symbols + refcrash_flow + refcrash_types + refcrash_emit ))
 
 # ★ NAMED, ALWAYS, AND NEVER SUMMARISED AWAY. A unit the reference cannot answer
 # is a hole in the measurement, so the list IS the point: it has to be possible to

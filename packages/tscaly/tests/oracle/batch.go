@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// batch — ALL SEVEN ORACLES IN ONE PROCESS, over a whole corpus, in one stream.
+// batch — ALL EIGHT ORACLES IN ONE PROCESS, over a whole corpus, in one stream.
 //
 // ★★★ WHY IT EXISTS (2026-09-02). The runner used to spawn the split oracle once per
 // case and six dump oracles once per unit, and write every answer to its own file:
 // a stage-2 run was ~130 000 process starts and 443 000 files, and the box's
 // endpoint protection scanned every one of them (packages/tscaly/CLAUDE.md §0.5).
 // This program reads `<case file>\t<case name>` lines on stdin, splits each case
-// with the reference's own splitter, dumps every unit's six artifacts in-process
+// with the reference's own splitter, dumps every unit's seven artifacts in-process
 // with a worker pool, and writes ONE framed stream to stdout. No file is created.
 //
 // ★★★ WHAT IS MEASURED IS UNCHANGED, and that is checked rather than argued: every
@@ -43,7 +43,7 @@
 //	==== TSCALY-CASE <name>\t<case file>
 //	==== TSCALY-SPLIT <rc> <errbytes>\n<err>\n            rc 0 ok, 1 unreadable, 3 rejected
 //	==== TSCALY-UNIT <idx> <bytes>\t<unit name>\t<path>\n<content>\n
-//	==== TSCALY-REF <artifact> <rc> <outbytes> <errbytes>\n<out>\n<err>\n   × tokens ast jsdoc symbols flow types
+//	==== TSCALY-REF <artifact> <rc> <outbytes> <errbytes>\n<out>\n<err>\n   × tokens ast jsdoc symbols flow types emit
 //
 // Usage:  batch <out dir>  < cases.tsv       (out dir only names the units' paths)
 package main
@@ -64,6 +64,7 @@ import (
 	"github.com/microsoft/typescript-go/internal/binder"
 	"github.com/microsoft/typescript-go/internal/bundled"
 	"github.com/microsoft/typescript-go/internal/checker"
+	"github.com/microsoft/typescript-go/internal/compiler"
 	"github.com/microsoft/typescript-go/internal/core"
 	"github.com/microsoft/typescript-go/internal/module"
 	"github.com/microsoft/typescript-go/internal/packagejson"
@@ -74,6 +75,7 @@ import (
 	"github.com/microsoft/typescript-go/internal/tsoptions"
 	"github.com/microsoft/typescript-go/internal/tspath"
 	"github.com/microsoft/typescript-go/internal/vfs/osvfs"
+	"github.com/microsoft/typescript-go/internal/vfs/vfstest"
 )
 
 // ───────────────────────── tokens.go ─────────────────────────
@@ -693,6 +695,46 @@ func dumpTypes(out *bytes.Buffer, fileName string, cwd string, text string) {
 	}
 }
 
+// ───────────────────────── emit.go ─────────────────────────
+//
+// THE EMIT YARDSTICK (slice 229): the JavaScript the reference's OWN emitter writes
+// for the unit — `compiler.Program.Emit` over a one-file program, the unit as its
+// only root, the bundled lib, the DEFAULT compiler options (target LatestStandard,
+// module per target), JS only. This is the checker yardstick's shape one stage
+// further: per UNIT and under the default options, so it measures the printer,
+// the script transformers and the emit resolver, and none of the per-case
+// `// @target`/`// @module` directives — those belong to the driver chapter, whose
+// yardstick is the reference's own `.js` baseline per CASE. The body is the text
+// of the `.js`/`.jsx`/`.mjs`/`.cjs` output exactly as handed to WriteFile; a unit
+// the reference does not emit (a `.d.ts`, a `.json` under these options) answers
+// an empty body, which is a MATCH only when the port emits nothing either.
+func dumpEmit(out *bytes.Buffer, fileName string, cwd string, text string) {
+	fn := tspath.GetNormalizedAbsolutePath(fileName, cwd)
+	fs := bundled.WrapFS(vfstest.FromMap(map[string]string{fn: text}, true))
+	host := compiler.NewCompilerHost(cwd, fs, bundled.LibPath(), nil, nil)
+	config := &tsoptions.ParsedCommandLine{
+		ParsedConfig: &core.ParsedOptions{
+			CompilerOptions: &core.CompilerOptions{},
+			FileNames:       []string{fn},
+		},
+	}
+	program := compiler.NewProgram(compiler.ProgramOptions{Config: config, Host: host, SingleThreaded: core.TSTrue})
+	sf := program.GetSourceFile(fn)
+	if sf == nil {
+		return
+	}
+	program.Emit(context.Background(), compiler.EmitOptions{
+		TargetSourceFile: sf,
+		EmitOnly:         compiler.EmitOnlyJs,
+		WriteFile: func(name string, text string, data *compiler.WriteFileData) error {
+			if tspath.HasJSFileExtension(name) {
+				out.WriteString(text)
+			}
+			return nil
+		},
+	})
+}
+
 // ───────────────────────── the batch ─────────────────────────
 
 //go:linkname astNextNodeId github.com/microsoft/typescript-go/internal/ast.nextNodeId
@@ -719,6 +761,7 @@ var artifacts = []artifact{
 	{"symbols", dumpSymbols},
 	{"flow", dumpFlow},
 	{"types", dumpTypes},
+	{"emit", dumpEmit},
 }
 
 // capture runs one dump under recover: rc 0 with its output, or rc 3 with the

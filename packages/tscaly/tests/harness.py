@@ -50,12 +50,12 @@ SUFFIXES = (".ts", ".mts", ".cts", ".tsx", ".jsx", ".js", ".cjs", ".mjs", ".json
 
 # (artifact, `cut -d' ' -f1-<keep>` width; 0 = no cut)
 ARTIFACTS = (("tokens", 4), ("ast", 5), ("jsdoc", 5), ("symbols", 0), ("flow", 0),
-             ("types", 0))
+             ("types", 0), ("emit", 0))
 ART_NAMES = [a for a, _ in ARTIFACTS]
 
 DUMP_SEPS = [b"==== TSCALY-DUMP ast\n", b"==== TSCALY-DUMP jsdoc\n",
              b"==== TSCALY-DUMP symbols\n", b"==== TSCALY-DUMP flow\n",
-             b"==== TSCALY-DUMP types\n"]
+             b"==== TSCALY-DUMP types\n", b"==== TSCALY-DUMP emit\n"]
 SEP_DIAGS = b"==== TSCALY-SECTION diags\n"
 SEP_DUMP = b"==== TSCALY-SECTION dump\n"
 UNIT_HEAD = b"==== TSCALY-UNIT "
@@ -196,7 +196,7 @@ def parse_dump_stream(blob: bytes):
 
 
 def split_dump(blob: bytes):
-    """tscaly_dump's five sections → {art: bytes}, or None when malformed."""
+    """tscaly_dump's six sections → {art: bytes}, or None when malformed."""
     parts, rest = [], blob
     for sp in DUMP_SEPS:
         if sp not in rest:

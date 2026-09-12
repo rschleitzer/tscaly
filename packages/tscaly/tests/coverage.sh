@@ -1,7 +1,8 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# coverage.sh — HOW MUCH OF THE REFERENCE CHECKER IS PORTED, as a percentage.
+# coverage.sh — HOW MUCH OF THE REFERENCE CHECKER IS PORTED, as a percentage — and, since
+# slice 229, the same figure for the EMITTER chapter (printer, transformers, emit driver).
 #
 # ★★★ IT ANSWERS A DIFFERENT QUESTION FROM frontier.sh. That one ranks what is LEFT by
 # units it would complete; this one measures what is DONE against the reference. Neither
@@ -84,4 +85,55 @@ for f, n, l in rows:
 for f, (d, t) in sorted(per.items(), key=lambda kv: -(kv[1][1] - kv[1][0])):
     if t < 300: continue
     print("  %-22s %3.0f%% ported, %5d reference lines still to go" % (f, 100.*d/t, t - d))
+
+# ── THE EMITTER CHAPTER (slice 229) — the same measure over the next reference packages ──
+#
+# §0.7 names what follows the checker: the emitter/printer, the transformers, module
+# resolution and the driver. This block counts them the way the checker was counted:
+# reference functions with a port, weighted by reference lines, per package. The port
+# files are the chapter's planned homes; a file that does not exist yet reads as 0 %.
+print()
+print("THE EMITTER CHAPTER — reference functions with a port, per package:")
+ROOT = os.path.dirname(os.path.dirname(TS))
+chapters = (('internal/printer',        ['printer.scaly'],       False),
+            ('internal/transformers',   ['transformers.scaly'],  True),
+            ('internal/compiler',       ['emitter.scaly'],       False),
+            ('internal/outputpaths',    ['emitter.scaly'],       False),
+            ('internal/sourcemap',      ['emitter.scaly'],       False))
+def scan_dir(d, recursive):
+    out = []
+    pat = os.path.join(ROOT, d, '**', '*.go') if recursive else os.path.join(ROOT, d, '*.go')
+    for p in sorted(glob.glob(pat, recursive=recursive)):
+        b = os.path.relpath(p, os.path.join(ROOT, d))
+        if p.endswith('_test.go'): continue
+        if d == 'internal/compiler' and b != 'emitter.go': continue
+        lines = io.open(p, encoding='utf-8', errors='replace').read().split('\n')
+        cur, start = None, 0
+        for i, l in enumerate(lines):
+            m = fn.match(l)
+            if m:
+                if cur: out.append((b, cur, i - start))
+                cur, start = m.group(1), i
+            elif l == '}' and cur:
+                out.append((b, cur, i - start + 1)); cur = None
+        if cur: out.append((b, cur, len(lines) - start))
+    return out
+grand = [0, 0, 0, 0]
+for d, files, rec in chapters:
+    text = ''
+    for f in files:
+        q = os.path.join('0.1.0/tscaly', f)
+        if os.path.isfile(q): text += io.open(q, encoding='utf-8').read()
+    have = set(re.findall(r'^\s*(?:function|procedure)\s+([a-z_][a-z0-9_]*)', text, re.M))
+    rows = scan_dir(d, rec)
+    if not rows: continue
+    tf, tl = len(rows), sum(l for _, _, l in rows)
+    df = sum(1 for f, n, l in rows if snake(n) in have)
+    dl = sum(l for f, n, l in rows if snake(n) in have)
+    for k, v in enumerate((df, tf, dl, tl)): grand[k] += v
+    print("  %-24s %4d/%4d functions = %3.0f%%   %6d/%6d ref lines = %3.0f%%" % (
+        d, df, tf, 100.*df/tf, dl, tl, 100.*dl/tl))
+if grand[1]:
+    print("  %-24s %4d/%4d functions = %3.0f%%   %6d/%6d ref lines = %3.0f%%" % (
+        'the chapter, whole', grand[0], grand[1], 100.*grand[0]/grand[1], grand[2], grand[3], 100.*grand[2]/grand[3]))
 PY
