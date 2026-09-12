@@ -7299,6 +7299,10 @@ define Checker
     ; serializationLevel — the TypeToString invocations in progress; see
     ; type_to_string_serialized and add_diagnostic_direct (slice 213).
     serialization_level: int
+    ; approximateLength's stand-in: the characters of the constituent pieces a print has
+    ; produced but not yet appended to their parent builder (write_constituent_list),
+    ; so the truncation budget sees the WHOLE print and not the current builder alone.
+    printer_emitted: int
     relation_capture: ref[Array[int]]
 
     ; `saveErrorState.errorChain`'s DEPTH, taken at structuredTypeRelatedTo and
@@ -7819,6 +7823,7 @@ define Checker
         set c.rel_error_chain: null
         set c.relation_capture_on: false
         set c.serialization_level: 0
+        set c.printer_emitted: 0
         let rcap &Array[int]^host()
         set c.relation_capture: rcap
         set c.printer_type_mapper: null
@@ -29005,7 +29010,34 @@ define Checker
     ; rather than turned into a sentinel, and the memo is left unwritten: a
     ; half-computed answer that got cached would make the SECOND ask disagree with
     ; the first.
+    ; getResolvedBaseConstraint's TOP-LEVEL entry — `getResolvedBaseConstraint(t, nil)`:
+    ; getBaseConstraintOfType and hasNonCircularBaseConstraint hand the worker an EMPTY
+    ; recursion-identity stack, even when they are reached from INSIDE another
+    ; base-constraint computation (a relation step under computeBaseConstraint asks
+    ; getBaseConstraintOfType again). Upstream threads the stack as a parameter; this port
+    ; keeps it on the checker, so an inner top-level ask saw the outer computation's
+    ; entries, met the 10-deep exploration limit early and stopped exploring where the
+    ; reference went on to depth 15 (slice 214; `excessivelyDeepConditionalTypes`, two
+    ; TS2321 the reference does not report). The outer stack is set aside for the inner
+    ; ask and restored after it; only get_next_base_constraint (computeBaseConstraint's
+    ; own recursion) stays on the inherited stack.
     function get_resolved_base_constraint(this, t: ref[Type]) returns ref[Type]?
+    {
+        if base_constraint_depth = 0
+            return this.get_resolved_base_constraint_in_stack(t)
+        let saved_stack base_constraint_stack
+        let saved_depth base_constraint_depth
+        let page Page.get(this)
+        let fresh &Array[ref[RecursionId]?]^page()
+        set base_constraint_stack: fresh
+        set base_constraint_depth: 0
+        let r this.get_resolved_base_constraint_in_stack(t)
+        set base_constraint_stack: saved_stack
+        set base_constraint_depth: saved_depth
+        r
+    }
+
+    function get_resolved_base_constraint_in_stack(this, t: ref[Type]) returns ref[Type]?
     {
         ; `constrained := t.AsConstrainedType(); if constrained == nil { return t }`
         if Checker.is_constrained_type(t) = false
@@ -29457,7 +29489,7 @@ define Checker
     {
         if t = null
             return null
-        let constraint this.get_resolved_base_constraint(t as ref[Type])
+        let constraint this.get_resolved_base_constraint_in_stack(t as ref[Type])
         if constraint = null
             return null
         let c constraint as ref[Type]
@@ -29679,10 +29711,18 @@ define Checker
             if row <> null
             {
                 let r row as ref[RecursionId]
+                ; ★ ALL THREE slots, slice 214: upstream's RecursionId is ONE `any` value
+                ; and two node identities with different nodes are unequal. Comparing
+                ; the symbol and type slots alone made every node identity equal to every
+                ; other (both nulls), so past ten levels the exploration stopped on a
+                ; false "already on the stack" where the reference went on to depth 32
+                ; (`excessivelyDeepConditionalTypes`).
                 var same true
                 if r.target_symbol <> id.target_symbol
                     set same: false
                 if r.target_type <> id.target_type
+                    set same: false
+                if r.target_node <> id.target_node
                     set same: false
                 if same
                     return true
@@ -38352,7 +38392,7 @@ define Checker
     ; budget is spent is one this port does not claim, and the arms below therefore
     ; report where the reference truncates.
     function truncation_budget_exceeded(this, out: ref[StringBuilder]) returns bool
-        (out.get_length() as int) > 1000000
+        (out.get_length() as int) + printer_emitted > 1000000
 
     ; typeToTypeNode's own two lines, and the reduction is the reason this is a
     ; wrapper (slice 170).
@@ -38392,9 +38432,11 @@ define Checker
         }
         if serialization_level = 0
         {
+            set printer_emitted: 0
             set serialization_level: 1
             let ok0 this.type_to_string(t, out)
             set serialization_level: 0
+            set printer_emitted: 0
             return ok0
         }
         ; ★★★ enterContext — a NESTED TypeToString prints in a FRESH node-builder context
@@ -38420,6 +38462,8 @@ define Checker
         let saved_infer printer_infer_type_parameters
         let saved_chain_length wrote_chain_length
         let saved_name_depth wrote_name_depth
+        let saved_emitted printer_emitted
+        set printer_emitted: 0
         let page Page.get(this)
         let pss &Array[ref[PrinterSymbolFrame]?]^page()
         set printer_symbols: pss
@@ -38457,6 +38501,7 @@ define Checker
         set printer_infer_type_parameters: saved_infer
         set wrote_chain_length: saved_chain_length
         set wrote_name_depth: saved_name_depth
+        set printer_emitted: saved_emitted
         ok
     }
 
@@ -39276,6 +39321,19 @@ define Checker
     ; exit and this body has six.
     function write_conditional_type(this, subject: ref[Type], root: ref[ConditionalRoot], out: ref[StringBuilder]) returns bool
     {
+        ; conditionalTypeToTypeNode's first line: past the truncation budget the whole
+        ; conditional is the elision placeholder (`any`), and its branches are not
+        ; resolved (slice 214).
+        if this.truncation_budget_exceeded(out)
+        {
+            if serialization_level = 0
+            {
+                this.record_unported("type-to-string-truncation", subject.flags)
+                return false
+            }
+            out.append("any")
+            return true
+        }
         let ct Checker.conditional_check_type_of(subject)
         let et Checker.conditional_extends_type_of(subject)
         if ct = null
@@ -41151,10 +41209,20 @@ define Checker
         ; createTypeNodesFromResolvedType's own checkTruncationLength, which is the
         ; whole-members arm rather than the per-property one: upstream elides the
         ; body to a single `...` member here.
+        ; ★ Under NoErrorTruncation the elided body is ONE NotEmittedTypeElement carrying
+        ; a comment the type printer strips (`createPrinterWithRemoveComments`), so the
+        ; text is the empty literal — and, load-bearing, NOTHING underneath is resolved
+        ; any more: a print past the budget stops asking (slice 214; this was a stop, and
+        ; the two message arguments of TS2321 in `excessivelyDeepConditionalTypes` reach it).
         if this.truncation_budget_exceeded(out)
         {
-            this.record_unported("type-to-string-truncation", TypeFlagsObject)
-            return false
+            if serialization_level = 0
+            {
+                this.record_unported("type-to-string-truncation", TypeFlagsObject)
+                return false
+            }
+            out.append("{  }")
+            return true
         }
         out.append("{ ")
         var i 0
@@ -44990,12 +45058,59 @@ define Checker
         ; belongs to something the constituent recursed into, not to the
         ; constituent. See printer_depth.
         let outer printer_depth
+        ; ★ `checkTruncationLength() && displayIndex+2 < len(list)-1` (slice 214): past
+        ; the budget the reference prints the elision placeholder (`any` once the comment
+        ; is stripped) and then only the LAST member — and resolves nothing in between.
+        ; This was a stop at the emission below; it is now the reference's elision, and
+        ; the collision marking is skipped for an elided list (its names no longer
+        ; align with the members).
+        var elided false
+        var pending 0
         var i 0
         while i < n
         {
+            if this.truncation_budget_exceeded(out)
+            {
+                if (i + 1) + 2 < n - 1
+                {
+                    ; ★ The VISIBLE print (the T dump, level 0) keeps the honest stop: the
+                    ; reference's approximateLength is a per-node estimate this port does not
+                    ; keep, so WHERE the elision begins cannot yet be matched, and a wrong
+                    ; elision point is a wrong answer where a stop is a known gap. A message
+                    ; argument (level ≥ 1) is not compared, and there the elision's only
+                    ; product — resolving nothing past the budget — is what matters.
+                    if serialization_level = 0
+                    {
+                        set printer_emitted: printer_emitted - pending
+                        this.record_unported("type-to-string-truncation", 0)
+                        return false
+                    }
+                    set elided: true
+                    let placeholder StringBuilder^host()
+                    placeholder.append("any")
+                    pieces.add(placeholder.to_string())
+                    names.add(Slice[char]())
+                    marks.add(0)
+                    let last StringBuilder^host()
+                    if this.write_constituent(list[n - 1], mode, &last) = false
+                    {
+                        set printer_emitted: printer_emitted - pending
+                        return false
+                    }
+                    pieces.add(last.to_string())
+                    names.add(Slice[char]())
+                    marks.add(0)
+                    break
+                }
+            }
             let piece StringBuilder^host()
             if this.write_constituent(list[i], mode, &piece) = false
+            {
+                set printer_emitted: printer_emitted - pending
                 return false
+            }
+            set pending: pending + (piece.get_length() as int)
+            set printer_emitted: printer_emitted + (piece.get_length() as int)
             pieces.add(piece.to_string())
             if this.wrote_identifier_type_reference(outer)
                 names.add(wrote_type_reference_name)
@@ -45003,6 +45118,20 @@ define Checker
                 names.add(Slice[char]())
             marks.add(0)
             set i: i + 1
+        }
+        set printer_emitted: printer_emitted - pending
+        if elided
+        {
+            let ne pieces.get_length() as int
+            var e 0
+            while e < ne
+            {
+                if e > 0
+                    out.append(sep.data, sep.length)
+                out.append(pieces.at(e))
+                set e: e + 1
+            }
+            return true
         }
         this.mark_name_collisions(list, names, marks)
         var j 0
@@ -45027,11 +45156,6 @@ define Checker
         var k 0
         while k < n
         {
-            if this.truncation_budget_exceeded(out)
-            {
-                this.record_unported("type-to-string-truncation", 0)
-                return false
-            }
             if k > 0
                 out.append(sep.data, sep.length)
             out.append(pieces.at(k))
@@ -115584,6 +115708,13 @@ define Checker
             var at error_node
             if at = null
                 set at: current_node
+            ; ★ `c.TypeToString(source), c.TypeToString(target)` — the message's two
+            ; arguments are PRINTED here upstream, and printing a conditional type reduces
+            ; its members' apparent types, which asks and memoizes base constraints the
+            ; comparisons that follow then find (slice 214): without the two prints the port
+            ; overflowed twice more at the same node (`excessivelyDeepConditionalTypes`).
+            this.name_type_for_message(source)
+            this.name_type_for_message(target)
             this.error_on_node(at, code)
         }
         if rel_overflow = false
