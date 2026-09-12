@@ -7290,6 +7290,13 @@ define Checker
     ; at the tail there has to be somewhere for the move to land. The parameter
     ; stays; it still says whether a level reports.
     rel_error_node: ref[AstNode]?
+    ; the reference's `diagnosticOutput` for isSignatureApplicable: the INDICES of the
+    ; diagnostics the relation machinery added while `relation_capture_on` was set —
+    ; side effects of checking the arguments (TS2454 on an unassigned variable) stay
+    ; outside it, so re-coding the last candidate's errors under TS2769 no longer
+    ; re-codes them (slice 209; `incompatibleTypes`)
+    relation_capture_on: bool
+    relation_capture: ref[Array[int]]
 
     ; `saveErrorState.errorChain`'s DEPTH, taken at structuredTypeRelatedTo and
     ; read by `reportStructuralErrors` inside its worker — see that function's
@@ -7807,6 +7814,9 @@ define Checker
         let prms &Array[ref[Symbol]?]^host()
         set c.printer_reverse_mapped_stack: prms as ref[Array[ref[Symbol]?]]
         set c.rel_error_chain: null
+        set c.relation_capture_on: false
+        let rcap &Array[int]^host()
+        set c.relation_capture: rcap
         set c.printer_type_mapper: null
         set c.rel_error_node: null
         set c.rel_structural_chain_depth: 0
@@ -21182,8 +21192,11 @@ define Checker
             set i: i + 1
         }
         var n TupleNormalizer()
+        ; `if !n.normalize(…) { return c.errorType }` — the tuple that hit the size wall is the
+        ; ERROR type, not a stop: its `as const` variable is then `any` and prints as such,
+        ; and no TS7005 follows (slice 210; `excessivelyLargeTupleSpread`)
         if this.normalize_tuple(&n, head, info_list) = false
-            return null
+            return error_type
         let types n.types as ref[Array[ref[Type]?]]
         let out_infos n.infos as ref[Array[ref[TupleElementInfo]?]]
         if given > arity
@@ -28943,7 +28956,12 @@ define Checker
     ; anywhere can come to hold a noConstraintType or a circularConstraintType.
     function get_base_constraint_of_type(this, t: ref[Type]) returns ref[Type]?
     {
-        if (t.flags & (TypeFlagsInstantiableNonPrimitive | TypeFlagsUnionOrIntersection | TypeFlagsTemplateLiteral | TypeFlagsStringMapping | TypeFlagsIndex)) = 0
+        ; `… != 0 || isGenericTupleType(t)`: a variadic tuple has a base constraint too —
+        ; its variadic elements replaced by theirs (`[...T, ...T]` → `[unknown, unknown]`)
+        var constrained (t.flags & (TypeFlagsInstantiableNonPrimitive | TypeFlagsUnionOrIntersection | TypeFlagsTemplateLiteral | TypeFlagsStringMapping | TypeFlagsIndex)) <> 0
+        if constrained = false
+            set constrained: Checker.is_generic_tuple_type(t)
+        if constrained = false
             return null
         let constraint this.get_resolved_base_constraint(t)
         if constraint = null
@@ -41019,7 +41037,9 @@ define Checker
         let copy_members this.resolve_structured_type_members(copy)
         if copy_members = null
             return null
-        set (copy_members as ref[StructuredMembers]).without_abstract_construct_signatures: copy
+        ; ★ never `set (x as ref[T]).f: v` — the cast is a TEMPORARY and the store lands in it (slice 209)
+        let copy_members_ref copy_members as ref[StructuredMembers]
+        set copy_members_ref.without_abstract_construct_signatures: copy
         copy
     }
 
@@ -66934,6 +66954,60 @@ define Checker
     ; reportCallResolutionErrors — the four-arm switch, in the reference's order,
     ; which IS the priority: an argument that did not fit outranks a type-argument
     ; failure, which outranks bare arity.
+    ; addImplementationSuccessElaboration: when the failed overload's symbol also has an
+    ; IMPLEMENTATION (a declaration with a body), upstream re-runs chooseOverload against
+    ; that one signature to decide whether to add *the call would have succeeded against
+    ; this implementation* as related information. The information is invisible here;
+    ; the RE-CHECK of the arguments is not — it reports its own side effects (TS2454 on
+    ; an unassigned variable) one more time (slice 210; `incompatibleTypes`).
+    procedure add_implementation_success_elaboration(this, s: ref[CallState], failed: ref[Signature])
+    {
+        if failed.declaration = null
+            return
+        let decl failed.declaration as ref[AstNode]
+        let sym this.symbol_of_declaration(decl)
+        if sym = null
+            return
+        let symbol sym as ref[Symbol]
+        let n Symbol.declaration_count(symbol)
+        if n <= 1
+            return
+        var implementation: ref[AstNode]? null
+        var i 0
+        while i < n
+        {
+            let d Symbol.declaration_at(symbol, i)
+            set i: i + 1
+            if d = null
+                continue
+            let dn d as ref[AstNode]
+            if AstNode.is_function_like_declaration(dn)
+            {
+                let body AstNode.body_of(dn)
+                if body <> null
+                {
+                    set implementation: dn
+                    set i: n
+                }
+            }
+        }
+        if implementation = null
+            return
+        let mark this.unported_mark()
+        let candidate this.get_signature_from_declaration(implementation as ref[AstNode])
+        if this.unported_mark() <> mark
+            return
+        if candidate = null
+            return
+        let one this.new_signature_list()
+        one.add(candidate)
+        var single_non_generic false
+        if Checker.type_parameter_count_of_signature(candidate as ref[Signature]) = 0
+            set single_non_generic: true
+        let local &CallState^host(s.node, s.args, one, s.type_arguments, s.arg_check_mode, single_non_generic, null, null, null)
+        let ignored this.choose_overload(local, RelationAssignable)
+    }
+
     procedure report_call_resolution_errors(this, node: ref[AstNode], s: ref[CallState], signatures: ref[Array[ref[Signature]?]], head_code: int)
     {
         let mark this.unported_mark()
@@ -66949,14 +67023,26 @@ define Checker
             ; of this one comparison — the resolution itself always runs with
             ; reportErrors false, which is why no head message is threaded through
             ; the relation and why the codes are re-headed afterwards instead.
-            let before diagnostics.length()
+            ; `var diags []*ast.Diagnostic; isSignatureApplicable(…, &diags)` — the relation's
+            ; own diagnostics are CAPTURED and re-headed one by one; anything the argument
+            ; checks report on the side (TS2454) goes to the main list untouched
+            relation_capture.clear()
+            set this.relation_capture_on: true
             let ignored this.is_signature_applicable(s.node, s.args, last, RelationAssignable, CheckModeNormal, true)
+            set this.relation_capture_on: false
             if this.unported_mark() <> mark
                 return
-            if arg_error_count > 1
-                diagnostics.recode_from(before, DiagNo_overload_matches_this_call)
-            if head_code <> 0
-                diagnostics.recode_from(before, head_code)
+            var ci 0
+            while ci < (relation_capture.get_length() as int)
+            {
+                let at relation_capture[ci]
+                if arg_error_count > 1
+                    diagnostics.recode_at(at, DiagNo_overload_matches_this_call)
+                if head_code <> 0
+                    diagnostics.recode_at(at, head_code)
+                set ci: ci + 1
+            }
+            this.add_implementation_success_elaboration(s, last)
             return
         }
         if s.candidate_for_argument_arity_error <> null
@@ -91497,13 +91583,20 @@ define Checker
             var error_node AstNode.name_of(member)
             if error_node = null
                 set error_node: member
-            let ok this.check_type_assignable_to(pt as ref[Type], bt as ref[Type], error_node, DiagProperty_0_in_type_1_is_not_assignable_to_the_same_property_in_base_type_2)
+            ; `checkTypeAssignableToEx(…, nil /*headMessage*/, &diags)` then ONE TS2416 wrapping
+            ; `diags[0]` — the private list is §3.24's mark + truncate, and a HEAD MESSAGE is not
+            ; the same thing (the relation would suppress it beside a matching missing-property
+            ; row and TS2739 would surface instead; slice 209, `incompatibleTypes`)
+            let diag_mark diagnostics.length()
+            let ok this.check_type_assignable_to(pt as ref[Type], bt as ref[Type], error_node, 0)
             if this.unported_mark() <> mark
                 return
             if ok = false
             {
+                diagnostics.truncate(diag_mark)
                 this.name_type_for_message(type_with_this)
                 this.name_type_for_message(base_with_this)
+                this.error_on_node_or_null(error_node, DiagProperty_0_in_type_1_is_not_assignable_to_the_same_property_in_base_type_2)
                 set issued_member_error: true
             }
         }
@@ -115011,7 +115104,25 @@ define Checker
     function check_type_related_to(this, source: ref[Type], target: ref[Type], relation: int, error_node: ref[AstNode]?) returns bool
         this.check_type_related_to_ex(source, target, relation, error_node, 0)
 
+    ; the capture (see `relation_capture`) sits on BOTH entries: the elaborating one above and
+    ; this direct one, which the `this`-argument check of isSignatureApplicable uses
     function check_type_related_to_ex(this, source: ref[Type], target: ref[Type], relation: int, error_node: ref[AstNode]?, head_code: int) returns bool
+    {
+        let capture_from diagnostics.length()
+        let answer this.check_type_related_to_ex_worker(source, target, relation, error_node, head_code)
+        if relation_capture_on
+        {
+            var ci capture_from
+            while ci < diagnostics.length()
+            {
+                relation_capture.add(ci)
+                set ci: ci + 1
+            }
+        }
+        answer
+    }
+
+    function check_type_related_to_ex_worker(this, source: ref[Type], target: ref[Type], relation: int, error_node: ref[AstNode]?, head_code: int) returns bool
     {
         let save_head rel_head_code
         set rel_head_code: head_code
@@ -116707,6 +116818,17 @@ define Checker
                 if Checker.is_hyphenated_jsx_name(d)
                     return true
             }
+        }
+        ; `if targetType.flags&Substitution != 0 { return isKnownProperty(baseType, …) }` — a
+        ; `NoInfer<{ x: string }>` member of a union target knows `x` through its base type;
+        ; without the arm every property was an excess property against it (slice 210;
+        ; `noInferUnionExcessPropertyCheck1`)
+        if (target_type.flags & TypeFlagsSubstitution) <> 0
+        {
+            let base Checker.substitution_base_type_of(target_type)
+            if base = null
+                return false
+            return this.is_known_property(base as ref[Type], d, is_comparing_jsx_attributes)
         }
         if (target_type.flags & TypeFlagsUnionOrIntersection) <> 0
         {
@@ -120167,6 +120289,29 @@ define Checker
             }
         }
         ; The fresh empty-object target under the two subtype relations.
+        ; `case isGenericTupleType(source) && isTupleType(target) && !isGenericTupleType(target)`:
+        ; a variadic source (`[...T, ...T]`) relates to a fixed tuple through its BASE
+        ; CONSTRAINT (`[unknown, unknown]` for `T extends [unknown]`); without the arm the
+        ; element loop meets a variadic element against a required one and fails
+        ; (slice 209; `variadicTuples1`'s `ft16`)
+        if Checker.is_generic_tuple_type(src)
+        {
+            if Checker.is_tuple_type(target)
+            {
+                if Checker.is_generic_tuple_type(target) = false
+                {
+                    let gmark this.unported_mark()
+                    let constraint this.get_base_constraint_or_type(src)
+                    if this.unported_mark() <> gmark
+                        return false
+                    if constraint <> null
+                    {
+                        if (constraint as ref[Type]) <> src
+                            return this.is_related_to_ex(constraint as ref[Type], target, relation, error_node, intersection_state, RecursionFlagsSource)
+                    }
+                }
+            }
+        }
         var subtypeish false
         if relation = RelationSubtype
             set subtypeish: true
@@ -124269,6 +124414,22 @@ define Checker
     ; nothing, because at the time nothing could carry it.
     function check_type_related_to_and_optionally_elaborate(this, source: ref[Type], target: ref[Type], relation: int, error_node: ref[AstNode]?, expr: ref[AstNode]?, head_code: int) returns bool
     {
+        let capture_from diagnostics.length()
+        let answer this.check_type_related_to_and_optionally_elaborate_worker(source, target, relation, error_node, expr, head_code)
+        if relation_capture_on
+        {
+            var ci capture_from
+            while ci < diagnostics.length()
+            {
+                relation_capture.add(ci)
+                set ci: ci + 1
+            }
+        }
+        answer
+    }
+
+    function check_type_related_to_and_optionally_elaborate_worker(this, source: ref[Type], target: ref[Type], relation: int, error_node: ref[AstNode]?, expr: ref[AstNode]?, head_code: int) returns bool
+    {
         let mark this.unported_mark()
         let related this.is_type_related_to(source, target, relation)
         if related
@@ -125909,14 +126070,20 @@ define Checker
                         if (candidate as ref[Symbol]) <> unknown_symbol
                         {
                             if links <> null
-                                set (links as ref[JsxElementLink]).jsx_namespace: candidate
+                            {
+                                let links_ref links as ref[JsxElementLink]
+                                set links_ref.jsx_namespace: candidate
+                            }
                             return candidate
                         }
                     }
                 }
             }
             if links <> null
-                set (links as ref[JsxElementLink]).jsx_namespace: unknown_symbol
+            {
+                let links_ref2 links as ref[JsxElementLink]
+                set links_ref2.jsx_namespace: unknown_symbol
+            }
         }
         ; "JSX global fallback" — getGlobalSymbol, which is resolveName with no
         ; location and no message.
@@ -135738,7 +135905,12 @@ define Checker
                         set i: i + 1
                     }
                     if spread = false
-                        set (info as ref[InferenceInfo]).implied_arity: all_args - arg_count
+                    {
+                        ; ★ `set (info as ref[…]).implied_arity` stored into the CAST'S TEMPORARY and the
+                        ; inference never saw an implied arity (slice 209; `variadicTuples1`'s `curry`)
+                        let info_ref info as ref[InferenceInfo]
+                        set info_ref.implied_arity: all_args - arg_count
+                    }
                 }
             }
         }
