@@ -117,6 +117,10 @@ SOURCES = [
     # qualified name without a leading @param object). Its third, TS8024, does
     # not either. The scrape is by NAME, so the cost is those three entries.
     os.path.join(SUB, "internal/checker/jsdoc.go"),
+    # Slice 202. flow.go joins under the same per-FILE rule: reportFlowControlError
+    # reports, and its one message — TS2563, the body too large for control flow
+    # analysis — appears in NO other source of this list. The cost is that entry.
+    os.path.join(SUB, "internal/checker/flow.go"),
 ]
 DST = os.path.join(REPO, "packages/tscaly/0.1.0/tscaly/DiagnosticCodes.scaly")
 
