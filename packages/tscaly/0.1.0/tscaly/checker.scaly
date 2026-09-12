@@ -3337,6 +3337,18 @@ define RelationComparisonResultReportsUnmeasurable: int 1 << 3
 define RelationComparisonResultReportsUnreliable: int 1 << 4
 define RelationComparisonResultReportsMask: int RelationComparisonResultReportsUnmeasurable | RelationComparisonResultReportsUnreliable
 
+; ★★★ THE TWO OVERFLOW BITS, SLICE 200 — and they are what a row written by the
+; DEPTH LIMITER means, as against a row written by a comparison that ran. The
+; distinction is load-bearing in exactly one place: `recursive_type_related_to`
+; redoes a cached FAILURE when it has an error node, so that the message can be
+; built — and a failure that came out of the limiter cannot be rebuilt, because
+; redoing it would overflow again. Upstream's condition is
+; `reportErrors && entry&Failed != 0 && entry&Overflow == 0`, i.e. the overflow
+; bit is what turns the redo off, and the message is then REPLAYED off the row.
+define RelationComparisonResultComplexityOverflow: int 1 << 5
+define RelationComparisonResultStackDepthOverflow: int 1 << 6
+define RelationComparisonResultOverflow: int RelationComparisonResultComplexityOverflow | RelationComparisonResultStackDepthOverflow
+
 ; ── inference: the priorities, the flags and the three records (slice 122) ──
 ;
 ; internal/checker/inference.go, plus the InferenceContext / InferenceInfo /
@@ -7144,6 +7156,28 @@ define Checker
     rel_result_buckets: ref[Vector[int]]?
     rel_result_mask: int
 
+    ; ── the COMPLEXITY BUDGET (slice 200) ──────────────────────────────────
+    ;
+    ; `Relater.relationCount`, set to `(16_000_000 - relation.size()) / 8` at the
+    ; head of every top-level comparison and spent one unit per cache row the
+    ; comparison writes. When it runs out the comparison is abandoned exactly as
+    ; the hundred-frame limit abandons one, and the two are told apart only by
+    ; which of them tripped — `Excessive_complexity_comparing_types` against
+    ; `Excessive_stack_depth_comparing_types`.
+    ;
+    ; ★★★ IT IS THE ONLY BRAKE ON A COMPARISON THAT IS *WIDE* RATHER THAN DEEP,
+    ; and its absence is measurable rather than theoretical: five stage-2 units
+    ; ran past the runner's sixty-second silence limit and were scored TIMEOUT,
+    ; and `relationComplexityError` — sixteen lines, the whole of whose point is
+    ; this budget — took **15.5 s** to answer with the two reports missing. The
+    ; depth limiter cannot see any of it: every one of those frames is shallow.
+    ;
+    ; ★★ THE SIZE IS PER RELATION, so a single shared table needs a counter per
+    ; relation id. The five ids are dense (RelationAssignable..RelationIdentity),
+    ; so the counter is an Array indexed by the id and not a map.
+    rel_relation_count: int
+    rel_result_counts: ref[Array[int]]
+
     ; ★★★ THE TERNARY'S SUBSTITUTE, AND IT IS EXACT. Upstream's result is a
     ; TERNARY and its write-back needs the distinction: a definite True is
     ; recorded at once, a MAYBE only once the stacks are empty, because a Maybe is
@@ -7710,6 +7744,14 @@ define Checker
         set c.rel_result_entries: rce as ref[Array[RelationCacheRow]]
         set c.rel_result_buckets: null
         set c.rel_result_mask: 0
+        set c.rel_relation_count: 0
+        let rrc &Array[int]^host()
+        set c.rel_result_counts: rrc as ref[Array[int]]
+        rrc.add(0)
+        rrc.add(0)
+        rrc.add(0)
+        rrc.add(0)
+        rrc.add(0)
         set c.rel_maybe_hits: 0
         let rmc &Array[ref[ReverseMappedRow]?]^host()
         set c.reverse_mapped_cache: rmc as ref[Array[ref[ReverseMappedRow]?]]
@@ -113827,11 +113869,18 @@ define Checker
         let save_source rel_source_depth
         let save_target rel_target_depth
         let save_expanding rel_expanding_flags
+        let save_count rel_relation_count
         set rel_overflow: false
         set rel_maybe_depth: 0
         set rel_source_depth: 0
         set rel_target_depth: 0
         set rel_expanding_flags: ExpandingFlagsNone
+        ; `r.relationCount = (16_000_000 - relation.size()) / 8` — the budget is
+        ; what the relation's cache has NOT already spent, so a file whose earlier
+        ; comparisons filled the table gets a smaller one. It is saved and restored
+        ; with the rest of the relater state for the reason that block's header
+        ; gives: this port shares one relater where upstream takes a fresh one.
+        set rel_relation_count: (16000000 - rel_result_counts[relation as size_t]) / 8
         let answer this.is_related_to_ex(source, target, relation, error_node, IntersectionStateNone, RecursionFlagsBoth)
         ; ★★★ THE ONE EMISSION, AND IT IS THE WHOLE POINT OF THE CHAIN. Upstream
         ; this is `c.reportDiagnostic(createDiagnosticChainFromErrorChain(...))`
@@ -113839,8 +113888,57 @@ define Checker
         ; the chain is written only on a failing level, so the condition is the
         ; failure. Every level under here has PREPENDED, so the head is the
         ; outermost message and the inner ones are links a `D` line cannot show.
-        if rel_error_chain <> null
-            this.emit_error_chain()
+        ;
+        ; ★★★ AND IT IS AN `else if` UPSTREAM, WHICH IS THE WHOLE OF THE OVERFLOW
+        ; ARM'S PLACEMENT. A comparison that overflowed reports the LIMITER's own
+        ; message at this node and nothing else: whatever levels underneath it had
+        ; already prepended describes a walk that was abandoned, so emitting the
+        ; chain as well would report a mismatch the reference never reaches.
+        if rel_overflow
+        {
+            ; `relation.set(id, Failed | <which limiter tripped>)` — *record this
+            ; relation as having failed such that we don't attempt the overflowing
+            ; operation again*. The bit is what tells a later ask that the row is
+            ; the limiter's verdict and not a comparison's.
+            var bits RelationComparisonResultStackDepthOverflow
+            if rel_relation_count <= 0
+                set bits: RelationComparisonResultComplexityOverflow
+            this.rel_result_set(relation, source.id, target.id, IntersectionStateNone, RelationComparisonResultFailed | bits)
+            var code DiagExcessive_stack_depth_comparing_types_0_and_1
+            if rel_relation_count <= 0
+                set code: DiagExcessive_complexity_comparing_types_0_and_1
+            ; `if errorNode == nil { errorNode = c.currentNode }` — the limiter
+            ; reports even where the caller asked for no message, because a
+            ; comparison it abandoned is not an answer about the two types.
+            ;
+            ; ★★★ AND THIS IS WHERE THE ONE KNOWN DIVERGENCE SITS: ONE REPORT PER
+            ; ASK. On `excessivelyDeepConditionalTypes` this arm fires SEVEN times
+            ; at the node where the reference reports five (the second node, four,
+            ; agrees exactly), so the unit is a `diagcheck` inconsistency it was
+            ; not before — printing nothing is a subsequence of anything, and this
+            ; port used to print nothing. `infiniteConstraints` carries one report
+            ; where the reference emits none. Both units were already FAIL, and
+            ; `tools/diagcensus.py --by-unit TS2321` is where the pair is read. What it is NOT: the cached replay above
+            ; never fires on that unit (probed by giving it a distinct code, 0 of
+            ; 11), and `isTypeRelatedTo`'s object-pair cache probe — the one line
+            ; of upstream's that reads this row without reporting, and which this
+            ; port does not have — changes the count by NOTHING when added
+            ; (measured, then taken back out unshipped). What remains is that this
+            ; port ASKS more often, or spends its budget faster for the same work:
+            ; it promotes far fewer maybe keys into the cache than upstream does
+            ; (the counter at `rel_maybe_hits`, slice 172), so the same comparison
+            ; costs it more rows. **A limiter ported faithfully still disagrees
+            ; where the thing it limits is not the same size.**
+            var at error_node
+            if at = null
+                set at: current_node
+            this.error_on_node(at, code)
+        }
+        if rel_overflow = false
+        {
+            if rel_error_chain <> null
+                this.emit_error_chain()
+        }
         set rel_head_code: save_head
         set rel_error_chain: save_chain
         set rel_error_node: save_error_node
@@ -113849,6 +113947,7 @@ define Checker
         set rel_source_depth: save_source
         set rel_target_depth: save_target
         set rel_expanding_flags: save_expanding
+        set rel_relation_count: save_count
         answer
     }
 
@@ -116276,6 +116375,9 @@ define Checker
             return
         let h Checker.rel_result_hash(rel, s, t, i_state)
         rel_result_entries.add(RelationCacheRow(h, rel, s, t, i_state, result))
+        ; `relation.size()` — per relation, because the budget is. The five ids
+        ; are dense, so the id indexes the counter directly.
+        rel_result_counts.put(rel as size_t, rel_result_counts[rel as size_t] + 1)
         let count rel_result_entries.get_length() as int
         var cap 0
         if rel_result_buckets <> null
@@ -116371,19 +116473,46 @@ define Checker
             ; — the side channel the row carries, replayed for a comparison that is
             ; not being performed. See the enum's own header for what its absence
             ; cost.
-            var answered false
-            if (cached & RelationComparisonResultSucceeded) <> 0
-                set answered: true
-            if (cached & RelationComparisonResultFailed) <> 0
+            ; ★★★ THE REDO IS OFF FOR AN OVERFLOW ROW, AND THAT IS WHAT THE BIT
+            ; IS FOR. Upstream redoes a cached FAILURE while it is building a
+            ; message — *we will do the comparison again to generate an error
+            ; message* — but a failure the limiter wrote has no comparison to
+            ; redo: running it again would spend the budget again and answer the
+            ; same way. So the row is taken, and its message is REPLAYED.
+            var answered true
+            if error_node <> null
             {
-                if error_node = null
-                    set answered: true
+                if (cached & RelationComparisonResultFailed) <> 0
+                {
+                    if (cached & RelationComparisonResultOverflow) = 0
+                        set answered: false
+                }
             }
             if answered
             {
                 set this.reliability_flags: reliability_flags | (cached & RelationComparisonResultReportsMask)
+                if error_node <> null
+                {
+                    if (cached & RelationComparisonResultOverflow) <> 0
+                    {
+                        var ocode DiagExcessive_stack_depth_comparing_types_0_and_1
+                        if (cached & RelationComparisonResultComplexityOverflow) <> 0
+                            set ocode: DiagExcessive_complexity_comparing_types_0_and_1
+                        this.report_error(ocode, source, target)
+                    }
+                }
                 return (cached & RelationComparisonResultSucceeded) <> 0
             }
+        }
+        ; `if r.relationCount <= 0 { r.overflow = true; return TernaryFalse }` —
+        ; asked AFTER the cache and BEFORE the maybe stack, which is upstream's
+        ; order and not an arbitrary one: a row that is already known costs
+        ; nothing and must still answer once the budget is gone, or a file's last
+        ; comparisons would all become false.
+        if rel_relation_count <= 0
+        {
+            set rel_overflow: true
+            return false
         }
         if this.rel_maybe_has(source.id, target.id, intersection_state)
         {
@@ -116464,6 +116593,7 @@ define Checker
             ; which costs recomputation and cannot cost an answer.
             if rel_maybe_hits = maybe_before
             {
+                set rel_relation_count: rel_relation_count - 1
                 if in_variance_computation = false
                     this.rel_result_set(relation, source.id, target.id, intersection_state, RelationComparisonResultSucceeded | propagating)
             }
@@ -116478,6 +116608,12 @@ define Checker
         ; Overflow bit rather than a plain failure.
         if rel_overflow = false
         {
+            ; `r.relationCount--`, at both of upstream's sites — one unit per row
+            ; the comparison commits. It is spent even where the row itself is not
+            ; written (inside the variance computation, where this port's cache is
+            ; off by the measurement above): the budget measures the WORK, and the
+            ; work is the same either way.
+            set rel_relation_count: rel_relation_count - 1
             if in_variance_computation = false
                 this.rel_result_set(relation, source.id, target.id, intersection_state, RelationComparisonResultFailed | propagating)
         }
