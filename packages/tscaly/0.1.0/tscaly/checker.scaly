@@ -1134,6 +1134,7 @@ define ConditionalInstantiation
     alias_type_arguments: ref[Array[ref[Type]?]]?
     for_constraint: bool
     instantiated: ref[Type]?
+    hash: int
 )
 
 ; ── ObjectInstantiation (slice 125) ─────────────────────────────────────────
@@ -3094,6 +3095,14 @@ define Signature
     ; combineUnionOrIntersectionMemberSignatures both write it straight after the
     ; construction, which is the reference's own shape.
     composite: ref[CompositeSignature]?
+
+    ; ★★★ THE SIGNATURE'S OWN CACHE ROWS (slice 227): upstream keeps a signature's
+    ; instantiations, erased, canonical, base and optional-call twins in
+    ; SignatureLinks PER SIGNATURE; this port kept every row of every signature in
+    ; ONE array and scanned it whole on each ask — 63 % of the run of
+    ; `performanceComparisonOfStructurallyIdenticalInterfacesWithGenericSignatures`
+    ; (95 s against the reference's 2 s) in that scan.
+    cache_rows: ref[Array[ref[CachedSignature]?]]?
 )
 {
     init(sid: int, f: int, decl: ref[AstNode]?, tps: ref[Array[ref[Type]?]]?, tp: ref[Symbol]?, ps: ref[Array[ref[Symbol]?]]?, rrt: ref[Type]?, minac: int)
@@ -3113,6 +3122,7 @@ define Signature
         set type_predicate_computed: false
         set isolated_signature_type: null
         set composite: null
+        set cache_rows: null
     }
 }
 
@@ -5426,6 +5436,14 @@ define Type
     ; is_constrained_type for the twelve, and getResolvedBaseConstraint's header
     ; for what the missing memo cost.
     resolved_base_constraint: ref[Type]?
+
+    ; ★ the recursion identity, computed once (slice 227): getRecursionIdentity is
+    ; a structural read upstream; here every arm copies a union arm out of `data`,
+    ; and isDeeplyNestedType asks it for every stack entry on every call
+    rid_symbol: ref[Symbol]?
+    rid_type: ref[Type]?
+    rid_node: ref[AstNode]?
+    rid_computed: bool
 )
 
 ; ── ModuleKind: the values this port can currently name ─────────────────────
@@ -6741,6 +6759,11 @@ define Checker
     ; `jsnum_from_string` of it is neither NaN nor negative zero — the two inputs a
     ; value-keyed table and a bit-keyed table would disagree about.
     string_literal_types: ref[Array[ref[Type]?]]
+    ; ★ the reference's `stringLiteralTypes[value]` is a map; a linear scan over
+    ; every string literal type was 90 % of `hugeDeclarationOutputGetsTruncatedWithError`
+    ; (slice 227): open-addressed buckets of row index + 1, 0 empty, as SymbolTable
+    string_literal_buckets: ref[Vector[int]]?
+    string_literal_mask: int
 
     ; c.templateLiteralTypes (slice 126). ★A LINEAR table like the three literal
     ; ones and like union_types, and for find_union_type's reason: the key is
@@ -6758,6 +6781,8 @@ define Checker
     ; its own constructor); the memo is what makes the two the same value.
     template_constraint_type: ref[Type]?
     number_literal_types: ref[Array[ref[Type]?]]
+    number_literal_buckets: ref[Vector[int]]?
+    number_literal_mask: int
     bigint_literal_types: ref[Array[ref[Type]?]]
 
     ; c.nodeLinks[node].hasReportedStatementInAmbientContext, as a SET of the
@@ -7567,7 +7592,6 @@ define Checker
     ; (signature, type arguments) intern table getSignatureInstantiation needs so
     ; that one call site's instantiation is ONE type.
     inference_context_infos: ref[Array[ref[InferenceContextInfo]?]]
-    cached_signatures: ref[Array[ref[CachedSignature]?]]
 
     ; c.instantiationExpressionTypes (slice 181) — see InstantiationExpressionCacheRow.
     instantiation_expression_types: ref[Array[ref[InstantiationExpressionCacheRow]?]]
@@ -7899,8 +7923,6 @@ define Checker
         set c.suggestion_count: 0
         let ici &Array[ref[InferenceContextInfo]?]^host()
         set c.inference_context_infos: ici
-        let csig &Array[ref[CachedSignature]?]^host()
-        set c.cached_signatures: csig
         let iext &Array[ref[InstantiationExpressionCacheRow]?]^host()
         set c.instantiation_expression_types: iext
         let stops &Array[ref[StopEvent]?]^host()
@@ -7934,6 +7956,8 @@ define Checker
         SymbolTable.set_entry(host, g, global_this_data, gts)
         let sl &Array[ref[Type]?]^host()
         set c.string_literal_types: sl
+        set c.string_literal_buckets: null
+        set c.string_literal_mask: 0
         let tlt &Array[ref[Type]?]^host()
         set c.template_literal_types: tlt
         let smt &Array[ref[Type]?]^host()
@@ -7941,6 +7965,8 @@ define Checker
         set c.template_constraint_type: null
         let nl &Array[ref[Type]?]^host()
         set c.number_literal_types: nl
+        set c.number_literal_buckets: null
+        set c.number_literal_mask: 0
         let bl &Array[ref[Type]?]^host()
         set c.bigint_literal_types: bl
         let ut &Array[ref[Type]?]^host()
@@ -8488,7 +8514,7 @@ define Checker
     function new_intrinsic_type_ex(this, flags: int, intrinsic_name: Slice[char], object_flags: int) returns ref[Type]
     {
         set type_count: type_count + 1
-        let t &Type^host(type_count, flags, object_flags, intrinsic_name, null, TypeData.None(NoTypeData()), null, null, null)
+        let t &Type^host(type_count, flags, object_flags, intrinsic_name, null, TypeData.None(NoTypeData()), null, null, null, null, null, null, false)
         t
     }
 
@@ -8535,7 +8561,7 @@ define Checker
         ; answered NULL, the printer returned false and TypeDump dropped the line.
         ; Four stage-2 units, no stop, no diagnostic — see §3.5dz.
         let masked object_flags & ~(ObjectFlagsCouldContainTypeVariablesComputed | ObjectFlagsCouldContainTypeVariables | ObjectFlagsMembersResolved)
-        let t &Type^host(type_count, flags, masked, null, sym, d, null, null, null)
+        let t &Type^host(type_count, flags, masked, null, sym, d, null, null, null, null, null, null, false)
         t
     }
 
@@ -8899,50 +8925,175 @@ define Checker
     ; The copy is on the MINT path only — one per distinct literal.
     function get_string_literal_type(this, text: Slice[char]) returns ref[Type]
     {
-        let len string_literal_types.get_length() as int
-        var i 0
-        while i < len
+        let h SymbolTable.hash_name(text)
+        if string_literal_buckets <> null
         {
-            let row string_literal_types[i]
-            if row <> null
+            let b string_literal_buckets as ref[Vector[int]]
+            var slot h & string_literal_mask
+            var probing true
+            while probing
             {
-                let t row as ref[Type]
-                if Checker.literal_text_length_of(t) = text.length
+                let e b.get(slot as size_t)
+                if e = null
+                    set probing: false
+                else
                 {
-                    if Checker.text_equals(Checker.literal_text_of(t), text)
-                        return t
+                    let idx *e
+                    if idx = 0
+                        set probing: false
+                    else
+                    {
+                        let row string_literal_types[idx - 1]
+                        if row <> null
+                        {
+                            let t row as ref[Type]
+                            if Checker.literal_text_length_of(t) = text.length
+                            {
+                                if Checker.text_equals(Checker.literal_text_of(t), text)
+                                    return t
+                            }
+                        }
+                        set slot: (slot + 1) & string_literal_mask
+                    }
                 }
             }
-            set i: i + 1
         }
         var owned text
         if text.length > 0
             set owned: this.copy_name_to_page(text)
         let t this.new_literal_type(TypeFlagsStringLiteral, owned, 0 as u64, false, false, null)
         string_literal_types.add(t)
+        this.string_literal_index_insert(h, string_literal_types.get_length() as int)
         t
+    }
+
+    procedure string_literal_index_insert(this, h: int, count: int)
+    {
+        var cap 0
+        if string_literal_buckets <> null
+            set cap: string_literal_mask + 1
+        if (count * 2) > cap
+        {
+            var new_cap 64
+            while (count * 2) > new_cap
+                set new_cap: new_cap * 2
+            let v Vector[int]^host(new_cap as size_t)
+            set this.string_literal_buckets: v
+            set this.string_literal_mask: new_cap - 1
+            var j 0
+            while j < count
+            {
+                let row string_literal_types[j]
+                if row <> null
+                {
+                    let hh SymbolTable.hash_name(Checker.literal_text_of(row as ref[Type]))
+                    Checker.bucket_insert(v, string_literal_mask, hh, j + 1)
+                }
+                set j: j + 1
+            }
+            return
+        }
+        Checker.bucket_insert(string_literal_buckets as ref[Vector[int]], string_literal_mask, h, count)
+    }
+
+    procedure bucket_insert(b: ref[Vector[int]], mask: int, h: int, value: int)
+    {
+        var slot h & mask
+        var probing true
+        while probing
+        {
+            let e b.get(slot as size_t)
+            var empty false
+            if e = null
+                set empty: true
+            else
+            {
+                if *e = 0
+                    set empty: true
+            }
+            if empty
+            {
+                b.put(slot as size_t, value)
+                set probing: false
+            }
+            else
+                set slot: (slot + 1) & mask
+        }
+    }
+
+    function number_bits_hash(bits: u64) returns int
+    {
+        let mixed (bits xor (bits >> 29)) * 1099511628211
+        ((mixed >> 1) as int)
     }
 
     ; getNumberLiteralType — see the table's own note for why the NaN cell the
     ; reference keeps beside it is not here.
     function get_number_literal_type(this, bits: u64) returns ref[Type]
     {
-        let len number_literal_types.get_length() as int
-        var i 0
-        while i < len
+        let h Checker.number_bits_hash(bits)
+        if number_literal_buckets <> null
         {
-            let row number_literal_types[i]
-            if row <> null
+            let b number_literal_buckets as ref[Vector[int]]
+            var slot h & number_literal_mask
+            var probing true
+            while probing
             {
-                let t row as ref[Type]
-                if Checker.literal_bits_of(t) = bits
-                    return t
+                let e b.get(slot as size_t)
+                if e = null
+                    set probing: false
+                else
+                {
+                    let idx *e
+                    if idx = 0
+                        set probing: false
+                    else
+                    {
+                        let row number_literal_types[idx - 1]
+                        if row <> null
+                        {
+                            let t row as ref[Type]
+                            if Checker.literal_bits_of(t) = bits
+                                return t
+                        }
+                        set slot: (slot + 1) & number_literal_mask
+                    }
+                }
             }
-            set i: i + 1
         }
         let t this.new_literal_type(TypeFlagsNumberLiteral, Slice[char](), bits, false, false, null)
         number_literal_types.add(t)
+        this.number_literal_index_insert(h, number_literal_types.get_length() as int)
         t
+    }
+
+    procedure number_literal_index_insert(this, h: int, count: int)
+    {
+        var cap 0
+        if number_literal_buckets <> null
+            set cap: number_literal_mask + 1
+        if (count * 2) > cap
+        {
+            var new_cap 64
+            while (count * 2) > new_cap
+                set new_cap: new_cap * 2
+            let v Vector[int]^host(new_cap as size_t)
+            set this.number_literal_buckets: v
+            set this.number_literal_mask: new_cap - 1
+            var j 0
+            while j < count
+            {
+                let row number_literal_types[j]
+                if row <> null
+                {
+                    let hh Checker.number_bits_hash(Checker.literal_bits_of(row as ref[Type]))
+                    Checker.bucket_insert(v, number_literal_mask, hh, j + 1)
+                }
+                set j: j + 1
+            }
+            return
+        }
+        Checker.bucket_insert(number_literal_buckets as ref[Vector[int]], number_literal_mask, h, count)
     }
 
     ; getBigIntLiteralType. The key is the whole PseudoBigInt — the sign AND the
@@ -29132,7 +29283,8 @@ define Checker
         ; there are no 'deeply nested' types on the stack." The reference's own
         ; comment adds that it has no test case reaching 50, so the second bound is
         ; a safety stop.
-        let identity this.get_recursion_identity(t)
+        let identity_value this.get_recursion_identity(t)
+        let identity &RecursionId^host(identity_value.target_symbol, identity_value.target_type, identity_value.target_node)
         var explore false
         if base_constraint_depth < 10
             set explore: true
@@ -29687,7 +29839,23 @@ define Checker
     ; moment the reverse-mapped chapter let the walk reach it (`F<T> = null extends
     ; T ? [F<NonNullable<T>>, "null"] : …` through a mapped type), and the tuple arm
     ; is in the same cycle as the conditional one.
-    function get_recursion_identity(this, t: ref[Type]) returns ref[RecursionId]
+    ; ★ A VALUE, not a page object (slice 227): hasMatchingRecursionIdentity asks
+    ; for the identity of EVERY stack entry on every isDeeplyNestedType call, and
+    ; an allocation per entry per call was the page churn of
+    ; `complexRecursiveCollections` (killed at 240 s against the reference's 2 s).
+    function get_recursion_identity(this, t: ref[Type]) returns RecursionId
+    {
+        if t.rid_computed
+            return RecursionId(t.rid_symbol, t.rid_type, t.rid_node)
+        let r this.compute_recursion_identity(t)
+        set t.rid_symbol: r.target_symbol
+        set t.rid_type: r.target_type
+        set t.rid_node: r.target_node
+        set t.rid_computed: true
+        r
+    }
+
+    function compute_recursion_identity(this, t: ref[Type]) returns RecursionId
     {
         var sym: ref[Symbol]? null
         var node: ref[AstNode]? null
@@ -29701,7 +29869,7 @@ define Checker
             {
                 let rn Checker.reference_node_of(t)
                 if rn <> null
-                    return &RecursionId^host(sym, ty, rn)
+                    return RecursionId(sym, ty, rn)
             }
             ; isObjectOrArrayLiteralType. Both flags are declared and neither is
             ; set by anything this port mints — checkObjectLiteral and
@@ -29729,7 +29897,7 @@ define Checker
                     if (t.object_flags & ObjectFlagsFromTypeNode) <> 0
                         set excluded: true
                     if excluded = false
-                        return &RecursionId^host(t.symbol, ty, node)
+                        return RecursionId(t.symbol, ty, node)
                 }
             }
             ; A TUPLE is tracked by its TARGET, so every instantiation of one
@@ -29737,7 +29905,7 @@ define Checker
             if Checker.is_tuple_type(t)
             {
                 if (t.object_flags & ObjectFlagsFromTypeNode) = 0
-                    return &RecursionId^host(sym, Checker.get_target_type(t), node)
+                    return RecursionId(sym, Checker.get_target_type(t), node)
             }
         }
         ; A type parameter by its symbol, *such that all "fresh" instantiations of
@@ -29745,7 +29913,7 @@ define Checker
         if (t.flags & TypeFlagsTypeParameter) <> 0
         {
             if t.symbol <> null
-                return &RecursionId^host(t.symbol, ty, node)
+                return RecursionId(t.symbol, ty, node)
         }
         ; An INDEXED ACCESS is *the leftmost object type in a chain of indexed
         ; accesses* — in `A[P1][P2][P3]` it is A.
@@ -29764,7 +29932,7 @@ define Checker
                         set walking: true
                 }
             }
-            return &RecursionId^host(sym, cur, node)
+            return RecursionId(sym, cur, node)
         }
         ; A CONDITIONAL is its ROOT's node — *the root object represents the
         ; origin of the conditional type*.
@@ -29772,9 +29940,9 @@ define Checker
         {
             let root Checker.conditional_root_of(t)
             if root <> null
-                return &RecursionId^host(sym, ty, (root as ref[ConditionalRoot]).node)
+                return RecursionId(sym, ty, (root as ref[ConditionalRoot]).node)
         }
-        &RecursionId^host(sym, t, node)
+        RecursionId(sym, t, node)
     }
 
     ; The three operations the reference gets from a slice: `append(stack, id)`,
@@ -66716,7 +66884,7 @@ define Checker
         let result this.clone_signature(signature)
         set result.flags: result.flags | call_chain_flags
         let row &CachedSignature^host(signature, kind, null, result)
-        cached_signatures.add(row as ref[CachedSignature]?)
+        Checker.signature_cache_add(signature, row)
         result
     }
 
@@ -105056,6 +105224,7 @@ define Checker
             set asym: al.symbol
             set aargs: al.type_arguments
         }
+        let h Checker.type_list_hash(args)
         let n rows.get_length() as int
         var i 0
         while i < n
@@ -105064,14 +105233,17 @@ define Checker
             if row <> null
             {
                 let r row as ref[ConditionalInstantiation]
-                if r.for_constraint = for_constraint
+                if r.hash = h
                 {
-                    if r.alias_symbol = asym
+                    if r.for_constraint = for_constraint
                     {
-                        if Checker.type_lists_equal(r.arguments, args)
+                        if r.alias_symbol = asym
                         {
-                            if Checker.type_lists_equal(r.alias_type_arguments, aargs)
-                                return r.instantiated
+                            if Checker.type_lists_equal(r.arguments, args)
+                            {
+                                if Checker.type_lists_equal(r.alias_type_arguments, aargs)
+                                    return r.instantiated
+                            }
                         }
                     }
                 }
@@ -105095,7 +105267,7 @@ define Checker
             set aargs: al.type_arguments
         }
         let rows_page Page.get(rows)
-        let row &ConditionalInstantiation^rows_page(args, asym, aargs, for_constraint, t)
+        let row &ConditionalInstantiation^rows_page(args, asym, aargs, for_constraint, t, Checker.type_list_hash(args))
         rows.add(row)
     }
 
@@ -120016,6 +120188,10 @@ define Checker
         ; keyed on it, never on the pair of ids (slice 216).
         var constrained false
         let key this.get_relation_key(source, target, intersection_state, relation = RelationIdentity, false, &constrained)
+        ; ★★★ THE CACHE STAYS OFF INSIDE THE VARIANCE COMPUTATION (slice 200's
+        ; measurement, re-measured in slice 227): with it on, `varianceMeasurement`
+        ; leaves MATCH while the three units the old note named stay — the flip the
+        ; note recorded is real and not the fall-through of slice 220 alone.
         var cached 0
         if in_variance_computation = false
             set cached: this.rel_result_get(relation, key, 0, 0)
@@ -132977,7 +133153,7 @@ define Checker
             if row <> null
             {
                 let st row as ref[Type]
-                if this.has_matching_recursion_identity(st, id)
+                if this.has_matching_recursion_identity(st, &id)
                 {
                     if st.id >= last_type_id
                     {
@@ -135464,23 +135640,33 @@ define Checker
     ; type parameters neither side can resolve.
     function signature_cache_lookup(this, sig: ref[Signature], kind: int) returns ref[Signature]?
     {
-        let n cached_signatures.get_length() as int
+        if sig.cache_rows = null
+            return null
+        let rows sig.cache_rows as ref[Array[ref[CachedSignature]?]]
+        let n rows.get_length() as int
         var i 0
         while i < n
         {
-            let e cached_signatures[i]
+            let e rows[i]
             if e <> null
             {
                 let row e as ref[CachedSignature]
-                if row.source = sig
-                {
-                    if row.kind = kind
-                        return row.instantiation
-                }
+                if row.kind = kind
+                    return row.instantiation
             }
             set i: i + 1
         }
         null
+    }
+
+    procedure signature_cache_add(sig: ref[Signature], row: ref[CachedSignature])
+    {
+        if sig.cache_rows = null
+        {
+            let sig_page Page.get(sig)
+            set sig.cache_rows: &Array[ref[CachedSignature]?]^sig_page()
+        }
+        (sig.cache_rows as ref[Array[ref[CachedSignature]?]]).add(row)
     }
 
     function get_base_signature(this, signature: ref[Signature]) returns ref[Signature]?
@@ -135554,7 +135740,7 @@ define Checker
         if result = null
             return null
         let row &CachedSignature^host(signature, SignatureCacheKindBase, null, result)
-        cached_signatures.add(row as ref[CachedSignature]?)
+        Checker.signature_cache_add(signature, row)
         result
     }
 
@@ -135576,7 +135762,7 @@ define Checker
         if erased = null
             return null
         let row &CachedSignature^host(signature, SignatureCacheKindErased, null, erased)
-        cached_signatures.add(row as ref[CachedSignature]?)
+        Checker.signature_cache_add(signature, row)
         erased
     }
 
@@ -135615,7 +135801,7 @@ define Checker
         if canonical = null
             return null
         let row &CachedSignature^host(signature, SignatureCacheKindCanonical, null, canonical)
-        cached_signatures.add(row as ref[CachedSignature]?)
+        Checker.signature_cache_add(signature, row)
         canonical
     }
 
@@ -138040,30 +138226,31 @@ define Checker
     ; TYPES, and everything downstream compares types by pointer.
     function get_signature_instantiation_without_filling_in_type_arguments(this, sig: ref[Signature], type_arguments: ref[Array[ref[Type]?]]?) returns ref[Signature]?
     {
-        let n cached_signatures.get_length() as int
-        var i 0
-        while i < n
+        if sig.cache_rows <> null
         {
-            let e cached_signatures[i]
-            if e <> null
+            let rows sig.cache_rows as ref[Array[ref[CachedSignature]?]]
+            let n rows.get_length() as int
+            var i 0
+            while i < n
             {
-                let row e as ref[CachedSignature]
-                if row.source = sig
+                let e rows[i]
+                if e <> null
                 {
+                    let row e as ref[CachedSignature]
                     if row.kind = SignatureCacheKindInstantiation
                     {
                         if Checker.type_lists_equal(row.type_arguments, type_arguments)
                             return row.instantiation
                     }
                 }
+                set i: i + 1
             }
-            set i: i + 1
         }
         let made this.create_signature_instantiation(sig, type_arguments)
         if made = null
             return null
         let row &CachedSignature^host(sig, SignatureCacheKindInstantiation, type_arguments, made)
-        cached_signatures.add(row as ref[CachedSignature]?)
+        Checker.signature_cache_add(sig, row)
         made
     }
 
