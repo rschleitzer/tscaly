@@ -7218,6 +7218,18 @@ define Checker
     rel_source_depth: int
     rel_target_stack: ref[Array[ref[Type]?]]
     rel_target_depth: int
+    ; ★★★ ONE RELATER PER checkTypeRelatedTo (slice 228). Upstream allocates a
+    ; fresh Relater — empty maybe keys, empty source/target stacks — for every
+    ; check, and a check NESTED in a relation (the variance measurement's
+    ; isTypeAssignableTo) sees none of the outer one's state. This port keeps ONE
+    ; set of arrays and used to reset the three depths to 0 for the nested check,
+    ; which made it OVERWRITE the outer check's entries from index 0: the outer
+    ; frames then scanned clobbered maybe keys and a clobbered deep-nesting
+    ; stack. The nested check now starts at the current depth and these bases
+    ; say where its own view begins.
+    rel_maybe_base: int
+    rel_source_base: int
+    rel_target_base: int
     rel_expanding_flags: int
     rel_overflow: bool
 
@@ -7276,6 +7288,15 @@ define Checker
     ; shape — needs the stack to hold a whole successful subtree and made the same
     ; file slower than the 81 s it was meant to fix. This needs no stack at all.
     rel_maybe_hits: int
+    ; ★★★ THE THIRD TERNARY VALUE (slice 228). Upstream's Ternary has FOUR members
+    ; and this port's bool-plus-counter had modelled three: False, True, and Maybe
+    ; (a true that moved `rel_maybe_hits`). The fourth, `TernaryUnknown`, is what a
+    ; RECURSIVE variance measurement answers (`getVariances`/`getAliasVariances`
+    ; returning the empty list), and it is not a Maybe: `recursiveTypeRelatedTo`
+    ; records a Maybe as Succeeded when it reaches depth 0 and NEVER records an
+    ; Unknown. The two sentinels answered a plain `true` here, i.e. a DEFINITE
+    ; True, and the frame wrote a Succeeded row the reference never writes.
+    rel_unknown_hits: int
 
     ; ── the reverse-mapped family's own state (slice 160) ───────────────────
     ;
@@ -7846,6 +7867,9 @@ define Checker
         set c.rel_maybe_depth: 0
         set c.rel_source_depth: 0
         set c.rel_target_depth: 0
+        set c.rel_maybe_base: 0
+        set c.rel_source_base: 0
+        set c.rel_target_base: 0
         set c.rel_expanding_flags: ExpandingFlagsNone
         set c.rel_overflow: false
         let rce &Array[RelationCacheRow]^host()
@@ -7861,6 +7885,7 @@ define Checker
         rrc.add(0)
         rrc.add(0)
         set c.rel_maybe_hits: 0
+        set c.rel_unknown_hits: 0
         let rmc &Array[ref[ReverseMappedRow]?]^host()
         set c.reverse_mapped_cache: rmc as ref[Array[ref[ReverseMappedRow]?]]
         let rhc &Array[ref[ReverseMappedRow]?]^host()
@@ -9163,6 +9188,14 @@ define Checker
     ; not the one asked about — and that reading was indistinguishable from *this
     ; instantiated type has no target*, which is the shape instantiate_type_worker
     ; forks on.
+    ; ★★★ THE TYPE-PARAMETER, INDEX AND STRING-MAPPING ARMS ARE SLICE 228'S, for
+    ; the same reason as the two above: upstream's `Target()` is ONE accessor over
+    ; every kind that carries a target, and `createCanonicalSignature` asks it of
+    ; a TYPE PARAMETER (`tp.Target() != nil && constraint == nil` → the original).
+    ; Answering null there kept every cloned method type parameter as its own
+    ; identity, so the canonical signature was the signature itself and the
+    ; instantiation stream forked from the reference at the first generic method
+    ; comparison (complexRecursiveCollections: >240 s against 2 s).
     function target_of(t: ref[Type]) returns ref[Type]?
     {
         choose t.data
@@ -9176,6 +9209,12 @@ define Checker
                 return m.target
             when ie: InstantiationExpression
                 return ie.target
+            when tp: TypeParameter
+                return tp.target
+            when ix: Index
+                return ix.target
+            when sm: StringMapping
+                return sm.target
         null
     }
 
@@ -117179,12 +117218,19 @@ define Checker
         let save_maybe rel_maybe_depth
         let save_source rel_source_depth
         let save_target rel_target_depth
+        let save_maybe_base rel_maybe_base
+        let save_source_base rel_source_base
+        let save_target_base rel_target_base
+        let save_maybe_hits rel_maybe_hits
+        let save_unknown_hits rel_unknown_hits
         let save_expanding rel_expanding_flags
         let save_count rel_relation_count
         set rel_overflow: false
-        set rel_maybe_depth: 0
-        set rel_source_depth: 0
-        set rel_target_depth: 0
+        ; A fresh Relater: its view of the shared arrays starts HERE (see
+        ; rel_maybe_base), and its Ternary counters are its own.
+        set rel_maybe_base: rel_maybe_depth
+        set rel_source_base: rel_source_depth
+        set rel_target_base: rel_target_depth
         set rel_expanding_flags: ExpandingFlagsNone
         ; `r.relationCount = (16_000_000 - relation.size()) / 8` — the budget is
         ; what the relation's cache has NOT already spent, so a file whose earlier
@@ -117266,6 +117312,11 @@ define Checker
         set rel_maybe_depth: save_maybe
         set rel_source_depth: save_source
         set rel_target_depth: save_target
+        set rel_maybe_base: save_maybe_base
+        set rel_source_base: save_source_base
+        set rel_target_base: save_target_base
+        set rel_maybe_hits: save_maybe_hits
+        set rel_unknown_hits: save_unknown_hits
         set rel_expanding_flags: save_expanding
         set rel_relation_count: save_count
         answer
@@ -119812,12 +119863,14 @@ define Checker
     {
         var stack rel_source_stack
         var depth rel_source_depth
+        var base rel_source_base
         if which = RecursionFlagsTarget
         {
             set stack: rel_target_stack
             set depth: rel_target_depth
+            set base: rel_target_base
         }
-        this.is_deeply_nested_type_in(t, stack, depth, max_depth)
+        this.is_deeply_nested_type_in(t, stack, base, depth, max_depth)
     }
 
     procedure rel_push_maybe(this, s: int, t: int, i_state: int)
@@ -119839,7 +119892,7 @@ define Checker
 
     function rel_maybe_has(this, s: int, t: int, i_state: int) returns bool
     {
-        var i 0
+        var i rel_maybe_base
         while i < rel_maybe_depth
         {
             var same true
@@ -120178,23 +120231,22 @@ define Checker
         ; while it measures variance, which changes what pushTypeResolution calls a
         ; cycle; that is the first place to look when this is picked up again.
         ;
-        ; Measured: with the cache on in that phase, exactly three stage-2 units
-        ; leave MATCH and all three are named after it —
-        ; `varianceRepeatedlyPropegatesWithUnreliableFlag` and the two
-        ; `varianceProblingAndZeroOrderIndexSignatureRelationsAlign`. With it off
-        ; there, nothing leaves MATCH and the speed-up is unaffected: the variance
-        ; worker is a small share of the comparisons.
+        ; (Slices 172–227 measured three, then one, stage-2 units leaving MATCH
+        ; with the cache on in the variance phase; slice 228 found the rows, not
+        ; the phase, to be the cause — see the tail of this function.)
         ; The comparison's KEY — see get_relation_key: the maybe-set and the result cache are
         ; keyed on it, never on the pair of ids (slice 216).
         var constrained false
         let key this.get_relation_key(source, target, intersection_state, relation = RelationIdentity, false, &constrained)
-        ; ★★★ THE CACHE STAYS OFF INSIDE THE VARIANCE COMPUTATION (slice 200's
-        ; measurement, re-measured in slice 227): with it on, `varianceMeasurement`
-        ; leaves MATCH while the three units the old note named stay — the flip the
-        ; note recorded is real and not the fall-through of slice 220 alone.
-        var cached 0
-        if in_variance_computation = false
-            set cached: this.rel_result_get(relation, key, 0, 0)
+        ; ★★★ THE CACHE IS ON INSIDE THE VARIANCE COMPUTATION TOO (slice 228). It
+        ; stood off there from slice 172 to 227 because with it on
+        ; `varianceMeasurement` left MATCH — and the cause was never the phase but
+        ; the ROWS: this frame wrote a subset of upstream's (its own key only, and
+        ; only on a definite true), which is harmless while the relation is a
+        ; function of its key and wrong inside a measurement, where rows are
+        ; provisional and upstream answers later asks from them. The tail below
+        ; writes upstream's rows; the guard is gone.
+        let cached this.rel_result_get(relation, key, 0, 0)
         if cached <> 0
         {
             ; `r.c.reliabilityFlags |= entry & (ReportsUnmeasurable|ReportsUnreliable)`
@@ -120262,18 +120314,22 @@ define Checker
                 return true
             }
         }
-        if rel_source_depth = 100
+        if rel_source_depth - rel_source_base = 100
         {
             set rel_overflow: true
             return false
         }
-        if rel_target_depth = 100
+        if rel_target_depth - rel_target_base = 100
         {
             set rel_overflow: true
             return false
         }
+        ; `maybeStart := len(r.maybeKeys)` — the keys this frame and its Maybe
+        ; children leave on the stack are recorded TOGETHER (slice 228).
+        let maybe_start rel_maybe_depth
         this.rel_push_maybe(key, 0, 0)
         let maybe_before rel_maybe_hits
+        let unknown_before rel_unknown_hits
         let save_expanding rel_expanding_flags
         ; `saveReliabilityFlags := r.c.reliabilityFlags; r.c.reliabilityFlags = 0`
         ; — what THIS comparison reports has to be separable from what its caller
@@ -120321,28 +120377,66 @@ define Checker
         if (recursion_flags & RecursionFlagsTarget) <> 0
             set rel_target_depth: rel_target_depth - 1
         set rel_expanding_flags: save_expanding
-        set rel_maybe_depth: rel_maybe_depth - 1
         let propagating reliability_flags & RelationComparisonResultReportsMask
         set this.reliability_flags: reliability_flags | save_reliability
+        ; ★★★ UPSTREAM'S FOUR-VALUED TAIL, ported whole in slice 228 (§3.5jc).
+        ; The result of this frame is
+        ;   False   — `result` false;
+        ;   Unknown — a recursive variance sentinel fired below (rel_unknown_hits);
+        ;   Maybe   — an assumption was used below (rel_maybe_hits), no Unknown;
+        ;   True    — neither counter moved across the subtree.
+        ; The counters are RESTORED on a False: a false child contributes nothing
+        ; to its parent's Ternary (`&=` stops at the first False, `some` discards
+        ; a False), exactly as upstream's discarded Ternary value.
+        ;
+        ; The maybe stack is NOT popped here as a matter of course. A Maybe leaves
+        ; its keys on the stack *"such that when we hit depth zero above, we can
+        ; report all of them as successful"*; a True records every key from
+        ; maybe_start and truncates; a Maybe at depth 0 does the same; an Unknown
+        ; at depth 0 truncates WITHOUT recording; a False truncates and records
+        ; only itself as Failed. ★This is what the cache-off-inside-variance
+        ; guard of slices 172–227 stood in for: the rows a variance measurement
+        ; writes are PROVISIONAL (answered under the `computing` sentinel) and the
+        ; reference answers later asks from them, so a port that writes FEWER rows
+        ; there answers those asks by recomputing and gets the post-measurement
+        ; answer instead (`varianceMeasurement`). Matching the rows, the guard
+        ; goes, and with it the exponential re-measurement it cost
+        ; (complexRecursiveCollections: >240 s → seconds).
         if result
         {
-            ; ★★★ THE COUNTER IS THE WHOLE TEST: unchanged across the subtree means
-            ; no assumption was used anywhere below, so this TRUE is upstream's
-            ; definite True and may be recorded. Changed means it is a Maybe, and a
-            ; Maybe is not cached at all here — upstream caches one only at the
-            ; outermost frame, and the rows this writes are a SUBSET of its rows,
-            ; which costs recomputation and cannot cost an answer.
-            if rel_maybe_hits = maybe_before
+            var is_unknown false
+            if rel_unknown_hits <> unknown_before
+                set is_unknown: true
+            var is_true false
+            if is_unknown = false
             {
-                set rel_relation_count: rel_relation_count - 1
-                if in_variance_computation = false
-                    this.rel_result_set(relation, key, 0, 0, RelationComparisonResultSucceeded | propagating)
+                if rel_maybe_hits = maybe_before
+                    set is_true: true
+            }
+            var at_root false
+            if rel_source_depth = rel_source_base
+            {
+                if rel_target_depth = rel_target_base
+                    set at_root: true
+            }
+            if is_true or at_root
+            {
+                if is_unknown = false
+                {
+                    var q maybe_start
+                    while q < rel_maybe_depth
+                    {
+                        this.rel_result_set(relation, rel_maybe_source[q], rel_maybe_target[q], rel_maybe_state[q], RelationComparisonResultSucceeded | propagating)
+                        set rel_relation_count: rel_relation_count - 1
+                        set q: q + 1
+                    }
+                }
+                set rel_maybe_depth: maybe_start
             }
             return true
         }
         ; `r.relation.set(id, Failed)` — *when something is false under assumptions
-        ; it will also be false without assumptions*, which is why this half needs
-        ; no counter.
+        ; it will also be false without assumptions*.
         ;
         ; ★ NOT under overflow: a false that came out of the depth limiter is not a
         ; fact about the two types, and upstream tags exactly that row with an
@@ -120353,15 +120447,11 @@ define Checker
         ; answered from the cache at the first level. The guard that stood here left the
         ; chain unrecorded, the next ask walked the whole chain again to the same wall,
         ; and reported TS2321 a second time (`excessivelyDeepConditionalTypes`).
-        ;
-        ; `r.relationCount--`, at both of upstream's sites — one unit per row the
-        ; comparison commits. It is spent even where the row itself is not written
-        ; (inside the variance computation, where this port's cache is off by the
-        ; measurement above): the budget measures the WORK, and the work is the same
-        ; either way.
+        this.rel_result_set(relation, key, 0, 0, RelationComparisonResultFailed | propagating)
         set rel_relation_count: rel_relation_count - 1
-        if in_variance_computation = false
-            this.rel_result_set(relation, key, 0, 0, RelationComparisonResultFailed | propagating)
+        set rel_maybe_depth: maybe_start
+        set rel_maybe_hits: maybe_before
+        set rel_unknown_hits: unknown_before
         false
     }
 
@@ -121313,7 +121403,11 @@ define Checker
                                 }
                                 let vs variances as ref[Array[int]]
                                 if (vs.get_length() as int) = 0
+                                {
+                                    ; TernaryUnknown — see rel_unknown_hits.
+                                    set rel_unknown_hits: rel_unknown_hits + 1
                                     return true
+                                }
                                 ; ★ `fillMissingTypeArguments` on both sides is the
                                 ; reference's next line and it is a stop of its own
                                 ; (the default-argument chapter). Where NEITHER side
@@ -121738,10 +121832,14 @@ define Checker
                         ; (slice 203; `typeof k === "number"` on that `keyof S`
                         ; answered `number` instead of `keyof S & number`).
                         let maybe_before rel_maybe_hits
+                        let unknown_before rel_unknown_hits
                         if this.is_related_to_ex(src, keys as ref[Type], relation, error_node, IntersectionStateNone, RecursionFlagsTarget)
                         {
                             if rel_maybe_hits = maybe_before
-                                return true
+                            {
+                                if rel_unknown_hits = unknown_before
+                                    return true
+                            }
                         }
                         if this.unported_mark() <> mark
                             return false
@@ -121782,8 +121880,18 @@ define Checker
                         }
                         if target_keys <> null
                         {
+                            ; `== TernaryTrue` here too (slice 228): the same
+                            ; circular-constraint reason as the arm above.
+                            let maybe_before rel_maybe_hits
+                            let unknown_before rel_unknown_hits
                             if this.is_related_to_ex(src, target_keys as ref[Type], relation, error_node, IntersectionStateNone, RecursionFlagsTarget)
-                                return true
+                            {
+                                if rel_maybe_hits = maybe_before
+                                {
+                                    if rel_unknown_hits = unknown_before
+                                        return true
+                                }
+                            }
                             if this.unported_mark() <> mark
                                 return false
                         }
@@ -122562,9 +122670,14 @@ define Checker
                     ; TernaryUnknown for a RECURSIVE getVariances — the empty list.
                     ; The reference's own comment: it measures variance only from
                     ; occurrences that are not nested in recursive instantiations,
-                    ; and Maybe is truthy, so the bool port answers `true`.
+                    ; and Maybe is truthy, so the bool port answers `true` —
+                    ; ★ counted as an UNKNOWN (slice 228, see rel_unknown_hits),
+                    ; which no frame above records.
                     if (vs.get_length() as int) = 0
+                    {
+                        set rel_unknown_hits: rel_unknown_hits + 1
                         return true
+                    }
                     let verdict this.relate_variances(this.get_type_arguments(src), this.get_type_arguments(target), vs, relation, error_node, intersection_state)
                     if verdict = RelateVariancesTrue
                         return true
@@ -133115,9 +133228,9 @@ define Checker
     ; own pair on its own state, and the reverse-mapped family will have a third.
     ; The body is one function with the stack as a parameter, and the two-stack
     ; entry point above now chooses which one to hand it.
-    function is_deeply_nested_type_in(this, t_in: ref[Type], stack: ref[Array[ref[Type]?]], depth: int, max_depth: int) returns bool
+    function is_deeply_nested_type_in(this, t_in: ref[Type], stack: ref[Array[ref[Type]?]], start: int, depth: int, max_depth: int) returns bool
     {
-        if depth < max_depth
+        if depth - start < max_depth
             return false
         ; ★ Slice 160 adds the reference's two pre-passes, both inside the depth
         ; guard where it has them: an instantiated mapped type is *considered
@@ -133138,7 +133251,7 @@ define Checker
                     set k: k + 1
                     if e = null
                         continue
-                    if this.is_deeply_nested_type_in(e as ref[Type], stack, depth, max_depth)
+                    if this.is_deeply_nested_type_in(e as ref[Type], stack, start, depth, max_depth)
                         return true
                 }
             }
@@ -133146,7 +133259,7 @@ define Checker
         let id this.get_recursion_identity(t)
         var count 0
         var last_type_id 0
-        var i 0
+        var i start
         while i < depth
         {
             let row stack[i]
@@ -134437,9 +134550,9 @@ define Checker
         let save_expanding n.expanding_flags
         n.source_stack.add(source as ref[Type]?)
         n.target_stack.add(target as ref[Type]?)
-        if this.is_deeply_nested_type_in(source, n.source_stack, n.source_stack.get_length() as int, 2)
+        if this.is_deeply_nested_type_in(source, n.source_stack, 0, n.source_stack.get_length() as int, 2)
             set n.expanding_flags: n.expanding_flags | ExpandingFlagsSource
-        if this.is_deeply_nested_type_in(target, n.target_stack, n.target_stack.get_length() as int, 2)
+        if this.is_deeply_nested_type_in(target, n.target_stack, 0, n.target_stack.get_length() as int, 2)
             set n.expanding_flags: n.expanding_flags | ExpandingFlagsTarget
         if n.expanding_flags <> ExpandingFlagsBoth
         {
@@ -136770,9 +136883,9 @@ define Checker
         reverse_mapped_source_stack.add(source as ref[Type]?)
         reverse_mapped_target_stack.add(target as ref[Type]?)
         let save_expanding reverse_expanding_flags
-        if this.is_deeply_nested_type_in(source, reverse_mapped_source_stack, reverse_mapped_source_stack.get_length() as int, 2)
+        if this.is_deeply_nested_type_in(source, reverse_mapped_source_stack, 0, reverse_mapped_source_stack.get_length() as int, 2)
             set reverse_expanding_flags: reverse_expanding_flags | ExpandingFlagsSource
-        if this.is_deeply_nested_type_in(target, reverse_mapped_target_stack, reverse_mapped_target_stack.get_length() as int, 2)
+        if this.is_deeply_nested_type_in(target, reverse_mapped_target_stack, 0, reverse_mapped_target_stack.get_length() as int, 2)
             set reverse_expanding_flags: reverse_expanding_flags | ExpandingFlagsTarget
         var t: ref[Type]? null
         if reverse_expanding_flags <> ExpandingFlagsBoth
