@@ -1,0 +1,1631 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; printer — the port of internal/printer, begun in slice 230 with its SUBSTRATE:
+; the emit flags, the generated-identifier flags, the text range, the text writer,
+; the printer's utilities and the emit-helper texts. The printer proper
+; (printer.go), the emit context and the node factory wrapper follow in their own
+; slices; the package's file-by-file countdown is `tests/coverage.sh`'s emitter
+; block, and the yardstick it answers to is the seventh artifact (TESTPLAN.md,
+; *The sixth yardstick*).
+;
+; ★★★ TWO WRITERS, ONE RECORD (a §3 decision, 3.35). The reference's EmitTextWriter
+; is an interface with two implementations the emitter uses — textWriter, which
+; tracks lines, indentation and columns, and singleLineStringWriter, which appends
+; and answers every position question with zero. Every method of the second is
+; the first with the bookkeeping removed, so this port carries ONE `TextWriter`
+; with a `single_line` flag read at the six places the two differ, the shape
+; §3.18 gives a func value whose call sites are not static. The third
+; implementation, changetrackerwriter.go, belongs to the language service and is
+; not a goal of this port (coverage.sh's denominator says so).
+;
+; ★ STRINGS. The reference's `string` is `Slice[char]` here where a text is READ
+; and a `StringBuilder` where one is BUILT; a builder's product is a `String`, and
+; `Printer.slice_of` is the view over it the readers take. The writers append
+; views; a caller holding a String hands `slice_of(s)`.
+;
+; ★ The scanner-package functions the utilities call (skip_trivia_ex, the comment
+; ranges, token_to_string, the line lookup) are statics on `Scanner` since this
+; slice — the reference keeps them in that package — and `TextRange` is declared
+; here because its first reader is this package.
+
+use scaly.memory.Page
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use scaly.containers.Array
+use tscaly.ast.AstNode
+use tscaly.scanner.Scanner
+use tscaly.binder.Binder
+use tscaly.scanner.CommentRange
+
+; ── emitflags.go ────────────────────────────────────────────────────────────
+define EFNone:                           int 0
+define EFSingleLine:                     int 1 << 0
+define EFMultiLine:                      int 1 << 1
+define EFNoLeadingSourceMap:             int 1 << 2
+define EFNoTrailingSourceMap:            int 1 << 3
+define EFNoNestedSourceMaps:             int 1 << 4
+define EFNoTokenLeadingSourceMaps:       int 1 << 5
+define EFNoTokenTrailingSourceMaps:      int 1 << 6
+define EFNoLeadingComments:              int 1 << 7
+define EFNoTrailingComments:             int 1 << 8
+define EFNoNestedComments:               int 1 << 9
+define EFHelperName:                     int 1 << 10
+define EFExportName:                     int 1 << 11
+define EFLocalName:                      int 1 << 12
+define EFIndented:                       int 1 << 13
+define EFNoIndentation:                  int 1 << 14
+define EFReuseTempVariableScope:         int 1 << 15
+define EFCustomPrologue:                 int 1 << 16
+define EFNoAsciiEscaping:                int 1 << 17
+define EFExternalHelpers:                int 1 << 18
+define EFStartOnNewLine:                 int 1 << 19
+define EFIndirectCall:                   int 1 << 20
+define EFAsyncFunctionBody:              int 1 << 21
+define EFNoLexicalArguments:             int 1 << 22
+define EFTransformPrivateStaticElements: int 1 << 23
+define EFNoLexicalThis:                  int 1 << 24
+define EFNoSourceMap:                    int EFNoLeadingSourceMap | EFNoTrailingSourceMap
+define EFNoTokenSourceMaps:              int EFNoTokenLeadingSourceMaps | EFNoTokenTrailingSourceMaps
+define EFNoComments:                     int EFNoLeadingComments | EFNoTrailingComments
+
+; ── generatedidentifierflags.go ─────────────────────────────────────────────
+define GeneratedIdentifierFlagsNone:                  int 0
+define GeneratedIdentifierFlagsAuto:                  int 1
+define GeneratedIdentifierFlagsLoop:                  int 2
+define GeneratedIdentifierFlagsUnique:                int 3
+define GeneratedIdentifierFlagsNode:                  int 4
+define GeneratedIdentifierFlagsKindMask:              int 7
+define GeneratedIdentifierFlagsReservedInNestedScopes: int 1 << 3
+define GeneratedIdentifierFlagsOptimistic:            int 1 << 4
+define GeneratedIdentifierFlagsFileLevel:             int 1 << 5
+define GeneratedIdentifierFlagsAllowNameSubstitution: int 1 << 6
+
+; ── utilities.go's literal-text flags and quote characters ──────────────────
+define LiteralTextFlagsNone:                          int 0
+define LiteralTextFlagsNeverAsciiEscape:              int 1 << 0
+define LiteralTextFlagsJsxAttributeEscape:            int 1 << 1
+define LiteralTextFlagsTerminateUnterminatedLiterals: int 1 << 2
+define LiteralTextFlagsAllowNumericSeparator:         int 1 << 3
+define QuoteCharSingleQuote: int 39
+define QuoteCharDoubleQuote: int 34
+define QuoteCharBacktick:    int 96
+
+; core.TextRange — a (pos, end) pair by value. `UndefinedTextRange` is (-1, -1).
+define TextRange
+(
+    pos: int
+    end: int
+)
+{
+    function undefined_range() returns TextRange
+        TextRange(0 - 1, 0 - 1)
+
+    function len(this) returns int
+        end - pos
+
+    function is_valid(this) returns bool
+        (pos >= 0) or (end >= 0)
+
+    function contains(this, p: int) returns bool
+        (p >= pos) and (p < end)
+
+    function contains_inclusive(this, p: int) returns bool
+        (p >= pos) and (p <= end)
+
+    function contains_exclusive(this, p: int) returns bool
+        (pos < p) and (p < end)
+
+    function with_pos(this, p: int) returns TextRange
+        TextRange(p, end)
+
+    function with_end(this, e: int) returns TextRange
+        TextRange(pos, e)
+
+    function contained_by(this, other: TextRange) returns bool
+        (other.pos <= pos) and (other.end >= end)
+
+    function overlaps(this, other: TextRange) returns bool
+    {
+        var start pos
+        if other.pos > start
+            set start: other.pos
+        var stop end
+        if other.end < stop
+            set stop: other.end
+        start < stop
+    }
+
+    ; Overlaps that treats touching ranges as intersecting: [0, 5) meets [5, 10).
+    function intersects(this, other: TextRange) returns bool
+    {
+        var start pos
+        if other.pos > start
+            set start: other.pos
+        var stop end
+        if other.end < stop
+            set stop: other.end
+        start <= stop
+    }
+
+    function compare(this, other: TextRange) returns int
+    {
+        let c pos - other.pos
+        if c <> 0
+            return c
+        end - other.end
+    }
+
+    function of_node(n: ref[AstNode]) returns TextRange
+        TextRange(AstNode.pos_of(n), AstNode.end_of(n))
+}
+
+; ── textwriter.go + singlelinestringwriter.go ───────────────────────────────
+;
+; The builder is page-hosted (StringBuilder allocates through `^this`), so a
+; writer is made by `TextWriter.create(host, ...)` and never on a frame; `clear`
+; takes the host for the same reason.
+define TextWriter
+(
+    new_line: Slice[char]
+    indent_size: int
+    single_line: bool
+    sb: ref[StringBuilder]
+    last_rune: int
+    indent: int
+    line_start: bool
+    line_count: int
+    line_pos: int
+    has_trailing_comment_state: bool
+    ; UTF-16 code units written since the line start — the reference computes
+    ; `UTF16Len(text[linePos:])` off its builder's bytes on every GetColumn; the
+    ; builder's buffer is not reachable through a reference here, so the count
+    ; is kept as the writes happen (a line terminator inside a write restarts it).
+    line_units: int
+)
+{
+    function create(host: ref[Page], new_line: Slice[char], indent_size_in: int) returns ref[TextWriter]
+    {
+        var indent_size indent_size_in
+        if indent_size <= 0
+            set indent_size: 4
+        let sb StringBuilder^host()
+        &TextWriter^host(new_line, indent_size, false, &sb, 0 - 1, 0, true, 0, 0, false, 0)
+    }
+
+    ; GetSingleLineStringWriter — the pooled single-line writer, one per call here.
+    function create_single_line(host: ref[Page]) returns ref[TextWriter]
+    {
+        let sb StringBuilder^host()
+        let no_new_line: Slice[char] ""
+        &TextWriter^host(no_new_line, 0, true, &sb, 0 - 1, 0, false, 0, 0, false, 0)
+    }
+
+    procedure clear(this, host: ref[Page])
+    {
+        let sb StringBuilder^host()
+        set this.sb: &sb
+        set this.last_rune: 0 - 1
+        set this.indent: 0
+        set this.line_start: single_line = false
+        set this.line_count: 0
+        set this.line_pos: 0
+        set this.has_trailing_comment_state: false
+        set this.line_units: 0
+    }
+
+    procedure increase_indent(this)
+    {
+        if single_line
+            return
+        set this.indent: indent + 1
+    }
+
+    procedure decrease_indent(this)
+    {
+        if single_line
+            return
+        set this.indent: indent - 1
+    }
+
+    function get_indent(this) returns int
+        indent
+
+    function get_line(this) returns int
+        line_count
+
+    function get_text_pos(this) returns int
+        sb.get_length() as int
+
+    function to_string(this) returns String
+        sb.to_string()
+
+    function is_at_start_of_line(this) returns bool
+        line_start
+
+    function has_trailing_comment(this) returns bool
+        has_trailing_comment_state
+
+    ; HasTrailingWhitespace — the last rune written, decoded once at the write.
+    function has_trailing_whitespace(this) returns bool
+    {
+        if (sb.get_length() as int) = 0
+            return false
+        if last_rune < 0
+            return false
+        Scanner.is_white_space_like(last_rune)
+    }
+
+    ; GetColumn — UTF-16 code units from the line start; the indent alone at a
+    ; line start (nothing has been written on the line yet).
+    function get_column(this) returns int
+    {
+        if single_line
+            return 0
+        if line_start
+            return indent * indent_size
+        line_units
+    }
+
+    ; core.UTF16Len over a view's bytes [from, to): one unit per lead byte, two
+    ; for a four-byte sequence.
+    function utf16_len_of(s: Slice[char], from: int, to: int) returns int
+    {
+        var n 0
+        var i from
+        while i < to
+        {
+            let c (s[i as size_t] as int) & 255
+            if (c & 0xC0) <> 0x80
+            {
+                set n: n + 1
+                if c >= 0xF0
+                    set n: n + 1
+            }
+            set i: i + 1
+        }
+        n
+    }
+
+    ; The last ECMA line start inside a view, or -1 when it has no terminator.
+    function last_line_start_in(s: Slice[char]) returns int
+    {
+        let n s.length as int
+        var last 0 - 1
+        var i 0
+        while i < n
+        {
+            let c (s[i as size_t] as int) & 255
+            if c = 13
+            {
+                set i: i + 1
+                if i < n
+                {
+                    if ((s[i as size_t] as int) & 255) = 10
+                        set i: i + 1
+                }
+                set last: i
+                continue
+            }
+            if c = 10
+            {
+                set i: i + 1
+                set last: i
+                continue
+            }
+            if c = 0xE2
+            {
+                if i + 2 < n
+                {
+                    if ((s[(i + 1) as size_t] as int) & 255) = 0x80
+                    {
+                        let c2 (s[(i + 2) as size_t] as int) & 255
+                        if (c2 = 0xA8) or (c2 = 0xA9)
+                        {
+                            set i: i + 3
+                            set last: i
+                            continue
+                        }
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        last
+    }
+
+    ; The last rune of a view, for has_trailing_whitespace; -1 for an empty view.
+    function last_rune_of(s: Slice[char]) returns int
+    {
+        let n s.length as int
+        if n = 0
+            return 0 - 1
+        var start n - 1
+        while start > 0
+        {
+            if (((s[start as size_t] as int) & 255) & 0xC0) <> 0x80
+                break
+            set start: start - 1
+        }
+        Scanner.utf8_decode_in(s, n, start)
+    }
+
+    procedure append_view(this, s: Slice[char])
+    {
+        sb.append(s.data, s.length)
+        set this.last_rune: TextWriter.last_rune_of(s)
+        let restart TextWriter.last_line_start_in(s)
+        if restart >= 0
+            set this.line_units: TextWriter.utf16_len_of(s, restart, s.length as int)
+        else
+            set this.line_units: line_units + TextWriter.utf16_len_of(s, 0, s.length as int)
+    }
+
+    ; updateLineCountAndPosFor — count the ECMA line starts of `s` (LF, CR, CRLF,
+    ; LS, PS); the first start is position 0 and always there, so a count above
+    ; one means a terminator was written.
+    procedure update_line_count_and_pos_for(this, s: Slice[char])
+    {
+        let n s.length as int
+        var count 1
+        var last_line_start 0
+        var i 0
+        while i < n
+        {
+            let c (s[i as size_t] as int) & 255
+            if c = 13
+            {
+                set i: i + 1
+                if i < n
+                {
+                    if ((s[i as size_t] as int) & 255) = 10
+                        set i: i + 1
+                }
+                set count: count + 1
+                set last_line_start: i
+                continue
+            }
+            if c = 10
+            {
+                set i: i + 1
+                set count: count + 1
+                set last_line_start: i
+                continue
+            }
+            if c = 0xE2
+            {
+                if i + 2 < n
+                {
+                    if ((s[(i + 1) as size_t] as int) & 255) = 0x80
+                    {
+                        let c2 (s[(i + 2) as size_t] as int) & 255
+                        if (c2 = 0xA8) or (c2 = 0xA9)
+                        {
+                            set i: i + 3
+                            set count: count + 1
+                            set last_line_start: i
+                            continue
+                        }
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        if count > 1
+        {
+            set this.line_count: line_count + (count - 1)
+            let cur_len sb.get_length() as int
+            set this.line_pos: (cur_len - n) + last_line_start
+            set this.line_start: (line_pos - cur_len) = 0
+            return
+        }
+        set this.line_start: false
+    }
+
+    procedure raw_write(this, s: Slice[char])
+    {
+        if single_line
+        {
+            this.append_view(s)
+            return
+        }
+        if (s.length as int) <> 0
+        {
+            this.append_view(s)
+            set this.has_trailing_comment_state: false
+        }
+        this.update_line_count_and_pos_for(s)
+    }
+
+    procedure write_indent(this)
+    {
+        var k indent * indent_size
+        set this.line_units: line_units + k
+        while k > 0
+        {
+            sb.append(" " as char)
+            set k: k - 1
+        }
+    }
+
+    procedure write_text(this, s: Slice[char])
+    {
+        if (s.length as int) = 0
+            return
+        if single_line
+        {
+            this.append_view(s)
+            return
+        }
+        if line_start
+        {
+            this.write_indent()
+            set this.line_start: false
+        }
+        this.append_view(s)
+        this.update_line_count_and_pos_for(s)
+    }
+
+    procedure write(this, s: Slice[char])
+    {
+        if (s.length as int) <> 0
+            set this.has_trailing_comment_state: false
+        this.write_text(s)
+    }
+
+    procedure write_comment(this, s: Slice[char])
+    {
+        if (s.length as int) <> 0
+        {
+            if single_line = false
+                set this.has_trailing_comment_state: true
+        }
+        this.write_text(s)
+    }
+
+    procedure write_keyword(this, s: Slice[char])
+        this.write(s)
+
+    procedure write_operator(this, s: Slice[char])
+        this.write(s)
+
+    procedure write_punctuation(this, s: Slice[char])
+        this.write(s)
+
+    procedure write_space(this, s: Slice[char])
+        this.write(s)
+
+    procedure write_string_literal(this, s: Slice[char])
+        this.write(s)
+
+    procedure write_parameter(this, s: Slice[char])
+        this.write(s)
+
+    procedure write_property(this, s: Slice[char])
+        this.write(s)
+
+    procedure write_symbol(this, s: Slice[char])
+        this.write(s)
+
+    procedure write_literal(this, s: Slice[char])
+        this.write(s)
+
+    procedure write_trailing_semicolon(this, s: Slice[char])
+        this.write(s)
+
+    procedure write_line_raw(this)
+    {
+        this.append_view(new_line)
+        set this.line_count: line_count + 1
+        set this.line_pos: sb.get_length() as int
+        set this.line_start: true
+        set this.line_units: 0
+        set this.has_trailing_comment_state: false
+    }
+
+    procedure write_line(this)
+    {
+        if single_line
+        {
+            this.append_view(" ")
+            return
+        }
+        if line_start = false
+            this.write_line_raw()
+    }
+
+    procedure write_line_force(this, force: bool)
+    {
+        if single_line
+        {
+            this.append_view(" ")
+            return
+        }
+        if (line_start = false) or force
+            this.write_line_raw()
+    }
+
+    function get_default_indent_size() returns int
+        4
+}
+
+; ── utilities.go ────────────────────────────────────────────────────────────
+;
+; The statics of the printer package. `Printer` grows its fields when printer.go
+; is ported (slice 232); until then it carries one so that it is a STRUCTURE and
+; its functions are statics mangled under its name — a define without fields is
+; a namespace whose functions are FREE and mangle without it, and the first such
+; name that also names a static elsewhere (`node_is_missing` in the parser and
+; the binder) took the link down (slice 230).
+define Printer
+(
+    host: ref[Page]
+)
+{
+    function slice_of(s: String) returns Slice[char]
+        Slice[char](s.get_length() as int, s.get_buffer() as pointer[char])
+
+    procedure append_hex_upper(b: ref[StringBuilder], value: int)
+    {
+        var digits u8[16]
+        var n 0
+        var v value
+        if v = 0
+        {
+            b.append("0" as char)
+            return
+        }
+        while v > 0
+        {
+            set digits[n]: (v & 15) as u8
+            set v: v >> 4
+            set n: n + 1
+        }
+        while n > 0
+        {
+            set n: n - 1
+            let d digits[n] as int
+            if d < 10
+                b.append((48 + d) as char)
+            else
+                b.append((55 + d) as char)
+        }
+    }
+
+    procedure encode_jsx_character_entity(b: ref[StringBuilder], char_code: int)
+    {
+        b.append("&#x")
+        Printer.append_hex_upper(b, char_code)
+        b.append(";" as char)
+    }
+
+    procedure encode_utf16_escape_sequence(b: ref[StringBuilder], char_code: int)
+    {
+        b.append("\\u")
+        var width 0
+        var v char_code
+        while v > 0
+        {
+            set width: width + 1
+            set v: v >> 4
+        }
+        if width = 0
+            set width: 1
+        while width < 4
+        {
+            b.append("0" as char)
+            set width: width + 1
+        }
+        Printer.append_hex_upper(b, char_code)
+    }
+
+    ; stringutil.DecodeJSStringRune's size: this port's texts are WTF-8, where a
+    ; lone surrogate is a three-byte sequence utf8_decode_in already yields as its
+    ; code point, so the scanner's decoder is the JS-string decoder.
+    procedure append_escaped_rune(b: ref[StringBuilder], ch: int, quote_char: int, flags: int, s: Slice[char], i: int, size: int, out_size: ref[int])
+    {
+        set out_size: size
+        let n s.length as int
+        if (flags & LiteralTextFlagsJsxAttributeEscape) <> 0
+        {
+            if ch = 0
+            {
+                b.append("&#0;")
+                return
+            }
+            if ch = 34
+            {
+                b.append("&quot;")
+                return
+            }
+            if ch = 39
+            {
+                b.append("&apos;")
+                return
+            }
+            Printer.encode_jsx_character_entity(b, ch)
+            return
+        }
+        if ch = 13
+        {
+            if quote_char = QuoteCharBacktick
+            {
+                if i + 1 < n
+                {
+                    if ((s[(i + 1) as size_t] as int) & 255) = 10
+                    {
+                        set out_size: size + 1
+                        b.append("\\r\\n")
+                        return
+                    }
+                }
+            }
+        }
+        if ch > 0xFFFF
+        {
+            let c ch - 0x10000
+            Printer.encode_utf16_escape_sequence(b, ((c & 0xFFC00) >> 10) + 0xD800)
+            Printer.encode_utf16_escape_sequence(b, (c & 0x3FF) + 0xDC00)
+            return
+        }
+        if (ch >= 0xD800) and (ch <= 0xDFFF)
+        {
+            Printer.encode_utf16_escape_sequence(b, ch)
+            return
+        }
+        if ch = 0
+        {
+            var digit_follows false
+            if i + 1 < n
+            {
+                if Scanner.is_digit((s[(i + 1) as size_t] as int) & 255)
+                    set digit_follows: true
+            }
+            if digit_follows
+                b.append("\\x00")
+            else
+                b.append("\\0")
+            return
+        }
+        if ch = 9
+        {
+            b.append("\\t")
+            return
+        }
+        if ch = 11
+        {
+            b.append("\\v")
+            return
+        }
+        if ch = 12
+        {
+            b.append("\\f")
+            return
+        }
+        if ch = 8
+        {
+            b.append("\\b")
+            return
+        }
+        if ch = 13
+        {
+            b.append("\\r")
+            return
+        }
+        if ch = 10
+        {
+            b.append("\\n")
+            return
+        }
+        if ch = 92
+        {
+            b.append("\\\\")
+            return
+        }
+        if ch = 34
+        {
+            b.append("\\\"")
+            return
+        }
+        if ch = 39
+        {
+            b.append("\\'")
+            return
+        }
+        if ch = 96
+        {
+            b.append("\\\`")
+            return
+        }
+        if ch = 36
+        {
+            b.append("\\$")
+            return
+        }
+        if ch = 0x2028
+        {
+            b.append("\\u2028")
+            return
+        }
+        if ch = 0x2029
+        {
+            b.append("\\u2029")
+            return
+        }
+        if ch = 0x85
+        {
+            b.append("\\u0085")
+            return
+        }
+        Printer.encode_utf16_escape_sequence(b, ch)
+    }
+
+    ; escapeStringWorker — ECMA-262's Quote, augmented; does not add the quotes.
+    procedure escape_string_worker(s: Slice[char], quote_char: int, flags: int, b: ref[StringBuilder])
+    {
+        let n s.length as int
+        var pos 0
+        var i 0
+        while i < n
+        {
+            let ch Scanner.utf8_decode_in(s, n, i)
+            var size Scanner.utf8_size_in(s, n, i)
+            var escape false
+            if (ch >= 0xD800) and (ch <= 0xDFFF)
+                set escape: true
+            if ch = 0xFFFD
+            {
+                if size = 1
+                    set escape: true
+            }
+            if ch = 92
+            {
+                if (flags & LiteralTextFlagsJsxAttributeEscape) = 0
+                    set escape: true
+            }
+            else
+            {
+                if ch = 36
+                {
+                    if quote_char = QuoteCharBacktick
+                    {
+                        if i + 1 < n
+                        {
+                            if ((s[(i + 1) as size_t] as int) & 255) = ("{" as char) as int
+                                set escape: true
+                        }
+                    }
+                }
+                else
+                {
+                    var listed false
+                    if (ch = quote_char) or (ch = 0x2028) or (ch = 0x2029) or (ch = 0x85) or (ch = 13)
+                        set listed: true
+                    if listed
+                        set escape: true
+                    else
+                    {
+                        if ch = 10
+                        {
+                            if quote_char <> QuoteCharBacktick
+                                set escape: true
+                        }
+                        else
+                        {
+                            if ch <= 0x1F
+                                set escape: true
+                            if (flags & LiteralTextFlagsNeverAsciiEscape) = 0
+                            {
+                                if ch > 0x7F
+                                    set escape: true
+                            }
+                        }
+                    }
+                }
+            }
+            if escape
+            {
+                if pos < i
+                {
+                    let run s.subslice(pos as size_t, i as size_t)
+                    b.append(run.data, run.length)
+                }
+                var used size
+                Printer.append_escaped_rune(b, ch, quote_char, flags, s, i, size, &used)
+                set size: used
+                set pos: i + size
+            }
+            set i: i + size
+        }
+        if pos < i
+        {
+            let tail s.slice_from(pos as size_t)
+            b.append(tail.data, tail.length)
+        }
+    }
+
+    function escape_string(host: ref[Page], s: Slice[char], quote_char: int) returns String
+    {
+        let b StringBuilder^host()
+        Printer.escape_string_worker(s, quote_char, LiteralTextFlagsNeverAsciiEscape, &b)
+        b.to_string()
+    }
+
+    function escape_non_ascii_string(host: ref[Page], s: Slice[char], quote_char: int) returns String
+    {
+        let b StringBuilder^host()
+        Printer.escape_string_worker(s, quote_char, LiteralTextFlagsNone, &b)
+        b.to_string()
+    }
+
+    function escape_jsx_attribute_string(host: ref[Page], s: Slice[char], quote_char: int) returns String
+    {
+        let b StringBuilder^host()
+        Printer.escape_string_worker(s, quote_char, LiteralTextFlagsJsxAttributeEscape | LiteralTextFlagsNeverAsciiEscape, &b)
+        b.to_string()
+    }
+
+    ; canUseOriginalText: a synthesized node, a parentless node and (when asked to
+    ; terminate) an unterminated literal have no usable source text; a numeric
+    ; literal's invalid or separator-bearing text neither.
+    function can_use_original_text(node: ref[AstNode], flags: int) returns bool
+    {
+        if AstNode.pos_of(node) < 0
+            return false
+        if AstNode.parent_node_of(node) = null
+            return false
+        if (flags & LiteralTextFlagsTerminateUnterminatedLiterals) <> 0
+        {
+            if AstNode.is_unterminated_literal(node)
+                return false
+        }
+        let kind AstNode.kind_of(node)
+        if kind = KindNumericLiteral
+        {
+            let token_flags AstNode.numeric_token_flags_of(node)
+            if (token_flags & TokenFlagsIsInvalid) <> 0
+                return false
+            if (token_flags & TokenFlagsContainsSeparator) <> 0
+                return (flags & LiteralTextFlagsAllowNumericSeparator) <> 0
+        }
+        kind <> KindBigIntLiteral
+    }
+
+    ; scanner.GetTextOfNodeFromSourceText (scanner/utilities.go), placed here
+    ; because the scanner module is declared before ast and cannot name a node.
+    function get_text_of_node_from_source_text(host: ref[Page], source_text: Slice[char], node: ref[AstNode], include_trivia: bool) returns Slice[char]
+    {
+        if Binder.node_is_missing(node)
+            return ""
+        var pos AstNode.pos_of(node)
+        if include_trivia = false
+            set pos: Scanner.skip_trivia(source_text, pos)
+        let text source_text.subslice(pos as size_t, AstNode.end_of(node) as size_t)
+        if (AstNode.flags_of(node) & NodeFlagsReparserTransformedLiteral) <> 0
+        {
+            let kind AstNode.kind_of(node)
+            if kind = KindStringLiteral
+            {
+                let b StringBuilder^host()
+                var q QuoteCharDoubleQuote
+                if (AstNode.string_token_flags_of(node) & TokenFlagsSingleQuote) <> 0
+                    set q: QuoteCharSingleQuote
+                b.append(q as char)
+                b.append(text.data, text.length)
+                b.append(q as char)
+                return Printer.slice_of(b.to_string())
+            }
+            if kind = KindIdentifier
+                return AstNode.identifier_text_of(node)
+        }
+        text
+    }
+
+    ; getLiteralText. `has_source` stands for the reference's non-nil sourceFile:
+    ; with it and a usable original, the text between the node's trimmed start and
+    ; its end; without, the canonical form — a quoted, escaped string, a template
+    ; part in its delimiters, a number's own text.
+    ; ★ The template arm's `rawText` is a field this port's template nodes do not
+    ; carry (their LiteralData is the cooked text and the token flags); every
+    ; template node the parser makes has original text, and a SYNTHESIZED one is
+    ; a transformer's — recorded for that chapter. Here the cooked text is
+    ; escaped as the reference does when rawText is empty.
+    function get_literal_text(host: ref[Page], node: ref[AstNode], source_text: Slice[char], has_source: bool, flags: int) returns Slice[char]
+    {
+        if has_source
+        {
+            if Printer.can_use_original_text(node, flags)
+                return Printer.get_text_of_node_from_source_text(host, source_text, node, false)
+        }
+        let kind AstNode.kind_of(node)
+        if kind = KindStringLiteral
+        {
+            let b StringBuilder^host()
+            var q QuoteCharDoubleQuote
+            if (AstNode.string_token_flags_of(node) & TokenFlagsSingleQuote) <> 0
+                set q: QuoteCharSingleQuote
+            b.append(q as char)
+            Printer.escape_string_worker(AstNode.literal_text_of(node), q, flags, &b)
+            b.append(q as char)
+            return Printer.slice_of(b.to_string())
+        }
+        var template false
+        if (kind = KindNoSubstitutionTemplateLiteral) or (kind = KindTemplateHead)
+            set template: true
+        if (kind = KindTemplateMiddle) or (kind = KindTemplateTail)
+            set template: true
+        if template
+        {
+            let b StringBuilder^host()
+            if (kind = KindNoSubstitutionTemplateLiteral) or (kind = KindTemplateHead)
+                b.append(96 as char)
+            else
+                b.append("}" as char)
+            Printer.escape_string_worker(AstNode.literal_text_of(node), QuoteCharBacktick, flags, &b)
+            if (kind = KindNoSubstitutionTemplateLiteral) or (kind = KindTemplateTail)
+                b.append(96 as char)
+            else
+                b.append("${")
+            return Printer.slice_of(b.to_string())
+        }
+        if (kind = KindNumericLiteral) or (kind = KindBigIntLiteral)
+            return AstNode.literal_text_of(node)
+        if kind = KindRegularExpressionLiteral
+        {
+            if (flags & LiteralTextFlagsTerminateUnterminatedLiterals) <> 0
+            {
+                if AstNode.is_unterminated_literal(node)
+                {
+                    let text AstNode.literal_text_of(node)
+                    let b StringBuilder^host()
+                    b.append(text.data, text.length)
+                    var ends_in_backslash false
+                    if (text.length as int) > 0
+                    {
+                        if ((text[(text.length as int - 1) as size_t] as int) & 255) = 92
+                            set ends_in_backslash: true
+                    }
+                    if ends_in_backslash
+                        b.append(" /")
+                    else
+                        b.append("/")
+                    return Printer.slice_of(b.to_string())
+                }
+            }
+            return AstNode.literal_text_of(node)
+        }
+        ""
+    }
+
+    ; ── the line helpers, over a source text and its ECMA line map ──
+
+    function range_is_on_single_line(r: TextRange, text: Slice[char], line_starts: ref[Array[int]]) returns bool
+        Printer.range_start_is_on_same_line_as_range_end(r, r, text, line_starts)
+
+    function range_start_positions_are_on_same_line(r1: TextRange, r2: TextRange, text: Slice[char], line_starts: ref[Array[int]]) returns bool
+        Printer.positions_are_on_same_line(Printer.get_start_position_of_range(r1, text, false), Printer.get_start_position_of_range(r2, text, false), line_starts)
+
+    function range_end_positions_are_on_same_line(r1: TextRange, r2: TextRange, line_starts: ref[Array[int]]) returns bool
+        Printer.positions_are_on_same_line(r1.end, r2.end, line_starts)
+
+    function range_start_is_on_same_line_as_range_end(r1: TextRange, r2: TextRange, text: Slice[char], line_starts: ref[Array[int]]) returns bool
+        Printer.positions_are_on_same_line(Printer.get_start_position_of_range(r1, text, false), r2.end, line_starts)
+
+    function range_end_is_on_same_line_as_range_start(r1: TextRange, r2: TextRange, text: Slice[char], line_starts: ref[Array[int]]) returns bool
+        Printer.positions_are_on_same_line(r1.end, Printer.get_start_position_of_range(r2, text, false), line_starts)
+
+    function get_start_position_of_range(r: TextRange, text: Slice[char], include_comments: bool) returns int
+    {
+        if r.pos < 0
+            return 0 - 1
+        Scanner.skip_trivia_ex(text, r.pos, false, include_comments, false)
+    }
+
+    function positions_are_on_same_line(pos1: int, pos2: int, line_starts: ref[Array[int]]) returns bool
+        Printer.get_lines_between_positions(line_starts, pos1, pos2) = 0
+
+    function get_lines_between_positions(line_starts: ref[Array[int]], pos1: int, pos2: int) returns int
+    {
+        if pos1 = pos2
+            return 0
+        var lower pos1
+        if pos2 < pos1
+            set lower: pos2
+        let is_negative lower = pos2
+        var upper pos2
+        if is_negative
+            set upper: pos1
+        let lower_line Scanner.compute_line_of_position(line_starts, lower)
+        let upper_line lower_line + Scanner.compute_line_of_position_from(line_starts, lower_line, upper)
+        if is_negative
+            return lower_line - upper_line
+        upper_line - lower_line
+    }
+
+    function get_lines_between_range_end_and_range_start(r1: TextRange, r2: TextRange, text: Slice[char], line_starts: ref[Array[int]], include_second_range_comments: bool) returns int
+    {
+        let range2_start Printer.get_start_position_of_range(r2, text, include_second_range_comments)
+        Printer.get_lines_between_positions(line_starts, r1.end, range2_start)
+    }
+
+    function get_lines_between_position_and_preceding_non_whitespace_character(pos: int, stop_pos: int, text: Slice[char], line_starts: ref[Array[int]], include_comments: bool) returns int
+    {
+        let start_pos Scanner.skip_trivia_ex(text, pos, false, include_comments, false)
+        let prev_pos Printer.get_previous_non_whitespace_position(start_pos, stop_pos, text)
+        var from stop_pos
+        if prev_pos >= 0
+            set from: prev_pos
+        Printer.get_lines_between_positions(line_starts, from, start_pos)
+    }
+
+    function get_lines_between_position_and_next_non_whitespace_character(pos: int, stop_pos: int, text: Slice[char], line_starts: ref[Array[int]], include_comments: bool) returns int
+    {
+        let next_pos Scanner.skip_trivia_ex(text, pos, false, include_comments, false)
+        var to next_pos
+        if stop_pos < next_pos
+            set to: stop_pos
+        Printer.get_lines_between_positions(line_starts, pos, to)
+    }
+
+    ; getPreviousNonWhitespacePosition — a byte walk, as the reference's.
+    function get_previous_non_whitespace_position(pos_in: int, stop_pos: int, text: Slice[char]) returns int
+    {
+        var pos pos_in
+        while pos >= stop_pos
+        {
+            if Scanner.is_white_space_like((text[pos as size_t] as int) & 255) = false
+                return pos
+            set pos: pos - 1
+        }
+        0 - 1
+    }
+
+    ; canHaveDecorators
+    function can_have_decorators(node: ref[AstNode]) returns bool
+    {
+        let kind AstNode.kind_of(node)
+        if (kind = KindParameter) or (kind = KindPropertyDeclaration) or (kind = KindMethodDeclaration)
+            return true
+        if (kind = KindGetAccessor) or (kind = KindSetAccessor)
+            return true
+        (kind = KindClassExpression) or (kind = KindClassDeclaration)
+    }
+
+    ; skipSynthesizedParentheses
+    function skip_synthesized_parentheses(node_in: ref[AstNode]) returns ref[AstNode]
+    {
+        var node node_in
+        while true
+        {
+            if AstNode.kind_of(node) <> KindParenthesizedExpression
+                return node
+            if AstNode.pos_of(node) >= 0
+                return node
+            let inner AstNode.expression_of(node)
+            if inner = null
+                return node
+            set node: inner as ref[AstNode]
+        }
+        node
+    }
+
+    function is_new_expression_without_arguments(node: ref[AstNode]) returns bool
+    {
+        if AstNode.kind_of(node) <> KindNewExpression
+            return false
+        AstNode.call_arguments_of(node) = null
+    }
+
+    function skip_partially_emitted_expressions(node_in: ref[AstNode]) returns ref[AstNode]
+    {
+        var node node_in
+        while AstNode.kind_of(node) = KindPartiallyEmittedExpression
+        {
+            let inner AstNode.expression_of(node)
+            if inner = null
+                return node
+            set node: inner as ref[AstNode]
+        }
+        node
+    }
+
+    function is_binary_operation(node_in: ref[AstNode], token: int) returns bool
+    {
+        let node Printer.skip_partially_emitted_expressions(node_in)
+        if AstNode.kind_of(node) <> KindBinaryExpression
+            return false
+        let op AstNode.binary_operator_token_of(node)
+        if op = null
+            return false
+        AstNode.kind_of(op) = token
+    }
+
+    function mixing_binary_operators_requires_parentheses(a: int, b: int) returns bool
+    {
+        if a = KindQuestionQuestionToken
+            return (b = KindAmpersandAmpersandToken) or (b = KindBarBarToken)
+        if b = KindQuestionQuestionToken
+            return (a = KindAmpersandAmpersandToken) or (a = KindBarBarToken)
+        false
+    }
+
+    function is_immediately_invoked_function_expression_or_arrow_function(node_in: ref[AstNode]) returns bool
+    {
+        var node Printer.skip_partially_emitted_expressions(node_in)
+        if AstNode.kind_of(node) <> KindCallExpression
+            return false
+        let callee AstNode.expression_of(node)
+        if callee = null
+            return false
+        set node: Printer.skip_partially_emitted_expressions(callee as ref[AstNode])
+        (AstNode.kind_of(node) = KindFunctionExpression) or (AstNode.kind_of(node) = KindArrowFunction)
+    }
+
+    ; ── generated names ──
+
+    function has_leading_hash(text: Slice[char]) returns bool
+    {
+        if (text.length as int) = 0
+            return false
+        ((text[0 as size_t] as int) & 255) = ("#" as char) as int
+    }
+
+    function remove_leading_hash(text: Slice[char]) returns Slice[char]
+    {
+        if Printer.has_leading_hash(text)
+            return text.slice_from(1 as size_t)
+        text
+    }
+
+    procedure append_without_leading_hash(b: ref[StringBuilder], text: Slice[char])
+    {
+        let t Printer.remove_leading_hash(text)
+        b.append(t.data, t.length)
+    }
+
+    function format_generated_name(host: ref[Page], private_name: bool, prefix: Slice[char], base: Slice[char], suffix: Slice[char]) returns String
+    {
+        let b StringBuilder^host()
+        if private_name
+            b.append("#" as char)
+        Printer.append_without_leading_hash(&b, prefix)
+        Printer.append_without_leading_hash(&b, base)
+        Printer.append_without_leading_hash(&b, suffix)
+        b.to_string()
+    }
+
+    function is_ascii_word_character(ch: int) returns bool
+    {
+        if Scanner.is_ascii_letter(ch)
+            return true
+        if Scanner.is_digit(ch)
+            return true
+        ch = ("_" as char) as int
+    }
+
+    ; makeIdentifierFromModuleName — over the base file name, bytewise.
+    function make_identifier_from_module_name(host: ref[Page], module_name: Slice[char]) returns String
+    {
+        let name Printer.base_file_name_of(module_name)
+        let b StringBuilder^host()
+        let n name.length as int
+        var pos 0
+        while pos < n
+        {
+            let ch (name[pos as size_t] as int) & 255
+            var written false
+            if pos = 0
+            {
+                if Scanner.is_digit(ch)
+                {
+                    b.append("_" as char)
+                    written: true
+                }
+            }
+            if written = false
+            {
+                if Printer.is_ascii_word_character(ch) = false
+                    b.append("_" as char)
+                else
+                    b.append(ch as char)
+            }
+            else
+                b.append(ch as char)
+            set pos: pos + 1
+        }
+        b.to_string()
+    }
+
+    ; tspath.GetBaseFileName's slash arm: the text after the last separator.
+    function base_file_name_of(path: Slice[char]) returns Slice[char]
+    {
+        let n path.length as int
+        var i n
+        while i > 0
+        {
+            let c (path[(i - 1) as size_t] as int) & 255
+            if (c = ("/" as char) as int) or (c = 92)
+                break
+            set i: i - 1
+        }
+        path.slice_from(i as size_t)
+    }
+
+    ; ── the triple-slash matcher, over a text and a cursor ──
+
+    procedure skip_white_space_single_line(text: Slice[char], pos: ref[int])
+    {
+        let n text.length as int
+        while pos < n
+        {
+            let ch Scanner.utf8_decode_in(text, n, pos)
+            if Scanner.is_white_space_single_line(ch) = false
+                break
+            set pos: pos + Scanner.utf8_size_in(text, n, pos)
+        }
+    }
+
+    function match_white_space_single_line(text: Slice[char], pos: ref[int]) returns bool
+    {
+        let start_pos pos
+        Printer.skip_white_space_single_line(text, pos)
+        pos <> start_pos
+    }
+
+    function match_rune(text: Slice[char], pos: ref[int], expected: int) returns bool
+    {
+        let n text.length as int
+        if pos >= n
+            return false
+        let ch Scanner.utf8_decode_in(text, n, pos)
+        if ch = expected
+        {
+            set pos: pos + Scanner.utf8_size_in(text, n, pos)
+            return true
+        }
+        false
+    }
+
+    function match_string(text: Slice[char], pos: ref[int], expected: Slice[char]) returns bool
+    {
+        var text_pos pos
+        let n text.length as int
+        let m expected.length as int
+        var expected_pos 0
+        while expected_pos < m
+        {
+            if text_pos >= n
+                return false
+            let expected_rune Scanner.utf8_decode_in(expected, m, expected_pos)
+            let expected_size Scanner.utf8_size_in(expected, m, expected_pos)
+            if Printer.match_rune(text, &text_pos, expected_rune) = false
+                return false
+            set expected_pos: expected_pos + expected_size
+        }
+        set pos: text_pos
+        true
+    }
+
+    function match_quoted_string(text: Slice[char], pos: ref[int]) returns bool
+    {
+        var text_pos pos
+        var quote_char 0
+        if Printer.match_rune(text, &text_pos, 39)
+            set quote_char: 39
+        else
+        {
+            if Printer.match_rune(text, &text_pos, 34)
+                set quote_char: 34
+            else
+                return false
+        }
+        let n text.length as int
+        while text_pos < n
+        {
+            let ch Scanner.utf8_decode_in(text, n, text_pos)
+            set text_pos: text_pos + Scanner.utf8_size_in(text, n, text_pos)
+            if ch = quote_char
+            {
+                set pos: text_pos
+                return true
+            }
+        }
+        false
+    }
+
+    function index_of_slash_greater(text: Slice[char], from: int) returns int
+    {
+        let n text.length as int
+        var i from
+        while i + 1 < n
+        {
+            if ((text[i as size_t] as int) & 255) = ("/" as char) as int
+            {
+                if ((text[(i + 1) as size_t] as int) & 255) = (">" as char) as int
+                    return i
+            }
+            set i: i + 1
+        }
+        0 - 1
+    }
+
+    ; IsRecognizedTripleSlashComment: `/// <reference path|types|lib|no-default-lib="…" />`,
+    ; `/// <amd-dependency path="…" />`, `/// <amd-module />`.
+    function is_recognized_triple_slash_comment(source: Slice[char], comment: CommentRange) returns bool
+    {
+        if comment.kind <> KindSingleLineCommentTrivia
+            return false
+        if comment.len() <= 2
+            return false
+        if ((source[(comment.pos + 1) as size_t] as int) & 255) <> ("/" as char) as int
+            return false
+        if ((source[(comment.pos + 2) as size_t] as int) & 255) <> ("/" as char) as int
+            return false
+        let text source.subslice((comment.pos + 3) as size_t, comment.end as size_t)
+        var pos 0
+        Printer.skip_white_space_single_line(text, &pos)
+        if Printer.match_rune(text, &pos, ("<" as char) as int) = false
+            return false
+        if Printer.match_string(text, &pos, "reference")
+        {
+            if Printer.match_white_space_single_line(text, &pos) = false
+                return false
+            var attr false
+            if Printer.match_string(text, &pos, "path")
+                set attr: true
+            if attr = false
+            {
+                if Printer.match_string(text, &pos, "types")
+                    set attr: true
+            }
+            if attr = false
+            {
+                if Printer.match_string(text, &pos, "lib")
+                    set attr: true
+            }
+            if attr = false
+            {
+                if Printer.match_string(text, &pos, "no-default-lib")
+                    set attr: true
+            }
+            if attr = false
+                return false
+            Printer.skip_white_space_single_line(text, &pos)
+            if Printer.match_rune(text, &pos, ("=" as char) as int) = false
+                return false
+            Printer.skip_white_space_single_line(text, &pos)
+            if Printer.match_quoted_string(text, &pos) = false
+                return false
+        }
+        else
+        {
+            if Printer.match_string(text, &pos, "amd-dependency")
+            {
+                if Printer.match_white_space_single_line(text, &pos) = false
+                    return false
+                if Printer.match_string(text, &pos, "path") = false
+                    return false
+                Printer.skip_white_space_single_line(text, &pos)
+                if Printer.match_rune(text, &pos, ("=" as char) as int) = false
+                    return false
+                Printer.skip_white_space_single_line(text, &pos)
+                if Printer.match_quoted_string(text, &pos) = false
+                    return false
+            }
+            else
+            {
+                if Printer.match_string(text, &pos, "amd-module")
+                    Printer.skip_white_space_single_line(text, &pos)
+                else
+                    return false
+            }
+        }
+        Printer.index_of_slash_greater(text, pos) >= 0
+    }
+
+    function is_jsdoc_like_text(text: Slice[char], comment: CommentRange) returns bool
+    {
+        if comment.kind <> KindMultiLineCommentTrivia
+            return false
+        if comment.len() < 5
+            return false
+        if ((text[(comment.pos + 2) as size_t] as int) & 255) <> ("*" as char) as int
+            return false
+        ((text[(comment.pos + 3) as size_t] as int) & 255) <> ("/" as char) as int
+    }
+
+    function is_pinned_comment(text: Slice[char], comment: CommentRange) returns bool
+    {
+        if comment.kind <> KindMultiLineCommentTrivia
+            return false
+        if comment.len() <= 5
+            return false
+        ((text[(comment.pos + 2) as size_t] as int) & 255) = ("!" as char) as int
+    }
+
+    ; calculateIndent — a tab goes to the next tab stop, a space counts one.
+    function calculate_indent(text: Slice[char], pos_in: int, stop: int) returns int
+    {
+        var current_line_indent 0
+        let indent_size TextWriter.get_default_indent_size()
+        let n text.length as int
+        var pos pos_in
+        while pos < stop
+        {
+            let ch Scanner.utf8_decode_in(text, n, pos)
+            if Scanner.is_white_space_single_line(ch) = false
+                break
+            if ch = 9
+                set current_line_indent: current_line_indent + (indent_size - (current_line_indent % indent_size))
+            else
+                set current_line_indent: current_line_indent + 1
+            set pos: pos + Scanner.utf8_size_in(text, n, pos)
+        }
+        current_line_indent
+    }
+
+    ; findSpanEnd is generic over a test func; each caller writes its loop (§3.18).
+}
+
+; lineCharacterCache — line and UTF-16 character of a byte position, cached for
+; monotone positions (the source-map emit). Over a text and its line map.
+define LineCharacterCache
+(
+    line_map: ref[Array[int]]
+    text: Slice[char]
+    cached_line: int
+    cached_pos: int
+    cached_char: int
+    has_cached: bool
+)
+{
+    function create(host: ref[Page], line_map: ref[Array[int]], text: Slice[char]) returns ref[LineCharacterCache]
+        &LineCharacterCache^host(line_map, text, 0, 0, 0, false)
+
+    function utf16_len_between(s: Slice[char], from: int, to: int) returns int
+        TextWriter.utf16_len_of(s, from, to)
+
+    procedure get_line_and_character(this, pos: int, out_line: ref[int], out_character: ref[int])
+    {
+        let line Scanner.compute_line_of_position(line_map, pos)
+        let line_start line_map[line as size_t]
+        var end_pos pos
+        if (text.length as int) < end_pos
+            set end_pos: text.length as int
+        var character 0
+        var incremental false
+        if has_cached
+        {
+            if line = cached_line
+            {
+                if end_pos >= cached_pos
+                    set incremental: true
+            }
+        }
+        if incremental
+            set character: cached_char + LineCharacterCache.utf16_len_between(text, cached_pos, end_pos)
+        else
+            set character: LineCharacterCache.utf16_len_between(text, line_start, end_pos)
+        let cached character
+        set character: character + (pos - end_pos)
+        set this.cached_line: line
+        set this.cached_pos: end_pos
+        set this.cached_char: cached
+        set this.has_cached: true
+        set out_line: line
+        set out_character: character
+    }
+}
+
+; ── helpers.go ──────────────────────────────────────────────────────────────
+;
+; EmitHelper. `priority` is -1 where the reference's pointer is nil; `text_kind`
+; is 0 for a fixed text and 1 / 2 for the two scoped helpers whose text is a
+; CALLBACK over makeUniqueName (async-super, advanced-async-super) — the printer
+; renders those at the emit site (§3.18). The helpers are singletons in the
+; reference; here they are made once per emit by `EmitHelpers.create`, so the
+; identity comparisons the reference makes hold within one emit.
+define EmitHelper
+(
+    name: Slice[char]
+    scoped: bool
+    text: Slice[char]
+    text_kind: int
+    priority: int
+    dependencies: ref[Array[ref[EmitHelper]?]]?
+    import_name: Slice[char]
+)
+{
+    function make(host: ref[Page], name: Slice[char], scoped: bool, text: Slice[char], text_kind: int, priority: int, import_name: Slice[char]) returns ref[EmitHelper]
+        &EmitHelper^host(name, scoped, text, text_kind, priority, null, import_name)
+
+    ; compareEmitHelpers
+    function compare(x: ref[EmitHelper], y: ref[EmitHelper]) returns int
+    {
+        if x = y
+            return 0
+        if x.priority = y.priority
+            return 0
+        if x.priority < 0
+            return 1
+        if y.priority < 0
+            return 0 - 1
+        x.priority - y.priority
+    }
+}
+
+define EmitHelpers
+(
+    decorate_helper: ref[EmitHelper]
+    metadata_helper: ref[EmitHelper]
+    param_helper: ref[EmitHelper]
+    add_disposable_resource_helper: ref[EmitHelper]
+    dispose_resources_helper: ref[EmitHelper]
+    class_private_field_get_helper: ref[EmitHelper]
+    class_private_field_set_helper: ref[EmitHelper]
+    class_private_field_in_helper: ref[EmitHelper]
+    await_helper: ref[EmitHelper]
+    async_generator_helper: ref[EmitHelper]
+    async_delegator_helper: ref[EmitHelper]
+    async_values_helper: ref[EmitHelper]
+    rest_helper: ref[EmitHelper]
+    awaiter_helper: ref[EmitHelper]
+    async_super_helper: ref[EmitHelper]
+    advanced_async_super_helper: ref[EmitHelper]
+    es_decorate_helper: ref[EmitHelper]
+    run_initializers_helper: ref[EmitHelper]
+    make_template_object_helper: ref[EmitHelper]
+    prop_key_helper: ref[EmitHelper]
+    set_function_name_helper: ref[EmitHelper]
+    create_binding_helper: ref[EmitHelper]
+    set_module_default_helper: ref[EmitHelper]
+    import_star_helper: ref[EmitHelper]
+    import_default_helper: ref[EmitHelper]
+    export_star_helper: ref[EmitHelper]
+    rewrite_relative_import_extensions_helper: ref[EmitHelper]
+)
+{
+    function create(host: ref[Page]) returns ref[EmitHelpers]
+    {
+        let decorate_helper EmitHelper.make(host, "typescript:decorate", false, "", 0, 2, "__decorate")
+        let metadata_helper EmitHelper.make(host, "typescript:metadata", false, "", 0, 3, "__metadata")
+        let param_helper EmitHelper.make(host, "typescript:param", false, "", 0, 4, "__param")
+        let add_disposable_resource_helper EmitHelper.make(host, "typescript:addDisposableResource", false, "", 0, -1, "__addDisposableResource")
+        let dispose_resources_helper EmitHelper.make(host, "typescript:disposeResources", false, "", 0, -1, "__disposeResources")
+        let class_private_field_get_helper EmitHelper.make(host, "typescript:classPrivateFieldGet", false, "", 0, -1, "__classPrivateFieldGet")
+        let class_private_field_set_helper EmitHelper.make(host, "typescript:classPrivateFieldSet", false, "", 0, -1, "__classPrivateFieldSet")
+        let class_private_field_in_helper EmitHelper.make(host, "typescript:classPrivateFieldIn", false, "", 0, -1, "__classPrivateFieldIn")
+        let await_helper EmitHelper.make(host, "typescript:await", false, "var __await = (this && this.__await) || function (v) { return this instanceof __await ? (this.v = v, this) : new __await(v); }", 0, -1, "__await")
+        let async_generator_helper EmitHelper.make(host, "typescript:asyncGenerator", false, "", 0, -1, "__asyncGenerator")
+        let async_delegator_helper EmitHelper.make(host, "typescript:asyncDelegator", false, "", 0, -1, "__asyncDelegator")
+        let async_values_helper EmitHelper.make(host, "typescript:asyncValues", false, "", 0, -1, "__asyncValues")
+        let rest_helper EmitHelper.make(host, "typescript:rest", false, "", 0, -1, "__rest")
+        let awaiter_helper EmitHelper.make(host, "typescript:awaiter", false, "", 0, 5, "__awaiter")
+        let async_super_helper EmitHelper.make(host, "typescript:async-super", true, "", 1, -1, "")
+        let advanced_async_super_helper EmitHelper.make(host, "typescript:advanced-async-super", true, "", 2, -1, "")
+        let es_decorate_helper EmitHelper.make(host, "typescript:esDecorate", false, "", 0, 2, "__esDecorate")
+        let run_initializers_helper EmitHelper.make(host, "typescript:runInitializers", false, "", 0, 2, "__runInitializers")
+        let make_template_object_helper EmitHelper.make(host, "typescript:makeTemplateObject", false, "", 0, 0, "__makeTemplateObject")
+        let prop_key_helper EmitHelper.make(host, "typescript:propKey", false, "", 0, -1, "__propKey")
+        let set_function_name_helper EmitHelper.make(host, "typescript:setFunctionName", false, "", 0, -1, "__setFunctionName")
+        let create_binding_helper EmitHelper.make(host, "typescript:commonjscreatebinding", false, "", 0, 1, "__createBinding")
+        let set_module_default_helper EmitHelper.make(host, "typescript:commonjscreatevalue", false, "", 0, 1, "__setModuleDefault")
+        let import_star_helper EmitHelper.make(host, "typescript:commonjsimportstar", false, "", 0, 2, "__importStar")
+        let import_default_helper EmitHelper.make(host, "typescript:commonjsimportdefault", false, "", 0, -1, "__importDefault")
+        let export_star_helper EmitHelper.make(host, "typescript:export-star", false, "", 0, 2, "__exportStar")
+        let rewrite_relative_import_extensions_helper EmitHelper.make(host, "typescript:rewriteRelativeImportExtensions", false, "", 0, -1, "__rewriteRelativeImportExtension")
+        let async_generator_helper_deps &Array[ref[EmitHelper]?]^host()
+        async_generator_helper_deps.add(await_helper)
+        set async_generator_helper.dependencies: async_generator_helper_deps
+        let async_delegator_helper_deps &Array[ref[EmitHelper]?]^host()
+        async_delegator_helper_deps.add(await_helper)
+        set async_delegator_helper.dependencies: async_delegator_helper_deps
+        let import_star_helper_deps &Array[ref[EmitHelper]?]^host()
+        import_star_helper_deps.add(create_binding_helper)
+        import_star_helper_deps.add(set_module_default_helper)
+        set import_star_helper.dependencies: import_star_helper_deps
+        let export_star_helper_deps &Array[ref[EmitHelper]?]^host()
+        export_star_helper_deps.add(create_binding_helper)
+        set export_star_helper.dependencies: export_star_helper_deps
+        &EmitHelpers^host(decorate_helper, metadata_helper, param_helper, add_disposable_resource_helper, dispose_resources_helper, class_private_field_get_helper, class_private_field_set_helper, class_private_field_in_helper, await_helper, async_generator_helper, async_delegator_helper, async_values_helper, rest_helper, awaiter_helper, async_super_helper, advanced_async_super_helper, es_decorate_helper, run_initializers_helper, make_template_object_helper, prop_key_helper, set_function_name_helper, create_binding_helper, set_module_default_helper, import_star_helper, import_default_helper, export_star_helper, rewrite_relative_import_extensions_helper)
+    }
+}
