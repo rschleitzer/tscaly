@@ -7321,6 +7321,16 @@ define Checker
     ; produced but not yet appended to their parent builder (write_constituent_list),
     ; so the truncation budget sees the WHOLE print and not the current builder alone.
     printer_emitted: int
+    ; ★★★ THE REFERENCE'S TRUNCATION BUDGET (slice 225): `approximateLength` is an
+    ; ESTIMATE the node builder adds to at ~49 sites (keyword widths, name
+    ; lengths, fixed costs per node kind), consulted by checkTruncationLength at
+    ; SIX places only (type-argument and constituent lists, the members of an
+    ; object type, a conditional type), and STICKY once past 1 000 000 (the
+    ; harness's noErrorTruncation). The port counted emitted characters and
+    ; stopped at the wall; both units past the wall are decided by where the
+    ; estimate crosses it, not by the characters.
+    printer_approximate_length: int
+    printer_truncating: bool
     relation_capture: ref[Array[int]]
 
     ; `saveErrorState.errorChain`'s DEPTH, taken at structuredTypeRelatedTo and
@@ -7842,6 +7852,8 @@ define Checker
         set c.relation_capture_on: false
         set c.serialization_level: 0
         set c.printer_emitted: 0
+        set c.printer_approximate_length: 0
+        set c.printer_truncating: false
         let rcap &Array[int]^host()
         set c.relation_capture: rcap
         set c.printer_type_mapper: null
@@ -38471,8 +38483,76 @@ define Checker
     ; so this asks the honest question and STOPS rather than eliding: a name whose
     ; budget is spent is one this port does not claim, and the arms below therefore
     ; report where the reference truncates.
-    function truncation_budget_exceeded(this, out: ref[StringBuilder]) returns bool
-        (out.get_length() as int) + printer_emitted > 1000000
+    procedure add_approximate_length(this, n: int)
+        set this.printer_approximate_length: printer_approximate_length + n
+
+    ; checkTruncationLength: the sticky verdict of the estimate against the
+    ; noTruncation maximum
+    function check_truncation_length(this) returns bool
+    {
+        if printer_truncating
+            return true
+        if printer_approximate_length > 1000000
+            set this.printer_truncating: true
+        printer_truncating
+    }
+
+    ; createElidedInformationPlaceholder: +3 and `any` (noTruncation)
+    function write_elided_placeholder(this, out: ref[StringBuilder]) returns bool
+    {
+        this.add_approximate_length(3)
+        Checker.write_elided_information_placeholder(out)
+    }
+
+    ; ★ mapToTypeNodes builds its `any` placeholders INLINE and adds nothing for
+    ; them; only createElidedInformationPlaceholder (a conditional past the
+    ; budget, a symbol past depth 10) adds 3 — the two list writers below call
+    ; the static placeholder, the others the adding wrapper.
+    ; mapToTypeNodes for a NON-bare list (type arguments): +2 per element; past
+    ; the budget the whole list is one placeholder, and a list crossing it mid-way
+    ; keeps its head, a placeholder for the rest, and the last element
+    function write_type_argument_list(this, args: ref[Array[ref[Type]?]], out: ref[StringBuilder]) returns bool
+        this.write_type_argument_range(args, 0, args.get_length() as int, out)
+
+    function write_type_argument_range(this, args: ref[Array[ref[Type]?]], from: int, to: int, out: ref[StringBuilder]) returns bool
+    {
+        let n to - from
+        if n <= 0
+            return true
+        out.append("<" as char)
+        if this.check_truncation_length()
+        {
+            if Checker.write_elided_information_placeholder(out) = false
+                return false
+            out.append(">" as char)
+            return true
+        }
+        var i 0
+        while i < n
+        {
+            if i > 0
+                out.append(", ")
+            if this.check_truncation_length()
+            {
+                if (i + 1) + 2 < n - 1
+                {
+                    if Checker.write_elided_information_placeholder(out) = false
+                        return false
+                    out.append(", ")
+                    if this.type_to_string(args[to - 1], out) = false
+                        return false
+                    out.append(">" as char)
+                    return true
+                }
+            }
+            this.add_approximate_length(2)
+            if this.type_to_string(args[from + i], out) = false
+                return false
+            set i: i + 1
+        }
+        out.append(">" as char)
+        true
+    }
 
     ; typeToTypeNode's own two lines, and the reduction is the reason this is a
     ; wrapper (slice 170).
@@ -38513,10 +38593,22 @@ define Checker
         if serialization_level = 0
         {
             set printer_emitted: 0
+            set this.printer_approximate_length: 0
+            set this.printer_truncating: false
             set serialization_level: 1
+            let start0 out.get_length() as int
             let ok0 this.type_to_string(t, out)
             set serialization_level: 0
             set printer_emitted: 0
+            set this.printer_approximate_length: 0
+            set this.printer_truncating: false
+            ; typeToStringEx's hard cutoff: a text of 2 000 000 characters or
+            ; more is cut to that length less "..." — not written; reported
+            if (out.get_length() as int) - start0 >= 2000000
+            {
+                this.record_unported("type-to-string-hard-cutoff", 0)
+                return false
+            }
             return ok0
         }
         ; ★★★ enterContext — a NESTED TypeToString prints in a FRESH node-builder context
@@ -38544,6 +38636,10 @@ define Checker
         let saved_name_depth wrote_name_depth
         let saved_emitted printer_emitted
         set printer_emitted: 0
+        let saved_approx printer_approximate_length
+        let saved_truncating printer_truncating
+        set this.printer_approximate_length: 0
+        set this.printer_truncating: false
         let page Page.get(this)
         let pss &Array[ref[PrinterSymbolFrame]?]^page()
         set printer_symbols: pss
@@ -38582,6 +38678,8 @@ define Checker
         set wrote_chain_length: saved_chain_length
         set wrote_name_depth: saved_name_depth
         set printer_emitted: saved_emitted
+        set this.printer_approximate_length: saved_approx
+        set this.printer_truncating: saved_truncating
         ok
     }
 
@@ -38597,6 +38695,13 @@ define Checker
 
     function type_to_string(this, t: ref[Type]?, out: ref[StringBuilder]) returns bool
     {
+        ; a TOP-LEVEL ask is a fresh node-builder context: the estimate and its
+        ; sticky verdict start at zero (typeToStringEx builds a new context per call)
+        if printer_depth = 0
+        {
+            set this.printer_approximate_length: 0
+            set this.printer_truncating: false
+        }
         ; ★ The ONE place the worker is entered, which is what makes the depth
         ; counter a counter rather than a discipline — see printer_depth's note.
         ; Every arm recurses through THIS function and not through the worker.
@@ -38675,6 +38780,7 @@ define Checker
                 this.record_unported("type-to-string-unresolved", 0)
                 return false
             }
+            this.add_approximate_length(3)
             if t = intrinsic_marker_type
                 return Checker.write_keyword(out, "intrinsic")
             return Checker.write_keyword(out, "any")
@@ -38682,11 +38788,20 @@ define Checker
         if (t.flags & TypeFlagsUnknown) <> 0
             return Checker.write_keyword(out, "unknown")
         if (t.flags & TypeFlagsString) <> 0
+        {
+            this.add_approximate_length(6)
             return Checker.write_keyword(out, "string")
+        }
         if (t.flags & TypeFlagsNumber) <> 0
+        {
+            this.add_approximate_length(6)
             return Checker.write_keyword(out, "number")
+        }
         if (t.flags & TypeFlagsBigInt) <> 0
+        {
+            this.add_approximate_length(6)
             return Checker.write_keyword(out, "bigint")
+        }
         ; `t.flags&Boolean != 0 && t.alias == nil`. ★★★ THE ARM IS LIVE SINCE
         ; SLICE 94 AND IT IS THE REASON THE UNION CHAPTER SETS TypeFlagsBoolean ON
         ; A TWO-BOOLEAN-LITERAL UNION AT ALL: booleanType IS a union, and it
@@ -38703,7 +38818,10 @@ define Checker
         if (t.flags & TypeFlagsBoolean) <> 0
         {
             if t.alias_symbol = null
+            {
+                this.add_approximate_length(7)
                 return Checker.write_keyword(out, "boolean")
+            }
         }
         ; ★★★ THE ENUM ARM, AND IT PRINTS THE PARENT ALONE MORE OFTEN THAN A
         ; READER EXPECTS. `getDeclaredTypeOfSymbol(parentSymbol) == t` is TRUE for
@@ -38790,6 +38908,7 @@ define Checker
         ; behaviour that would otherwise depend on it.
         if (t.flags & TypeFlagsStringLiteral) <> 0
         {
+            this.add_approximate_length((Checker.literal_text_of(t).length as int) + 2)
             Checker.write_string_literal_name(out, Checker.literal_text_of(t))
             return true
         }
@@ -38803,19 +38922,26 @@ define Checker
             var nb char[JSNUM_MAX_TEXT]
             let nn jsnum_to_string(Checker.literal_bits_of(t), Slice[char](JSNUM_MAX_TEXT as size_t, &nb[0]))
             out.append(&nb[0], nn as size_t)
+            this.add_approximate_length(nn as int)
             return true
         }
         ; pseudoBigIntToString(value) + "n".
         if (t.flags & TypeFlagsBigIntLiteral) <> 0
         {
+            let big_start out.get_length() as int
             Checker.write_pseudo_big_int(out, t)
+            this.add_approximate_length(((out.get_length() as int) - big_start) + 1)
             out.append("n" as char)
             return true
         }
         if (t.flags & TypeFlagsBooleanLiteral) <> 0
         {
             if Checker.literal_bool_of(t)
+            {
+                this.add_approximate_length(4)
                 return Checker.write_keyword(out, "true")
+            }
+            this.add_approximate_length(5)
             return Checker.write_keyword(out, "false")
         }
         ; ★★★ `unique symbol`, AND THE FLAG IS WHAT MAKES IT ONE LINE. The
@@ -38827,22 +38953,41 @@ define Checker
         ; and it expires the same day a second entry point appears.
         if (t.flags & TypeFlagsUniqueESSymbol) <> 0
         {
+            this.add_approximate_length(13)
             out.append("unique symbol")
             set wrote_type_precedence: TypePrecedenceTypeOperator
             return true
         }
         if (t.flags & TypeFlagsVoid) <> 0
+        {
+            this.add_approximate_length(4)
             return Checker.write_keyword(out, "void")
+        }
         if (t.flags & TypeFlagsUndefined) <> 0
+        {
+            this.add_approximate_length(9)
             return Checker.write_keyword(out, "undefined")
+        }
         if (t.flags & TypeFlagsNull) <> 0
+        {
+            this.add_approximate_length(4)
             return Checker.write_keyword(out, "null")
+        }
         if (t.flags & TypeFlagsNever) <> 0
+        {
+            this.add_approximate_length(5)
             return Checker.write_keyword(out, "never")
+        }
         if (t.flags & TypeFlagsESSymbol) <> 0
+        {
+            this.add_approximate_length(6)
             return Checker.write_keyword(out, "symbol")
+        }
         if (t.flags & TypeFlagsNonPrimitive) <> 0
+        {
+            this.add_approximate_length(6)
             return Checker.write_keyword(out, "object")
+        }
         ; `isThisTypeParameter(t)` → a ThisTypeNode, i.e. the keyword `this`.
         ;
         ; ★★★ IT WAS A SILENT WRONG ANSWER UNTIL SLICE 109, and the reason it could
@@ -38860,7 +39005,10 @@ define Checker
         ; ★ The two FlagsInObjectTypeLiteral branches around it are unreachable:
         ; typeToString does not set that flag.
         if Checker.is_this_type_parameter(t)
+        {
+            this.add_approximate_length(4)
             return Checker.write_keyword(out, "this")
+        }
         ; ── slice 111: the type ALIAS, at the reference's own position ───────
         ;
         ; `inTypeAlias == 0 && t.alias != nil && (flags&UseAliasDefinedOutsideCurrentScope != 0 || IsTypeSymbolAccessible(…))`
@@ -38929,17 +39077,8 @@ define Checker
             ; mapToTypeNodes over the alias's own type arguments — the printer's
             ; `<A, B>`.
             let args t.alias_type_arguments as ref[Array[ref[Type]?]]
-            out.append("<" as char)
-            var ai 0
-            while ai < na
-            {
-                if ai > 0
-                    out.append(", ")
-                if this.type_to_string(args[ai], out) = false
-                    return false
-                set ai: ai + 1
-            }
-            out.append(">" as char)
+            if this.write_type_argument_list(args, out) = false
+                return false
             set wrote_type_precedence: TypePrecedenceNonArray
             set wrote_type_reference_name: alias_ref_name
             set wrote_name_depth: printer_depth
@@ -39257,6 +39396,7 @@ define Checker
                 this.record_unported("type-to-string-index", subject.flags)
                 return false
             }
+            this.add_approximate_length(6)
             out.append("keyof ")
             if this.write_operand_at_postfix_precedence(target, out) = false
                 return false
@@ -39285,6 +39425,7 @@ define Checker
             if this.type_to_string(it, out) = false
                 return false
             out.append("]" as char)
+            this.add_approximate_length(2)
             set wrote_type_precedence: TypePrecedencePostfix
             return true
         }
@@ -39308,7 +39449,7 @@ define Checker
             }
             let rnode (root as ref[ConditionalRoot]).node
             if this.printer_node_visits(rnode) > 10
-                return Checker.write_elided_information_placeholder(out)
+                return this.write_elided_placeholder(out)
             this.push_printer_node(rnode)
             let ok this.write_conditional_type(subject, root as ref[ConditionalRoot], out)
             this.pop_printer_symbol()
@@ -39331,9 +39472,12 @@ define Checker
             }
             ; `symbolToTypeNode(t.symbol, Type, [typeNode])` — the intrinsic's own
             ; name with the target as its single type argument.
+            let sm_start out.get_length() as int
             if this.write_symbol_name(subject.symbol as ref[Symbol], out) = false
                 return false
+            this.add_approximate_length(((out.get_length() as int) - sm_start) + 1)
             out.append("<" as char)
+            this.add_approximate_length(2)
             if this.type_to_string(target, out) = false
                 return false
             out.append(">" as char)
@@ -39381,9 +39525,12 @@ define Checker
             }
             if no_infer = null
                 return this.type_to_string(base, out)
+            let ni_start out.get_length() as int
             if this.write_symbol_name(no_infer as ref[Symbol], out) = false
                 return false
+            this.add_approximate_length(((out.get_length() as int) - ni_start) + 1)
             out.append("<" as char)
+            this.add_approximate_length(2)
             if this.type_to_string(base, out) = false
                 return false
             out.append(">" as char)
@@ -39414,13 +39561,13 @@ define Checker
         if (t.flags & TypeFlagsUnion) = 0
             return this.type_to_string(t, out)
         if this.visited_type(t.id)
-            return Checker.write_elided_information_placeholder(out)
+            return this.write_elided_placeholder(out)
         var pushed_symbol false
         if t.symbol <> null
         {
             let sym t.symbol as ref[Symbol]
             if this.printer_symbol_visits(false, sym) > 10
-                return Checker.write_elided_information_placeholder(out)
+                return this.write_elided_placeholder(out)
             this.push_printer_symbol(false, sym)
             set pushed_symbol: true
         }
@@ -39434,19 +39581,10 @@ define Checker
 
     function write_conditional_type(this, subject: ref[Type], root: ref[ConditionalRoot], out: ref[StringBuilder]) returns bool
     {
-        ; conditionalTypeToTypeNode's first line: past the truncation budget the whole
-        ; conditional is the elision placeholder (`any`), and its branches are not
-        ; resolved (slice 214).
-        if this.truncation_budget_exceeded(out)
-        {
-            if serialization_level = 0
-            {
-                this.record_unported("type-to-string-truncation", subject.flags)
-                return false
-            }
-            out.append("any")
-            return true
-        }
+        ; conditionalTypeToTypeNode's first line: past the budget the whole
+        ; conditional is the placeholder, and its branches are not resolved
+        if this.check_truncation_length()
+            return this.write_elided_placeholder(out)
         let ct Checker.conditional_check_type_of(subject)
         let et Checker.conditional_extends_type_of(subject)
         if ct = null
@@ -39482,6 +39620,7 @@ define Checker
         ; write_operand_in_extends two slices before this one.
         if this.write_operand_at_union_precedence(ct, out) = false
             return false
+        this.add_approximate_length(15)
         out.append(" extends ")
         let saved_infers printer_infer_type_parameters
         set this.printer_infer_type_parameters: root.infer_type_parameters
@@ -39621,6 +39760,7 @@ define Checker
             set i: i + 1
         }
         out.append("\`" as char)
+        this.add_approximate_length(2)
         set wrote_type_precedence: TypePrecedenceNonArray
         true
     }
@@ -39658,9 +39798,11 @@ define Checker
     ; asks nothing, which is every `infer P` in an ordinary conditional.
     function write_infer_type(this, t: ref[Type], out: ref[StringBuilder]) returns bool
     {
+        let infer_start out.get_length() as int
         out.append("infer ")
         if this.write_symbol_name_or_question(t, out) = false
             return false
+        this.add_approximate_length((out.get_length() as int) - infer_start)
         let mark this.unported_mark()
         let constraint this.get_constraint_of_type_parameter(t)
         if this.unported_mark() <> mark
@@ -39680,6 +39822,7 @@ define Checker
             }
             if elide = false
             {
+                this.add_approximate_length(9)
                 out.append(" extends ")
                 if this.type_to_string(constraint, out) = false
                     return false
@@ -40004,6 +40147,7 @@ define Checker
             if arg = null
                 return false
             let piece StringBuilder^host()
+            this.add_approximate_length(2)
             if this.type_to_string(arg, &piece) = false
                 return false
             pieces.add(piece.to_string())
@@ -40300,17 +40444,8 @@ define Checker
             set count: na
         if count <= arg_start
             return true
-        out.append("<" as char)
-        var i arg_start
-        while i < count
-        {
-            if i > arg_start
-                out.append(", ")
-            if this.type_to_string(list[i], out) = false
-                return false
-            set i: i + 1
-        }
-        out.append(">" as char)
+        if this.write_type_argument_range(list, arg_start, count, out) = false
+            return false
         set wrote_type_precedence: TypePrecedenceNonArray
         set wrote_type_reference_name: ref_name
         set wrote_name_depth: printer_depth
@@ -40462,7 +40597,7 @@ define Checker
                         if (denoted as ref[Type]) = t
                         {
                             if this.visited_type(t.id)
-                                return Checker.write_elided_information_placeholder(out)
+                                return this.write_elided_placeholder(out)
                             this.push_visited_type(t.id)
                             let reused this.write_reused_node(ex, out)
                             this.pop_visited_type()
@@ -40473,7 +40608,7 @@ define Checker
                 }
             }
             if this.visited_type(t.id)
-                return Checker.write_elided_information_placeholder(out)
+                return this.write_elided_placeholder(out)
             this.push_visited_type(t.id)
             let ok this.create_type_node_from_object_type(t, out)
             this.pop_visited_type()
@@ -40527,7 +40662,7 @@ define Checker
                 ; "The specified symbol flags need to be reinterpreted as type
                 ; flags" — upstream's own comment on the mask.
                 return this.symbol_to_type_node(alias_symbol as ref[Symbol], SymbolFlagsType, out)
-            return Checker.write_elided_information_placeholder(out)
+            return this.write_elided_placeholder(out)
         }
         ; visitAndTransformType, minus its memo. ★★★THE MEMO IS NOT AN OMISSION AND
         ; IT WOULD NOT BE SAFE TO ADD: upstream keys `ctx.typeCache` on the type id
@@ -40556,7 +40691,7 @@ define Checker
                 set is_constructor_object: true
         }
         if this.printer_symbol_visits(is_constructor_object, sym) > 10
-            return Checker.write_elided_information_placeholder(out)
+            return this.write_elided_placeholder(out)
         this.push_printer_symbol(is_constructor_object, sym)
         this.push_visited_type(t.id)
         let ok this.create_type_node_from_object_type(t, out)
@@ -40685,6 +40820,7 @@ define Checker
         ; shape that produces one is a parse recovery, and printing it would be a
         ; name for a type the reference reports on instead.
         out.append(" }")
+        this.add_approximate_length(10)
         true
     }
 
@@ -41137,6 +41273,7 @@ define Checker
                     {
                         ; NewTypeLiteralNode with an empty member list, EFSingleLine
                         ; — the printer writes the two braces and nothing between.
+                        this.add_approximate_length(2)
                         out.append("{}")
                         return true
                     }
@@ -41319,22 +41456,13 @@ define Checker
 
     function write_type_literal(this, sm: ref[StructuredMembers], calls: ref[Array[ref[Signature]?]], ctors: ref[Array[ref[Signature]?]], reverse_mapped: bool, out: ref[StringBuilder]) returns bool
     {
-        ; createTypeNodesFromResolvedType's own checkTruncationLength, which is the
-        ; whole-members arm rather than the per-property one: upstream elides the
-        ; body to a single `...` member here.
-        ; ★ Under NoErrorTruncation the elided body is ONE NotEmittedTypeElement carrying
-        ; a comment the type printer strips (`createPrinterWithRemoveComments`), so the
-        ; text is the empty literal — and, load-bearing, NOTHING underneath is resolved
-        ; any more: a print past the budget stops asking (slice 214; this was a stop, and
-        ; the two message arguments of TS2321 in `excessivelyDeepConditionalTypes` reach it).
-        if this.truncation_budget_exceeded(out)
+        ; createTypeNodesFromResolvedType's own checkTruncationLength: past the
+        ; budget the members are ONE NotEmittedTypeElement carrying a comment the
+        ; type printer strips, and nothing underneath is resolved
+        if this.check_truncation_length()
         {
-            if serialization_level = 0
-            {
-                this.record_unported("type-to-string-truncation", TypeFlagsObject)
-                return false
-            }
             out.append("{  }")
+            this.add_approximate_length(2)
             return true
         }
         out.append("{ ")
@@ -41393,9 +41521,25 @@ define Checker
         if sm.properties <> null
         {
             let props sm.properties as ref[Array[ref[Symbol]?]]
+            let np props.get_length() as int
             set i: 0
-            while i < (props.get_length() as int)
+            while i < np
             {
+                ; a property list crossing the budget keeps its head and its LAST
+                ; property; the elided middle is a trailing comment the printer
+                ; strips (noTruncation)
+                if this.check_truncation_length()
+                {
+                    if (i + 1) + 2 < np - 1
+                    {
+                        let last props[np - 1]
+                        if last = null
+                            return false
+                        if this.write_property_member(last as ref[Symbol], out) = false
+                            return false
+                        break
+                    }
+                }
                 let p props[i]
                 if p = null
                     return false
@@ -41405,6 +41549,7 @@ define Checker
             }
         }
         out.append("}")
+        this.add_approximate_length(2)
         true
     }
 
@@ -41583,6 +41728,7 @@ define Checker
 
     function write_signature_form_scoped(this, sig: ref[Signature], form: int, name: ref[Symbol]?, out: ref[StringBuilder]) returns bool
     {
+        this.add_approximate_length(3)
         ; `if kind == KindConstructorType && signature.flags&Abstract != 0` — the
         ; ONE modifier this writer can emit, and it is the CONSTRUCTOR TYPE's
         ; alone: a construct SIGNATURE inside an object type carries no modifier
@@ -42216,7 +42362,14 @@ define Checker
             if nt <> null
             {
                 if (nt as ref[Type]) = tt
-                    return this.write_reused_node(nd, out)
+                {
+                    ; tryReuseExistingNodeHelper: the boundary restores the estimate
+                    ; and the reused node counts its SOURCE width
+                    let saved_approx printer_approximate_length
+                    let reused this.write_reused_node(nd, out)
+                    set this.printer_approximate_length: saved_approx + (AstNode.end_of(nd) - AstNode.pos_of(nd))
+                    return reused
+                }
             }
         }
         this.type_to_string(tt, out)
@@ -43593,7 +43746,9 @@ define Checker
                     return false
             }
         }
-        this.type_to_string(pt, out)
+        let okp this.type_to_string(pt, out)
+        this.add_approximate_length((Symbol.name_len_of(ps) as int) + 3)
+        okp
     }
 
     ; EmitResolver.requiresAddingImplicitUndefined at its PARAMETER arm, which is
@@ -44259,8 +44414,12 @@ define Checker
     function write_index_signature_ex(this, info: ref[IndexInfo], elide: bool, out: ref[StringBuilder]) returns bool
     {
         if info.is_readonly
+        {
+            this.add_approximate_length(9)
             out.append("readonly ")
+        }
         out.append("[" as char)
+        let name_start out.get_length() as int
         if info.declaration = null
             out.append("x" as char)
         else
@@ -44280,6 +44439,7 @@ define Checker
                 }
             }
         }
+        this.add_approximate_length(((out.get_length() as int) - name_start) + 4)
         out.append(": ")
         if this.type_to_string(info.key_type, out) = false
             return false
@@ -44349,6 +44509,7 @@ define Checker
     function write_property_member(this, sym: ref[Symbol], out: ref[StringBuilder]) returns bool
     {
         let mark this.unported_mark()
+        this.add_approximate_length((Symbol.name_len_of(sym) as int) + 1)
         let use_placeholder this.should_use_placeholder_for_property(sym)
         var ptype: ref[Type] any_type
         if use_placeholder = false
@@ -44514,7 +44675,10 @@ define Checker
             }
         }
         if this.is_readonly_symbol(sym)
+        {
+            this.add_approximate_length(9)
             out.append("readonly ")
+        }
         if this.write_property_name_of_symbol(sym, out) = false
             return false
         if optional
@@ -45098,7 +45262,18 @@ define Checker
     function write_alias_type_reference(this, t: ref[Type], out: ref[StringBuilder]) returns bool
     {
         let asym t.alias_symbol as ref[Symbol]
+        let en_start out.get_length() as int
         Checker.write_symbol_entity_name(asym, out)
+        ; createAccessFromSymbolChain: every component counts its width plus one,
+        ; the ROOT component twice (its index-0 arm and the unconditional add)
+        var en_root asym
+        var en_parent Symbol.parent_of(asym)
+        while en_parent <> null
+        {
+            set en_root: en_parent as ref[Symbol]
+            set en_parent: Symbol.parent_of(en_parent as ref[Symbol])
+        }
+        this.add_approximate_length(((out.get_length() as int) - en_start) + (Symbol.name_len_of(en_root) as int) + 2)
         ; symbolToEntityNameNode joins the PARENT chain with dots, so the TypeName
         ; is an Identifier exactly when the alias symbol has no parent. Held in a
         ; local and re-stated at the exits, for type_reference_to_type_node's
@@ -45117,17 +45292,8 @@ define Checker
             return true
         }
         let args t.alias_type_arguments as ref[Array[ref[Type]?]]
-        out.append("<" as char)
-        var i 0
-        while i < na
-        {
-            if i > 0
-                out.append(", ")
-            if this.type_to_string(args[i], out) = false
-                return false
-            set i: i + 1
-        }
-        out.append(">" as char)
+        if this.write_type_argument_list(args, out) = false
+            return false
         set wrote_type_precedence: TypePrecedenceNonArray
         set wrote_type_reference_name: ref_name
         set wrote_name_depth: printer_depth
@@ -45358,59 +45524,65 @@ define Checker
         ; belongs to something the constituent recursed into, not to the
         ; constituent. See printer_depth.
         let outer printer_depth
-        ; ★ `checkTruncationLength() && displayIndex+2 < len(list)-1` (slice 214): past
-        ; the budget the reference prints the elision placeholder (`any` once the comment
-        ; is stripped) and then only the LAST member — and resolves nothing in between.
-        ; This was a stop at the emission below; it is now the reference's elision, and
-        ; the collision marking is skipped for an elided list (its names no longer
-        ; align with the members).
+        ; mapToTypeNodes for a BARE list: +2 per element; past the budget a list
+        ; of more than two prints its first element, a placeholder and its last;
+        ; a list crossing the budget mid-way keeps its head, a placeholder for the
+        ; rest, and the last element
         var elided false
-        var pending 0
+        if this.check_truncation_length()
+        {
+            if n > 2
+            {
+                set elided: true
+                let first StringBuilder^host()
+                if this.write_constituent(list[0], mode, &first) = false
+                    return false
+                pieces.add(first.to_string())
+                names.add(Slice[char]())
+                marks.add(0)
+                let placeholder StringBuilder^host()
+                if Checker.write_elided_information_placeholder(&placeholder) = false
+                    return false
+                pieces.add(placeholder.to_string())
+                names.add(Slice[char]())
+                marks.add(0)
+                let last StringBuilder^host()
+                if this.write_constituent(list[n - 1], mode, &last) = false
+                    return false
+                pieces.add(last.to_string())
+                names.add(Slice[char]())
+                marks.add(0)
+            }
+        }
         var i 0
+        if elided
+            set i: n
         while i < n
         {
-            if this.truncation_budget_exceeded(out)
+            if this.check_truncation_length()
             {
                 if (i + 1) + 2 < n - 1
                 {
-                    ; ★ The VISIBLE print (the T dump, level 0) keeps the honest stop: the
-                    ; reference's approximateLength is a per-node estimate this port does not
-                    ; keep, so WHERE the elision begins cannot yet be matched, and a wrong
-                    ; elision point is a wrong answer where a stop is a known gap. A message
-                    ; argument (level ≥ 1) is not compared, and there the elision's only
-                    ; product — resolving nothing past the budget — is what matters.
-                    if serialization_level = 0
-                    {
-                        set printer_emitted: printer_emitted - pending
-                        this.record_unported("type-to-string-truncation", 0)
-                        return false
-                    }
                     set elided: true
                     let placeholder StringBuilder^host()
-                    placeholder.append("any")
+                    if Checker.write_elided_information_placeholder(&placeholder) = false
+                        return false
                     pieces.add(placeholder.to_string())
                     names.add(Slice[char]())
                     marks.add(0)
                     let last StringBuilder^host()
                     if this.write_constituent(list[n - 1], mode, &last) = false
-                    {
-                        set printer_emitted: printer_emitted - pending
                         return false
-                    }
                     pieces.add(last.to_string())
                     names.add(Slice[char]())
                     marks.add(0)
                     break
                 }
             }
+            this.add_approximate_length(2)
             let piece StringBuilder^host()
             if this.write_constituent(list[i], mode, &piece) = false
-            {
-                set printer_emitted: printer_emitted - pending
                 return false
-            }
-            set pending: pending + (piece.get_length() as int)
-            set printer_emitted: printer_emitted + (piece.get_length() as int)
             pieces.add(piece.to_string())
             if this.wrote_identifier_type_reference(outer)
                 names.add(wrote_type_reference_name)
@@ -45419,7 +45591,6 @@ define Checker
             marks.add(0)
             set i: i + 1
         }
-        set printer_emitted: printer_emitted - pending
         if elided
         {
             let ne pieces.get_length() as int
@@ -46815,9 +46986,11 @@ define Checker
             }
             if mask = SymbolFlagsValue
                 out.append("typeof ")
+            let imp_start out.get_length() as int
             out.append("import(")
             Checker.write_ascii_escaped_literal_name(out, nd.subslice(1, (nl - 1) as size_t))
             out.append(")" as char)
+            this.add_approximate_length((out.get_length() as int) - imp_start)
             ; An ImportTypeNode is TypePrecedenceNonArray — `typeof import("x")`
             ; included, because the `typeof` is a FIELD of that node and not a
             ; TypeQuery around it.
@@ -46882,8 +47055,14 @@ define Checker
             let e chain[i]
             if e = null
                 return false
+            let el_start out.get_length() as int
             if this.write_symbol_name(e as ref[Symbol], out) = false
                 return false
+            ; createAccessFromSymbolChain adds the ROOT's width twice — once in
+            ; its index-0 arm and once unconditionally after it
+            this.add_approximate_length(((out.get_length() as int) - el_start) + 1)
+            if i = 0
+                this.add_approximate_length(((out.get_length() as int) - el_start) + 1)
             set i: i + 1
         }
         true
