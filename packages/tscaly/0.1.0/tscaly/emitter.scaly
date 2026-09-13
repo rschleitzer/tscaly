@@ -28,6 +28,7 @@ use tscaly.ast.*
 use tscaly.parser.Parser
 use tscaly.binder.Binder
 use tscaly.checker.Checker
+use tscaly.checker.EvalResult
 use tscaly.printer.EmitContext
 use tscaly.printer.NameGenerator
 use tscaly.printer.EmitHelper
@@ -35,6 +36,8 @@ use tscaly.printer.Printer
 use tscaly.printer.PrinterOptions
 use tscaly.printer.SourceFileInfo
 use tscaly.printer.TextWriter
+use tscaly.printer.NameNode
+use tscaly.printer.TextRange
 use tscaly.factory.NodeFactory
 use tscaly.factory.NodeVisitor
 
@@ -57,6 +60,10 @@ define TransformerTagESModule: int 3
 define TransformerTagChain: int 4
 define TransformerTagModifierVisitor: int 5
 define TransformerTagImportElision: int 6
+define TransformerTagRuntimeSyntax: int 7
+define TransformerTagConstEnumInlining: int 8
+; ast.ModifierFlagsTypeScriptModifier
+define ModifierFlagsTypeScriptModifier: int ModifierFlagsAmbient | ModifierFlagsPublic | ModifierFlagsPrivate | ModifierFlagsProtected | ModifierFlagsReadonly | ModifierFlagsAbstract | ModifierFlagsConst | ModifierFlagsOverride | ModifierFlagsIn | ModifierFlagsOut
 
 ; ── ast/subtreefacts.go — the transformers' gate (slice 237) ──────────────────
 ;
@@ -226,6 +233,11 @@ define Transformer
     current_source_file: ref[AstNode]?
     import_require_statements: ref[Array[ref[AstNode]?]]?
     require_helper_name: ref[AstNode]?
+    ; runtimesyntax.go's scope state (slice 238)
+    current_scope: ref[AstNode]?
+    current_scope_first_declarations: ref[Array[NameNode]]?
+    current_enum: ref[AstNode]?
+    current_namespace: ref[AstNode]?
     unported_count: int
     unported_tag: Slice[char]
     unported_detail: int
@@ -237,7 +249,7 @@ define Transformer
     {
         let comps &Array[ref[Transformer]?]^host()
         let no_tag: Slice[char] ""
-        let t &Transformer^host(host, tag, opts.context, opts.context.the_factory(), null, opts, null, null, comps, 0, null, null, null, 0, no_tag, 0)
+        let t &Transformer^host(host, tag, opts.context, opts.context.the_factory(), null, opts, null, null, comps, 0, null, null, null, null, null, null, null, 0, no_tag, 0)
         let v opts.context.new_node_visitor(VisitTagTransformer)
         set v.transformer: t
         set t.visitor: v
@@ -286,6 +298,10 @@ define Transformer
             return this.visit_modifier(node)
         if tag = TransformerTagImportElision
             return this.visit_import_elision(node)
+        if tag = TransformerTagRuntimeSyntax
+            return this.visit_runtime_syntax(node)
+        if tag = TransformerTagConstEnumInlining
+            return this.visit_const_enum_inlining(node)
         this.record_unported("transformer-tag", tag)
         node
     }
@@ -434,6 +450,1237 @@ define Transformer
         if p = null
             return false
         this.the_checker().is_top_level_value_import_equals_with_entity_name(p as ref[AstNode])
+    }
+
+    ; ═══ tstransforms/runtimesyntax.go (slice 238) ═══
+    ;
+    ; TypeScript's RUNTIME syntax — enums, namespaces, `import x = N.M`,
+    ; parameter properties, the exports of a namespace body — into JavaScript.
+    ; The reference's `resolver` (binder.ReferenceResolver with EMPTY hooks) is
+    ; `Checker.get_referenced_export_container`, its `emitResolver` the checker
+    ; itself (§3.41). One said stop: a destructuring `export var {a} = x` inside a
+    ; namespace needs FlattenDestructuringAssignment (transformers/destructuring.go),
+    ; which lands with the ES chapter that needs it everywhere.
+
+    procedure push_scope(this, node: ref[AstNode], saved_scope: ref[ref[AstNode]?], saved_names: ref[ref[Array[NameNode]]?])
+    {
+        set saved_scope: current_scope
+        set saved_names: current_scope_first_declarations
+        let k node.kind
+        if k = KindSourceFile
+        {
+            set this.current_scope: node
+            set this.current_source_file: node
+            set this.current_scope_first_declarations: null
+            return
+        }
+        if (k = KindCaseBlock) or (k = KindModuleBlock) or (k = KindBlock)
+        {
+            set this.current_scope: node
+            set this.current_scope_first_declarations: null
+            return
+        }
+        if (k = KindFunctionDeclaration) or (k = KindClassDeclaration) or (k = KindVariableStatement)
+            this.record_declaration_in_scope(node)
+    }
+
+    procedure pop_scope(this, saved_scope: ref[AstNode]?, saved_names: ref[Array[NameNode]]?)
+    {
+        if current_scope <> saved_scope
+            set this.current_scope_first_declarations: saved_names
+        set this.current_scope: saved_scope
+    }
+
+    procedure visit_runtime_syntax(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let grandparent this.push_node(node)
+        var saved_scope: ref[AstNode]? null
+        var saved_names: ref[Array[NameNode]]? null
+        this.push_scope(node, &saved_scope, &saved_names)
+        let result this.visit_runtime_syntax_worker(node)
+        this.pop_scope(saved_scope, saved_names)
+        this.pop_node(grandparent)
+        result
+    }
+
+    procedure visit_runtime_syntax_worker(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let v this.the_visitor()
+        let facts Emitter.subtree_facts(node)
+        if (facts & SubtreeContainsTypeScript) = 0
+        {
+            if (current_namespace = null) and (current_enum = null)
+                return node
+            if (facts & SubtreeContainsIdentifier) = 0
+                return node
+        }
+        let k node.kind
+        ; TypeScript parameter property modifiers are elided
+        if (k = KindPublicKeyword) or (k = KindPrivateKeyword) or (k = KindProtectedKeyword) or (k = KindReadonlyKeyword) or (k = KindOverrideKeyword)
+            return null
+        if k = KindEnumDeclaration
+            return this.rs_visit_enum_declaration(node)
+        if k = KindModuleDeclaration
+            return this.rs_visit_module_declaration(node)
+        if k = KindClassDeclaration
+            return this.rs_visit_class_declaration(node)
+        if k = KindClassExpression
+            return this.rs_visit_class_expression(node)
+        if k = KindConstructor
+            return this.rs_visit_constructor_declaration(node)
+        if k = KindFunctionDeclaration
+            return this.rs_visit_function_declaration(node)
+        if k = KindVariableStatement
+            return this.rs_visit_variable_statement(node)
+        if (k = KindExportDeclaration) or (k = KindImportDeclaration) or (k = KindImportClause)
+        {
+            ; do not emit ES6 imports and exports since they are illegal inside a namespace
+            if this.rs_in_namespace_body()
+                return null
+            return v.visit_each_child(node)
+        }
+        if k = KindImportEqualsDeclaration
+        {
+            let external AstNode.kind_of(AstNode.module_reference_of(node)) = KindExternalModuleReference
+            if this.rs_in_namespace_body() and external
+                return null
+            if (current_namespace <> null) and (current_scope <> null) and (AstNode.kind_of(current_scope) = KindBlock) and (external = false)
+                return null
+            return this.rs_visit_import_equals_declaration(node)
+        }
+        if k = KindIdentifier
+            return this.rs_visit_identifier(node)
+        if k = KindShorthandPropertyAssignment
+            return this.rs_visit_shorthand_property_assignment(node)
+        v.visit_each_child(node)
+    }
+
+    ; `tx.currentNamespace != nil && tx.currentScope != nil && tx.currentScope.Kind != KindBlock`
+    function rs_in_namespace_body(this) returns bool
+    {
+        if current_namespace = null
+            return false
+        if current_scope = null
+            return false
+        AstNode.kind_of(current_scope) <> KindBlock
+    }
+
+    ; recordDeclarationInScope
+    procedure record_declaration_in_scope(this, node: ref[AstNode])
+    {
+        let k node.kind
+        if k = KindVariableStatement
+        {
+            let dl Printer.declaration_list_of(node)
+            if dl <> null
+                this.record_declaration_in_scope(dl as ref[AstNode])
+            return
+        }
+        if k = KindVariableDeclarationList
+        {
+            this.record_declarations_in_scope(Printer.declarations_of(node))
+            return
+        }
+        if (k = KindArrayBindingPattern) or (k = KindObjectBindingPattern)
+        {
+            this.record_declarations_in_scope(AstNode.elements_of(node))
+            return
+        }
+        let name Printer.declaration_name_of(node)
+        if name = null
+            return
+        let nm name as ref[AstNode]
+        if nm.kind = KindIdentifier
+        {
+            if current_scope_first_declarations = null
+                set this.current_scope_first_declarations: &Array[NameNode]^host()
+            let table current_scope_first_declarations as ref[Array[NameNode]]
+            let text AstNode.identifier_text_of(nm)
+            if Transformer.first_declaration_of(table, text) = null
+                table.add(NameNode(text, node))
+            return
+        }
+        if AstNode.is_binding_pattern(nm)
+            this.record_declaration_in_scope(nm)
+    }
+
+    procedure record_declarations_in_scope(this, list: ref[Array[ref[AstNode]?]]?)
+    {
+        if list = null
+            return
+        let l list as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (l.get_length() as int)
+        {
+            let d l[i as size_t]
+            set i: i + 1
+            if d <> null
+                this.record_declaration_in_scope(d as ref[AstNode])
+        }
+    }
+
+    function first_declaration_of(table: ref[Array[NameNode]], text: Slice[char]) returns ref[AstNode]?
+    {
+        var i 0
+        while i < (table.get_length() as int)
+        {
+            let e table[i as size_t]
+            set i: i + 1
+            if e.name.equals(text)
+                return e.node
+        }
+        null
+    }
+
+    ; isFirstDeclarationInScope
+    function is_first_declaration_in_scope(this, node: ref[AstNode]) returns bool
+    {
+        let name Printer.declaration_name_of(node)
+        if name = null
+            return false
+        let nm name as ref[AstNode]
+        if nm.kind <> KindIdentifier
+            return false
+        if current_scope_first_declarations = null
+            return false
+        let first Transformer.first_declaration_of(current_scope_first_declarations as ref[Array[NameNode]], AstNode.identifier_text_of(nm))
+        if first = null
+            return false
+        first = node
+    }
+
+    ; isExportOfNamespace
+    function is_export_of_namespace(this, node: ref[AstNode]) returns bool
+    {
+        if current_namespace = null
+            return false
+        if current_scope <> null
+        {
+            if AstNode.kind_of(current_scope) = KindBlock
+                return false
+        }
+        (Transformer.modifier_flags_of(node) & ModifierFlagsExport) <> 0
+    }
+
+    ; getExpressionForPropertyName: `"foo"` for the identifier `foo`
+    procedure rs_expression_for_property_name(this, member: ref[AstNode]) returns ref[AstNode]?
+    {
+        let name Printer.declaration_name_of(member)
+        if name = null
+            return null
+        let nm name as ref[AstNode]
+        let k nm.kind
+        if k = KindPrivateIdentifier
+        {
+            let empty: Slice[char] ""
+            return factory.new_identifier(empty)
+        }
+        if k = KindComputedPropertyName
+            return this.the_visitor().visit_node(AstNode.expression_of(nm))
+        if k = KindIdentifier
+            return factory.new_string_literal(AstNode.identifier_text_of(nm), TokenFlagsNone)
+        if k = KindStringLiteral
+            return factory.new_string_literal(AstNode.literal_text_of(nm), TokenFlagsNone)
+        if k = KindNumericLiteral
+            return factory.new_numeric_literal(AstNode.literal_text_of(nm), TokenFlagsNone)
+        nm
+    }
+
+    ; getEnumQualifiedElement: `E["A"]`
+    procedure rs_enum_qualified_element(this, enum_node: ref[AstNode], member: ref[AstNode]) returns ref[AstNode]
+    {
+        let prop this.rs_namespace_qualified_element(this.rs_namespace_container_name(enum_node), this.rs_expression_for_property_name(member))
+        context.add_emit_flags(prop, EFNoComments | EFNoNestedComments | EFNoSourceMap | EFNoNestedSourceMaps)
+        prop
+    }
+
+    ; getNamespaceContainerName
+    procedure rs_namespace_container_name(this, node: ref[AstNode]) returns ref[AstNode]
+        factory.new_generated_name_for_node(node)
+
+    ; getNamespaceQualifiedProperty
+    procedure rs_namespace_qualified_property(this, ns: ref[AstNode], name: ref[AstNode]) returns ref[AstNode]
+        factory.get_namespace_member_name(ns, name, false, true)
+
+    ; getNamespaceQualifiedElement
+    procedure rs_namespace_qualified_element(this, ns: ref[AstNode], expression: ref[AstNode]?) returns ref[AstNode]
+    {
+        let qualified factory.new_element_access_expression(ns, null, expression, NodeFlagsNone)
+        if expression <> null
+            context.assign_comment_and_source_map_ranges(qualified, expression as ref[AstNode])
+        qualified
+    }
+
+    ; getExportQualifiedReferenceToDeclaration
+    procedure rs_export_qualified_reference_to_declaration(this, node: ref[AstNode]) returns ref[AstNode]
+    {
+        if this.is_export_of_namespace(node)
+            return factory.get_external_module_or_namespace_export_name(this.rs_namespace_container_name(current_namespace as ref[AstNode]), node, false, true)
+        factory.get_declaration_name_ex(node, false, true)
+    }
+
+    ; addVarForDeclaration: `var name;` once per scope, answered whether it was added
+    procedure rs_add_var_for_declaration(this, statements: ref[Array[ref[AstNode]?]], node: ref[AstNode]) returns bool
+    {
+        this.record_declaration_in_scope(node)
+        if this.is_first_declaration_in_scope(node) = false
+            return false
+        let name factory.get_local_name_ex(node, false, true, false)
+        let var_decl factory.new_variable_declaration(name, null, null, null)
+        var var_flags NodeFlagsNone
+        if current_scope <> current_source_file
+            set var_flags: NodeFlagsLet
+        let decls &Array[ref[AstNode]?]^host()
+        decls.add(var_decl)
+        let var_decls factory.new_variable_declaration_list(decls, var_flags)
+        ; Replicate modifierVisitor: strip decorators, TypeScript modifiers, and export when in namespace.
+        var mask ModifierFlagsAll xor (ModifierFlagsTypeScriptModifier | ModifierFlagsDecorator)
+        if current_namespace <> null
+            set mask: mask & (ModifierFlagsAll xor ModifierFlagsExport)
+        let modifiers Transformer.extract_modifiers(host, opts, Printer.modifier_list_of(node), mask)
+        let var_statement factory.new_variable_statement(modifiers, var_decls)
+        context.set_original(var_decl, node)
+        context.set_original(var_statement, node)
+        ; Adjust the source map emit to match the old emitter.
+        if node.kind = KindEnumDeclaration
+            context.set_source_map_range(var_decls, TextRange.of_node(node))
+        else
+            context.set_source_map_range(var_statement, TextRange.of_node(node))
+        ; Trailing comments for enum declaration should be emitted after the function closure
+        ; instead of the variable statement
+        context.set_comment_range(var_statement, TextRange.of_node(node))
+        context.add_emit_flags(var_statement, EFNoTrailingComments)
+        statements.add(var_statement)
+        true
+    }
+
+    ; `(function (name) { ... })(name || (name = {}))` — the shape enum and
+    ; module declarations share (visitEnumDeclaration / visitModuleDeclaration)
+    procedure rs_visit_container_declaration(this, node: ref[AstNode], is_enum: bool) returns ref[AstNode]?
+    {
+        let statements &Array[ref[AstNode]?]^host()
+        let var_added this.rs_add_var_for_declaration(statements, node)
+        var emit_flags EFNone
+        if var_added
+        {
+            if (opts.options.get_emit_module_kind() <> ModuleKindSystem) or (current_scope <> current_source_file)
+                set emit_flags: emit_flags | EFNoLeadingComments
+        }
+        ;  x || (x = {})
+        ;  exports.x || (exports.x = {})
+        var arg factory.new_logical_or_expression(this.rs_export_qualified_reference_to_declaration(node), factory.new_assignment_expression(this.rs_export_qualified_reference_to_declaration(node), factory.new_object_literal_expression(&Array[ref[AstNode]?]^host(), false)))
+        if this.is_export_of_namespace(node)
+        {
+            ;  x = (exports.x || (exports.x = {}))
+            let local_name factory.get_local_name_ex(node, false, true, false)
+            set arg: factory.new_assignment_expression(local_name, arg)
+        }
+        let param_name factory.new_generated_name_for_node(node)
+        let name Printer.declaration_name_of(node)
+        if name <> null
+            context.set_source_map_range(param_name, TextRange.of_node(name as ref[AstNode]))
+        let param factory.new_parameter_declaration(null, null, param_name, null, null, null)
+        var body: ref[AstNode]? null
+        if is_enum
+            set body: this.rs_transform_enum_body(node)
+        else
+            set body: this.rs_transform_module_body(node, this.rs_namespace_container_name(node))
+        let params &Array[ref[AstNode]?]^host()
+        params.add(param)
+        let func factory.new_function_expression(null, null, null, null, params, null, null, body)
+        let args &Array[ref[AstNode]?]^host()
+        args.add(arg)
+        let call factory.new_call_expression(factory.new_parenthesized_expression(func), null, null, args, NodeFlagsNone)
+        let statement factory.new_expression_statement(call)
+        context.set_original(statement, node)
+        context.assign_comment_and_source_map_ranges(statement, node)
+        context.add_emit_flags(statement, emit_flags)
+        statements.add(statement)
+        factory.new_syntax_list(statements)
+    }
+
+    procedure rs_visit_enum_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if this.rs_should_emit_enum_declaration(node) = false
+            return context.new_not_emitted_statement(node)
+        this.rs_visit_container_declaration(node, true)
+    }
+
+    ; transformEnumBody
+    procedure rs_transform_enum_body(this, node_in: ref[AstNode]) returns ref[AstNode]
+    {
+        let saved_enum current_enum
+        set this.current_enum: node_in
+        ; visit the children of `node` in advance to capture any references to enum members
+        let node this.the_visitor().visit_each_child(node_in) as ref[AstNode]
+        let statements &Array[ref[AstNode]?]^host()
+        let members Printer.member_list_of(node)
+        if members <> null
+        {
+            let ml members as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (ml.get_length() as int)
+            {
+                this.rs_transform_enum_member(statements, node, i)
+                set i: i + 1
+            }
+            var mp 0 - 1
+            var me 0 - 1
+            AstNode.list_range_of(current_source_file, members, &mp, &me)
+            factory.set_list_range(statements, mp, me)
+        }
+        set this.current_enum: saved_enum
+        factory.new_block(statements, true)
+    }
+
+    ; transformEnumMember: `E[E["A"] = 0] = "A";`
+    procedure rs_transform_enum_member(this, statements: ref[Array[ref[AstNode]?]], enum_node: ref[AstNode], index: int)
+    {
+        let ml Printer.member_list_of(enum_node) as ref[Array[ref[AstNode]?]]
+        let member ml[index as size_t] as ref[AstNode]
+        let saved_parent parent_node
+        set this.parent_node: current_node
+        set this.current_node: member
+        var expression AstNode.initializer_of(member)
+        var use_explicit_reverse_mapping false
+        let parse_node context.parse_node(member)
+        let result this.the_checker().get_enum_member_value(parse_node)
+        ; the reference's `result.Value` is a number, a string, or nil; here a
+        ; String kind WITHOUT a buffer is the nil-but-syntactically-string case
+        ; (Checker.eval_has_value)
+        var has_value false
+        if result.kind = EvalKindNumber
+        {
+            set expression: this.rs_constant_number_expression(result.bits)
+            set use_explicit_reverse_mapping: true
+            set has_value: true
+        }
+        if result.kind = EvalKindString
+        {
+            if Checker.eval_has_value(result)
+            {
+                set expression: factory.new_string_literal(result.text, TokenFlagsNone)
+                set has_value: true
+            }
+        }
+        if has_value = false
+        {
+            if expression = null
+                set expression: factory.new_void_zero_expression()
+            set use_explicit_reverse_mapping: result.is_syntactically_string = false
+        }
+        ;  E[E["A"] = 0] = "A";
+        ;    ^^^^^^^^--_____
+        set expression: factory.new_assignment_expression(this.rs_enum_qualified_element(enum_node, member), expression)
+        if use_explicit_reverse_mapping
+            set expression: factory.new_assignment_expression(factory.new_element_access_expression(this.rs_namespace_container_name(enum_node), null, expression, NodeFlagsNone), this.rs_expression_for_property_name(member))
+        let member_statement factory.new_expression_statement(expression)
+        context.assign_comment_and_source_map_ranges(expression as ref[AstNode], member)
+        context.assign_comment_and_source_map_ranges(member_statement, member)
+        statements.add(member_statement)
+        set this.current_node: parent_node
+        set this.parent_node: saved_parent
+    }
+
+    ; constantExpression for a jsnum value: the literal, `Infinity`, `NaN`, or
+    ; a minus over the positive one
+    procedure rs_constant_number_expression(this, bits: u64) returns ref[AstNode]
+    {
+        if jsnum_is_inf(bits)
+        {
+            let inf: Slice[char] "Infinity"
+            if jsnum_double_of(bits) > 0.0
+                return factory.new_identifier(inf)
+            return factory.new_prefix_unary_expression(KindMinusToken, factory.new_identifier(inf))
+        }
+        if jsnum_is_nan(bits)
+        {
+            let nan: Slice[char] "NaN"
+            return factory.new_identifier(nan)
+        }
+        if jsnum_double_of(bits) < 0.0
+            return factory.new_prefix_unary_expression(KindMinusToken, this.rs_constant_number_expression(jsnum_negate_value(bits)))
+        let buf allocate_slice[char](host, 64)
+        let n jsnum_to_string(bits, buf)
+        factory.new_numeric_literal(buf.subslice(0, n as size_t), TokenFlagsNone)
+    }
+
+    procedure rs_visit_module_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if this.rs_should_emit_module_declaration(node) = false
+            return context.new_not_emitted_statement(node)
+        this.rs_visit_container_declaration(node, false)
+    }
+
+    ; transformModuleBody
+    procedure rs_transform_module_body(this, node_in: ref[AstNode], namespace_local_name: ref[AstNode]) returns ref[AstNode]
+    {
+        let saved_namespace current_namespace
+        let saved_scope current_scope
+        let saved_names current_scope_first_declarations
+        set this.current_namespace: node_in
+        set this.current_scope_first_declarations: null
+        var statements: ref[Array[ref[AstNode]?]]? null
+        context.start_variable_environment()
+        var sp 0 - 1
+        var se 0 - 1
+        var bp 0 - 1
+        var be 0 - 1
+        let body_in Printer.module_body_of(node_in)
+        if body_in <> null
+        {
+            if AstNode.kind_of(body_in) = KindModuleBlock
+            {
+                ; visit the children of `node` in advance to capture any references to namespace members
+                let node this.the_visitor().visit_each_child(node_in) as ref[AstNode]
+                let body Printer.module_body_of(node) as ref[AstNode]
+                set statements: AstNode.statements_of(body)
+                AstNode.list_range_of(current_source_file, statements, &sp, &se)
+                set bp: body.pos
+                set be: body.end
+            }
+            else
+            {
+                ; node.Body.Kind == KindModuleDeclaration
+                let one &Array[ref[AstNode]?]^host()
+                one.add(body_in)
+                var changed false
+                set statements: this.the_visitor().visit_slice(one, &changed)
+                let inner Transformer.get_innermost_module_declaration_from_dotted_module(node_in)
+                let inner_body Printer.module_body_of(inner)
+                if inner_body <> null
+                {
+                    var ip 0 - 1
+                    AstNode.list_range_of(current_source_file, AstNode.statements_of(inner_body as ref[AstNode]), &ip, &se)
+                }
+                set sp: 0 - 1
+            }
+        }
+        set this.current_namespace: saved_namespace
+        set this.current_scope: saved_scope
+        set this.current_scope_first_declarations: saved_names
+        set statements: context.end_and_merge_variable_environment(statements)
+        let list &Array[ref[AstNode]?]^host()
+        if statements <> null
+        {
+            let sl statements as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (sl.get_length() as int)
+            {
+                list.add(sl[i as size_t])
+                set i: i + 1
+            }
+        }
+        factory.set_list_range(list, sp, se)
+        let block factory.new_block(list, true)
+        set block.pos: bp
+        set block.end: be
+        ; We only want to emit comment on the namespace which contains block body itself, not the containing namespaces.
+        var no_comments true
+        if body_in <> null
+        {
+            if AstNode.kind_of(body_in) = KindModuleBlock
+                set no_comments: false
+        }
+        if no_comments
+            context.add_emit_flags(block, EFNoComments)
+        block
+    }
+
+    procedure rs_visit_import_equals_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let mr AstNode.module_reference_of(node) as ref[AstNode]
+        if mr.kind = KindExternalModuleReference
+            return this.the_visitor().visit_each_child(node)
+        let module_reference factory.create_expression_from_entity_name(mr)
+        context.set_emit_flags(module_reference, EFNoComments | EFNoNestedComments)
+        let name Printer.declaration_name_of(node)
+        if this.is_export_of_namespace(node) = false
+        {
+            ;  export var ${name} = ${moduleReference};
+            ;  var ${name} = ${moduleReference};
+            let var_decl factory.new_variable_declaration(name, null, null, module_reference)
+            context.set_original(var_decl, node)
+            let decls &Array[ref[AstNode]?]^host()
+            decls.add(var_decl)
+            let var_list factory.new_variable_declaration_list(decls, NodeFlagsNone)
+            let var_modifiers Transformer.extract_modifiers(host, opts, Printer.modifier_list_of(node), ModifierFlagsExport)
+            let var_statement factory.new_variable_statement(var_modifiers, var_list)
+            context.set_original(var_statement, node)
+            context.assign_comment_and_source_map_ranges(var_statement, node)
+            return var_statement
+        }
+        ; exports.${name} = ${moduleReference};
+        let statement this.rs_create_export_statement(name as ref[AstNode], module_reference, TextRange.of_node(node), TextRange.of_node(node), node)
+        set statement.pos: node.pos
+        set statement.end: node.end
+        statement
+    }
+
+    procedure rs_visit_variable_statement(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let v this.the_visitor()
+        if this.is_export_of_namespace(node) = false
+            return v.visit_each_child(node)
+        let expressions &Array[ref[AstNode]?]^host()
+        let decls Printer.declarations_of(Printer.declaration_list_of(node) as ref[AstNode])
+        if decls <> null
+        {
+            let dl decls as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (dl.get_length() as int)
+            {
+                let declaration dl[i as size_t] as ref[AstNode]
+                set i: i + 1
+                if AstNode.initializer_of(declaration) = null
+                    continue
+                if AstNode.is_binding_pattern(Printer.declaration_name_of(declaration))
+                {
+                    ; FlattenDestructuringAssignment (transformers/destructuring.go)
+                    this.record_unported("transform-runtime-syntax-destructuring", 0)
+                    return node
+                }
+                let expression Transformer.convert_variable_declaration_to_assignment_expression(context, declaration)
+                if expression <> null
+                    expressions.add(expression)
+            }
+        }
+        if expressions.get_length() = 0
+            return null
+        let expression factory.inline_expressions(expressions)
+        let statement factory.new_expression_statement(expression)
+        context.set_original(statement, node)
+        context.assign_comment_and_source_map_ranges(statement, node)
+        ; re-visit as the new node
+        let saved_current current_node
+        set this.current_node: statement
+        let visited v.visit_each_child(statement)
+        set this.current_node: saved_current
+        visited
+    }
+
+    ; transformers.ConvertVariableDeclarationToAssignmentExpression, for an
+    ; IDENTIFIER name (the binding-pattern half is the destructuring chapter's)
+    function convert_variable_declaration_to_assignment_expression(ctx: ref[EmitContext], element: ref[AstNode]) returns ref[AstNode]?
+    {
+        let initializer AstNode.initializer_of(element)
+        if initializer = null
+            return null
+        let name Printer.declaration_name_of(element)
+        let assignment ctx.the_factory().new_assignment_expression(name, initializer)
+        ctx.set_original(assignment, element)
+        ctx.assign_comment_and_source_map_ranges(assignment, element)
+        assignment
+    }
+
+    procedure rs_visit_function_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let v this.the_visitor()
+        if this.is_export_of_namespace(node) = false
+            return v.visit_each_child(node)
+        let updated factory.update_function_declaration(node, v.visit_modifiers(Transformer.extract_modifiers(host, opts, Printer.modifier_list_of(node), ModifierFlagsAll xor ModifierFlagsExport)), AstNode.asterisk_token_of(node), v.visit_node(Printer.declaration_name_of(node)), null, v.visit_nodes(AstNode.parameters_of(node)), null, null, v.visit_node(AstNode.body_of(node)))
+        let export this.rs_create_export_statement_for_declaration(node)
+        let pair &Array[ref[AstNode]?]^host()
+        pair.add(updated)
+        pair.add(export)
+        factory.new_syntax_list(pair)
+    }
+
+    ; getParameterProperties
+    procedure rs_parameter_properties(this, constructor: ref[AstNode]?) returns ref[Array[ref[AstNode]?]]
+    {
+        let out &Array[ref[AstNode]?]^host()
+        if constructor = null
+            return out
+        let c constructor as ref[AstNode]
+        let params AstNode.parameters_of(c)
+        if params = null
+            return out
+        let pl params as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (pl.get_length() as int)
+        {
+            let p pl[i as size_t]
+            set i: i + 1
+            if p = null
+                continue
+            if Transformer.is_parameter_property_declaration(p as ref[AstNode], c)
+                out.add(p)
+        }
+        out
+    }
+
+    ; the property declarations a class gains for its parameter properties,
+    ; prepended to the visited members (visitClassDeclaration / visitClassExpression)
+    procedure rs_members_with_parameter_properties(this, node: ref[AstNode], members: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    {
+        let ctor Transformer.find_constructor(Printer.member_list_of(node))
+        let parameter_properties this.rs_parameter_properties(ctor)
+        if parameter_properties.get_length() = 0
+            return members
+        let new_members &Array[ref[AstNode]?]^host()
+        var i 0
+        while i < (parameter_properties.get_length() as int)
+        {
+            let parameter parameter_properties[i as size_t] as ref[AstNode]
+            set i: i + 1
+            let pname Printer.declaration_name_of(parameter)
+            if AstNode.kind_of(pname) <> KindIdentifier
+                continue
+            let parameter_property factory.new_property_declaration(null, factory.clone(pname as ref[AstNode]), null, null, null)
+            context.set_original(parameter_property, parameter)
+            new_members.add(parameter_property)
+        }
+        if new_members.get_length() = 0
+            return members
+        if members <> null
+        {
+            let ml members as ref[Array[ref[AstNode]?]]
+            var j 0
+            while j < (ml.get_length() as int)
+            {
+                new_members.add(ml[j as size_t])
+                set j: j + 1
+            }
+        }
+        var mp 0 - 1
+        var me 0 - 1
+        AstNode.list_range_of(current_source_file, Printer.member_list_of(node), &mp, &me)
+        factory.set_list_range(new_members, mp, me)
+        new_members
+    }
+
+    function find_constructor(members: ref[Array[ref[AstNode]?]]?) returns ref[AstNode]?
+    {
+        if members = null
+            return null
+        let ml members as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (ml.get_length() as int)
+        {
+            let m ml[i as size_t]
+            set i: i + 1
+            if AstNode.kind_of(m) = KindConstructor
+                return m
+        }
+        null
+    }
+
+    procedure rs_visit_class_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let v this.the_visitor()
+        let exported this.is_export_of_namespace(node)
+        var modifiers: ref[Array[ref[AstNode]?]]? null
+        if exported
+            set modifiers: v.visit_modifiers(Transformer.extract_modifiers(host, opts, Printer.modifier_list_of(node), ModifierFlagsAll xor ModifierFlagsExportDefault))
+        else
+            set modifiers: v.visit_modifiers(Printer.modifier_list_of(node))
+        var name v.visit_node(Printer.declaration_name_of(node))
+        if name = null
+        {
+            if exported or this.the_checker().child_is_decorated(opts.options.experimental_decorators = TristateTrue, node, null)
+                set name: factory.new_generated_name_for_node(node)
+        }
+        let heritage_clauses v.visit_nodes(AstNode.heritage_clauses_of(node))
+        let members this.rs_members_with_parameter_properties(node, v.visit_nodes(Printer.member_list_of(node)))
+        let updated factory.update_class_declaration(node, modifiers, name, null, heritage_clauses, members)
+        if exported
+        {
+            let export this.rs_create_export_statement_for_declaration(node)
+            let pair &Array[ref[AstNode]?]^host()
+            pair.add(updated)
+            pair.add(export)
+            return factory.new_syntax_list(pair)
+        }
+        updated
+    }
+
+    procedure rs_visit_class_expression(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let v this.the_visitor()
+        let modifiers v.visit_modifiers(Transformer.extract_modifiers(host, opts, Printer.modifier_list_of(node), ModifierFlagsAll xor ModifierFlagsExportDefault))
+        let name v.visit_node(Printer.declaration_name_of(node))
+        let heritage_clauses v.visit_nodes(AstNode.heritage_clauses_of(node))
+        let members this.rs_members_with_parameter_properties(node, v.visit_nodes(Printer.member_list_of(node)))
+        factory.update_class_expression(node, modifiers, name, null, heritage_clauses, members)
+    }
+
+    procedure rs_visit_constructor_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let v this.the_visitor()
+        let modifiers v.visit_modifiers(Printer.modifier_list_of(node))
+        let parameters context.visit_parameters(AstNode.parameters_of(node), v)
+        let body this.rs_visit_constructor_body(AstNode.body_of(node), node)
+        factory.update_constructor_declaration(node, modifiers, null, parameters, null, null, body)
+    }
+
+    ; visitConstructorBody: `constructor (public x) {}` → `constructor (x) { this.x = x; }`
+    procedure rs_visit_constructor_body(this, body_in: ref[AstNode]?, constructor: ref[AstNode]) returns ref[AstNode]?
+    {
+        let v this.the_visitor()
+        let parameter_properties this.rs_parameter_properties(constructor)
+        if (parameter_properties.get_length() = 0) or (body_in = null)
+            return context.visit_function_body(body_in, v)
+        let body body_in as ref[AstNode]
+        let grandparent_of_body this.push_node(body)
+        var saved_scope: ref[AstNode]? null
+        var saved_names: ref[Array[NameNode]]? null
+        this.push_scope(body, &saved_scope, &saved_names)
+        context.start_variable_environment()
+        let source AstNode.statements_of(body) as ref[Array[ref[AstNode]?]]
+        let prologue_end factory.split_standard_prologue(source)
+        let statements &Array[ref[AstNode]?]^host()
+        var i 0
+        while i < prologue_end
+        {
+            statements.add(source[i as size_t])
+            set i: i + 1
+        }
+        let rest &Array[ref[AstNode]?]^host()
+        while i < (source.get_length() as int)
+        {
+            rest.add(source[i as size_t])
+            set i: i + 1
+        }
+        let assignments &Array[ref[AstNode]?]^host()
+        var p 0
+        while p < (parameter_properties.get_length() as int)
+        {
+            let parameter parameter_properties[p as size_t] as ref[AstNode]
+            set p: p + 1
+            let pname Printer.declaration_name_of(parameter)
+            if AstNode.kind_of(pname) <> KindIdentifier
+                continue
+            let nm pname as ref[AstNode]
+            let property_name factory.clone(nm)
+            set property_name.parent: nm.parent
+            context.add_emit_flags(property_name, EFNoComments | EFNoSourceMap)
+            let local_name factory.clone(nm)
+            set local_name.parent: nm.parent
+            context.add_emit_flags(local_name, EFNoComments)
+            let assignment factory.new_expression_statement(factory.new_assignment_expression(factory.new_property_access_expression(factory.new_this_expression(), null, property_name, NodeFlagsNone), local_name))
+            context.set_original(assignment, parameter)
+            context.add_emit_flags(assignment, EFStartOnNewLine)
+            assignments.add(assignment)
+        }
+        let super_path Transformer.find_super_statement_index_path(host, rest, 0)
+        if super_path <> null
+            this.rs_transform_constructor_body_worker(statements, rest, super_path as ref[Array[int]], 0, assignments)
+        else
+        {
+            Transformer.add_all(statements, assignments)
+            var changed false
+            Transformer.add_all(statements, v.visit_slice(rest, &changed))
+        }
+        let merged context.end_and_merge_variable_environment(statements)
+        let list &Array[ref[AstNode]?]^host()
+        Transformer.add_all(list, merged)
+        var sp 0 - 1
+        var se 0 - 1
+        AstNode.list_range_of(current_source_file, source, &sp, &se)
+        factory.set_list_range(list, sp, se)
+        this.pop_scope(saved_scope, saved_names)
+        this.pop_node(grandparent_of_body)
+        let updated factory.new_block(list, true)
+        context.set_original(updated, body)
+        set updated.pos: body.pos
+        set updated.end: body.end
+        updated
+    }
+
+    ; transformConstructorBodyWorker: the parameter-property assignments go right
+    ; after the statement holding `super()`, into a `try` block if that is where it sits
+    procedure rs_transform_constructor_body_worker(this, out: ref[Array[ref[AstNode]?]], statements_in: ref[Array[ref[AstNode]?]], super_path: ref[Array[int]], depth: int, initializers: ref[Array[ref[AstNode]?]])
+    {
+        let v this.the_visitor()
+        let super_index super_path[depth as size_t]
+        let super_statement statements_in[super_index as size_t] as ref[AstNode]
+        var changed false
+        ; visit up to the statement containing `super`
+        Transformer.add_all(out, v.visit_slice(Transformer.sub_list(host, statements_in, 0, super_index), &changed))
+        if super_statement.kind = KindTryStatement
+        {
+            let try_block AstNode.try_block_of(super_statement) as ref[AstNode]
+            let grandparent_of_try this.push_node(super_statement)
+            let grandparent_of_block this.push_node(try_block)
+            var saved_scope: ref[AstNode]? null
+            var saved_names: ref[Array[NameNode]]? null
+            this.push_scope(try_block, &saved_scope, &saved_names)
+            let try_statements &Array[ref[AstNode]?]^host()
+            this.rs_transform_constructor_body_worker(try_statements, AstNode.statements_of(try_block) as ref[Array[ref[AstNode]?]], super_path, depth + 1, initializers)
+            this.pop_scope(saved_scope, saved_names)
+            this.pop_node(grandparent_of_block)
+            var tp 0 - 1
+            var te 0 - 1
+            AstNode.list_range_of(current_source_file, AstNode.statements_of(try_block), &tp, &te)
+            factory.set_list_range(try_statements, tp, te)
+            out.add(factory.update_try_statement(super_statement, factory.update_block(try_block, try_statements, AstNode.multi_line_of(try_block)), v.visit_node(AstNode.catch_clause_of(super_statement)), v.visit_node(AstNode.finally_block_of(super_statement))))
+            this.pop_node(grandparent_of_try)
+        }
+        else
+        {
+            ; visit the statement containing `super`, then insert the initializer statements
+            Transformer.add_all(out, v.visit_slice(Transformer.sub_list(host, statements_in, super_index, super_index + 1), &changed))
+            Transformer.add_all(out, initializers)
+        }
+        ; visit the statements after `super`
+        Transformer.add_all(out, v.visit_slice(Transformer.sub_list(host, statements_in, super_index + 1, statements_in.get_length() as int), &changed))
+    }
+
+    function sub_list(host: ref[Page], list: ref[Array[ref[AstNode]?]], from: int, to: int) returns ref[Array[ref[AstNode]?]]
+    {
+        let out &Array[ref[AstNode]?]^host()
+        var i from
+        while i < to
+        {
+            out.add(list[i as size_t])
+            set i: i + 1
+        }
+        out
+    }
+
+    function add_all(out: ref[Array[ref[AstNode]?]], list: ref[Array[ref[AstNode]?]]?)
+    {
+        if list = null
+            return
+        let l list as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (l.get_length() as int)
+        {
+            out.add(l[i as size_t])
+            set i: i + 1
+        }
+    }
+
+    ; transformers.FindSuperStatementIndexPath: the indices, outermost first,
+    ; to the statement holding the `super()` call (through `try` blocks); null
+    ; when there is none
+    function find_super_statement_index_path(host: ref[Page], statements: ref[Array[ref[AstNode]?]], start: int) returns ref[Array[int]]?
+    {
+        var i start
+        while i < (statements.get_length() as int)
+        {
+            let statement statements[i as size_t]
+            set i: i + 1
+            if statement = null
+                continue
+            let s statement as ref[AstNode]
+            if Transformer.get_super_call_from_statement(s) <> null
+            {
+                let path &Array[int]^host()
+                path.add(i - 1)
+                return path
+            }
+            if s.kind = KindTryStatement
+            {
+                let try_block AstNode.try_block_of(s)
+                if try_block <> null
+                {
+                    let inner AstNode.statements_of(try_block as ref[AstNode])
+                    if inner <> null
+                    {
+                        let rest Transformer.find_super_statement_index_path(host, inner as ref[Array[ref[AstNode]?]], 0)
+                        if rest <> null
+                        {
+                            let path &Array[int]^host()
+                            path.add(i - 1)
+                            Transformer.add_all_ints(path, rest as ref[Array[int]])
+                            return path
+                        }
+                    }
+                }
+            }
+        }
+        null
+    }
+
+    function add_all_ints(out: ref[Array[int]], list: ref[Array[int]])
+    {
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            out.add(list[i as size_t])
+            set i: i + 1
+        }
+    }
+
+    ; transformers.GetSuperCallFromStatement
+    function get_super_call_from_statement(statement: ref[AstNode]) returns ref[AstNode]?
+    {
+        if statement.kind <> KindExpressionStatement
+            return null
+        let inner Printer.statement_expression_of(statement)
+        if inner = null
+            return null
+        let e Checker.skip_parentheses(inner as ref[AstNode])
+        if e.kind <> KindCallExpression
+            return null
+        if AstNode.kind_of(AstNode.expression_of(e)) = KindSuperKeyword
+            return e
+        null
+    }
+
+    procedure rs_visit_shorthand_property_assignment(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let v this.the_visitor()
+        let name Printer.declaration_name_of(node) as ref[AstNode]
+        let exported_or_imported_name this.rs_visit_expression_identifier(name)
+        let oai AstNode.shorthand_object_assignment_initializer_of(node)
+        if exported_or_imported_name <> name
+        {
+            var expression exported_or_imported_name
+            if oai <> null
+            {
+                var equals_token AstNode.shorthand_equals_token_of(node)
+                if equals_token = null
+                    set equals_token: factory.new_token(KindEqualsToken)
+                set expression: factory.new_binary_expression(null, expression, null, equals_token, v.visit_node(oai))
+            }
+            let updated factory.new_property_assignment(null, name, null, null, expression)
+            set updated.pos: node.pos
+            set updated.end: node.end
+            context.set_original(updated, node)
+            context.assign_comment_and_source_map_ranges(updated, node)
+            return updated
+        }
+        factory.update_shorthand_property_assignment(node, null, exported_or_imported_name, null, null, AstNode.shorthand_equals_token_of(node), v.visit_node(oai))
+    }
+
+    procedure rs_visit_identifier(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if parent_node = null
+            return node
+        if Transformer.is_identifier_reference(node, parent_node as ref[AstNode])
+            return this.rs_visit_expression_identifier(node)
+        node
+    }
+
+    ; visitExpressionIdentifier: a reference to an export of the enclosing
+    ; namespace or enum becomes `ns.name`
+    procedure rs_visit_expression_identifier(this, node: ref[AstNode]) returns ref[AstNode]
+    {
+        if (current_enum = null) and (current_namespace = null)
+            return node
+        if context.has_auto_generate_info(node)
+            return node
+        if (context.emit_flags(node) & EFLocalName) <> 0
+            return node
+        let location context.most_original(node)
+        if location = null
+            return node
+        let container this.the_checker().get_referenced_export_container(location as ref[AstNode], false)
+        if container = null
+            return node
+        let c container as ref[AstNode]
+        if (c.kind <> KindEnumDeclaration) and (c.kind <> KindModuleDeclaration)
+            return node
+        let container_name this.rs_namespace_container_name(c)
+        let member_name factory.clone(node)
+        context.set_emit_flags(member_name, EFNoComments | EFNoSourceMap)
+        let expression factory.get_namespace_member_name(container_name, member_name, false, true)
+        context.assign_comment_and_source_map_ranges(expression, node)
+        expression
+    }
+
+    ; createExportStatementForDeclaration: `exports.x = x;` after the declaration
+    procedure rs_create_export_statement_for_declaration(this, node: ref[AstNode]) returns ref[AstNode]
+    {
+        let export_name factory.get_external_module_or_namespace_export_name(this.rs_namespace_container_name(current_namespace as ref[AstNode]), node, false, true)
+        let local_name factory.get_local_name(node)
+        let expression factory.new_assignment_expression(export_name, local_name)
+        var range TextRange.of_node(node)
+        let name Printer.declaration_name_of(node)
+        if name <> null
+            set range: TextRange((name as ref[AstNode]).pos, node.end)
+        context.set_source_map_range(expression, range)
+        let statement factory.new_expression_statement(expression)
+        context.set_source_map_range(statement, TextRange(0 - 1, node.end))
+        statement
+    }
+
+    procedure rs_create_export_assignment(this, name: ref[AstNode], expression: ref[AstNode], source_map_range: TextRange, original: ref[AstNode]) returns ref[AstNode]
+    {
+        let export_name this.rs_namespace_qualified_property(this.rs_namespace_container_name(current_namespace as ref[AstNode]), name)
+        let export_assignment factory.new_assignment_expression(export_name, expression)
+        context.set_original(export_assignment, original)
+        context.set_source_map_range(export_assignment, source_map_range)
+        export_assignment
+    }
+
+    procedure rs_create_export_statement(this, name: ref[AstNode], expression: ref[AstNode], assignment_range: TextRange, statement_range: TextRange, original: ref[AstNode]) returns ref[AstNode]
+    {
+        let export_statement factory.new_expression_statement(this.rs_create_export_assignment(name, expression, assignment_range, original))
+        context.set_original(export_statement, original)
+        context.set_source_map_range(export_statement, statement_range)
+        export_statement
+    }
+
+    function rs_should_emit_enum_declaration(this, node: ref[AstNode]) returns bool
+    {
+        if this.the_checker().is_enum_const(node) = false
+            return true
+        opts.options.should_preserve_const_enums()
+    }
+
+    function rs_should_emit_module_declaration(this, node: ref[AstNode]) returns bool
+    {
+        let pn context.parse_node(node)
+        if pn = null
+            return true
+        this.the_checker().is_instantiated_module(pn as ref[AstNode])
+    }
+
+    ; transformers.IsIdentifierReference: whether an identifier CHILD of `parent`
+    ; is a reference (an expression) rather than a name
+    function is_identifier_reference(name: ref[AstNode], parent: ref[AstNode]) returns bool
+    {
+        let k parent.kind
+        if (k = KindBinaryExpression) or (k = KindPrefixUnaryExpression) or (k = KindPostfixUnaryExpression) or (k = KindYieldExpression) or (k = KindAsExpression) or (k = KindSatisfiesExpression) or (k = KindElementAccessExpression) or (k = KindNonNullExpression) or (k = KindSpreadElement) or (k = KindSpreadAssignment) or (k = KindParenthesizedExpression) or (k = KindArrayLiteralExpression) or (k = KindDeleteExpression) or (k = KindTypeOfExpression) or (k = KindVoidExpression) or (k = KindAwaitExpression) or (k = KindTypeAssertionExpression) or (k = KindExpressionWithTypeArguments) or (k = KindJsxSelfClosingElement) or (k = KindJsxSpreadAttribute) or (k = KindJsxExpression) or (k = KindPartiallyEmittedExpression)
+            return true
+        if (k = KindComputedPropertyName) or (k = KindDecorator) or (k = KindIfStatement) or (k = KindDoStatement) or (k = KindWhileStatement) or (k = KindWithStatement) or (k = KindReturnStatement) or (k = KindSwitchStatement) or (k = KindCaseClause) or (k = KindThrowStatement) or (k = KindExpressionStatement) or (k = KindExportAssignment) or (k = KindPropertyAccessExpression) or (k = KindTemplateSpan)
+            return Transformer.expression_child_of(parent) = name
+        if (k = KindVariableDeclaration) or (k = KindParameter) or (k = KindBindingElement) or (k = KindPropertyDeclaration) or (k = KindPropertySignature) or (k = KindPropertyAssignment) or (k = KindEnumMember) or (k = KindJsxAttribute)
+            return AstNode.initializer_of(parent) = name
+        if k = KindShorthandPropertyAssignment
+            return AstNode.shorthand_object_assignment_initializer_of(parent) = name
+        if k = KindForStatement
+        {
+            if AstNode.initializer_of(parent) = name
+                return true
+            if AstNode.for_condition_of(parent) = name
+                return true
+            return AstNode.for_incrementor_of(parent) = name
+        }
+        if (k = KindForInStatement) or (k = KindForOfStatement)
+        {
+            if AstNode.initializer_of(parent) = name
+                return true
+            return AstNode.expression_of(parent) = name
+        }
+        if k = KindImportEqualsDeclaration
+            return AstNode.module_reference_of(parent) = name
+        if k = KindArrowFunction
+            return AstNode.body_of(parent) = name
+        if k = KindConditionalExpression
+        {
+            if AstNode.conditional_condition_of(parent) = name
+                return true
+            if AstNode.conditional_when_true_of(parent) = name
+                return true
+            return AstNode.conditional_when_false_of(parent) = name
+        }
+        if (k = KindCallExpression) or (k = KindNewExpression)
+        {
+            if AstNode.expression_of(parent) = name
+                return true
+            return Transformer.list_contains(AstNode.call_arguments_of(parent), name)
+        }
+        if k = KindTaggedTemplateExpression
+            return AstNode.tagged_template_tag_of(parent) = name
+        if k = KindImportAttribute
+            return AstNode.import_attribute_value_of(parent) = name
+        if (k = KindJsxOpeningElement) or (k = KindJsxClosingElement)
+            return AstNode.jsx_tag_name_of(parent) = name
+        false
+    }
+
+    ; the reference's Node.Expression() for the parents IsIdentifierReference asks
+    function expression_child_of(parent: ref[AstNode]) returns ref[AstNode]?
+    {
+        let k parent.kind
+        if k = KindPropertyAccessExpression
+            return AstNode.property_access_expression_of(parent)
+        if (k = KindComputedPropertyName) or (k = KindDecorator)
+            return Printer.wrapped_inner_of(parent)
+        if (k = KindExpressionStatement) or (k = KindThrowStatement) or (k = KindReturnStatement)
+            return Printer.statement_expression_of(parent)
+        if k = KindExportAssignment
+            return Checker.export_assignment_expression_of(parent)
+        if k = KindTemplateSpan
+            return AstNode.expression_of(parent)
+        ; if / do / while / with / switch / case clause
+        AstNode.expression_of(parent)
+    }
+
+    function list_contains(list: ref[Array[ref[AstNode]?]]?, n: ref[AstNode]) returns bool
+    {
+        if list = null
+            return false
+        let l list as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (l.get_length() as int)
+        {
+            if l[i as size_t] = n
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    ; ═══ inliners/constenum.go (slice 238) ═══
+    ;
+    ; A property or element access that the checker knows as a const enum
+    ; member becomes its value, with the original text as a trailing `/* */`
+    ; comment unless comments are removed.
+    procedure visit_const_enum_inlining(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let v this.the_visitor()
+        let k node.kind
+        if (k <> KindPropertyAccessExpression) and (k <> KindElementAccessExpression)
+            return v.visit_each_child(node)
+        let parse context.parse_node(node)
+        if parse = null
+            return v.visit_each_child(node)
+        let value this.the_checker().get_constant_value(parse as ref[AstNode])
+        if value.kind = EvalKindNone
+            return v.visit_each_child(node)
+        var replacement: ref[AstNode]? null
+        if value.kind = EvalKindNumber
+            set replacement: this.rs_constant_number_expression(value.bits)
+        if value.kind = EvalKindString
+            set replacement: factory.new_string_literal(value.text, TokenFlagsNone)
+        if replacement = null
+            return v.visit_each_child(node)
+        let r replacement as ref[AstNode]
+        if opts.options.remove_comments = false
+        {
+            let original context.most_original(node)
+            if original <> null
+            {
+                let o original as ref[AstNode]
+                if Printer.node_is_synthesized(o) = false
+                {
+                    let original_text Printer.get_text_of_node_from_source_text(host, opts.file_info.text, o, false)
+                    context.add_synthetic_trailing_comment(r, KindMultiLineCommentTrivia, Transformer.safe_multi_line_comment(host, original_text), false)
+                }
+            }
+        }
+        r
+    }
+
+    ; safeMultiLineComment: ` text ` with every `*/` inside spelled `*_/`
+    function safe_multi_line_comment(host: ref[Page], text: Slice[char]) returns Slice[char]
+    {
+        let b StringBuilder^host()
+        b.append(" " as char)
+        var i 0
+        while i < text.length
+        {
+            let c text[i]
+            if (c = ("*" as char)) and (i + 1 < text.length)
+            {
+                if text[i + 1] = ("/" as char)
+                {
+                    b.append("*_/")
+                    set i: i + 2
+                    continue
+                }
+            }
+            b.append(c)
+            set i: i + 1
+        }
+        b.append(" " as char)
+        Printer.slice_on(host, b.to_string())
     }
 
     ; ── the AST questions the transformers ask (ast/utilities.go) ──
@@ -2066,8 +3313,6 @@ define Emitter
         this.scan(file, checker, &facts)
         ; getScriptTransformers, each gate a transformer not yet ported
         let import_elision_enabled (options.verbatim_module_syntax <> TristateTrue) and ((file.flags & NodeFlagsJavaScriptFile) = 0)
-        if facts.has_runtime_syntax
-            this.record_unported("transform-runtime-syntax", 0)
         if options.experimental_decorators = TristateTrue
             this.record_unported("transform-legacy-decorators", 0)
         if options.get_jsx_transform_enabled()
@@ -2097,8 +3342,6 @@ define Emitter
             else
                 this.record_unported("transform-commonjs", module_kind)
         }
-        if (options.get_isolated_modules() = false) and facts.has_runtime_syntax
-            this.record_unported("transform-const-enum-inlining", 0)
         if facts.has_dynamic_import and (format < ModuleKindES2015)
             this.record_unported("transform-commonjs", format)
         if unported_count > 0
@@ -2111,18 +3354,29 @@ define Emitter
         let elision Transformer.create(host, TransformerTagImportElision, opts)
         if import_elision_enabled
             set current: elision.transform_source_file(current)
+        ; transform `enum`, `namespace`, and parameter properties
+        let runtime Transformer.create(host, TransformerTagRuntimeSyntax, opts)
+        set current: runtime.transform_source_file(current)
         let use_strict Transformer.create(host, TransformerTagUseStrict, opts)
         set current: use_strict.transform_source_file(current)
         let es_module Transformer.create(host, TransformerTagESModule, opts)
         set current: es_module.transform_source_file(current)
+        ; inlining (formerly done via substitutions)
+        let inliner Transformer.create(host, TransformerTagConstEnumInlining, opts)
+        if options.get_isolated_modules() = false
+            set current: inliner.transform_source_file(current)
         if eraser.unported_count > 0
             this.record_unported(eraser.unported_tag, eraser.unported_detail)
         if elision.unported_count > 0
             this.record_unported(elision.unported_tag, elision.unported_detail)
+        if runtime.unported_count > 0
+            this.record_unported(runtime.unported_tag, runtime.unported_detail)
         if use_strict.unported_count > 0
             this.record_unported(use_strict.unported_tag, use_strict.unported_detail)
         if es_module.unported_count > 0
             this.record_unported(es_module.unported_tag, es_module.unported_detail)
+        if inliner.unported_count > 0
+            this.record_unported(inliner.unported_tag, inliner.unported_detail)
         if unported_count > 0
             return
         ; the printer, over the TRANSFORMED file (its record's node is the one it prints)
