@@ -253,11 +253,15 @@ def strip_directives(content):
     return text.encode("utf-8")
 
 
+# option VALUES that are text, not an enum: the case decides (`jsxFactory: h`, `reactNamespace: myReactLib`)
+TEXT_OPTIONS = {"jsxfactory", "jsxfragmentfactory", "reactnamespace", "jsximportsource", "emitfilename"}
+
+
 def options_string(cfg):
     items = dict(cfg)
     if allow_js(cfg):
         items["allowjs"] = "true"     # GetAllowJS: checkJs implies allowJs
-    return ";".join("%s=%s" % (k, str(v).strip().lower()) for k, v in sorted(items.items()))
+    return ";".join("%s=%s" % (k, str(v).strip() if k in TEXT_OPTIONS else str(v).strip().lower()) for k, v in sorted(items.items()))
 
 
 def main():
