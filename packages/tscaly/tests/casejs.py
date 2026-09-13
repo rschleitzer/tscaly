@@ -34,7 +34,7 @@ Usage:
   tests/casejs.py [--store tests/out/run.db] [--binary tests/out/tscaly_dump]
                   [--filter SUBSTR] [--jobs N] [--verdicts FILE] [--show CASE[:CONFIG]]
 """
-import argparse, os, re, sqlite3, sys, itertools, collections, difflib
+import argparse, os, re, sqlite3, sys, itertools, collections, difflib, posixpath
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.dirname(HERE)
@@ -165,6 +165,10 @@ def unsupported(cfg):
         return "outFile"
     if cfg.get("alwaysstrict", "").lower() == "false":
         return "alwaysStrict=false"
+    # the resolver's optional settings the port does not read (slice 248)
+    for key in ("paths", "rootdirs", "modulesuffixes", "customconditions", "currentdirectory", "typeroots", "link"):
+        if cfg.get(key):
+            return key
     return None
 
 
@@ -184,6 +188,10 @@ def output_name(unit_name, cfg):
         return base
     if ext == ".jsx":
         return stem + (".jsx" if jsx in ("preserve", "react-native") else ".js")
+    if ext == ".json":
+        return base
+    if ext in (".mjs", ".cjs"):
+        return base
     return None
 
 
@@ -204,6 +212,9 @@ def emitted(unit_name, cfg):
         return True
     if ext in (".js", ".jsx", ".mjs", ".cjs"):
         return allow_js(cfg)
+    # a JSON module is emitted (copied) only into an outDir (compiler/emitter.go sourceFileMayBeEmitted)
+    if ext == ".json":
+        return bool(cfg.get("outdir"))
     return False
 
 
@@ -251,6 +262,72 @@ def strip_directives(content):
         else:
             break
     return text.encode("utf-8")
+
+
+def common_source_directory(units, cfg):
+    """outputpaths.GetCommonSourceDirectory: rootDir, else the longest common directory of the
+    non-declaration source units (a single file's directory when there is one)"""
+    if cfg.get("rootdir"):
+        return posixpath.normpath(posixpath.join("/.src", cfg["rootdir"].replace("\\", "/")))
+    dirs = []
+    for n, _ in units:
+        low = n.lower()
+        if low.endswith(".d.ts") or low.endswith(".d.mts") or low.endswith(".d.cts") or low.endswith(".json"):
+            continue
+        dirs.append(posixpath.dirname(program_path(n)))
+    if not dirs:
+        return "/.src"
+    common = dirs[0]
+    for d in dirs[1:]:
+        while not (d == common or d.startswith(common.rstrip("/") + "/")):
+            up = posixpath.dirname(common)
+            if up == common or up in ("", "/"):
+                # no common directory (a drive-letter unit beside a rooted one): the root
+                return "/"
+            common = up
+    return common
+
+
+def output_path(unit_name, cfg, common):
+    """the baseline's section name: the bare output name, or `<outDir>/<relative to the common
+    source directory>` when an outDir is set (outputpaths.GetSourceFilePathInNewDir)"""
+    oname = output_name(unit_name, cfg)
+    if oname is None:
+        return None
+    outdir = cfg.get("outdir")
+    # the runner names a section by its full emit path only under @fullEmitPaths
+    if not outdir or cfg.get("fullemitpaths", "").lower() != "true":
+        return oname
+    outdir = outdir.replace("\\", "/").rstrip("/")
+    if outdir.startswith("./"):
+        outdir = outdir[2:]
+    rel = posixpath.relpath(posixpath.dirname(program_path(unit_name)), common) if common else "."
+    parts = [outdir] + ([] if rel in (".", "") else [rel]) + [oname]
+    return posixpath.normpath("/".join(parts))
+
+
+def program_path(unit_name):
+    """the unit's path in the program: /.src/<unit>, an absolute name standing"""
+    name = unit_name.replace("\\", "/")
+    # a rooted name stands (tspath.GetNormalizedAbsolutePath: `/x.ts`, `A:/x.ts`)
+    if name.startswith("/") or re.match(r"^[A-Za-z]:/", name):
+        return posixpath.normpath(name)
+    return posixpath.normpath(posixpath.join("/.src", name))
+
+
+BUNDLE_HEAD = b"==== TSCALY-FILE "
+
+
+def split_bundle_answer(body):
+    """the dump's answer for a bundle → {program path: that unit's bytes}"""
+    out = {}
+    parts = body.split(BUNDLE_HEAD)
+    for part in parts[1:]:
+        nl = part.find(b"\n")
+        if nl < 0:
+            continue
+        out[part[:nl].decode("utf-8", "surrogateescape")] = part[nl + 1:]
+    return out
 
 
 # option VALUES that are text, not an enum: the case decides (`jsxFactory: h`, `reactNamespace: myReactLib`)
@@ -310,7 +387,10 @@ def main():
         settings = {m.group(1).lower(): m.group(2).strip().rstrip(";") for m in OPTION_RE.finditer(text)}
         units = db.execute("SELECT name, content FROM units WHERE ci=? ORDER BY idx", (ci,)).fetchall()
         units = [(n, strip_directives(c)) for n, c in units]
-        units = [(n, c) for n, c in units if not os.path.basename(n).lower() in ("tsconfig.json", "jsconfig.json")]
+        if any(os.path.basename(n).lower() in ("tsconfig.json", "jsconfig.json") for n, c in units):
+            # the runner takes the file list and the options from the config (a chapter of its own)
+            skips["tsconfig.json in the case"] += 1
+            continue
         # a name declared twice is ONE file to the reference (a map by path; the last content wins)
         last = {}
         for i, (n, c) in enumerate(units):
@@ -347,13 +427,32 @@ def main():
                 skips["baseline carries declaration errors / noCheck notes"] += 1
                 continue
             to_emit = [(n, c) for n, c in units if emitted(n, cfg)]
+            # compiler_runner.go: when the LAST unit carries a `require(` or a triple-slash
+            # reference, it is the only root file and the rest reach the program through
+            # references — a unit the reference did not emit was not in the program; and a
+            # JSON unit is never a root file (harnessutil), it is emitted only when imported.
+            # Both are read off the baseline's section list (WHICH files, never their content).
+            section_names = set(n for n, _ in outputs)
+            last_content = units[-1][1] if units else b""
+            last_text = last_content.decode("utf-8", "replace") if isinstance(last_content, bytes) else last_content
+            last_is_root_only = bool(re.search(r"require\(", last_text) or re.search(r"reference\s+path", last_text) or cfg.get("noimplicitreferences"))
+            common = common_source_directory(units, cfg)
+            to_emit = [(n, c) for n, c in to_emit if (output_path(n, cfg, common) in section_names) or not (last_is_root_only or n.lower().endswith(".json"))]
             opts = options_string(cfg)
-            plan = {"case": name, "config": cname, "opts": opts, "units": [], "outputs": outputs, "baseline": bname}
-            for ui, (un, content) in enumerate(to_emit):
-                # one answer per (case, configuration, unit) — a case may declare a name twice
-                vpath = "/cases/%s/%s/u%d/%s" % (name, cname or "default", ui, un)
-                groups[opts].append((vpath, content))
-                plan["units"].append((vpath, un, output_name(un, cfg)))
+            # one BUNDLE per (case, configuration): every unit, rooted at /.src as the
+            # reference's runner roots them, the emitted ones flagged (slice 248)
+            vpath = "/cases/%s/%s" % (name, cname or "default")
+            plan = {"case": name, "config": cname, "opts": opts, "vpath": vpath, "units": [], "outputs": outputs, "baseline": bname}
+            parts = []
+            for un, content in units:
+                body = content if isinstance(content, bytes) else content.encode("utf-8", "surrogateescape")
+                parts.append(b"==== TSCALY-FILE %d %d %s\n" % (len(body), 1 if emitted(un, cfg) else 0, un.encode("utf-8", "surrogateescape")))
+                parts.append(body)
+                parts.append(b"\n")
+            groups[opts].append((vpath, b"".join(parts)))
+            common = common_source_directory(units, cfg)
+            for un, content in to_emit:
+                plan["units"].append((program_path(un), un, output_path(un, cfg, common)))
             plans.append(plan)
 
     # ── run: one batch per configuration string ──
@@ -379,30 +478,40 @@ def main():
     stops = collections.Counter()
     for plan in plans:
         verdict, detail = "MATCH", ""
-        used = collections.Counter()
-        for vpath, un, oname in plan["units"]:
-            rc, body, err = answers.get(vpath, (None, b"", b""))
+        used = {}
+        rc, body, err = answers.get(plan["vpath"], (None, b"", b""))
+        sections = split_bundle_answer(body)
+        for ppath, un, oname in plan["units"]:
             if rc is None:
                 verdict, detail = "CRASH", "no answer for %s" % un
                 break
             if rc != 0:
                 verdict, detail = "CRASH", "rc %s on %s" % (rc, un)
                 break
-            ours = body.decode("utf-8", "replace")
+            if body.startswith(b"UNPORTED "):
+                verdict, detail = "UNPORTED", body.decode("utf-8", "replace").split("\n")[0]
+                break
+            if ppath not in sections:
+                verdict, detail = "CRASH", "no answer for %s" % un
+                break
+            ours = sections[ppath].decode("utf-8", "replace")
             if ours.startswith("UNPORTED "):
                 verdict, detail = "UNPORTED", ours.split("\n")[0]
                 break
-            # the k-th output section of that name
-            k = used[oname]
-            used[oname] += 1
-            matches = [b for n, b in plan["outputs"] if n == oname]
+            # the output sections of that name: the reference writes them in ITS program
+            # order (an imported file before its importer), so a same-named section is
+            # matched by content — any not-yet-taken section that equals ours (slice 248)
+            matches = [(i, b) for i, (n, b) in enumerate(plan["outputs"]) if n == oname and i not in used]
             if not matches:
                 verdict, detail = "FAIL", "no output section %s in the baseline" % oname
                 break
-            expected = matches[min(k, len(matches) - 1)]
-            if expected.rstrip("\n") != ours.replace("\r\n", "\n").rstrip("\n"):
+            ours_text = ours.replace("\r\n", "\n").rstrip("\n")
+            hit = [i for i, b in matches if b.rstrip("\n") == ours_text]
+            if not hit:
+                used[matches[0][0]] = True
                 verdict, detail = "FAIL", oname
                 break
+            used[hit[0]] = True
         if verdict == "MATCH" and any(n.endswith(".d.ts") or n.endswith(".d.mts") or n.endswith(".d.cts") for n, _ in plan["outputs"]):
             # the JavaScript matched; the declaration files beside it are a chapter of their own
             verdict, detail = "UNPORTED", "UNPORTED 1 emit-declaration 0"
@@ -436,11 +545,17 @@ def main():
         want_case, _, want_cfg = args.show.partition(":")
         for plan in plans:
             if plan["case"] == want_case and plan["config"] == want_cfg:
-                for vpath, un, oname in plan["units"]:
-                    rc, body, err = answers.get(vpath, (None, b"", b""))
-                    ours = body.decode("utf-8", "replace").replace("\r\n", "\n")
-                    matches = [b for n, b in plan["outputs"] if n == oname]
-                    expected = matches[0] if matches else ""
+                rc, body, err = answers.get(plan["vpath"], (None, b"", b""))
+                sections = split_bundle_answer(body)
+                shown = {}
+                for ppath, un, oname in plan["units"]:
+                    ours = sections.get(ppath, body).decode("utf-8", "replace").replace("\r\n", "\n")
+                    matches = [(i, b) for i, (n, b) in enumerate(plan["outputs"]) if n == oname and i not in shown]
+                    hit = [(i, b) for i, b in matches if b.rstrip("\n") == ours.rstrip("\n")]
+                    pick = hit[0] if hit else (matches[0] if matches else (None, ""))
+                    if pick[0] is not None:
+                        shown[pick[0]] = True
+                    expected = pick[1]
                     print("==== %s -> %s (options %s)" % (un, oname, plan["opts"]))
                     for line in difflib.unified_diff(expected.rstrip("\n").split("\n"), ours.rstrip("\n").split("\n"), "reference", "ours", lineterm=""):
                         print(line)

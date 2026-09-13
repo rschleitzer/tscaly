@@ -120,6 +120,8 @@ use tscaly.ast.PropertyDeclarationData
 use tscaly.scanner.Scanner
 use tscaly.parser.Parser
 use tscaly.binder.Binder
+use tscaly.program.ProgramFiles
+use tscaly.program.ModuleResolver
 use tscaly.Diagnostics.DiagnosticList
 ; ★ Slice 113: the Checker is this port's PROGRAM stub (see create's header), and
 ; a program is what reads the lib off the disk. The oracle's `main` does the same
@@ -5856,6 +5858,16 @@ define Checker
     ; the rest of the lib chain (slice 248): the first lib stays `lib_file`
     extra_lib_files: ref[Array[ref[AstNode]?]]?
     extra_lib_binders: ref[Array[ref[Binder]?]]?
+    ; slice 248: the program — every unit of a case with its binder and parser,
+    ; the table the module resolver answers over; null in the single-unit runs
+    program: ref[ProgramFiles]?
+    ; the resolver's two options (EmitOptions.get_module_resolution_kind,
+    ; get_resolve_json_module), set by the driver after construction
+    module_resolution_kind: int
+    resolve_json_module: bool
+    ; `importHelpers`: checkExternalEmitHelpers returns at once without it, and
+    ; the tslib lookup it does with it is a said stop (slice 248)
+    import_helpers: bool
 
     ; ★ THE RE-SCANNING SCANNER IS THE BINDER'S, AND THAT IS AN ARGUMENT RATHER
     ; THAN A SAVING. grammarErrorOnFirstToken reports at
@@ -7807,14 +7819,14 @@ define Checker
     ; ★ Since slice 113 the one thing the stub program DOES carry is the file set,
     ; and it is the oracle's own: lib.es5.d.ts plus the unit.
     function create(host: ref[Page], file: ref[AstNode], file_name: String, b: ref[Binder], p: ref[Parser], lib_file: ref[AstNode]?, lib_b: ref[Binder]?) returns ref[Checker]
-        Checker.create_ex(host, file, file_name, b, p, lib_file, lib_b, null, null)
+        Checker.create_ex(host, file, file_name, b, p, lib_file, lib_b, null, null, null)
 
     ; the same with the REST of the lib chain (slice 247): the extra libs must be
     ; in hand when initialize_checker merges the globals at the end of this
     ; constructor — set afterwards they were never merged, and a chain whose
     ; first file was a referenced lib (lib.decorators.d.ts before lib.es5.d.ts)
     ; checked the unit against thirteen globals
-    function create_ex(host: ref[Page], file: ref[AstNode], file_name: String, b: ref[Binder], p: ref[Parser], lib_file: ref[AstNode]?, lib_b: ref[Binder]?, extra_files: ref[Array[ref[AstNode]?]]?, extra_binders: ref[Array[ref[Binder]?]]?) returns ref[Checker]
+    function create_ex(host: ref[Page], file: ref[AstNode], file_name: String, b: ref[Binder], p: ref[Parser], lib_file: ref[AstNode]?, lib_b: ref[Binder]?, extra_files: ref[Array[ref[AstNode]?]]?, extra_binders: ref[Array[ref[Binder]?]]?, program: ref[ProgramFiles]?) returns ref[Checker]
     {
         let c host.allocate(sizeof Checker, alignof Checker) as pointer[Checker]
         set c.host: host
@@ -7825,6 +7837,10 @@ define Checker
         set c.lib_b: lib_b
         set c.extra_lib_files: extra_files
         set c.extra_lib_binders: extra_binders
+        set c.program: program
+        set c.module_resolution_kind: ModuleResolutionKindUnknown
+        set c.resolve_json_module: false
+        set c.import_helpers: false
         set c.is_declaration_file: is_declaration_file_name(file_name)
         ; The one question the arrow-function grammar check asks of the FILE NAME
         ; (slice 100). Derived at construction, on is_declaration_file's own
@@ -8272,6 +8288,14 @@ define Checker
         ; — see the field's own note. The LOG is appended outside it for the same
         ; reason, one notch further: the count says how many and the log says which.
         set unported_count: unported_count + 1
+        ; TSCALY_DEBUG_STOPS prints every stop as it fires — the emit driver reports
+        ; none of the checker's, and one hidden `cannot-find-global-type` cost a
+        ; slice (§3.5jt 6)
+        if getenv("TSCALY_DEBUG_STOPS") <> null
+        {
+            let stop_line String("stop `Parser.tag_text(tag)` `detail`")
+            Console.println(stop_line.to_c_string())
+        }
         let ev &StopEvent^host(tag, detail)
         stop_log.add(ev as ref[StopEvent])
         if unported_pos < 0
@@ -8662,6 +8686,7 @@ define Checker
             return 0
         (ev as ref[StopEvent]).detail
     }
+
 
     ; ── the intrinsic types ─────────────────────────────────────────────────
 
@@ -13579,10 +13604,12 @@ define Checker
         ; later slice gives the Checker more files.
         if dk = KindSourceFile
         {
+            ; slice 248: any unit of the program — the parser stamps NodeFlagsJsonFile
+            ; on a JSON parse, so the flag stands in for the script kind
             var json false
-            if declaration = file
+            if (AstNode.flags_of(declaration) & NodeFlagsJsonFile) <> 0
             {
-                if p.script_kind = ScriptKindJSON
+                if true
                     set json: true
             }
             if json
@@ -23335,6 +23362,41 @@ define Checker
         false
     }
 
+    ; FindBestPatternMatch over the ambient modules whose quoted name carries a
+    ; `*` (slice 248; the reference keeps them in c.patternAmbientModules, this
+    ; port scans the globals — they are bound there under their quoted name)
+    function find_best_pattern_ambient_module(this, d: Slice[char]) returns ref[Symbol]?
+    {
+        var best: ref[Symbol]? null
+        var longest 0 - 1
+        let n SymbolTable.length(globals)
+        var i 0
+        while i < n
+        {
+            let nd SymbolTable.entry_name_at(globals, i)
+            set i: i + 1
+            if Checker.is_ambient_module_symbol_name(nd) = false
+                continue
+            ; the pattern text without its quotes
+            let text nd.subslice(1, (nd.length - 1))
+            let star slice_index_of_byte(text, ("*" as char) as int)
+            if star < 0
+                continue
+            if star <= longest
+                continue
+            let prefix text.subslice(0, star as size_t)
+            let suffix text.slice_from((star + 1) as size_t)
+            if ((d.length as int) + 1) < (text.length as int)
+                continue
+            if d.starts_with(prefix) and d.ends_with(suffix)
+            {
+                set best: SymbolTable.entry_symbol_at(globals, i - 1)
+                set longest: star
+            }
+        }
+        best
+    }
+
     ; resolveExternalModule — the reachable half, with the dead guards named in the
     ; chapter header above.
     function resolve_external_module(this, location: ref[AstNode]?, d: Slice[char], module_not_found_error: int, error_node: ref[AstNode]?, is_for_augmentation: bool) returns ref[Symbol]?
@@ -23350,13 +23412,47 @@ define Checker
         let ambient this.try_find_ambient_module(d, true)
         if ambient <> null
             return ambient
+        ; slice 248: the program's resolution — `c.program.GetResolvedModule` and
+        ; the resolved file's module symbol (`File is not a module` otherwise)
+        if program <> null
+        {
+            let pf program as ref[ProgramFiles]
+            var ci this.program_index_of_node(location)
+            if ci < 0
+                set ci: pf.index_of_file(file)
+            if ci >= 0
+            {
+                let containing_path pf.path_at(ci)
+                let esm this.usage_is_esm(location, pf.format_at(ci))
+                let resolver ModuleResolver.create(host, pf, module_resolution_kind, resolve_json_module, esm)
+                let idx resolver.resolve(d, containing_path)
+                if (resolver.stop_tag.length as int) > 0
+                {
+                    this.record_unported(resolver.stop_tag, 0)
+                    return null
+                }
+                if idx >= 0
+                {
+                    let sf pf.file_at(idx)
+                    if sf <> null
+                    {
+                        let file_symbol AstNode.symbol_of(sf)
+                        if file_symbol <> null
+                            return this.get_merged_symbol(file_symbol)
+                        if (error_node <> null) and (module_not_found_error <> 0) and (Checker.is_side_effect_import(error_node) = false)
+                            this.error_on_node(error_node, DiagFile_0_is_not_a_module)
+                        return null
+                    }
+                }
+            }
+        }
         ; The contextSpecifier walk and both `mode` routes are the stub program's
         ; ResolutionModeNone either way, so `mode` has no reader that is alive.
-        if this.has_pattern_ambient_module()
-        {
-            this.record_unported("pattern-ambient-module", d.length)
-            return null
-        }
+        ; the pattern ambient modules (`declare module "foo*baz"`): the best match
+        ; is the one with the longest prefix before its `*` (core.FindBestPatternMatch)
+        let pattern this.find_best_pattern_ambient_module(d)
+        if pattern <> null
+            return this.get_merged_symbol(pattern)
         if error_node = null
             return null
         if module_not_found_error <> 0
@@ -23996,19 +24092,103 @@ define Checker
     ; GetEmitSyntaxForUsageLocation answers ResolutionModeNone for every location,
     ; so this is a CONSTANT under the harness rather than a hole — and it is the
     ; constant three forks below read.
-    function get_emit_syntax_for_module_specifier_expression(usage: ref[AstNode]?) returns int
+    ; getEmitSyntaxForModuleSpecifierExpression → the program's
+    ; GetEmitSyntaxForUsageLocation (slice 248): a `require` or `import =` is
+    ; CommonJS, an `import()` follows whether it is transformed, anything else
+    ; takes the FILE's emit format. None without a program (the single-unit runs).
+    function get_emit_syntax_for_module_specifier_expression(this, usage: ref[AstNode]?) returns int
+    {
+        if usage = null
+            return ModuleKindNone
+        let uk Checker.kind_or_unknown(usage)
+        if (uk <> KindStringLiteral) and (uk <> KindNoSubstitutionTemplateLiteral)
+            return ModuleKindNone
+        if program = null
+            return ModuleKindNone
+        let file_format this.file_emit_format_of(Checker.source_file_of_node(usage))
+        let parent AstNode.parent_node_of(usage)
+        if parent = null
+            return ModuleKindNone
+        let pn parent as ref[AstNode]
+        let pk AstNode.kind_of(pn)
+        if pk = KindCallExpression
+        {
+            if Parser.is_require_call(pn, false)
+                return ModuleKindCommonJS
+            if AstNode.is_import_call(pn)
+            {
+                ; ShouldTransformImportCall: a CommonJS-emitting file lowers it
+                if file_format = ModuleKindCommonJS
+                    return ModuleKindCommonJS
+                return ModuleKindESNext
+            }
+        }
+        if pk = KindExternalModuleReference
+        {
+            if Checker.kind_or_unknown(AstNode.parent_node_of(pn)) = KindImportEqualsDeclaration
+                return ModuleKindCommonJS
+        }
+        if file_format = ModuleKindCommonJS
+            return ModuleKindCommonJS
+        if ((file_format >= ModuleKindES2015) and (file_format <= ModuleKindESNext)) or (file_format = ModuleKindPreserve)
+            return ModuleKindESNext
         ModuleKindNone
+    }
 
-    ; isOnlyImportableAsDefault. `Node16 <= moduleKind` is FALSE under this harness
-    ; (module_kind is ES2022 = 7, Node16 is 100), so the whole body is dead by
-    ; value — the JSON-module rule it encodes cannot apply.
+    ; the emit format of a program file (GetEmitModuleFormatOfFile); the unit's own
+    ; `emit_module_format` when the file is not in the table
+    function file_emit_format_of(this, sf: ref[AstNode]?) returns int
+    {
+        if program <> null
+        {
+            let pf program as ref[ProgramFiles]
+            let fi pf.index_of_file(sf)
+            if fi >= 0
+                return pf.format_at(fi)
+        }
+        emit_module_format
+    }
+
+    function current_file_emit_format(this) returns int
+        this.file_emit_format_of(file)
+
+    ; isOnlyImportableAsDefault: in Node.js a JSON module has no named exports
+    ; (slice 248: the usage mode and the resolved file come from the program)
     function is_only_importable_as_default(this, usage: ref[AstNode]?, resolved_module: ref[Symbol]?) returns bool
     {
         if module_kind < ModuleKindNode16
             return false
         if module_kind > ModuleKindNodeNext
             return false
-        this.record_unported("is-only-importable-as-default", module_kind)
+        if this.get_emit_syntax_for_module_specifier_expression(usage) <> ModuleKindESNext
+            return false
+        var rm resolved_module
+        if rm = null
+            set rm: this.resolve_external_module_name(usage, usage, true)
+        if rm = null
+            return false
+        let rms rm as ref[Symbol]
+        let dn Symbol.declaration_count(rms)
+        var di 0
+        while di < dn
+        {
+            let d Symbol.declaration_at(rms, di)
+            set di: di + 1
+            if Checker.kind_or_unknown(d) = KindSourceFile
+            {
+                if (AstNode.flags_of(d as ref[AstNode]) & NodeFlagsJsonFile) <> 0
+                    return true
+                let pf_index this.program_index_of_node(d)
+                if pf_index >= 0
+                {
+                    let pf program as ref[ProgramFiles]
+                    let path pf.path_at(pf_index)
+                    if path.ends_with(".d.json.ts")
+                        return true
+                }
+                return false
+            }
+        }
         false
     }
 
@@ -24024,21 +24204,29 @@ define Checker
             ; usageMode is ModuleKindNone (above), so the reference's whole
             ; program-format block is skipped; what is behind it is the project-
             ; reference redirect, which the stub program answers with nil.
-            if Checker.get_emit_syntax_for_module_specifier_expression(usage) <> ModuleKindNone
+            let usage_mode this.get_emit_syntax_for_module_specifier_expression(usage)
+            if usage_mode <> ModuleKindNone
             {
-                this.record_unported("synthetic-default-usage-mode", 0)
-                return false
+                let target_mode this.file_emit_format_of(file)
+                if (usage_mode = ModuleKindESNext) and (target_mode = ModuleKindCommonJS) and (module_kind >= ModuleKindNode16) and (module_kind <= ModuleKindNodeNext)
+                    return true
+                if (usage_mode = ModuleKindESNext) and (target_mode = ModuleKindESNext)
+                    return false
+                ; the project-reference redirect arm needs a config: not here
             }
         }
         if module_symbol = null
             return false
         let ms module_symbol as ref[Symbol]
+        ; `file.IsDeclarationFile` — the RESOLVED file's, asked of its binder (the
+        ; checker's own `is_declaration_file` is the unit being checked; slice 248)
         var is_declaration_like false
         if file = null
             set is_declaration_like: true
         if file <> null
         {
-            if is_declaration_file
+            let fb this.binder_of_node(file)
+            if fb.is_declaration_file_of()
                 set is_declaration_like: true
         }
         if is_declaration_like
@@ -24068,8 +24256,16 @@ define Checker
         ; `export =`; a JS file has one when it shows no ES module syntax and no
         ; `__esModule` marker. Both need the module's own SOURCE FILE, which the
         ; branch above proves cannot be reached here.
-        this.record_unported("synthetic-default-source-file", 0)
-        false
+        ; a source file (slice 248): TypeScript answers by its `export =`; JavaScript
+        ; by having no statement that makes it a module and no `__esModule` export
+        let f file as ref[AstNode]
+        if Parser.is_in_js_file(f) = false
+            return this.has_export_assignment_symbol(ms)
+        if Parser.external_module_indicator(f, AstNode.statements_of(f))
+            return false
+        var ed2 Slice[char]()
+        set ed2: Binder.internal_name_unprefixed(host, "__esModule")
+        this.resolve_export_by_name(ms, ed2, null, dont_resolve_alias) = null
     }
 
     ; isSyntacticDefault.
@@ -24483,13 +24679,15 @@ define Checker
             if typ = null
                 return null
             let t typ as ref[Type]
-            if this.is_only_importable_as_default(reference, null)
-            {
-                this.record_unported("synthetic-default-only-type", 0)
-                return null
-            }
+            ; slice 248: the clone as a MODULE TYPE (a multi-file program reaches
+            ; it for every namespace import of a module with a default or call
+            ; signatures); the node20+ `module.exports` export and the ESM→CJS
+            ; reference still read a usage mode of None and never apply
+            let default_only this.get_type_with_synthetic_default_only(t, sym, module_symbol, reference)
             if this.unported_mark() <> unported_before
                 return null
+            if default_only <> null
+                return this.clone_type_as_module_type(sym, default_only as ref[Type], reference_parent)
             var wrap false
             if this.has_signatures(t)
                 set wrap: true
@@ -24504,11 +24702,132 @@ define Checker
             }
             if wrap
             {
-                this.record_unported("synthetic-default-import-type", 0)
-                return null
+                var module_type: ref[Type]? null
+                if (t.flags & TypeFlagsStructuredType) <> 0
+                    set module_type: this.get_type_with_synthetic_default_import_type(t, sym, module_symbol, reference)
+                else
+                    set module_type: this.create_default_property_wrapper_for_module(sym, Symbol.parent_of(sym), null)
+                if this.unported_mark() <> unported_before
+                    return null
+                if module_type = null
+                    return null
+                return this.clone_type_as_module_type(sym, module_type as ref[Type], reference_parent)
             }
         }
         symbol
+    }
+
+    ; getTypeWithSyntheticDefaultOnly — the `{ default: … }` wrapper alone, for a
+    ; module only importable as a default (no cache: the alias resolution that
+    ; asks is memoized one level up)
+    function get_type_with_synthetic_default_only(this, t: ref[Type], symbol: ref[Symbol], original_symbol: ref[Symbol]?, module_specifier: ref[AstNode]?) returns ref[Type]?
+    {
+        if this.is_only_importable_as_default(module_specifier, null) = false
+            return null
+        if this.is_error_type(t)
+            return null
+        this.create_default_property_wrapper_for_module(symbol, original_symbol, null)
+    }
+
+    ; getTypeWithSyntheticDefaultImportType: the module's own type spread with the
+    ; `default` wrapper when the module can have a synthetic default
+    function get_type_with_synthetic_default_import_type(this, t: ref[Type], symbol: ref[Symbol], original_symbol: ref[Symbol]?, module_specifier: ref[AstNode]?) returns ref[Type]?
+    {
+        if this.is_error_type(t)
+            return t
+        var file: ref[AstNode]? null
+        if original_symbol <> null
+        {
+            let os original_symbol as ref[Symbol]
+            let dn Symbol.declaration_count(os)
+            var di 0
+            while di < dn
+            {
+                let d Symbol.declaration_at(os, di)
+                if (file = null) and (Checker.kind_or_unknown(d) = KindSourceFile)
+                    set file: d
+                set di: di + 1
+            }
+        }
+        if this.can_have_synthetic_default(file, original_symbol, false, module_specifier) = false
+            return t
+        var type_name Slice[char]()
+        set type_name: Binder.internal_name_unprefixed(host, "type")
+        let anonymous_symbol this.new_symbol(SymbolFlagsTypeLiteral, type_name)
+        let default_containing_object this.create_default_property_wrapper_for_module(symbol, original_symbol, anonymous_symbol)
+        if default_containing_object = null
+            return null
+        let dco default_containing_object as ref[Type]
+        let al this.value_symbol_link_of(anonymous_symbol)
+        set al.resolved_type: dco
+        if this.is_valid_spread_type(t)
+            return this.get_spread_type(t, dco, anonymous_symbol, 0, false)
+        dco
+    }
+
+    ; createDefaultPropertyWrapperForModule: an anonymous object type with one
+    ; member, an alias `default` whose target is the module's resolved symbol
+    function create_default_property_wrapper_for_module(this, symbol: ref[Symbol], original_symbol: ref[Symbol]?, anonymous_symbol: ref[Symbol]?) returns ref[Type]?
+    {
+        let member_table SymbolTable.create(host)
+        var default_name Slice[char]()
+        set default_name: Binder.internal_name_unprefixed(host, "default")
+        let made this.new_symbol(SymbolFlagsAlias, default_name)
+        set made.parent: original_symbol
+        let vl this.value_symbol_link_of(made)
+        set vl.name_type: this.get_string_literal_type("default")
+        let al this.alias_symbol_link_of(made)
+        set al.alias_target: this.resolve_symbol(symbol)
+        SymbolTable.set_entry(host, member_table, default_name, made)
+        this.new_anonymous_type(anonymous_symbol, member_table, null, null, null)
+    }
+
+    ; cloneTypeAsModuleType: a copy of the module symbol whose type is the module
+    ; type's members. ★The reference also files the clone in `exportTypeLinks`
+    ; (target, originatingImport) for two diagnostics and a services walk; this
+    ; port has no such table and none of those readers.
+    function clone_type_as_module_type(this, symbol: ref[Symbol], module_type: ref[Type], reference_parent: ref[AstNode]?) returns ref[Symbol]?
+    {
+        let result this.new_symbol(Symbol.flags_of(symbol), Symbol.name_of(symbol))
+        let decls &Array[ref[AstNode]?]^host()
+        let dn Symbol.declaration_count(symbol)
+        var di 0
+        while di < dn
+        {
+            decls.add(Symbol.declaration_at(symbol, di))
+            set di: di + 1
+        }
+        set result.declarations: decls
+        set result.value_declaration: Symbol.value_declaration_of(symbol)
+        set result.members: this.symbol_table_shallow_copy(Symbol.members_of(symbol))
+        set result.exports: this.symbol_table_shallow_copy(Symbol.exports_of(symbol))
+        set result.parent: Symbol.parent_of(symbol)
+        let resolved this.resolve_structured_type_members(module_type)
+        if resolved = null
+            return null
+        let rm resolved as ref[StructuredMembers]
+        let cloned this.new_anonymous_type(result, rm.members, null, null, rm.index_infos)
+        if cloned = null
+            return null
+        let rl this.value_symbol_link_of(result)
+        set rl.resolved_type: cloned
+        result
+    }
+
+    ; maps.Clone over a symbol table (null stays null)
+    function symbol_table_shallow_copy(this, t: ref[SymbolTable]?) returns ref[SymbolTable]?
+    {
+        if t = null
+            return null
+        let copy SymbolTable.create(host)
+        let n SymbolTable.length(t)
+        var i 0
+        while i < n
+        {
+            SymbolTable.set_entry(host, copy, SymbolTable.entry_name_at(t, i), SymbolTable.entry_symbol_at(t, i))
+            set i: i + 1
+        }
+        copy
     }
 
     function has_signatures(this, t: ref[Type]) returns bool
@@ -25522,7 +25841,7 @@ define Checker
                     let t target as ref[Symbol]
                     if b.has_syntactic_modifier(node, ModifierFlagsExport) and ((this.get_symbol_flags(t) & SymbolFlagsValue) <> 0)
                     {
-                        if preserve_const_enums or (Checker.is_const_enum_or_const_enum_only_module(t) = false)
+                        if this.should_preserve_const_enums() or (Checker.is_const_enum_or_const_enum_only_module(t) = false)
                             return true
                     }
                 }
@@ -25641,7 +25960,7 @@ define Checker
         }
         if (this.get_symbol_flags_ex(s, exclude_type_only_values, true) & SymbolFlagsValue) = 0
             return false
-        preserve_const_enums or (Checker.is_const_enum_or_const_enum_only_module(target) = false)
+        this.should_preserve_const_enums() or (Checker.is_const_enum_or_const_enum_only_module(target) = false)
     }
 
     ; IsTopLevelValueImportEqualsWithEntityName
@@ -26197,7 +26516,7 @@ define Checker
             set early: true
         if early = false
         {
-            if Checker.should_preserve_const_enums()
+            if this.should_preserve_const_enums()
             {
                 if Checker.is_export_or_export_expression(location)
                     set early: true
@@ -26321,8 +26640,14 @@ define Checker
 
     ; ShouldPreserveConstEnums — `preserveConstEnums || isolatedModules`, both
     ; unset under this harness.
-    function should_preserve_const_enums() returns bool
-        false
+    ; ShouldPreserveConstEnums: `preserveConstEnums` or isolatedModules (which
+    ; keeps every const enum, since nothing can be inlined across a file)
+    function should_preserve_const_enums(this) returns bool
+    {
+        if preserve_const_enums
+            return true
+        this.get_isolated_modules()
+    }
 
     ; isExportOrExportExpression — an export assignment's expression, an export
     ; specifier's name, or an exported declaration on the way up.
@@ -26479,8 +26804,8 @@ define Checker
         this.mark_alias_referenced(symbol, location)
     }
 
-    ; markAliasReferenced. ★`GetIsolatedModules()` and `ShouldPreserveConstEnums()`
-    ; are both false under this harness, so the third disjunct is the live one.
+    ; markAliasReferenced — all three disjuncts since slice 248 (a multi-file
+    ; program reaches the first two).
     procedure mark_alias_referenced(this, symbol: ref[Symbol]?, location: ref[AstNode])
     {
         let unported_before this.unported_mark()
@@ -26496,8 +26821,20 @@ define Checker
             return
         if this.unported_mark() <> unported_before
             return
-        if Checker.is_const_enum_or_const_enum_only_module(this.get_export_symbol_of_value_symbol_if_exported(target))
-            return
+        ; an alias resolving to a const enum cannot be elided under isolatedModules
+        ; (nothing is inlined), nor when it is an export of a const enum that will
+        ; be preserved — the two disjuncts the single-file harness never reached
+        var keep this.get_isolated_modules()
+        if keep = false
+        {
+            if this.should_preserve_const_enums()
+                set keep: Checker.is_export_or_export_expression(location)
+        }
+        if keep = false
+        {
+            if Checker.is_const_enum_or_const_enum_only_module(this.get_export_symbol_of_value_symbol_if_exported(target))
+                return
+        }
         this.mark_alias_symbol_as_referenced(s)
     }
 
@@ -26777,7 +27114,11 @@ define Checker
         ; The emit-helper branch needs the file's emit format to be CommonJS, and
         ; the stub program answers ModuleKindNone.
         if emit_module_format = ModuleKindCommonJS
-            this.record_unported("external-emit-helpers", KindExportSpecifier)
+            {
+                ; checkExternalEmitHelpers: nothing without importHelpers
+                if import_helpers
+                    this.record_unported("external-emit-helpers", KindExportSpecifier)
+            }
     }
 
     ; checkModuleExportName. ★The second arm needs module_kind to be ES2015 or
@@ -50282,7 +50623,7 @@ define Checker
         let state b.get_module_instance_state(node)
         if state = ModuleInstanceStateInstantiated
             return true
-        if preserve_const_enums = false
+        if this.should_preserve_const_enums() = false
             return false
         state = ModuleInstanceStateConstEnumOnly
     }
@@ -50311,7 +50652,7 @@ define Checker
             {
                 if this.is_enum_const(node) = false
                     return true
-                return preserve_const_enums
+                return this.should_preserve_const_enums()
             }
             if k = KindModuleDeclaration
                 return this.is_instantiated_module(node)
@@ -66492,8 +66833,22 @@ define Checker
                 ; no source for. The row therefore stands at the moment a specifier
                 ; RESOLVES; an unresolved one answers `Promise<any>` below, which is
                 ; the reference's own answer.
-                this.record_unported("type-with-synthetic-default", AstNode.kind_of(node))
-                return null
+                ; slice 248: the default-only wrapper, else the synthetic-default type
+                let esm es_module_symbol as ref[Symbol]
+                let esm_type this.get_type_of_symbol(esm)
+                if this.unported_mark() <> mark
+                    return null
+                if esm_type = null
+                    return null
+                let et esm_type as ref[Type]
+                var synthetic this.get_type_with_synthetic_default_only(et, esm, module_symbol, specifier)
+                if this.unported_mark() <> mark
+                    return null
+                if synthetic = null
+                    set synthetic: this.get_type_with_synthetic_default_import_type(et, esm, module_symbol, specifier)
+                if this.unported_mark() <> mark
+                    return null
+                return this.create_promise_return_type(node, synthetic)
             }
         }
         this.create_promise_return_type(node, any_type)
@@ -70388,8 +70743,42 @@ define Checker
         }
         ; slice 134 — a decorator's arguments are SYNTHESIZED from its own call
         ; signature; see get_effective_decorator_arguments.
+        if k = KindTaggedTemplateExpression
+        {
+            ; the template strings array first, then every span's expression (slice 248)
+            let template AstNode.tagged_template_template_of(node)
+            if template = null
+                return null
+            let tpl template as ref[AstNode]
+            let strings_type this.get_global_template_strings_array_type()
+            if this.unported_mark() <> mark_of_effective_arguments
+                return null
+            let targs &Array[ref[AstNode]?]^host()
+            targs.add(this.new_synthetic_expression(tpl, strings_type, false, null))
+            if AstNode.kind_of(tpl) = KindTemplateExpression
+            {
+                let spans AstNode.template_expression_spans_of(tpl)
+                if spans <> null
+                {
+                    let sl spans as ref[Array[ref[AstNode]?]]
+                    var si 0
+                    while si < (sl.get_length() as int)
+                    {
+                        targs.add(AstNode.expression_of(sl[si as size_t]))
+                        set si: si + 1
+                    }
+                }
+            }
+            return targs
+        }
         if k = KindDecorator
             return this.get_effective_decorator_arguments(node)
+        if k = KindBinaryExpression
+        {
+            let bargs &Array[ref[AstNode]?]^host()
+            bargs.add(AstNode.binary_left_of(node))
+            return bargs
+        }
         var is_call_or_new false
         if k = KindCallExpression
             set is_call_or_new: true
@@ -74742,8 +75131,9 @@ define Checker
             {
                 ; The implied node format of the containing file, which this
                 ; harness has no program to ask.
-                this.record_unported("import-meta-implied-node-format", module_kind)
-                return null
+                ; the file's implied node format (slice 248: the program's table)
+                if this.current_file_emit_format() <> ModuleKindESNext
+                    this.error_on_node(node, DiagThe_import_meta_meta_property_is_not_allowed_in_files_which_will_build_into_CommonJS_output)
             }
         }
         else
@@ -83604,7 +83994,23 @@ define Checker
                 set li: li + 1
             }
         }
-        this.merge_file_globals(file as ref[AstNode], b, ambient)
+        ; slice 248: every unit of the program, in the program's order (the
+        ; module ones contribute nothing here — merge_file_globals asks the binder)
+        if program <> null
+        {
+            let pfm program as ref[ProgramFiles]
+            var pmi 0
+            while pmi < pfm.count()
+            {
+                let pmf pfm.file_at(pmi)
+                let pmb pfm.binder_at(pmi)
+                if (pmf <> null) and (pmb <> null)
+                    this.merge_file_globals(pmf as ref[AstNode], pmb as ref[Binder], ambient)
+                set pmi: pmi + 1
+            }
+        }
+        else
+            this.merge_file_globals(file as ref[AstNode], b, ambient)
         ; ★★★ THE TWO AUGMENTATION LOOPS ARE THE REFERENCE'S SINCE SLICE 137, AND
         ; THEIR OLD STOP NAMED THE PRODUCER: *"`mergeModuleAugmentation` needs
         ; mergeSymbolTable and is still not written"*. That stop returned from HERE,
@@ -83616,8 +84022,23 @@ define Checker
         ; ★★ THE COLLECTION IS BEHIND THE PREDICATE, so a unit with no augmentation
         ; pays one statement walk and nothing else — the shape the stop already had.
         let augmentations &Array[ref[AstNode]?]^host()
-        if this.file_has_module_augmentation()
-            this.collect_module_augmentations(augmentations, file, false)
+        if program <> null
+        {
+            let pfa program as ref[ProgramFiles]
+            var pai 0
+            while pai < pfa.count()
+            {
+                let paf pfa.file_at(pai)
+                if paf <> null
+                    this.collect_module_augmentations(augmentations, paf, false)
+                set pai: pai + 1
+            }
+        }
+        else
+        {
+            if this.file_has_module_augmentation()
+                this.collect_module_augmentations(augmentations, file, false)
+        }
         ; "We do global augmentations separately from module augmentations (and
         ; before creating global types)": pass one, the `declare global` blocks.
         let agn augmentations.get_length() as int
@@ -89443,7 +89864,7 @@ define Checker
                 let module_state b.get_module_instance_state(node)
                 if module_state = ModuleInstanceStateInstantiated
                     set instantiated: true
-                if preserve_const_enums
+                if this.should_preserve_const_enums()
                 {
                     if module_state = ModuleInstanceStateConstEnumOnly
                         set instantiated: true
@@ -89627,8 +90048,12 @@ define Checker
         var li 0
         while li < (efs.get_length() as int)
         {
-            if efs[li as size_t] = sf
-                return li
+            let ef efs[li as size_t]
+            if ef <> null
+            {
+                if (ef as ref[AstNode]) = (sf as ref[AstNode])
+                    return li
+            }
             set li: li + 1
         }
         0 - 1
@@ -89664,7 +90089,80 @@ define Checker
                 return ebs[li as size_t] as ref[Binder]
             }
         }
+        if program <> null
+        {
+            let pfb program as ref[ProgramFiles]
+            let psf Checker.source_file_of_node(n)
+            let pbi pfb.index_of_file(psf)
+            if pbi >= 0
+            {
+                let pb pfb.binder_at(pbi)
+                if pb <> null
+                    return pb as ref[Binder]
+            }
+        }
         b
+    }
+
+    ; ── slice 248: the program ──────────────────────────────────────────────
+
+    ; the index of the unit a node belongs to, -1 for a node of no unit (a
+    ; synthesized one, or a lib's)
+    function program_index_of_node(this, n: ref[AstNode]?) returns int
+    {
+        if (program = null) or (n = null)
+            return 0 - 1
+        let pf program as ref[ProgramFiles]
+        pf.index_of_file(Checker.source_file_of_node(n))
+    }
+
+    ; getModeForUsageLocation, reduced to what decides the resolver's esm mode:
+    ; node16/nodenext only; a `require` call or an `import =` is CommonJS, an
+    ; import declaration takes its FILE's format
+    function usage_is_esm(this, location: ref[AstNode]?, file_format: int) returns bool
+    {
+        if (module_resolution_kind <> ModuleResolutionKindNode16) and (module_resolution_kind <> ModuleResolutionKindNodeNext)
+            return false
+        if location <> null
+        {
+            if Checker.find_ancestor_kind(location, KindImportEqualsDeclaration) <> null
+                return false
+            let call Checker.find_ancestor_kind(location, KindCallExpression)
+            if call <> null
+            {
+                if Parser.is_require_call(call, false)
+                    return false
+            }
+        }
+        file_format = ModuleKindESNext
+    }
+
+    ; isSideEffectImport: an import declaration without a clause
+    function is_side_effect_import(node: ref[AstNode]?) returns bool
+    {
+        let decl Checker.find_ancestor_kind(node, KindImportDeclaration)
+        if decl = null
+            return false
+        AstNode.import_clause_of(decl) = null
+    }
+
+    ; the driver's switch between units: the checker's per-file state (the
+    ; reference reads them off the SourceFile; this port keeps them as fields)
+    procedure select_program_file(this, index: int, format: int)
+    {
+        let pf program as ref[ProgramFiles]
+        set file: pf.file_at(index)
+        set b: pf.binder_at(index) as ref[Binder]
+        set p: pf.parser_at(index) as ref[Parser]
+        let path pf.path_at(index)
+        let name String^host(path.data as pointer[const_char], path.length)
+        set is_declaration_file: is_declaration_file_name(name)
+        set is_mts_or_cts_file: file_extension_is_mts_or_cts(name)
+        set emit_module_format: format
+        ; `c.renamedBindingElementsInTypes = nil` at checkSourceFile — the list
+        ; the per-file constructor's note said would need clearing the day a
+        ; checker saw a second file
+        set renamed_binding_elements_in_types: &Array[ref[AstNode]?]^host()
     }
 
 
@@ -89997,7 +90495,11 @@ define Checker
                 }
             }
             if emit_module_format = ModuleKindCommonJS
-                this.record_unported("external-emit-helpers", KindExportDeclaration)
+                {
+                    ; checkExternalEmitHelpers: nothing without importHelpers
+                    if import_helpers
+                        this.record_unported("external-emit-helpers", KindExportDeclaration)
+                }
             this.check_import_attributes(node)
             return
         }
@@ -90255,10 +90757,11 @@ define Checker
         let specifier this.get_module_specifier_from_node(declaration)
         if specifier <> null
         {
-            ; getEmitSyntaxForModuleSpecifierExpression — the program's per-file
-            ; module format, which this harness has no program to ask.
-            this.record_unported("emit-syntax-for-module-specifier", AstNode.kind_of(specifier as ref[AstNode]))
-            return
+            if this.get_emit_syntax_for_module_specifier_expression(specifier) = ModuleKindCommonJS
+            {
+                this.grammar_error_on_node(node, DiagImport_attributes_are_not_allowed_on_statements_that_compile_to_CommonJS_require_calls)
+                return
+            }
         }
         if is_type_only
         {
@@ -91175,13 +91678,153 @@ define Checker
         null
     }
 
+    ; getLegacyDecoratorCallSignature (slice 248): the expected signature of an
+    ; experimental decorator — `(target)` for a class, `(target, propertyKey,
+    ; parameterIndex)` for a parameter, `(target, propertyKey[, descriptor])` for
+    ; a member — memoized on the decorated node's signature link
     function get_legacy_decorator_call_signature(this, decorator: ref[AstNode]) returns ref[Signature]?
     {
-        let node AstNode.parent_node_of(decorator)
-        if node = null
+        let parent AstNode.parent_node_of(decorator)
+        if parent = null
             return null
-        this.record_unported("legacy-decorator-call-signature", AstNode.kind_of(node as ref[AstNode]))
-        null
+        let node parent as ref[AstNode]
+        let links this.signature_link_of(node)
+        if links.decorator_signature = null
+        {
+            let mark this.unported_mark()
+            set links.decorator_signature: any_signature
+            let made this.legacy_decorator_call_signature_worker(node)
+            if this.unported_mark() <> mark
+            {
+                set links.decorator_signature: null
+                return null
+            }
+            if made <> null
+                set links.decorator_signature: made
+        }
+        let ds links.decorator_signature
+        if ds = null
+            return null
+        if (ds as ref[Signature]) = any_signature
+            return null
+        ds
+    }
+
+    function legacy_decorator_call_signature_worker(this, node: ref[AstNode]) returns ref[Signature]?
+    {
+        let k AstNode.kind_of(node)
+        if (k = KindClassDeclaration) or (k = KindClassExpression)
+        {
+            let sym this.get_symbol_of_declaration(node)
+            if sym = null
+                return null
+            let target_type this.get_type_of_symbol(sym as ref[Symbol])
+            let params &Array[ref[Symbol]?]^host()
+            params.add(this.new_parameter("target", target_type))
+            let members &Array[ref[Type]?]^host()
+            members.add(target_type)
+            members.add(void_type)
+            return this.new_call_signature(null, null, params, this.get_union_type(members))
+        }
+        if k = KindParameter
+        {
+            let owner_opt AstNode.parent_node_of(node)
+            if owner_opt = null
+                return null
+            let owner owner_opt as ref[AstNode]
+            let ok AstNode.kind_of(owner)
+            var eligible false
+            if ok = KindConstructor
+                set eligible: true
+            if ok = KindMethodDeclaration
+                set eligible: true
+            if ok = KindSetAccessor
+            {
+                let grand AstNode.parent_node_of(owner)
+                if grand <> null
+                {
+                    if Checker.is_class_like(grand as ref[AstNode])
+                        set eligible: true
+                }
+            }
+            if eligible = false
+                return null
+            let this_param Checker.get_this_parameter(owner)
+            if this_param <> null
+            {
+                if (this_param as ref[AstNode]) = node
+                    return null
+            }
+            let ps AstNode.parameters_of(owner)
+            if ps = null
+                return null
+            let pl ps as ref[Array[ref[AstNode]?]]
+            var index 0 - 1
+            var pi 0
+            while pi < (pl.get_length() as int)
+            {
+                let pp pl[pi as size_t]
+                if pp <> null
+                {
+                    if (pp as ref[AstNode]) = node
+                        set index: pi
+                }
+                set pi: pi + 1
+            }
+            if index < 0
+                return null
+            if this_param <> null
+                set index: index - 1
+            var target_type: ref[Type]? null
+            var key_type: ref[Type]? null
+            if ok = KindConstructor
+            {
+                let cls AstNode.parent_node_of(owner)
+                let csym this.get_symbol_of_declaration(cls)
+                if csym = null
+                    return null
+                set target_type: this.get_type_of_symbol(csym as ref[Symbol])
+                set key_type: undefined_type
+            }
+            else
+            {
+                set target_type: this.get_parent_type_of_class_element(owner)
+                set key_type: this.get_class_element_property_key_type(owner)
+            }
+            let index_type this.get_number_literal_type(Checker.number_bits_from_int(index))
+            let params &Array[ref[Symbol]?]^host()
+            params.add(this.new_parameter("target", target_type))
+            params.add(this.new_parameter("propertyKey", key_type))
+            params.add(this.new_parameter("parameterIndex", index_type))
+            return this.new_call_signature(null, null, params, void_type)
+        }
+        var member_like false
+        if (k = KindMethodDeclaration) or (k = KindGetAccessor) or (k = KindSetAccessor) or (k = KindPropertyDeclaration)
+            set member_like: true
+        if member_like = false
+            return null
+        let holder AstNode.parent_node_of(node)
+        if holder = null
+            return null
+        if Checker.is_class_like(holder as ref[AstNode]) = false
+            return null
+        let target_type this.get_parent_type_of_class_element(node)
+        let key_type this.get_class_element_property_key_type(node)
+        var return_type: ref[Type]? void_type
+        if k <> KindPropertyDeclaration
+            set return_type: this.new_typed_property_descriptor_type(this.get_type_of_node(node))
+        var has_prop_desc k <> KindPropertyDeclaration
+        if has_prop_desc = false
+            set has_prop_desc: this.binder_of_node(node).has_syntactic_modifier(node, ModifierFlagsAccessor)
+        let params &Array[ref[Symbol]?]^host()
+        params.add(this.new_parameter("target", target_type))
+        params.add(this.new_parameter("propertyKey", key_type))
+        if has_prop_desc
+            params.add(this.new_parameter("descriptor", this.new_typed_property_descriptor_type(this.get_type_of_node(node))))
+        let members &Array[ref[Type]?]^host()
+        members.add(return_type)
+        members.add(void_type)
+        this.new_call_signature(null, null, params, this.get_union_type(members))
     }
 
     ; getESDecoratorCallSignature. The reference's 80-line comment above it
@@ -91441,9 +92084,31 @@ define Checker
         n
     }
 
+    ; getLegacyDecoratorArgumentCount (slice 248)
     function get_legacy_decorator_argument_count(this, node: ref[AstNode], signature: ref[Signature]) returns int
     {
-        this.record_unported("legacy-decorator-argument-count", Checker.kind_or_unknown(AstNode.parent_node_of(node)))
+        let parent AstNode.parent_node_of(node)
+        let k Checker.kind_or_unknown(parent)
+        if (k = KindClassDeclaration) or (k = KindClassExpression)
+            return 1
+        if k = KindPropertyDeclaration
+        {
+            if this.binder_of_node(parent).has_syntactic_modifier(parent as ref[AstNode], ModifierFlagsAccessor)
+                return 3
+            return 2
+        }
+        if (k = KindMethodDeclaration) or (k = KindGetAccessor) or (k = KindSetAccessor)
+        {
+            var n 0
+            if signature.parameters <> null
+                set n: (signature.parameters as ref[Array[ref[Symbol]?]]).get_length() as int
+            if n <= 2
+                return 2
+            return 3
+        }
+        if k = KindParameter
+            return 3
+        this.record_unported("legacy-decorator-argument-count", k)
         0
     }
 
@@ -91810,11 +92475,327 @@ define Checker
     ; markEntityNameOrEntityExpressionAsReference — is unreachable. It is a
     ; procedure rather than a line in mark_linked_references so that the day an
     ; options record arrives, this is the one body that fills.
+    ; markDecoratorAliasReferenced (slice 248): under emitDecoratorMetadata the
+    ; type names a decorated member's signature carries are VALUE references —
+    ; the alias they resolve through must survive import elision.
+    ; ★checkExternalEmitHelpers(Metadata) is a diagnostic about tslib and is not
+    ; ported here.
     procedure mark_decorator_alias_referenced(this, node: ref[AstNode])
     {
         if emit_decorator_metadata = false
             return
-        this.record_unported("mark-decorator-alias-referenced", AstNode.kind_of(node))
+        let mods AstNode.modifiers_of(node)
+        if mods = null
+            return
+        let ml mods as ref[Array[ref[AstNode]?]]
+        var first_decorator: ref[AstNode]? null
+        var mi 0
+        while mi < (ml.get_length() as int)
+        {
+            let m ml[mi as size_t]
+            set mi: mi + 1
+            if (first_decorator = null) and AstNode.is_decorator(m)
+                set first_decorator: m
+        }
+        if first_decorator = null
+            return
+        let k AstNode.kind_of(node)
+        if k = KindClassDeclaration
+        {
+            let ctor Checker.first_constructor_with_body(node)
+            if ctor <> null
+                this.mark_decorator_metadata_parameters_as_referenced(AstNode.parameters_of(ctor))
+            return
+        }
+        if (k = KindGetAccessor) or (k = KindSetAccessor)
+        {
+            var other_kind KindSetAccessor
+            if k = KindSetAccessor
+                set other_kind: KindGetAccessor
+            var annotation this.get_annotated_accessor_type_node(node)
+            if annotation = null
+            {
+                let sym this.get_symbol_of_declaration(node)
+                if sym <> null
+                {
+                    let other Checker.get_declaration_of_kind(sym as ref[Symbol], other_kind)
+                    if other <> null
+                        set annotation: this.get_annotated_accessor_type_node(other)
+                }
+            }
+            this.mark_decorator_metadata_type_node_as_referenced(annotation)
+            return
+        }
+        if k = KindMethodDeclaration
+        {
+            this.mark_decorator_metadata_parameters_as_referenced(AstNode.parameters_of(node))
+            this.mark_decorator_metadata_type_node_as_referenced(AstNode.type_of(node))
+            return
+        }
+        if k = KindPropertyDeclaration
+        {
+            this.mark_decorator_metadata_type_node_as_referenced(AstNode.type_of(node))
+            return
+        }
+        if k = KindParameter
+        {
+            this.mark_decorator_metadata_type_node_as_referenced(this.get_parameter_type_node_for_decorator_check(node))
+            ; the containing signature's parameters and return type (its
+            ; `design:paramtypes`/`design:returntype` are emitted for a parameter decorator)
+            let containing AstNode.parent_node_of(node)
+            if containing <> null
+            {
+                this.mark_decorator_metadata_parameters_as_referenced(AstNode.parameters_of(containing))
+                this.mark_decorator_metadata_type_node_as_referenced(AstNode.type_of(containing))
+            }
+        }
+    }
+
+    procedure mark_decorator_metadata_parameters_as_referenced(this, params: ref[Array[ref[AstNode]?]]?)
+    {
+        if params = null
+            return
+        let pl params as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (pl.get_length() as int)
+        {
+            let prm pl[i as size_t]
+            set i: i + 1
+            if prm <> null
+                this.mark_decorator_metadata_type_node_as_referenced(this.get_parameter_type_node_for_decorator_check(prm as ref[AstNode]))
+        }
+    }
+
+    ; `core.Find(node.ModifierNodes(), ast.IsDecorator)`
+    function first_decorator_of(node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let mods AstNode.modifiers_of(node)
+        if mods = null
+            return null
+        let ml mods as ref[Array[ref[AstNode]?]]
+        var mi 0
+        while mi < (ml.get_length() as int)
+        {
+            let m ml[mi as size_t]
+            set mi: mi + 1
+            if AstNode.is_decorator(m)
+                return m
+        }
+        null
+    }
+
+    ; `core.Some(node.Members(), HasStaticModifier && IsPrivateIdentifierClassElementDeclaration)`
+    function some_member_is_static_private(bd: ref[Binder], node: ref[AstNode]) returns bool
+    {
+        let members AstNode.member_list_of(node)
+        if members = null
+            return false
+        let ml members as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (ml.get_length() as int)
+        {
+            let m ml[i as size_t]
+            set i: i + 1
+            if m <> null
+            {
+                if bd.is_static(m) and AstNode.is_private_identifier_class_element_declaration(m)
+                    return true
+            }
+        }
+        false
+    }
+
+    ; ast.GetFirstConstructorWithBody
+    function first_constructor_with_body(node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let members AstNode.member_list_of(node)
+        if members = null
+            return null
+        let ml members as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (ml.get_length() as int)
+        {
+            let m ml[i as size_t]
+            set i: i + 1
+            if AstNode.kind_of(m) = KindConstructor
+            {
+                let body AstNode.body_of(m as ref[AstNode])
+                if body <> null
+                {
+                    if Parser.node_is_missing(body) = false
+                        return m
+                }
+            }
+        }
+        null
+    }
+
+    ; getParameterTypeNodeForDecoratorCheck: a rest parameter's element type
+    function get_parameter_type_node_for_decorator_check(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let t AstNode.type_of(node)
+        if AstNode.dot_dot_dot_token_of(node) <> null
+            return Checker.rest_parameter_element_type(t)
+        t
+    }
+
+    ; ast.GetRestParameterElementType
+    function rest_parameter_element_type(node: ref[AstNode]?) returns ref[AstNode]?
+    {
+        if node = null
+            return null
+        let n node as ref[AstNode]
+        if n.kind = KindArrayType
+            return AstNode.array_element_type_of(n)
+        if n.kind = KindTypeReference
+        {
+            let args AstNode.type_reference_arguments_of(n)
+            if args <> null
+            {
+                let a args as ref[Array[ref[AstNode]?]]
+                if a.get_length() > 0
+                    return a[0]
+            }
+        }
+        null
+    }
+
+    ; markDecoratorMedataDataTypeNodeAsReferenced
+    procedure mark_decorator_metadata_type_node_as_referenced(this, node: ref[AstNode]?)
+    {
+        let entity_name this.get_entity_name_for_decorator_metadata(node)
+        if entity_name = null
+            return
+        if Checker.is_entity_name(entity_name)
+            this.mark_entity_name_or_entity_expression_as_reference(entity_name, true)
+    }
+
+    ; getEntityNameForDecoratorMetadata
+    function get_entity_name_for_decorator_metadata(this, node: ref[AstNode]?) returns ref[AstNode]?
+    {
+        if node = null
+            return null
+        let k AstNode.kind_of(node)
+        if (k = KindIntersectionType) or (k = KindUnionType)
+            return this.get_entity_name_for_decorator_metadata_from_type_list(AstNode.type_list_of(node as ref[AstNode]))
+        if k = KindConditionalType
+        {
+            let pair &Array[ref[AstNode]?]^host()
+            pair.add(AstNode.conditional_true_type_of(node))
+            pair.add(AstNode.conditional_false_type_of(node))
+            return this.get_entity_name_for_decorator_metadata_from_type_list(pair)
+        }
+        if (k = KindParenthesizedType) or (k = KindNamedTupleMember)
+            return this.get_entity_name_for_decorator_metadata(AstNode.type_of(node))
+        if k = KindTypeReference
+            return AstNode.type_reference_name_of(node)
+        null
+    }
+
+    ; getEntityNameForDecoratorMetadataFromTypeList: one common identifier, `never`
+    ; skipped, `null`/`undefined` skipped without strictNullChecks
+    function get_entity_name_for_decorator_metadata_from_type_list(this, type_nodes: ref[Array[ref[AstNode]?]]?) returns ref[AstNode]?
+    {
+        if type_nodes = null
+            return null
+        let list type_nodes as ref[Array[ref[AstNode]?]]
+        var common: ref[AstNode]? null
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            let tn list[i as size_t]
+            set i: i + 1
+            if tn = null
+                return null
+            let t tn as ref[AstNode]
+            let k AstNode.kind_of(t)
+            if k = KindNeverKeyword
+                continue
+            if Checker.strict_null_checks() = false
+            {
+                var elide false
+                if k = KindUndefinedKeyword
+                    set elide: true
+                if k = KindLiteralType
+                {
+                    if Checker.kind_or_unknown(AstNode.literal_type_inner_of(t)) = KindNullKeyword
+                        set elide: true
+                }
+                if elide
+                    continue
+            }
+            let individual this.get_entity_name_for_decorator_metadata(t)
+            if individual = null
+                return null
+            if common = null
+                set common: individual
+            else
+            {
+                let c common as ref[AstNode]
+                let ind individual as ref[AstNode]
+                if (AstNode.kind_of(c) <> KindIdentifier) or (AstNode.kind_of(ind) <> KindIdentifier)
+                    return null
+                let ct AstNode.identifier_text_of(c)
+                let it AstNode.identifier_text_of(ind)
+                if ct.equals(it) = false
+                    return null
+            }
+        }
+        common
+    }
+
+    ; markEntityNameOrEntityExpressionAsReference
+    procedure mark_entity_name_or_entity_expression_as_reference(this, type_name: ref[AstNode]?, for_decorator_metadata: bool)
+    {
+        if type_name = null
+            return
+        let root_opt Checker.get_first_identifier(type_name)
+        if root_opt = null
+            return
+        let root_name root_opt as ref[AstNode]
+        var meaning SymbolFlagsNamespace | SymbolFlagsAlias
+        if AstNode.kind_of(type_name) = KindIdentifier
+            set meaning: SymbolFlagsType | SymbolFlagsAlias
+        let root_symbol this.resolve_name(root_name, AstNode.identifier_text_of(root_name), meaning, 0, true, false)
+        if root_symbol = null
+            return
+        let rs root_symbol as ref[Symbol]
+        if (Symbol.flags_of(rs) & SymbolFlagsAlias) = 0
+            return
+        var take false
+        if this.symbol_is_value(rs)
+        {
+            if Checker.is_const_enum_or_const_enum_only_module(this.resolve_alias(rs)) = false
+            {
+                if this.get_type_only_alias_declaration(rs) = null
+                    set take: true
+            }
+        }
+        if take
+            this.mark_alias_symbol_as_referenced(rs)
+            if take = false
+            {
+                if for_decorator_metadata and this.get_isolated_modules() and (module_kind >= ModuleKindES2015) and (this.symbol_is_value(rs) = false) and (Checker.some_declaration_is_type_only_import_or_export(rs) = false)
+                    this.error_on_node(type_name, DiagA_type_referenced_in_a_decorated_signature_must_be_imported_with_import_type_or_a_namespace_import_when_isolatedModules_and_emitDecoratorMetadata_are_enabled)
+            }
+    }
+
+    ; core.Some(symbol.Declarations, ast.IsTypeOnlyImportOrExportDeclaration)
+    function some_declaration_is_type_only_import_or_export(s: ref[Symbol]) returns bool
+    {
+        let n Symbol.declaration_count(s)
+        var i 0
+        while i < n
+        {
+            let d Symbol.declaration_at(s, i)
+            set i: i + 1
+            if d <> null
+            {
+                if Checker.is_type_only_import_or_export_declaration(d as ref[AstNode])
+                    return true
+            }
+        }
+        false
     }
 
     ; ── slice 73: checkObjectTypeForDuplicateDeclarations ─────────────────────
@@ -95235,8 +96216,12 @@ define Checker
         ; which nothing in this port has a live reader for yet.
         if legacy_decorators
         {
-            this.record_unported("grammar-class-decorators-static-private", KindClassDeclaration)
-            return
+            let first_decorator Checker.first_decorator_of(node)
+            if first_decorator <> null
+            {
+                if Checker.some_member_is_static_private(b, node)
+                    this.grammar_error_on_node(first_decorator, DiagClass_decorators_can_t_be_used_with_static_private_identifier_Consider_removing_the_experimental_decorator)
+            }
         }
         if AstNode.name_of(node) = null
         {
@@ -95722,7 +96707,11 @@ define Checker
             if Checker.module_export_name_is_default(Checker.property_name_or_name_of(node))
             {
                 if emit_module_format = ModuleKindCommonJS
-                    this.record_unported("external-emit-helpers", AstNode.kind_of(node))
+                    {
+                        ; checkExternalEmitHelpers: nothing without importHelpers
+                        if import_helpers
+                            this.record_unported("external-emit-helpers", AstNode.kind_of(node))
+                    }
             }
         }
     }

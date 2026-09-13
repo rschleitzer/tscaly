@@ -1,0 +1,950 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; program — the FILE TABLE of a multi-file compilation and the module resolver
+; over it (slice 248): the sliver of internal/compiler/program.go a case's units
+; reach (which file a specifier names) and internal/module/resolver.go's
+; node-like resolution over that table — relative names with the reference's
+; extension probing, bare names through node_modules and @types with the
+; package.json `types`/`typings`/`main` fields, the ESM-mode restrictions of
+; node16/nodenext. What it does NOT port is said as a STOP rather than answered:
+; a package.json `exports`/`imports` map (a JSON value tree the port has no
+; reader for yet), a self-name reference, `paths`/`rootDirs`/`moduleSuffixes`,
+; typesVersions. The checker asks `ModuleResolver.resolve` where the reference
+; asks `c.program.GetResolvedModule`, and records the stop tag it hands back.
+;
+; ★ The file system is the TABLE: the harness roots every unit at `/.src/<unit>`
+; (tspath.GetNormalizedAbsolutePath(unit, "/.src") in the reference's runner,
+; case-sensitive), so `FileExists` is a lookup by exact path and
+; `DirectoryExists` is "some path lies below it".
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use tscaly.ast.AstNode
+use tscaly.binder.Binder
+use tscaly.parser.Parser
+
+; core.ModuleResolutionKind — the three the reference's resolver serves
+define ModuleResolutionKindUnknown: int 0
+define ModuleResolutionKindNode16: int 3
+define ModuleResolutionKindNodeNext: int 99
+define ModuleResolutionKindBundler: int 100
+
+; module/types.go's `extensions` bit set
+define ExtTypeScript: int 1
+define ExtJavaScript: int 2
+define ExtDeclaration: int 4
+define ExtJson: int 8
+
+; ── small string helpers over Slice[char] (page-hosted results) ────────────────
+
+function join_slices(host: ref[Page], a: Slice[char], b: Slice[char]) returns Slice[char]
+{
+    let n (a.length + b.length) as int
+    let buf host.allocate((n + 1) as size_t, 1) as pointer[char]
+    var i 0
+    while i < (a.length as int)
+    {
+        set *(buf + i): a[i as size_t]
+        set i: i + 1
+    }
+    var j 0
+    while j < (b.length as int)
+    {
+        set *(buf + i + j): b[j as size_t]
+        set j: j + 1
+    }
+    Slice[char](n as size_t, buf)
+}
+
+function slice_index_of_byte(d: Slice[char], c: int) returns int
+{
+    var i 0
+    while i < (d.length as int)
+    {
+        if (d[i as size_t] as int) = c
+            return i
+        set i: i + 1
+    }
+    0 - 1
+}
+
+function slice_last_index_of_byte(d: Slice[char], c: int) returns int
+{
+    var i (d.length as int) - 1
+    while i >= 0
+    {
+        if (d[i as size_t] as int) = c
+            return i
+        set i: i - 1
+    }
+    0 - 1
+}
+
+function slice_contains_byte(d: Slice[char], c: int) returns bool
+    slice_index_of_byte(d, c) >= 0
+
+; tspath.IsDeclarationFileName: `.d.ts`, `.d.mts`, `.d.cts`, or `.d.<ext>.ts`
+function is_declaration_file_name_of(d: Slice[char]) returns bool
+{
+    if d.ends_with(".d.ts") or d.ends_with(".d.mts") or d.ends_with(".d.cts")
+        return true
+    if d.ends_with(".ts") = false
+        return false
+    ; the base name carries `.d.` somewhere before its last `.ts`
+    let slash slice_last_index_of_byte(d, ("/" as char) as int)
+    var i slash + 1
+    let n (d.length as int) - 3
+    while (i + 2) < n
+    {
+        if ((d[i as size_t] as int) = ("." as char) as int) and ((d[(i + 1) as size_t] as int) = ("d" as char) as int) and ((d[(i + 2) as size_t] as int) = ("." as char) as int)
+            return true
+        set i: i + 1
+    }
+    false
+}
+
+; tspath.HasImplementationTSFileExtension: .ts .tsx .mts .cts, not a declaration
+function has_implementation_ts_file_extension(d: Slice[char]) returns bool
+{
+    if is_declaration_file_name_of(d)
+        return false
+    d.ends_with(".ts") or d.ends_with(".tsx") or d.ends_with(".mts") or d.ends_with(".cts")
+}
+
+; module/util.go ParsePackageName: the split between the package and the rest,
+; a scoped name (`@scope/name`) keeping its two segments; -1 when there is none
+function package_name_split(name: Slice[char]) returns int
+{
+    var idx slice_index_of_byte(name, ("/" as char) as int)
+    if ((name.length as int) > 0) and ((name[0] as int) = ("@" as char) as int)
+    {
+        let offset idx + 1
+        let rest name.slice_from(offset as size_t)
+        let idx2 slice_index_of_byte(rest, ("/" as char) as int)
+        if idx2 < 0
+            return 0 - 1
+        set idx: idx2 + offset
+    }
+    idx
+}
+
+; module/util.go MangleScopedPackageName: `@scope/name` → `scope__name`
+function mangle_scoped_package_name(host: ref[Page], name: Slice[char]) returns Slice[char]
+{
+    if ((name.length as int) = 0) or ((name[0] as int) <> ("@" as char) as int)
+        return name
+    let slash slice_index_of_byte(name, ("/" as char) as int)
+    if slash < 0
+        return name
+    let sb StringBuilder^host()
+    let scope name.subslice(1, slash as size_t)
+    sb.append(scope.data, scope.length)
+    sb.append("__")
+    let rest name.slice_from((slash + 1) as size_t)
+    sb.append(rest.data, rest.length)
+    let s String^host(sb.to_string())
+    Slice[char](s.get_length(), s.get_buffer() as pointer[char])
+}
+
+; ── the program's file table ───────────────────────────────────────────────────
+
+define ProgramFiles
+(
+    paths: ref[Array[Slice[char]]]
+    texts: ref[Array[Slice[char]]]
+    files: ref[Array[ref[AstNode]?]]
+    binders: ref[Array[ref[Binder]?]]
+    parsers: ref[Array[ref[Parser]?]]
+    emits: ref[Array[bool]]
+    formats: ref[Array[int]]
+)
+{
+    function create(host: ref[Page]) returns ref[ProgramFiles]
+        &ProgramFiles^host(&Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[ref[AstNode]?]^host(), &Array[ref[Binder]?]^host(), &Array[ref[Parser]?]^host(), &Array[bool]^host(), &Array[int]^host())
+
+    ; the two views are COPIED onto the table's page: a caller without a page of
+    ; its own (the dump's driver) may hand in a view of its frame
+    procedure add(this, path: Slice[char], text: Slice[char], file: ref[AstNode]?, binder: ref[Binder]?, parser: ref[Parser]?, emit: bool, format: int)
+    {
+        let pg Page.get(this)
+        paths.add(slice_copy_on(pg, path))
+        texts.add(slice_copy_on(pg, text))
+        files.add(file)
+        binders.add(binder)
+        parsers.add(parser)
+        emits.add(emit)
+        formats.add(format)
+    }
+
+    function count(this) returns int
+        paths.get_length() as int
+
+    function path_at(this, i: int) returns Slice[char]
+        paths[i as size_t]
+
+    function text_at(this, i: int) returns Slice[char]
+        texts[i as size_t]
+
+    function file_at(this, i: int) returns ref[AstNode]?
+        files[i as size_t]
+
+    function binder_at(this, i: int) returns ref[Binder]?
+        binders[i as size_t]
+
+    function parser_at(this, i: int) returns ref[Parser]?
+        parsers[i as size_t]
+
+    function emit_at(this, i: int) returns bool
+        emits[i as size_t]
+
+    function format_at(this, i: int) returns int
+        formats[i as size_t]
+
+    procedure set_format(this, i: int, format: int)
+        formats.put(i as size_t, format)
+
+    ; the `type` of the nearest package.json above a file (the program's
+    ; SourceFileMetaData.PackageJsonType), empty when none
+    function package_json_type_of(this, host: ref[Page], path: Slice[char]) returns Slice[char]
+    {
+        var dir get_directory_path(host, path)
+        repeat
+        {
+            let info PackageJsonInfo.at(host, this, dir)
+            if info.exists
+                return info.type_field
+            let parent get_directory_path(host, dir)
+            if parent.equals(dir)
+                return Slice[char]()
+            set dir: parent
+        }
+    }
+
+    function index_of_path(this, path: Slice[char]) returns int
+    {
+        let n paths.get_length() as int
+        var i 0
+        while i < n
+        {
+            let p paths[i as size_t]
+            if p.equals(path)
+                return i
+            set i: i + 1
+        }
+        0 - 1
+    }
+
+    function index_of_file(this, f: ref[AstNode]?) returns int
+    {
+        if f = null
+            return 0 - 1
+        let n files.get_length() as int
+        var i 0
+        while i < n
+        {
+            let fi files[i as size_t]
+            if fi <> null
+            {
+                ; an identity test on the two references (an Option = Option
+                ; comparison is not one this port relies on)
+                if (fi as ref[AstNode]) = (f as ref[AstNode])
+                    return i
+            }
+            set i: i + 1
+        }
+        0 - 1
+    }
+
+    function file_exists(this, path: Slice[char]) returns bool
+        this.index_of_path(path) >= 0
+
+    ; a directory exists when some file lies below it (the root always does)
+    function directory_exists(this, dir: Slice[char]) returns bool
+    {
+        var d dir
+        if has_trailing_directory_separator(d)
+            set d: remove_trailing_directory_separator(d)
+        if (d.length as int) = 0
+            return true
+        if d.equals("/")
+            return true
+        let n paths.get_length() as int
+        var i 0
+        while i < n
+        {
+            let p paths[i as size_t]
+            if (p.length as int) > (d.length as int)
+            {
+                if (p[d.length] as int) = ("/" as char) as int
+                {
+                    let head p.subslice(0, d.length)
+                    if head.equals(d)
+                        return true
+                }
+            }
+            set i: i + 1
+        }
+        false
+    }
+
+    function text_of_path(this, path: Slice[char]) returns Slice[char]
+    {
+        let i this.index_of_path(path)
+        if i < 0
+            return Slice[char]()
+        texts[i as size_t]
+    }
+}
+
+; ── package.json, the fields the resolver reads ────────────────────────────────
+
+define PackageJsonInfo
+(
+    exists: bool
+    directory: Slice[char]
+    name: Slice[char]
+    types: Slice[char]
+    typings: Slice[char]
+    main: Slice[char]
+    type_field: Slice[char]
+    has_exports: bool
+    has_imports: bool
+    has_types_versions: bool
+)
+{
+    function none() returns PackageJsonInfo
+        PackageJsonInfo(false, null, null, null, null, null, null, false, false, false)
+
+    ; the package.json of a directory, read off the table; `exists` false when
+    ; the directory carries none
+    function at(host: ref[Page], files: ref[ProgramFiles], directory: Slice[char]) returns PackageJsonInfo
+    {
+        let path combine_paths(host, directory, "package.json")
+        if files.file_exists(path) = false
+            return PackageJsonInfo.none()
+        var info PackageJsonInfo.none()
+        set info.exists: true
+        set info.directory: directory
+        PackageJsonInfo.scan(files.text_of_path(path), &info)
+        info
+    }
+
+    ; the TOP-LEVEL string fields of a JSON object and the presence of the
+    ; structured ones — enough for the reference's packagejson.Fields reader here
+    procedure scan(text: Slice[char], out: ref[PackageJsonInfo])
+    {
+        let n text.length as int
+        var depth 0
+        var i 0
+        var expect_value false
+        var key Slice[char]()
+        while i < n
+        {
+            let c text[i as size_t] as int
+            if c = ("\"" as char) as int
+            {
+                ; a string: from i + 1 to the closing quote, escapes skipped
+                var j i + 1
+                while j < n
+                {
+                    let cj text[j as size_t] as int
+                    if cj = ("\\" as char) as int
+                    {
+                        set j: j + 2
+                        continue
+                    }
+                    if cj = ("\"" as char) as int
+                        break
+                    set j: j + 1
+                }
+                let s text.subslice((i + 1) as size_t, j as size_t)
+                set i: j + 1
+                if depth = 1
+                {
+                    if expect_value
+                    {
+                        PackageJsonInfo.apply(out, key, s)
+                        set expect_value: false
+                    }
+                    else
+                    {
+                        set key: s
+                        ; the colon that makes it a key
+                        var k i
+                        while (k < n) and (((text[k as size_t] as int) = 32) or ((text[k as size_t] as int) = 10) or ((text[k as size_t] as int) = 13) or ((text[k as size_t] as int) = 9))
+                            set k: k + 1
+                        if (k < n) and ((text[k as size_t] as int) = (":" as char) as int)
+                        {
+                            set expect_value: true
+                            set i: k + 1
+                            ; a structured value is noted by its key and skipped by the depth walk
+                            var m i
+                            while (m < n) and (((text[m as size_t] as int) = 32) or ((text[m as size_t] as int) = 10) or ((text[m as size_t] as int) = 13) or ((text[m as size_t] as int) = 9))
+                                set m: m + 1
+                            if m < n
+                            {
+                                let vc text[m as size_t] as int
+                                if vc <> ("\"" as char) as int
+                                {
+                                    PackageJsonInfo.note_structured(out, key)
+                                    set expect_value: false
+                                }
+                            }
+                        }
+                    }
+                }
+                continue
+            }
+            if (c = ("{" as char) as int) or (c = ("[" as char) as int)
+                set depth: depth + 1
+            if (c = ("}" as char) as int) or (c = ("]" as char) as int)
+                set depth: depth - 1
+            set i: i + 1
+        }
+    }
+
+    procedure apply(out: ref[PackageJsonInfo], key: Slice[char], value: Slice[char])
+    {
+        if key.equals("name")
+            set out.name: value
+        if key.equals("types")
+            set out.types: value
+        if key.equals("typings")
+            set out.typings: value
+        if key.equals("main")
+            set out.main: value
+        if key.equals("type")
+            set out.type_field: value
+        if key.equals("exports")
+            set out.has_exports: true
+        if key.equals("imports")
+            set out.has_imports: true
+    }
+
+    procedure note_structured(out: ref[PackageJsonInfo], key: Slice[char])
+    {
+        if key.equals("exports")
+            set out.has_exports: true
+        if key.equals("imports")
+            set out.has_imports: true
+        if key.equals("typesVersions")
+            set out.has_types_versions: true
+    }
+}
+
+; ── the resolver ───────────────────────────────────────────────────────────────
+
+; module/resolver.go's resolutionState over the program's table. `resolve`
+; answers the INDEX of the file in the table, -1 for none; a shape this port has
+; not written sets `stop_tag` (the checker records it) and answers -1.
+define ModuleResolver
+(
+    host: ref[Page]
+    files: ref[ProgramFiles]
+    module_resolution: int
+    resolve_json: bool
+    esm_mode: bool
+    stop_tag: Slice[char]
+    name: Slice[char]
+    containing_directory: Slice[char]
+)
+{
+    function create(host: ref[Page], files: ref[ProgramFiles], module_resolution: int, resolve_json: bool, esm_mode: bool) returns ref[ModuleResolver]
+        &ModuleResolver^host(host, files, module_resolution, resolve_json, esm_mode, null, null, null)
+
+    function extensions(this) returns int
+    {
+        var ext ExtTypeScript | ExtJavaScript | ExtDeclaration
+        if resolve_json
+            set ext: ext | ExtJson
+        ext
+    }
+
+    procedure stop(this, tag: Slice[char])
+    {
+        if (stop_tag.length as int) = 0
+            set stop_tag: tag
+    }
+
+    ; ResolveModuleName → resolveNodeLike → resolveNodeLikeWorker
+    procedure resolve(this, module_name: Slice[char], containing_file: Slice[char]) returns int
+    {
+        set name: module_name
+        set containing_directory: get_directory_path(host, containing_file)
+        let ext this.extensions()
+        if is_external_module_name_relative(module_name) = false
+        {
+            ; `#` imports and a package self-name need the package.json maps
+            if ((module_name.length as int) > 0) and ((module_name[0] as int) = ("#" as char) as int)
+            {
+                this.stop("module-package-imports")
+                return 0 - 1
+            }
+            if this.is_self_name_reference()
+            {
+                this.stop("module-self-name")
+                return 0 - 1
+            }
+            if slice_contains_byte(module_name, (":" as char) as int)
+                return 0 - 1
+            return this.load_module_from_nearest_node_modules_directory()
+        }
+        ; normalizePathForCJSResolution: a `.`/`..` tail keeps its separator
+        var candidate get_normalized_absolute_path(host, combine_paths(host, containing_directory, module_name), Slice[char]())
+        if module_name.equals(".") or module_name.equals("..") or module_name.ends_with("/.") or module_name.ends_with("/..")
+            set candidate: ensure_trailing_directory_separator(host, candidate)
+        this.node_load_module_by_relative_name(ext, candidate, true)
+    }
+
+    ; loadModuleFromSelfNameReference's gate: the nearest package.json with an
+    ; `exports` map whose name the specifier starts with
+    function is_self_name_reference(this) returns bool
+    {
+        var dir containing_directory
+        repeat
+        {
+            let info PackageJsonInfo.at(host, files, dir)
+            if info.exists
+            {
+                if info.has_exports = false
+                    return false
+                if (info.name.length as int) = 0
+                    return false
+                if name.starts_with(info.name)
+                {
+                    if (name.length as int) = (info.name.length as int)
+                        return true
+                    if (name[info.name.length] as int) = ("/" as char) as int
+                        return true
+                }
+                return false
+            }
+            let parent get_directory_path(host, dir)
+            if parent.equals(dir)
+                return false
+            set dir: parent
+        }
+    }
+
+    ; nodeLoadModuleByRelativeName
+    procedure node_load_module_by_relative_name(this, ext: int, candidate: Slice[char], consider_package_json: bool) returns int
+    {
+        if has_trailing_directory_separator(candidate) = false
+        {
+            let parent get_directory_path(host, candidate)
+            if files.directory_exists(parent) = false
+                return 0 - 1
+            let from_file this.load_module_from_file(ext, candidate)
+            if from_file >= 0
+                return from_file
+            if (stop_tag.length as int) > 0
+                return 0 - 1
+        }
+        if files.directory_exists(candidate) = false
+            return 0 - 1
+        ; esm mode relative imports do no directory lookups
+        if esm_mode = false
+            return this.load_node_module_from_directory(ext, candidate, consider_package_json)
+        0 - 1
+    }
+
+    ; loadModuleFromFile: `./foo.js` → `./foo.ts`, then `./foo` → `./foo.ts`
+    procedure load_module_from_file(this, ext: int, candidate: Slice[char]) returns int
+    {
+        let by_replacing this.load_module_from_file_no_implicit_extensions(ext, candidate)
+        if by_replacing >= 0
+            return by_replacing
+        if esm_mode = false
+            return this.try_adding_extensions(ext, candidate, Slice[char]())
+        0 - 1
+    }
+
+    ; loadModuleFromFileNoImplicitExtensions
+    procedure load_module_from_file_no_implicit_extensions(this, ext: int, candidate: Slice[char]) returns int
+    {
+        let slash slice_last_index_of_byte(candidate, ("/" as char) as int)
+        let base candidate.slice_from((slash + 1) as size_t)
+        if slice_contains_byte(base, ("." as char) as int) = false
+            return 0 - 1
+        var cut remove_file_extension(candidate)
+        if cut = (candidate.length as int)
+            set cut: slice_last_index_of_byte(candidate, ("." as char) as int)
+        let extensionless candidate.subslice(0, cut as size_t)
+        let extension candidate.slice_from(cut as size_t)
+        this.try_adding_extensions(ext, extensionless, extension)
+    }
+
+    ; tryAddingExtensions, arm by arm
+    procedure try_adding_extensions(this, ext: int, extensionless: Slice[char], original_extension: Slice[char]) returns int
+    {
+        let directory get_directory_path(host, extensionless)
+        if ((directory.length as int) > 0) and (files.directory_exists(directory) = false)
+            return 0 - 1
+        var r 0 - 1
+        if original_extension.equals(".mjs") or original_extension.equals(".mts") or original_extension.equals(".d.mts")
+        {
+            if (ext & ExtTypeScript) <> 0
+            {
+                set r: this.try_extension(".mts", extensionless)
+                if r >= 0
+                    return r
+            }
+            if (ext & ExtDeclaration) <> 0
+            {
+                set r: this.try_extension(".d.mts", extensionless)
+                if r >= 0
+                    return r
+            }
+            if (ext & ExtJavaScript) <> 0
+            {
+                set r: this.try_extension(".mjs", extensionless)
+                if r >= 0
+                    return r
+            }
+            return 0 - 1
+        }
+        if original_extension.equals(".cjs") or original_extension.equals(".cts") or original_extension.equals(".d.cts")
+        {
+            if (ext & ExtTypeScript) <> 0
+            {
+                set r: this.try_extension(".cts", extensionless)
+                if r >= 0
+                    return r
+            }
+            if (ext & ExtDeclaration) <> 0
+            {
+                set r: this.try_extension(".d.cts", extensionless)
+                if r >= 0
+                    return r
+            }
+            if (ext & ExtJavaScript) <> 0
+            {
+                set r: this.try_extension(".cjs", extensionless)
+                if r >= 0
+                    return r
+            }
+            return 0 - 1
+        }
+        if original_extension.equals(".json")
+        {
+            if (ext & ExtDeclaration) <> 0
+            {
+                set r: this.try_extension(".d.json.ts", extensionless)
+                if r >= 0
+                    return r
+            }
+            if (ext & ExtJson) <> 0
+            {
+                set r: this.try_extension(".json", extensionless)
+                if r >= 0
+                    return r
+            }
+            return 0 - 1
+        }
+        if original_extension.equals(".tsx") or original_extension.equals(".jsx")
+        {
+            if (ext & ExtTypeScript) <> 0
+            {
+                set r: this.try_extension(".tsx", extensionless)
+                if r >= 0
+                    return r
+                set r: this.try_extension(".ts", extensionless)
+                if r >= 0
+                    return r
+            }
+            if (ext & ExtDeclaration) <> 0
+            {
+                set r: this.try_extension(".d.ts", extensionless)
+                if r >= 0
+                    return r
+            }
+            if (ext & ExtJavaScript) <> 0
+            {
+                set r: this.try_extension(".jsx", extensionless)
+                if r >= 0
+                    return r
+                set r: this.try_extension(".js", extensionless)
+                if r >= 0
+                    return r
+            }
+            return 0 - 1
+        }
+        if original_extension.equals(".ts") or original_extension.equals(".d.ts") or original_extension.equals(".js") or ((original_extension.length as int) = 0)
+        {
+            if (ext & ExtTypeScript) <> 0
+            {
+                set r: this.try_extension(".ts", extensionless)
+                if r >= 0
+                    return r
+                set r: this.try_extension(".tsx", extensionless)
+                if r >= 0
+                    return r
+            }
+            if (ext & ExtDeclaration) <> 0
+            {
+                set r: this.try_extension(".d.ts", extensionless)
+                if r >= 0
+                    return r
+            }
+            if (ext & ExtJavaScript) <> 0
+            {
+                set r: this.try_extension(".js", extensionless)
+                if r >= 0
+                    return r
+                set r: this.try_extension(".jsx", extensionless)
+                if r >= 0
+                    return r
+            }
+            return 0 - 1
+        }
+        ; an arbitrary extension: its declaration file `.d.<ext>.ts`
+        if (ext & ExtDeclaration) <> 0
+        {
+            let whole join_slices(host, extensionless, original_extension)
+            if is_declaration_file_name_of(whole) = false
+            {
+                let dext join_slices(host, join_slices(host, ".d", original_extension), ".ts")
+                set r: this.try_extension(dext, extensionless)
+                if r >= 0
+                    return r
+            }
+        }
+        0 - 1
+    }
+
+    ; tryExtension → tryFile (moduleSuffixes are not read)
+    procedure try_extension(this, extension: Slice[char], extensionless: Slice[char]) returns int
+    {
+        let file_name join_slices(host, extensionless, extension)
+        files.index_of_path(file_name)
+    }
+
+    ; loadNodeModuleFromDirectory(Worker): the package.json's file, then `index`
+    procedure load_node_module_from_directory(this, ext: int, candidate: Slice[char], consider_package_json: bool) returns int
+    {
+        var info PackageJsonInfo.none()
+        if consider_package_json
+            set info: PackageJsonInfo.at(host, files, candidate)
+        this.load_node_module_from_directory_worker(ext, candidate, info)
+    }
+
+    procedure load_node_module_from_directory_worker(this, ext: int, candidate: Slice[char], info: PackageJsonInfo) returns int
+    {
+        var package_file Slice[char]()
+        if info.exists
+        {
+            if info.has_types_versions
+            {
+                this.stop("module-types-versions")
+                return 0 - 1
+            }
+            set package_file: this.package_file_of(ext, info)
+        }
+        if (package_file.length as int) > 0
+        {
+            let r this.load_package_file(ext, package_file, info)
+            if r >= 0
+                return r
+            if (stop_tag.length as int) > 0
+                return 0 - 1
+        }
+        ; ESM mode resolutions do no package `index` lookups
+        if esm_mode = false
+        {
+            if files.directory_exists(candidate) = false
+                return 0 - 1
+            return this.load_module_from_file(ext, combine_paths(host, candidate, "index"))
+        }
+        0 - 1
+    }
+
+    ; the worker's `loader`: the field's path as a file, then as a module by
+    ; relative name with esm mode off for a package that is not `"type": "module"`
+    procedure load_package_file(this, ext: int, package_file: Slice[char], info: PackageJsonInfo) returns int
+    {
+        let from_field this.load_file_name_from_package_json_field(ext, package_file)
+        if from_field >= 0
+            return from_field
+        var expanded ext
+        if ext = ExtDeclaration
+            set expanded: ExtTypeScript | ExtDeclaration
+        let save_esm esm_mode
+        if info.exists
+        {
+            if info.type_field.equals("module") = false
+                set esm_mode: false
+        }
+        let r this.node_load_module_by_relative_name(expanded, package_file, false)
+        set esm_mode: save_esm
+        r
+    }
+
+    ; getPackageFile: typings, types, then main, combined with the package directory
+    function package_file_of(this, ext: int, info: PackageJsonInfo) returns Slice[char]
+    {
+        if (ext & ExtDeclaration) <> 0
+        {
+            if (info.typings.length as int) > 0
+                return get_normalized_absolute_path(host, combine_paths(host, info.directory, info.typings), Slice[char]())
+            if (info.types.length as int) > 0
+                return get_normalized_absolute_path(host, combine_paths(host, info.directory, info.types), Slice[char]())
+        }
+        if (ext & (ExtTypeScript | ExtJavaScript | ExtDeclaration)) <> 0
+        {
+            if (info.main.length as int) > 0
+                return get_normalized_absolute_path(host, combine_paths(host, info.directory, info.main), Slice[char]())
+        }
+        Slice[char]()
+    }
+
+    ; loadFileNameFromPackageJSONField: a TS/declaration path is tried as written
+    ; and nothing else; anything else strips and re-adds extensions
+    procedure load_file_name_from_package_json_field(this, ext: int, candidate: Slice[char]) returns int
+    {
+        var direct false
+        if ((ext & ExtTypeScript) <> 0) and has_implementation_ts_file_extension(candidate)
+            set direct: true
+        if ((ext & ExtDeclaration) <> 0) and is_declaration_file_name_of(candidate)
+            set direct: true
+        if direct
+            return files.index_of_path(candidate)
+        this.load_module_from_file_no_implicit_extensions(ext, candidate)
+    }
+
+    ; loadModuleFromNearestNodeModulesDirectory: TS and declarations first up
+    ; every ancestor, then JavaScript
+    procedure load_module_from_nearest_node_modules_directory(this) returns int
+    {
+        let ext this.extensions()
+        let priority ext & (ExtTypeScript | ExtDeclaration)
+        let secondary ext & (ExtJavaScript | ExtJson)
+        if priority <> 0
+        {
+            let r this.load_module_from_nearest_node_modules_directory_worker(priority)
+            if r >= 0
+                return r
+            if (stop_tag.length as int) > 0
+                return 0 - 1
+        }
+        if secondary <> 0
+            return this.load_module_from_nearest_node_modules_directory_worker(secondary)
+        0 - 1
+    }
+
+    procedure load_module_from_nearest_node_modules_directory_worker(this, ext: int) returns int
+    {
+        var dir containing_directory
+        repeat
+        {
+            let base get_base_file_name(host, dir)
+            if base.equals("node_modules") = false
+            {
+                let r this.load_module_from_immediate_node_modules_directory(ext, dir)
+                if r >= 0
+                    return r
+                if (stop_tag.length as int) > 0
+                    return 0 - 1
+            }
+            let parent get_directory_path(host, dir)
+            if parent.equals(dir)
+                return 0 - 1
+            set dir: parent
+        }
+    }
+
+    ; loadModuleFromImmediateNodeModulesDirectory: the package, then `@types`
+    procedure load_module_from_immediate_node_modules_directory(this, ext: int, directory: Slice[char]) returns int
+    {
+        let node_modules combine_paths(host, directory, "node_modules")
+        if files.directory_exists(node_modules) = false
+            return 0 - 1
+        let r this.load_module_from_specific_node_modules_directory(ext, name, node_modules)
+        if r >= 0
+            return r
+        if (stop_tag.length as int) > 0
+            return 0 - 1
+        if (ext & ExtDeclaration) <> 0
+        {
+            let at_types combine_paths(host, node_modules, "@types")
+            if files.directory_exists(at_types) = false
+                return 0 - 1
+            return this.load_module_from_specific_node_modules_directory(ExtDeclaration, mangle_scoped_package_name(host, name), at_types)
+        }
+        0 - 1
+    }
+
+    ; loadModuleFromSpecificNodeModulesDirectory
+    procedure load_module_from_specific_node_modules_directory(this, ext: int, module_name: Slice[char], node_modules_directory: Slice[char]) returns int
+    {
+        let candidate remove_trailing_directory_separator(get_normalized_absolute_path(host, combine_paths(host, node_modules_directory, module_name), Slice[char]()))
+        let split package_name_split(module_name)
+        var package_name module_name
+        var rest Slice[char]()
+        if split >= 0
+        {
+            set package_name: module_name.subslice(0, split as size_t)
+            set rest: module_name.slice_from((split + 1) as size_t)
+        }
+        let package_directory combine_paths(host, node_modules_directory, package_name)
+        ; a nested package.json first (`node_modules/foo/bar/package.json`)
+        var info PackageJsonInfo.at(host, files, candidate)
+        var root_info PackageJsonInfo.none()
+        var root_read false
+        if ((rest.length as int) > 0) and info.exists
+        {
+            set root_info: PackageJsonInfo.at(host, files, package_directory)
+            set root_read: true
+            if (root_info.exists = false) or (root_info.has_exports = false)
+            {
+                let from_file this.load_module_from_file(ext, candidate)
+                if from_file >= 0
+                    return from_file
+                let from_directory this.load_node_module_from_directory_worker(ext, candidate, info)
+                if from_directory >= 0
+                    return from_directory
+                if (stop_tag.length as int) > 0
+                    return 0 - 1
+            }
+        }
+        if (rest.length as int) > 0
+        {
+            if root_read = false
+                set root_info: PackageJsonInfo.at(host, files, package_directory)
+            set info: root_info
+        }
+        if info.exists
+        {
+            ; package exports are higher priority than file/directory lookups
+            if info.has_exports
+            {
+                this.stop("module-package-exports")
+                return 0 - 1
+            }
+            if ((rest.length as int) > 0) and info.has_types_versions
+            {
+                this.stop("module-types-versions")
+                return 0 - 1
+            }
+        }
+        ; the `loader`
+        if ((rest.length as int) > 0) or (esm_mode = false)
+        {
+            let from_file this.load_module_from_file(ext, candidate)
+            if from_file >= 0
+                return from_file
+        }
+        let from_directory this.load_node_module_from_directory_worker(ext, candidate, info)
+        if from_directory >= 0
+            return from_directory
+        if (stop_tag.length as int) > 0
+            return 0 - 1
+        if ((rest.length as int) = 0) and info.exists and esm_mode
+        {
+            ; a bare package in esm mode still assumes `index.js`
+            return this.load_module_from_file(ext, combine_paths(host, candidate, "index.js"))
+        }
+        0 - 1
+    }
+}
