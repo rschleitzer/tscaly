@@ -3,9 +3,10 @@
 """
 casejs.py — THE DRIVER CHAPTER'S YARDSTICK (slice 243): the JavaScript the port emits
 for a whole CASE under the case's own `// @option:` directives, against the reference's
-own `.js` baseline per case — the TypeScript submodule's tests/baselines/reference,
-which typescript-go's compiler runner reproduces byte for byte except for the ten
-cases it records a `.js.diff` for (testdata/baselines/reference/submodule).
+OWN `.js` baseline per case — typescript-go's testdata/baselines/reference/submodule
+(compiler/ and conformance/), the output its compiler runner accepted. The TypeScript
+submodule's tests/baselines/reference are Strada's, and the `.js.diff` files beside the
+reference's record where the two disagree (slice 244, §3.5jq 1).
 
 The seventh yardstick (tests/oracle/batch.go, dumpEmit) compares one UNIT under the
 DEFAULT options; its header names this one as the driver chapter's. What this one
@@ -41,8 +42,11 @@ sys.path.insert(0, HERE)
 import harness  # noqa: E402  (write_units_file, run_batch, parse_dump_stream)
 
 TS = os.path.join(PKG, "_submodules", "typescript-go", "_submodules", "TypeScript")
-BASELINES = os.path.join(TS, "tests", "baselines", "reference")
-TSGO_DIFFS = os.path.join(PKG, "_submodules", "typescript-go", "testdata", "baselines", "reference", "submodule")
+# the reference keeps its OWN emitted baselines (compiler/ and conformance/ by case
+# category); the TypeScript submodule's baselines are Strada's, and the `.js.diff`
+# files there record where the two disagree. The port follows the reference.
+TSGO_BASELINES = os.path.join(PKG, "_submodules", "typescript-go", "testdata", "baselines", "reference", "submodule")
+TSGO_DIFFS = TSGO_BASELINES
 
 OPTION_RE = re.compile(r"^//\s*@(\w+)\s*:\s*([^\r\n]*)", re.M)
 
@@ -315,13 +319,13 @@ def main():
             if reason:
                 skips["unsupported: " + reason] += 1
                 continue
-            bpath = os.path.join(BASELINES, bname)
+            category = "conformance" if name.startswith("submodule_conformance_") else "compiler"
+            bpath = os.path.join(TSGO_BASELINES, category, bname)
             if not os.path.exists(bpath):
                 skips["no baseline"] += 1
                 continue
             if bname in diff_names:
-                skips["reference records a diff"] += 1
-                continue
+                skips["(reference differs from Strada here; its own baseline is compared)"] += 1
             if cfg.get("noemit", "").lower() == "true":
                 skips["noEmit"] += 1
                 continue
