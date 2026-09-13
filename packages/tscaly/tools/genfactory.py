@@ -157,6 +157,8 @@ FACTORY_TAIL = """
     {
         if visit_tag = VisitTagDeepClone
             return this.deep_clone_visit(node)
+        if visit_tag = VisitTagTransformer
+            return (transformer as ref[Transformer]).visit(node)
         node
     }
 
@@ -483,7 +485,7 @@ FACTORY_EXTRAS = """
         b.append("@" as char)
         b.append(n)
         b.append(")" as char)
-        Printer.slice_of(b.to_string())
+        Printer.slice_on(host, b.to_string())
     }
 
     procedure new_generated_identifier(this, kind: int, text_in: Slice[char], node: ref[AstNode]?, flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
@@ -599,7 +601,7 @@ FACTORY_EXTRAS = """
                 b.append(":" as char)
                 let nm AstNode.identifier_text_of(AstNode.namespaced_name_of(text_source_node))
                 b.append(nm.data, nm.length)
-                set text: Printer.slice_of(b.to_string())
+                set text: Printer.slice_on(host, b.to_string())
             }
             else
             {
@@ -803,7 +805,7 @@ FACTORY_EXTRAS = """
         {
             let b StringBuilder^host()
             b.append(start)
-            args.add(this.new_numeric_literal(Printer.slice_of(b.to_string()), TokenFlagsNone))
+            args.add(this.new_numeric_literal(Printer.slice_on(host, b.to_string()), TokenFlagsNone))
         }
         this.new_method_call(array, this.new_identifier("slice"), args)
     }
@@ -862,7 +864,8 @@ FACTORY_EXTRAS = """
             let first statements[0 as size_t]
             if EmitContext.is_prologue_directive(first)
             {
-                if EmitContext.prologue_text(first as ref[AstNode]) = "use strict"
+                let use_strict: Slice[char] "use strict"
+                if EmitContext.prologue_text(first as ref[AstNode]).equals(use_strict)
                     return statements
             }
         }
@@ -1071,7 +1074,7 @@ FACTORY_EXTRAS = """
         ctx.request_emit_helper(ctx.helpers.param_helper)
         let b StringBuilder^host()
         b.append(parameter_offset)
-        let helper this.helper_call("__param", this.list2(this.new_numeric_literal(Printer.slice_of(b.to_string()), TokenFlagsNone), expression))
+        let helper this.helper_call("__param", this.list2(this.new_numeric_literal(Printer.slice_on(host, b.to_string()), TokenFlagsNone), expression))
         set helper.pos: location.pos
         set helper.end: location.end
         helper
@@ -1434,6 +1437,7 @@ use tscaly.printer.EmitContext
 use tscaly.printer.EmitHelper
 use tscaly.printer.EmitHelpers
 use tscaly.printer.EmitNode
+use tscaly.emitter.Transformer
 use tscaly.printer.AutoGenerateInfo
 use tscaly.printer.Printer
 use tscaly.printer.TextRange
@@ -1493,6 +1497,26 @@ define NodeFactory
                 (context as ref[EmitContext]).on_update(updated, original)
         }
         updated
+    }
+
+    ; UpdateSourceFile (ast.go, hand-written in the reference): a copy of the
+    ; node carrying the new statement list and token, else the node itself
+    procedure update_source_file(this, node: ref[AstNode], statements: ref[Array[ref[AstNode]?]]?, end_of_file_token: ref[AstNode]?) returns ref[AstNode]
+    {
+        choose node.data
+            when sf: SourceFile
+            {
+                if (sf.statements = statements) and (sf.end_of_file_token = end_of_file_token)
+                    return node
+                var d sf
+                set d.statements: statements
+                set d.end_of_file_token: end_of_file_token
+                let c AstNode.alloc(host)
+                set c: node
+                set c.data: NodeData.SourceFile(d)
+                return this.update_node(c, node)
+            }
+        node
     }
 
     procedure clone_node(this, updated: ref[AstNode], original: ref[AstNode]) returns ref[AstNode]
@@ -1718,6 +1742,7 @@ out('''; ast.NodeVisitor. `visit_tag` names the callback the reference passes as
 ; `hooks_tag` names the hook set: none, the emit context's, the deep clone's.
 define VisitTagNone: int 0
 define VisitTagDeepClone: int 1
+define VisitTagTransformer: int 2
 
 define NodeVisitor
 (
@@ -1727,10 +1752,11 @@ define NodeVisitor
     hooks_tag: int
     synthetic_location: bool
     context: ref[EmitContext]?
+    transformer: ref[Transformer]?
 )
 {
     function create(host: ref[Page], factory: ref[NodeFactory], visit_tag: int, hooks_tag: int) returns ref[NodeVisitor]
-        &NodeVisitor^host(host, factory, visit_tag, hooks_tag, false, null)
+        &NodeVisitor^host(host, factory, visit_tag, hooks_tag, false, null, null)
 
     ; VisitEachChild: the per-kind dispatch (generated).
     procedure visit_each_child(this, node: ref[AstNode]?) returns ref[AstNode]?
@@ -1740,6 +1766,10 @@ define NodeVisitor
         if visit_tag = VisitTagNone
             return node
         let n node as ref[AstNode]
+        ; SourceFile: its VisitEachChild is hand-written in the reference (ast.go),
+        ; not generated — the statements, then the end-of-file token
+        if n.kind = KindSourceFile
+            return factory.update_source_file(n, this.visit_nodes_h(AstNode.statements_of(n)), this.visit_token_h(AstNode.end_of_file_token_of(n)))
         choose n.data''')
 for arm, rec in arms.items():
     # find the Go struct whose visit applies to this arm

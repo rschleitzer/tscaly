@@ -96,7 +96,7 @@ print()
 print("THE EMITTER CHAPTER — reference functions with a port, per package:")
 ROOT = os.path.dirname(os.path.dirname(TS))
 chapters = (('internal/printer',        ['printer.scaly', 'factory.scaly'], False),
-            ('internal/transformers',   ['transformers.scaly'],  True),
+            ('internal/transformers',   ['emitter.scaly'],       True),
             ('internal/compiler',       ['emitter.scaly'],       False),
             ('internal/outputpaths',    ['emitter.scaly'],       False),
             ('internal/sourcemap',      ['emitter.scaly'],       False))

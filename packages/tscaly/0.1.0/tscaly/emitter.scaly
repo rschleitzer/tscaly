@@ -1,0 +1,1232 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; emitter — the JS half of internal/compiler/emitter.go, and the TRANSFORMERS it
+; runs: internal/transformers (transformer.go, chain.go, modifiervisitor.go,
+; utilities.go), tstransforms/typeeraser.go, estransforms/usestrict.go and
+; moduletransforms/esmodule.go (+ utilities.go). Ported from
+; microsoft/typescript-go at the pin named in tscaly.scaly.
+;
+; ★★★ THE TRANSFORMER HIERARCHY IS ONE RECORD WITH A TAG (§3.41). The reference
+; embeds `transformers.Transformer` in every transformer struct and hands the
+; visitor a method value; here `Transformer` carries a `tag`, the fields of
+; every transformer (prefixed where they would collide), and ONE `visit` that
+; dispatches on the tag. The NodeVisitor reaches it through its `transformer`
+; field under `VisitTagTransformer` (§3.18: a func value is a tag).
+;
+; ★★★ EVERY TRANSFORMER THE DRIVER DOES NOT RUN YET IS A SAID STOP. The reference
+; gates each of them by the file's SubtreeFacts; this port has no facts, so the
+; driver SCANS the file for what each unported transformer would act on and
+; records `transform-<name>` when it finds it — the unit is UNPORTED, never
+; emitted wrongly. The gates and the chain order are in `Emitter.emit_js`.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use tscaly.ast.AstNode
+use tscaly.ast.NodeData
+use tscaly.ast.SourceFileData
+use tscaly.parser.Parser
+use tscaly.binder.Binder
+use tscaly.checker.Checker
+use tscaly.printer.EmitContext
+use tscaly.printer.NameGenerator
+use tscaly.printer.EmitHelper
+use tscaly.printer.Printer
+use tscaly.printer.PrinterOptions
+use tscaly.printer.SourceFileInfo
+use tscaly.printer.TextWriter
+use tscaly.factory.NodeFactory
+use tscaly.factory.NodeVisitor
+
+; core.JsxEmit
+define JsxEmitNone: int 0
+define JsxEmitPreserve: int 1
+define JsxEmitReactNative: int 2
+define JsxEmitReact: int 3
+define JsxEmitReactJSX: int 4
+define JsxEmitReactJSXDev: int 5
+
+; ast.OEKAllExceptAssertionsOrExpressionsWithTypeArguments = OEKAll &^ OEKAssertions
+; &^ OEKExpressionsWithTypeArguments = OEKParentheses | OEKPartiallyEmittedExpressions
+define OEKAllExceptAssertionsOrExpressionsWithTypeArguments: int 9
+
+define TransformerTagNone: int 0
+define TransformerTagTypeEraser: int 1
+define TransformerTagUseStrict: int 2
+define TransformerTagESModule: int 3
+define TransformerTagChain: int 4
+define TransformerTagModifierVisitor: int 5
+
+; core.CompilerOptions, the slots the emit reads. Every unset option is its zero
+; (a Tristate is `TristateUnknown`), as the yardstick's `&core.CompilerOptions{}`.
+define EmitOptions
+(
+    target: int
+    module_kind: int
+    jsx: int
+    remove_comments: bool
+    no_emit_helpers: bool
+    new_line: int
+    verbatim_module_syntax: int
+    isolated_modules: int
+    experimental_decorators: int
+    emit_decorator_metadata: int
+    import_helpers: int
+    rewrite_relative_import_extensions: int
+    use_define_for_class_fields: int
+    preserve_const_enums: int
+)
+{
+    function defaults() returns EmitOptions
+        EmitOptions(ScriptTargetNone, ModuleKindNone, 0, false, false, NewLineKindNone, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown)
+
+    function get_emit_script_target(this) returns int
+    {
+        if target <> ScriptTargetNone
+            return target
+        ; ScriptTargetLatestStandard
+        ScriptTargetES2025
+    }
+
+    function get_emit_module_kind(this) returns int
+    {
+        if module_kind <> ModuleKindNone
+            return module_kind
+        let t this.get_emit_script_target()
+        if t = ScriptTargetLatest
+            return ModuleKindESNext
+        if t >= ScriptTargetES2022
+            return ModuleKindES2022
+        if t >= ScriptTargetES2020
+            return ModuleKindES2020
+        if t >= ScriptTargetES2015
+            return ModuleKindES2015
+        ModuleKindCommonJS
+    }
+
+    function get_jsx_transform_enabled(this) returns bool
+        (jsx = JsxEmitReact) or (jsx = JsxEmitReactJSX) or (jsx = JsxEmitReactJSXDev)
+
+    function get_isolated_modules(this) returns bool
+        (isolated_modules = TristateTrue) or (verbatim_module_syntax = TristateTrue)
+
+    function get_use_define_for_class_fields(this) returns bool
+    {
+        if use_define_for_class_fields = TristateUnknown
+            return this.get_emit_script_target() >= ScriptTargetES2022
+        use_define_for_class_fields = TristateTrue
+    }
+
+    function should_preserve_const_enums(this) returns bool
+        (preserve_const_enums = TristateTrue) or this.get_isolated_modules()
+
+    ; ast.GetEmitModuleFormatOfFileWorker for a file with no package.json above
+    ; it: the implied node format is CommonJS for `.cjs`/`.cts`, ESNext for
+    ; `.mjs`/`.mts`, else the emit module kind itself.
+    function get_emit_module_format_of_file(this, file_name: Slice[char]) returns int
+    {
+        let mk this.get_emit_module_kind()
+        if (mk >= ModuleKindNode16) and (mk <= ModuleKindNodeNext)
+        {
+            if file_name.ends_with(".mjs") or file_name.ends_with(".mts")
+                return ModuleKindESNext
+            return ModuleKindCommonJS
+        }
+        if file_name.ends_with(".cjs") or file_name.ends_with(".cts")
+            return ModuleKindCommonJS
+        if file_name.ends_with(".mjs") or file_name.ends_with(".mts")
+            return ModuleKindESNext
+        mk
+    }
+}
+
+; transformers.TransformOptions: the context, the options, and the resolver —
+; which is the checker here (§3.41), beside the binder for the file's flags.
+define TransformOptions
+(
+    context: ref[EmitContext]
+    options: EmitOptions
+    checker: ref[Checker]?
+    binder: ref[Binder]?
+    file_info: ref[SourceFileInfo]
+)
+
+define Transformer
+(
+    host: ref[Page]
+    tag: int
+    context: ref[EmitContext]
+    factory: ref[NodeFactory]
+    visitor: ref[NodeVisitor]?
+    opts: TransformOptions
+    parent_node: ref[AstNode]?
+    current_node: ref[AstNode]?
+    components: ref[Array[ref[Transformer]?]]
+    allowed_modifiers: int
+    current_source_file: ref[AstNode]?
+    import_require_statements: ref[Array[ref[AstNode]?]]?
+    require_helper_name: ref[AstNode]?
+    unported_count: int
+    unported_tag: Slice[char]
+    unported_detail: int
+)
+{
+    ; NewTransformer: the visitor is the context's, with this transformer as its
+    ; visit callback.
+    function create(host: ref[Page], tag: int, opts: TransformOptions) returns ref[Transformer]
+    {
+        let comps &Array[ref[Transformer]?]^host()
+        let no_tag: Slice[char] ""
+        let t &Transformer^host(host, tag, opts.context, opts.context.the_factory(), null, opts, null, null, comps, 0, null, null, null, 0, no_tag, 0)
+        let v opts.context.new_node_visitor(VisitTagTransformer)
+        set v.transformer: t
+        set t.visitor: v
+        t
+    }
+
+    procedure record_unported(this, tag_text: Slice[char], detail: int)
+    {
+        if unported_count = 0
+        {
+            set this.unported_tag: tag_text
+            set this.unported_detail: detail
+        }
+        set this.unported_count: unported_count + 1
+    }
+
+    function the_visitor(this) returns ref[NodeVisitor]
+        visitor as ref[NodeVisitor]
+
+    function the_checker(this) returns ref[Checker]
+        opts.checker as ref[Checker]
+
+    procedure transform_source_file(this, file: ref[AstNode]) returns ref[AstNode]
+    {
+        let visited this.the_visitor().visit_node(file)
+        if visited = null
+        {
+            this.record_unported("transform-dropped-source-file", tag)
+            return file
+        }
+        visited as ref[AstNode]
+    }
+
+    ; the one `visit` — the func value of every transformer, by tag
+    procedure visit(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if tag = TransformerTagTypeEraser
+            return this.visit_type_eraser(node)
+        if tag = TransformerTagUseStrict
+            return this.visit_use_strict(node)
+        if tag = TransformerTagESModule
+            return this.visit_es_module(node)
+        if tag = TransformerTagChain
+            return this.visit_chain(node)
+        if tag = TransformerTagModifierVisitor
+            return this.visit_modifier(node)
+        this.record_unported("transformer-tag", tag)
+        node
+    }
+
+    ; ── the AST questions the transformers ask (ast/utilities.go) ──
+
+    ; GetSyntacticModifierFlags over the COMPLETE modifier list (§3.5jh)
+    function modifier_flags_of(n: ref[AstNode]?) returns int
+    {
+        let mods Printer.modifier_list_of(n)
+        if mods = null
+            return ModifierFlagsNone
+        let list mods as ref[Array[ref[AstNode]?]]
+        var flags ModifierFlagsNone
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            set flags: flags | AstNode.modifier_to_flag(AstNode.kind_of(list[i as size_t]))
+            set i: i + 1
+        }
+        flags
+    }
+
+    function has_syntactic_modifier(n: ref[AstNode]?, flag: int) returns bool
+        (Transformer.modifier_flags_of(n) & flag) <> 0
+
+    function has_decorators(n: ref[AstNode]?) returns bool
+        (Transformer.modifier_flags_of(n) & ModifierFlagsDecorator) <> 0
+
+    ; Node.Decorators(): the decorators of the modifier list, in order
+    function decorators_of(host: ref[Page], n: ref[AstNode]) returns ref[Array[ref[AstNode]?]]
+    {
+        let out &Array[ref[AstNode]?]^host()
+        let mods Printer.modifier_list_of(n)
+        if mods = null
+            return out
+        let list mods as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            let m list[i as size_t]
+            if AstNode.is_decorator(m)
+                out.add(m)
+            set i: i + 1
+        }
+        out
+    }
+
+    ; IsParameterPropertyDeclaration(node, parent)
+    function is_parameter_property_declaration(n: ref[AstNode], parent: ref[AstNode]?) returns bool
+    {
+        if n.kind <> KindParameter
+            return false
+        if parent = null
+            return false
+        if (parent as ref[AstNode]).kind <> KindConstructor
+            return false
+        Transformer.has_syntactic_modifier(n, ModifierFlagsParameterPropertyModifier)
+    }
+
+    function get_innermost_module_declaration_from_dotted_module(n: ref[AstNode]) returns ref[AstNode]
+    {
+        var m n
+        while true
+        {
+            let body Printer.module_body_of(m)
+            if body = null
+                return m
+            let b body as ref[AstNode]
+            if b.kind <> KindModuleDeclaration
+                return m
+            set m: b
+        }
+        m
+    }
+
+    function is_assertion_expression(n: ref[AstNode]?) returns bool
+    {
+        let k AstNode.kind_of(n)
+        (k = KindTypeAssertionExpression) or (k = KindAsExpression)
+    }
+
+    ; SingleOrMany
+    procedure single_or_many(this, nodes: ref[Array[ref[AstNode]?]]) returns ref[AstNode]?
+    {
+        let n nodes.get_length() as int
+        if n = 0
+            return null
+        if n = 1
+            return nodes[0]
+        factory.new_syntax_list(nodes)
+    }
+
+    ; SplitStandardPrologue / SplitCustomPrologue: the index where the prologue ends
+    function standard_prologue_end(statements: ref[Array[ref[AstNode]?]]) returns int
+    {
+        var i 0
+        while i < (statements.get_length() as int)
+        {
+            if EmitContext.is_prologue_directive(statements[i as size_t]) = false
+                return i
+            set i: i + 1
+        }
+        i
+    }
+
+    function custom_prologue_end(this, statements: ref[Array[ref[AstNode]?]], from: int) returns int
+    {
+        var i from
+        while i < (statements.get_length() as int)
+        {
+            if context.is_custom_prologue(statements[i as size_t]) = false
+                return i
+            set i: i + 1
+        }
+        i
+    }
+
+    ; ═══ tstransforms/typeeraser.go ═══
+
+    procedure push_node(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let grandparent parent_node
+        set this.parent_node: current_node
+        set this.current_node: node
+        grandparent
+    }
+
+    procedure pop_node(this, grandparent: ref[AstNode]?)
+    {
+        set this.current_node: parent_node
+        set this.parent_node: grandparent
+    }
+
+    procedure elide(this, node: ref[AstNode]) returns ref[AstNode]?
+        context.new_not_emitted_statement(node)
+
+    procedure visit_type_eraser(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        ; the reference skips a subtree without TypeScript by its facts; here
+        ; every node is visited, and an unchanged subtree answers itself
+        if Checker.is_statement(node) and Transformer.has_syntactic_modifier(node, ModifierFlagsAmbient)
+            return this.elide(node)
+        let grandparent this.push_node(node)
+        let result this.visit_type_eraser_worker(node)
+        this.pop_node(grandparent)
+        result
+    }
+
+    procedure visit_type_eraser_worker(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let v this.the_visitor()
+        let k node.kind
+        if (k = KindPublicKeyword) or (k = KindPrivateKeyword) or (k = KindProtectedKeyword) or (k = KindAbstractKeyword) or (k = KindOverrideKeyword) or (k = KindConstKeyword) or (k = KindDeclareKeyword) or (k = KindReadonlyKeyword) or (k = KindArrayType) or (k = KindTupleType) or (k = KindOptionalType) or (k = KindRestType) or (k = KindTypeLiteral) or (k = KindTypePredicate) or (k = KindTypeParameter) or (k = KindAnyKeyword) or (k = KindUnknownKeyword) or (k = KindBooleanKeyword) or (k = KindStringKeyword) or (k = KindNumberKeyword) or (k = KindNeverKeyword) or (k = KindVoidKeyword) or (k = KindSymbolKeyword) or (k = KindConstructorType) or (k = KindFunctionType) or (k = KindTypeQuery) or (k = KindTypeReference) or (k = KindUnionType) or (k = KindIntersectionType) or (k = KindConditionalType) or (k = KindParenthesizedType) or (k = KindThisType) or (k = KindTypeOperator) or (k = KindIndexedAccessType) or (k = KindMappedType) or (k = KindLiteralType) or (k = KindIndexSignature)
+            return null
+        if (k = KindInKeyword) or (k = KindOutKeyword)
+        {
+            if parent_node = null
+                return null
+            if (parent_node as ref[AstNode]).kind <> KindBinaryExpression
+                return null
+            return v.visit_each_child(node)
+        }
+        if k = KindJSImportDeclaration
+            return null
+        if (k = KindTypeAliasDeclaration) or (k = KindJSTypeAliasDeclaration) or (k = KindInterfaceDeclaration)
+            return this.elide(node)
+        if k = KindNamespaceExportDeclaration
+            return null
+        if k = KindModuleDeclaration
+        {
+            let name Printer.declaration_name_of(node)
+            var keep AstNode.kind_of(name) = KindIdentifier
+            if keep
+            {
+                if this.the_checker().is_instantiated_module(node) = false
+                    set keep: false
+            }
+            if keep
+            {
+                if Printer.module_body_of(Transformer.get_innermost_module_declaration_from_dotted_module(node)) = null
+                    set keep: false
+            }
+            if keep = false
+                return this.elide(node)
+            return v.visit_each_child(node)
+        }
+        if k = KindExpressionWithTypeArguments
+            return factory.update_expression_with_type_arguments(node, v.visit_node(AstNode.expression_of(node)), null)
+        if k = KindPropertyDeclaration
+        {
+            if (opts.options.experimental_decorators = TristateTrue) and Transformer.has_syntactic_modifier(node, ModifierFlagsAmbient | ModifierFlagsAbstract) and Transformer.has_decorators(node)
+                return factory.update_property_declaration(node, v.visit_modifiers(Printer.modifier_list_of(node)), v.visit_node(Printer.declaration_name_of(node)), null, null, v.visit_node(AstNode.initializer_of(node)))
+            if Transformer.has_syntactic_modifier(node, ModifierFlagsAmbient | ModifierFlagsAbstract)
+                return null
+            return factory.update_property_declaration(node, v.visit_modifiers(Printer.modifier_list_of(node)), v.visit_node(Printer.declaration_name_of(node)), null, null, v.visit_node(AstNode.initializer_of(node)))
+        }
+        if k = KindConstructor
+        {
+            if Parser.node_is_missing(AstNode.body_of(node))
+                return null
+            return factory.update_constructor_declaration(node, null, null, v.visit_nodes(AstNode.parameters_of(node)), null, null, v.visit_node(AstNode.body_of(node)))
+        }
+        if k = KindMethodDeclaration
+        {
+            if Parser.node_is_missing(AstNode.body_of(node))
+                return null
+            return factory.update_method_declaration(node, v.visit_modifiers(Printer.modifier_list_of(node)), AstNode.asterisk_token_of(node), v.visit_node(Printer.declaration_name_of(node)), null, null, v.visit_nodes(AstNode.parameters_of(node)), null, null, v.visit_node(AstNode.body_of(node)))
+        }
+        if (k = KindGetAccessor) or (k = KindSetAccessor)
+        {
+            if Parser.node_is_missing(AstNode.body_of(node)) and Transformer.has_syntactic_modifier(node, ModifierFlagsAbstract)
+                return null
+            var body v.visit_node(AstNode.body_of(node))
+            if body = null
+                set body: factory.new_block(&Array[ref[AstNode]?]^host(), false)
+            if k = KindGetAccessor
+                return factory.update_get_accessor_declaration(node, v.visit_modifiers(Printer.modifier_list_of(node)), v.visit_node(Printer.declaration_name_of(node)), null, v.visit_nodes(AstNode.parameters_of(node)), null, null, body)
+            return factory.update_set_accessor_declaration(node, v.visit_modifiers(Printer.modifier_list_of(node)), v.visit_node(Printer.declaration_name_of(node)), null, v.visit_nodes(AstNode.parameters_of(node)), null, null, body)
+        }
+        if k = KindVariableDeclaration
+        {
+            let updated factory.update_variable_declaration(node, v.visit_node(Printer.declaration_name_of(node)), null, null, v.visit_node(AstNode.initializer_of(node)))
+            let type_node AstNode.type_of(node)
+            if type_node <> null
+                context.set_type_node(Printer.declaration_name_of(updated) as ref[AstNode], type_node)
+            return updated
+        }
+        if k = KindHeritageClause
+        {
+            let token AstNode.heritage_clause_token_of(node)
+            if token = KindImplementsKeyword
+                return null
+            return factory.update_heritage_clause(node, token, v.visit_nodes(AstNode.heritage_clause_types_of(node)))
+        }
+        if k = KindClassDeclaration
+            return factory.update_class_declaration(node, v.visit_modifiers(Printer.modifier_list_of(node)), v.visit_node(Printer.declaration_name_of(node)), null, v.visit_nodes(AstNode.heritage_clauses_of(node)), v.visit_nodes(Printer.member_list_of(node)))
+        if k = KindClassExpression
+            return factory.update_class_expression(node, v.visit_modifiers(Printer.modifier_list_of(node)), v.visit_node(Printer.declaration_name_of(node)), null, v.visit_nodes(AstNode.heritage_clauses_of(node)), v.visit_nodes(Printer.member_list_of(node)))
+        if k = KindFunctionDeclaration
+        {
+            if Parser.node_is_missing(AstNode.body_of(node))
+                return this.elide(node)
+            return factory.update_function_declaration(node, v.visit_modifiers(Printer.modifier_list_of(node)), AstNode.asterisk_token_of(node), v.visit_node(Printer.declaration_name_of(node)), null, v.visit_nodes(AstNode.parameters_of(node)), null, null, v.visit_node(AstNode.body_of(node)))
+        }
+        if k = KindFunctionExpression
+            return factory.update_function_expression(node, v.visit_modifiers(Printer.modifier_list_of(node)), AstNode.asterisk_token_of(node), v.visit_node(Printer.declaration_name_of(node)), null, v.visit_nodes(AstNode.parameters_of(node)), null, null, v.visit_node(AstNode.body_of(node)))
+        if k = KindArrowFunction
+            return factory.update_arrow_function(node, v.visit_modifiers(Printer.modifier_list_of(node)), null, v.visit_nodes(AstNode.parameters_of(node)), null, null, AstNode.equals_greater_than_token_of(node), v.visit_node(AstNode.body_of(node)))
+        if k = KindParameter
+        {
+            if AstNode.is_this_parameter(node)
+                return null
+            var modifiers: ref[Array[ref[AstNode]?]]? null
+            if Transformer.is_parameter_property_declaration(node, parent_node)
+                set modifiers: Transformer.extract_modifiers(host, opts, Printer.modifier_list_of(node), ModifierFlagsParameterPropertyModifier)
+            if Transformer.has_decorators(node)
+            {
+                var changed false
+                let visited v.visit_slice(Transformer.decorators_of(host, node), &changed)
+                if modifiers = null
+                    set modifiers: visited
+                else
+                {
+                    let merged &Array[ref[AstNode]?]^host()
+                    let ms modifiers as ref[Array[ref[AstNode]?]]
+                    var i 0
+                    while i < (ms.get_length() as int)
+                    {
+                        merged.add(ms[i as size_t])
+                        set i: i + 1
+                    }
+                    set i: 0
+                    while i < (visited.get_length() as int)
+                    {
+                        merged.add(visited[i as size_t])
+                        set i: i + 1
+                    }
+                    set modifiers: merged
+                }
+            }
+            return factory.update_parameter_declaration(node, modifiers, AstNode.dot_dot_dot_token_of(node), v.visit_node(Printer.declaration_name_of(node)), null, null, v.visit_node(AstNode.initializer_of(node)))
+        }
+        if k = KindCallExpression
+            return factory.update_call_expression(node, v.visit_node(AstNode.expression_of(node)), AstNode.question_dot_token_of(node), null, v.visit_nodes(AstNode.call_arguments_of(node)), node.flags)
+        if k = KindNewExpression
+            return factory.update_new_expression(node, v.visit_node(AstNode.expression_of(node)), null, v.visit_nodes(AstNode.call_arguments_of(node)))
+        if k = KindTaggedTemplateExpression
+            return factory.update_tagged_template_expression(node, v.visit_node(AstNode.tagged_template_tag_of(node)), AstNode.question_dot_token_of(node), null, v.visit_node(AstNode.tagged_template_template_of(node)), node.flags)
+        if (k = KindNonNullExpression) or (k = KindTypeAssertionExpression) or (k = KindAsExpression) or (k = KindSatisfiesExpression)
+        {
+            let partial factory.new_partially_emitted_expression(v.visit_node(AstNode.expression_of(node)))
+            context.set_original(partial, node)
+            set partial.pos: node.pos
+            set partial.end: node.end
+            return partial
+        }
+        if k = KindParenthesizedExpression
+        {
+            if Checker.is_jsdoc_type_assertion(node) = false
+            {
+                let inner AstNode.expression_of(node)
+                let expression Parser.skip_outer_expressions(inner, OEKAllExceptAssertionsOrExpressionsWithTypeArguments)
+                if Transformer.is_assertion_expression(expression) or (AstNode.kind_of(expression) = KindSatisfiesExpression)
+                {
+                    let partial factory.new_partially_emitted_expression(v.visit_node(inner))
+                    context.set_original(partial, node)
+                    set partial.pos: node.pos
+                    set partial.end: node.end
+                    return partial
+                }
+            }
+            return v.visit_each_child(node)
+        }
+        if k = KindJsxSelfClosingElement
+            return factory.update_jsx_self_closing_element(node, v.visit_node(AstNode.jsx_tag_name_of(node)), null, v.visit_node(AstNode.jsx_attributes_of(node)))
+        if k = KindJsxOpeningElement
+            return factory.update_jsx_opening_element(node, v.visit_node(AstNode.jsx_tag_name_of(node)), null, v.visit_node(AstNode.jsx_attributes_of(node)))
+        if k = KindImportEqualsDeclaration
+        {
+            if AstNode.is_type_only_of(node)
+                return null
+            return v.visit_each_child(node)
+        }
+        if k = KindImportDeclaration
+        {
+            let import_clause AstNode.import_clause_of(node)
+            if import_clause = null
+                return node
+            let visited_clause v.visit_node(import_clause)
+            if visited_clause = null
+                return null
+            return factory.update_import_declaration(node, Printer.modifier_list_of(node), visited_clause, AstNode.module_specifier_of(node), AstNode.import_attributes_of(node))
+        }
+        if k = KindImportClause
+        {
+            if AstNode.is_type_only_of(node)
+                return null
+            let name Printer.declaration_name_of(node)
+            let named_bindings v.visit_node(AstNode.named_bindings_of(node))
+            if (name = null) and (named_bindings = null)
+                return null
+            return factory.update_import_clause(node, AstNode.import_clause_phase_modifier_of(node), name, named_bindings)
+        }
+        if k = KindNamedImports
+        {
+            let elements AstNode.elements_of(node)
+            if Transformer.list_is_empty(elements)
+                return node
+            let visited v.visit_nodes(elements)
+            if (opts.options.verbatim_module_syntax <> TristateTrue) and Transformer.list_is_empty(visited)
+                return null
+            return factory.update_named_imports(node, visited)
+        }
+        if k = KindImportSpecifier
+        {
+            if Printer.specifier_is_type_only_of(node)
+                return null
+            return node
+        }
+        if k = KindExportDeclaration
+        {
+            if AstNode.is_type_only_of(node)
+                return null
+            var export_clause: ref[AstNode]? null
+            let ec AstNode.export_clause_of(node)
+            if ec <> null
+            {
+                set export_clause: v.visit_node(ec)
+                if export_clause = null
+                    return null
+            }
+            return factory.update_export_declaration(node, null, false, export_clause, v.visit_node(AstNode.module_specifier_of(node)), v.visit_node(AstNode.import_attributes_of(node)))
+        }
+        if k = KindNamedExports
+        {
+            let elements AstNode.elements_of(node)
+            if Transformer.list_is_empty(elements)
+                return node
+            let visited v.visit_nodes(elements)
+            if (opts.options.verbatim_module_syntax <> TristateTrue) and Transformer.list_is_empty(visited)
+                return null
+            return factory.update_named_exports(node, visited)
+        }
+        if k = KindExportSpecifier
+        {
+            if Printer.specifier_is_type_only_of(node)
+                return null
+            return node
+        }
+        if k = KindEnumDeclaration
+        {
+            if this.the_checker().is_enum_const(node)
+                return node
+            return v.visit_each_child(node)
+        }
+        v.visit_each_child(node)
+    }
+
+    function list_is_empty(list: ref[Array[ref[AstNode]?]]?) returns bool
+    {
+        if list = null
+            return true
+        ((list as ref[Array[ref[AstNode]?]]).get_length() as int) = 0
+    }
+
+    ; ═══ transformers/modifiervisitor.go ═══
+
+    procedure visit_modifier(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let flags AstNode.modifier_to_flag(node.kind)
+        if (flags <> ModifierFlagsNone) and ((flags & allowed_modifiers) = 0)
+            return null
+        node
+    }
+
+    ; ExtractModifiers
+    function extract_modifiers(host: ref[Page], opts: TransformOptions, modifiers: ref[Array[ref[AstNode]?]]?, allowed: int) returns ref[Array[ref[AstNode]?]]?
+    {
+        if modifiers = null
+            return null
+        let tx Transformer.create(host, TransformerTagModifierVisitor, opts)
+        set tx.allowed_modifiers: allowed
+        tx.the_visitor().visit_modifiers(modifiers)
+    }
+
+    ; ═══ transformers/chain.go ═══
+
+    procedure visit_chain(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if node.kind <> KindSourceFile
+        {
+            ; the reference PANICS ("Chained transform passed non-sourcefile initial node")
+            this.record_unported("chain-non-source-file", node.kind)
+            return node
+        }
+        var result node
+        var i 0
+        while i < (components.get_length() as int)
+        {
+            let t components[i as size_t] as ref[Transformer]
+            set result: t.transform_source_file(result)
+            if t.unported_count > 0
+                this.record_unported(t.unported_tag, t.unported_detail)
+            set i: i + 1
+        }
+        result
+    }
+
+    ; ═══ estransforms/usestrict.go ═══
+
+    procedure visit_use_strict(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if node.kind <> KindSourceFile
+            return node
+        let info opts.file_info
+        if info.script_kind = ScriptKindJSON
+            return node
+        let is_external_module info.is_external_module
+        let module_kind opts.options.get_emit_module_kind()
+        let format opts.options.get_emit_module_format_of_file(info.file_name)
+        if is_external_module and (module_kind >= ModuleKindES2015) and ((module_kind = ModuleKindPreserve) or (format >= ModuleKindES2015))
+            return node
+        let old AstNode.statements_of(node)
+        var statements old
+        if statements = null
+            set statements: &Array[ref[AstNode]?]^host()
+        let ensured factory.ensure_use_strict(statements as ref[Array[ref[AstNode]?]])
+        if ensured = statements
+            return node
+        let statement_list factory.new_node_list_like(ensured, old)
+        factory.update_source_file(node, statement_list, AstNode.end_of_file_token_of(node))
+    }
+
+    ; ═══ moduletransforms/esmodule.go ═══
+
+    procedure visit_es_module(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let k node.kind
+        if k = KindSourceFile
+            return this.es_visit_source_file(node)
+        if k = KindImportDeclaration
+            return this.es_visit_import_declaration(node)
+        if k = KindImportEqualsDeclaration
+            return this.es_visit_import_equals_declaration(node)
+        if k = KindExportAssignment
+            return this.es_visit_export_assignment(node)
+        if k = KindExportDeclaration
+            return this.es_visit_export_declaration(node)
+        if k = KindCallExpression
+            return this.es_visit_call_expression(node)
+        this.the_visitor().visit_each_child(node)
+    }
+
+    procedure es_visit_source_file(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let info opts.file_info
+        if info.is_declaration_file
+            return node
+        if (info.is_external_module = false) and (opts.options.get_isolated_modules() = false)
+            return node
+        set this.current_source_file: node
+        set this.import_require_statements: null
+        var result this.the_visitor().visit_each_child(node) as ref[AstNode]
+        let helpers context.read_emit_helpers()
+        var i 0
+        while i < (helpers.get_length() as int)
+        {
+            context.add_emit_helper(result, helpers[i as size_t] as ref[EmitHelper])
+            set i: i + 1
+        }
+        let external_helpers_import_declaration this.create_external_helpers_import_declaration_if_needed(result, opts.options.get_emit_module_format_of_file(info.file_name))
+        if (external_helpers_import_declaration <> null) or (import_require_statements <> null)
+        {
+            let old AstNode.statements_of(result)
+            var src old
+            if src = null
+                set src: &Array[ref[AstNode]?]^host()
+            let s src as ref[Array[ref[AstNode]?]]
+            let n s.get_length() as int
+            let prologue_end Transformer.standard_prologue_end(s)
+            let custom_end this.custom_prologue_end(s, prologue_end)
+            let statements &Array[ref[AstNode]?]^host()
+            var j 0
+            while j < custom_end
+            {
+                statements.add(s[j as size_t])
+                set j: j + 1
+            }
+            if external_helpers_import_declaration <> null
+                statements.add(this.the_visitor().visit_node(external_helpers_import_declaration))
+            if import_require_statements <> null
+            {
+                let irs import_require_statements as ref[Array[ref[AstNode]?]]
+                var r 0
+                while r < (irs.get_length() as int)
+                {
+                    statements.add(irs[r as size_t])
+                    set r: r + 1
+                }
+            }
+            while j < n
+            {
+                statements.add(s[j as size_t])
+                set j: j + 1
+            }
+            set result: factory.update_source_file(result, factory.new_node_list_like(statements, old), AstNode.end_of_file_token_of(node))
+        }
+        if info.is_external_module and (opts.options.get_emit_module_kind() <> ModuleKindPreserve) and (Transformer.some_external_module_indicator(AstNode.statements_of(result)) = false)
+        {
+            let old AstNode.statements_of(result)
+            let statements &Array[ref[AstNode]?]^host()
+            if old <> null
+            {
+                let s old as ref[Array[ref[AstNode]?]]
+                var j 0
+                while j < (s.get_length() as int)
+                {
+                    statements.add(s[j as size_t])
+                    set j: j + 1
+                }
+            }
+            statements.add(this.create_empty_imports())
+            set result: factory.update_source_file(result, factory.new_node_list_like(statements, old), AstNode.end_of_file_token_of(node))
+        }
+        set this.import_require_statements: null
+        set this.current_source_file: null
+        result
+    }
+
+    function some_external_module_indicator(statements: ref[Array[ref[AstNode]?]]?) returns bool
+    {
+        if statements = null
+            return false
+        let s statements as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (s.get_length() as int)
+        {
+            if Parser.statement_is_external_module_indicator(s[i as size_t])
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    ; createEmptyImports: `export {};`
+    procedure create_empty_imports(this) returns ref[AstNode]
+        factory.new_export_declaration(null, false, factory.new_named_exports(&Array[ref[AstNode]?]^host()), null, null)
+
+    ; rewriteModuleSpecifier: identity unless rewriteRelativeImportExtensions
+    ; (a said stop when the option is on — the extension rewrite needs tspath
+    ; and outputpaths this port has not reached)
+    procedure rewrite_module_specifier(this, node: ref[AstNode]?) returns ref[AstNode]?
+    {
+        if node = null
+            return null
+        if opts.options.rewrite_relative_import_extensions = TristateTrue
+            this.record_unported("rewrite-relative-import-extensions", 0)
+        node
+    }
+
+    ; createExternalHelpersImportDeclarationIfNeeded: nothing unless importHelpers
+    ; (a said stop when the option is on)
+    procedure create_external_helpers_import_declaration_if_needed(this, source_file: ref[AstNode], file_module_kind: int) returns ref[AstNode]?
+    {
+        if opts.options.import_helpers = TristateTrue
+            this.record_unported("import-helpers", file_module_kind)
+        null
+    }
+
+    procedure es_visit_import_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if opts.options.rewrite_relative_import_extensions <> TristateTrue
+            return node
+        let updated_module_specifier this.rewrite_module_specifier(AstNode.module_specifier_of(node))
+        factory.update_import_declaration(node, null, this.the_visitor().visit_node(AstNode.import_clause_of(node)), updated_module_specifier, this.the_visitor().visit_node(AstNode.import_attributes_of(node)))
+    }
+
+    procedure es_visit_import_equals_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if opts.options.get_emit_module_kind() < ModuleKindNode16
+            return null
+        ; the node16+ `import x = require(...)` lowering (createRequireCall and the
+        ; `_createRequire` prologue) — a said stop until a module kind reaches it
+        this.record_unported("esmodule-import-equals", node.kind)
+        null
+    }
+
+    procedure es_visit_export_assignment(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if AstNode.is_export_equals_of(node) = false
+            return this.the_visitor().visit_each_child(node)
+        if opts.options.get_emit_module_kind() <> ModuleKindPreserve
+            return null
+        let f factory
+        let statement f.new_expression_statement(f.new_assignment_expression(f.new_property_access_expression(f.new_identifier("module"), null, f.new_identifier("exports"), NodeFlagsNone), this.the_visitor().visit_node(Printer.statement_expression_of(node))))
+        context.set_original(statement, node)
+        statement
+    }
+
+    procedure es_visit_export_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let module_specifier AstNode.module_specifier_of(node)
+        if module_specifier = null
+            return node
+        let updated_module_specifier this.rewrite_module_specifier(module_specifier)
+        let export_clause AstNode.export_clause_of(node)
+        ; the RAW module option, as the reference reads it here
+        if (opts.options.module_kind > ModuleKindES2015) or (export_clause = null) or (AstNode.kind_of(export_clause) <> KindNamespaceExport)
+            return factory.update_export_declaration(node, null, false, export_clause, updated_module_specifier, this.the_visitor().visit_node(AstNode.import_attributes_of(node)))
+        ; ES2015: `export * as ns from "m"` becomes an import plus a named export
+        let ec export_clause as ref[AstNode]
+        let old_identifier Printer.declaration_name_of(ec) as ref[AstNode]
+        let f factory
+        let synth_name f.new_generated_name_for_node(old_identifier)
+        let import_decl f.new_import_declaration(null, f.new_import_clause(KindUnknown, null, f.new_namespace_import(synth_name)), updated_module_specifier, this.the_visitor().visit_node(AstNode.import_attributes_of(node)))
+        context.set_original(import_decl, ec)
+        var export_decl: ref[AstNode]? null
+        if Checker.module_export_name_is_default(old_identifier)
+            set export_decl: f.new_export_assignment(null, false, null, synth_name)
+        else
+        {
+            let specifiers &Array[ref[AstNode]?]^host()
+            specifiers.add(f.new_export_specifier(false, synth_name, old_identifier))
+            set export_decl: f.new_export_declaration(null, false, f.new_named_exports(specifiers), null, null)
+        }
+        context.set_original(export_decl as ref[AstNode], node)
+        let both &Array[ref[AstNode]?]^host()
+        both.add(import_decl)
+        both.add(export_decl)
+        this.single_or_many(both)
+    }
+
+    procedure es_visit_call_expression(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if opts.options.rewrite_relative_import_extensions = TristateTrue
+        {
+            if (Parser.is_import_call(node) and (Transformer.list_is_empty(AstNode.call_arguments_of(node)) = false)) or (Checker.is_in_json_file(node) = false and Parser.is_require_call(node, false) and ((node.flags & NodeFlagsJavaScriptFile) <> 0))
+                this.record_unported("rewrite-relative-import-extensions", node.kind)
+        }
+        this.the_visitor().visit_each_child(node)
+    }
+}
+
+; ═══ compiler/emitter.go, the JS half, over the corpus's default options ═══
+
+; What the driver scans a file for before it decides which transformers it
+; needs: each bit names a transformer this port has not ported yet.
+define EmitFacts
+(
+    has_import_or_export: bool
+    has_runtime_syntax: bool
+    has_decorator: bool
+    has_using: bool
+    has_auto_accessor: bool
+    has_dynamic_import: bool
+)
+
+define Emitter
+(
+    host: ref[Page]
+    unported_count: int
+    unported_tag: Slice[char]
+    unported_detail: int
+)
+{
+    function create(host: ref[Page]) returns ref[Emitter]
+    {
+        let no_tag: Slice[char] ""
+        &Emitter^host(host, 0, no_tag, 0)
+    }
+
+    procedure record_unported(this, tag_text: Slice[char], detail: int)
+    {
+        if unported_count = 0
+        {
+            set this.unported_tag: tag_text
+            set this.unported_detail: detail
+        }
+        set this.unported_count: unported_count + 1
+    }
+
+    ; ast.isFileForcedToBeModuleByFormat under moduleDetection "auto": a file
+    ; whose implied node format is ESNext (`.mts`/`.mjs`), or a `.mts`/`.mjs`
+    ; file outright, is an external module whatever its statements say. The
+    ; parser's `external_module_indicator` reads the statements only; the
+    ; emitter's file record ORs this in.
+    ; internal/vfs/internal/internal.go decodeBytes + decodeUtf16: the compiler
+    ; host reads a source file THROUGH this — a UTF-16 file (either byte order
+    ; mark) is transcoded to UTF-8 and a UTF-8 mark is dropped — while the
+    ; yardstick oracles read the raw bytes (os.ReadFile). The emit baseline is
+    ; the decoded file's, so the emit path decodes and the other six do not;
+    ; tscaly_dump re-parses the decoded text for the emit alone. Answers true
+    ; when `out` holds a DIFFERENT text than `text` (a mark was found).
+    function decode_bytes(text: Slice[char], out: ref[StringBuilder]) returns bool
+    {
+        let n text.length
+        if n >= 2
+        {
+            let b0 text[0] as int
+            let b1 text[1] as int
+            if (b0 = 0xFF) and (b1 = 0xFE)
+            {
+                Emitter.decode_utf16(text, 2, true, out)
+                return true
+            }
+            if (b0 = 0xFE) and (b1 = 0xFF)
+            {
+                Emitter.decode_utf16(text, 2, false, out)
+                return true
+            }
+        }
+        if n >= 3
+        {
+            if ((text[0] as int) = 0xEF) and ((text[1] as int) = 0xBB) and ((text[2] as int) = 0xBF)
+            {
+                out.append(text.data + 3, (n - 3) as size_t)
+                return true
+            }
+        }
+        false
+    }
+
+    ; decodeUtf16: the code units in the given byte order (an odd trailing byte
+    ; is dropped, as binary.Read's len/2 does), unicode/utf16.Decode's pairing
+    ; (an unpaired surrogate becomes U+FFFD), then UTF-8.
+    function decode_utf16(text: Slice[char], start: int, little_endian: bool, out: ref[StringBuilder])
+    {
+        let units (text.length - start) / 2
+        var i 0
+        while i < units
+        {
+            var u Emitter.utf16_unit_at(text, start + i * 2, little_endian)
+            set i: i + 1
+            var cp u
+            if (u >= 0xD800) and (u < 0xDC00)
+            {
+                set cp: 0xFFFD
+                if i < units
+                {
+                    let lo Emitter.utf16_unit_at(text, start + i * 2, little_endian)
+                    if (lo >= 0xDC00) and (lo < 0xE000)
+                    {
+                        set cp: 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00)
+                        set i: i + 1
+                    }
+                }
+            }
+            if (u >= 0xDC00) and (u < 0xE000)
+                set cp: 0xFFFD
+            Emitter.append_utf8(out, cp)
+        }
+    }
+
+    function utf16_unit_at(text: Slice[char], at: int, little_endian: bool) returns int
+    {
+        let a text[at] as int
+        let b text[at + 1] as int
+        if little_endian
+            return (a & 0xFF) | ((b & 0xFF) << 8)
+        ((a & 0xFF) << 8) | (b & 0xFF)
+    }
+
+    function append_utf8(out: ref[StringBuilder], cp: int)
+    {
+        if cp < 0x80
+        {
+            out.append(cp as char)
+            return
+        }
+        if cp < 0x800
+        {
+            out.append((0xC0 | (cp >> 6)) as char)
+            out.append((0x80 | (cp & 0x3F)) as char)
+            return
+        }
+        if cp < 0x10000
+        {
+            out.append((0xE0 | (cp >> 12)) as char)
+            out.append((0x80 | ((cp >> 6) & 0x3F)) as char)
+            out.append((0x80 | (cp & 0x3F)) as char)
+            return
+        }
+        out.append((0xF0 | (cp >> 18)) as char)
+        out.append((0x80 | ((cp >> 12) & 0x3F)) as char)
+        out.append((0x80 | ((cp >> 6) & 0x3F)) as char)
+        out.append((0x80 | (cp & 0x3F)) as char)
+    }
+
+    function is_file_forced_to_be_module_by_format(file_name: Slice[char], options: EmitOptions) returns bool
+    {
+        if options.get_emit_module_format_of_file(file_name) = ModuleKindESNext
+            return true
+        file_name.ends_with(".mts") or file_name.ends_with(".mjs")
+    }
+
+    ; the file's identifier table (sourceFile.Identifiers): every Identifier and
+    ; PrivateIdentifier text in the tree, once
+    function collect_identifiers(host: ref[Page], node: ref[AstNode], out: ref[Array[Slice[char]]])
+    {
+        let k node.kind
+        if (k = KindIdentifier) or (k = KindPrivateIdentifier)
+        {
+            let text AstNode.identifier_text_of(node)
+            if NameGenerator.names_contain(out, text) = false
+                out.add(text)
+        }
+        var i 0
+        while true
+        {
+            let child AstNode.child_at(node, i)
+            if child = null
+                break
+            Emitter.collect_identifiers(host, child as ref[AstNode], out)
+            set i: i + 1
+        }
+    }
+
+    procedure scan(this, node: ref[AstNode], checker: ref[Checker], facts: ref[EmitFacts])
+    {
+        let k node.kind
+        if (k = KindImportDeclaration) or (k = KindExportDeclaration) or (k = KindExportAssignment) or (k = KindNamespaceExportDeclaration) or (k = KindImportEqualsDeclaration)
+            set facts.has_import_or_export: true
+        if k = KindEnumDeclaration
+            set facts.has_runtime_syntax: true
+        if k = KindModuleDeclaration
+        {
+            ; the eraser drops a non-instantiated one itself; an instantiated one
+            ; is the runtime-syntax transformer's
+            if checker.is_instantiated_module(node)
+                set facts.has_runtime_syntax: true
+        }
+        if k = KindParameter
+        {
+            if Transformer.is_parameter_property_declaration(node, node.parent)
+                set facts.has_runtime_syntax: true
+        }
+        if k = KindDecorator
+            set facts.has_decorator: true
+        if k = KindVariableDeclarationList
+        {
+            if (node.flags & NodeFlagsUsing) <> 0
+                set facts.has_using: true
+        }
+        if k = KindAccessorKeyword
+            set facts.has_auto_accessor: true
+        if k = KindCallExpression
+        {
+            if Parser.is_import_call(node)
+                set facts.has_dynamic_import: true
+        }
+        if k = KindMetaProperty
+        {
+            if AstNode.meta_property_keyword_token_of(node) = KindImportKeyword
+                set facts.has_dynamic_import: true
+        }
+        var i 0
+        while true
+        {
+            let child AstNode.child_at(node, i)
+            if child = null
+                break
+            this.scan(child as ref[AstNode], checker, facts)
+            set i: i + 1
+        }
+    }
+
+    ; emitJSFile for one file under the default options: the transformers in
+    ; getScriptTransformers' order, then the printer. The JS text is APPENDED to
+    ; `out`, the caller's builder; a said stop leaves `unported_count` > 0 and
+    ; appends nothing. ★Neither a returned nor a stored String survives this
+    ; routine: `to_string()` constructs on the CALLER page, which for a call
+    ; made here is this routine's own region — gone with the return, and the
+    ; text read back as garbage three units in (root CLAUDE.md, the out-param
+    ; class). The bytes are copied out while the region lives.
+    procedure emit_js(this, file: ref[AstNode], info: ref[SourceFileInfo], options: EmitOptions, checker: ref[Checker], binder: ref[Binder], out: ref[StringBuilder])
+    {
+        ; sourceFileMayBeEmitted: no JS for a declaration file, nor for JSON
+        ; without an outDir
+        if info.is_declaration_file
+            return
+        if info.script_kind = ScriptKindJSON
+            return
+        ; a JavaScript file is not in the program without allowJs (the yardstick's
+        ; default options), so the reference emits nothing for it: 158 `.js`,
+        ; 4 `.jsx` and 2 `.cjs` units of the corpus, every reference answer empty
+        if (info.script_kind = ScriptKindJS) or (info.script_kind = ScriptKindJSX)
+            return
+        var facts EmitFacts(false, false, false, false, false, false)
+        this.scan(file, checker, &facts)
+        ; getScriptTransformers, each gate a transformer not yet ported
+        let import_elision_enabled (options.verbatim_module_syntax <> TristateTrue) and ((file.flags & NodeFlagsJavaScriptFile) = 0)
+        if import_elision_enabled and facts.has_import_or_export
+            this.record_unported("transform-import-elision", 0)
+        if facts.has_runtime_syntax
+            this.record_unported("transform-runtime-syntax", 0)
+        if options.experimental_decorators = TristateTrue
+            this.record_unported("transform-legacy-decorators", 0)
+        if options.get_jsx_transform_enabled()
+            this.record_unported("transform-jsx", 0)
+        ; estransforms.GetESTransformer at the default target: using, ES decorators, class fields
+        let target options.get_emit_script_target()
+        if target < ScriptTargetES2021
+            this.record_unported("transform-es-downlevel", target)
+        if facts.has_using
+            this.record_unported("transform-using", 0)
+        if facts.has_decorator and (target < ScriptTargetLatest)
+            this.record_unported("transform-es-decorators", 0)
+        if facts.has_auto_accessor and (target < ScriptTargetLatest)
+            this.record_unported("transform-class-fields", 0)
+        let module_kind options.get_emit_module_kind()
+        let format options.get_emit_module_format_of_file(info.file_name)
+        if module_kind = ModuleKindPreserve
+            this.record_unported("transform-module-preserve", 0)
+        else
+        {
+            if (module_kind >= ModuleKindES2015) and (module_kind <= ModuleKindNodeNext) and (module_kind <> ModuleKindSystem)
+            {
+                ; the implied module transformer: ESM by format, else CommonJS
+                if format < ModuleKindES2015
+                    this.record_unported("transform-commonjs", format)
+            }
+            else
+                this.record_unported("transform-commonjs", module_kind)
+        }
+        if (options.get_isolated_modules() = false) and facts.has_runtime_syntax
+            this.record_unported("transform-const-enum-inlining", 0)
+        if facts.has_dynamic_import and (format < ModuleKindES2015)
+            this.record_unported("transform-commonjs", format)
+        if unported_count > 0
+            return
+        let context EmitContext.create(host, AstNode.list_ranges_of(file))
+        let opts TransformOptions(context, options, checker, binder, info)
+        var current file
+        let eraser Transformer.create(host, TransformerTagTypeEraser, opts)
+        set current: eraser.transform_source_file(current)
+        let use_strict Transformer.create(host, TransformerTagUseStrict, opts)
+        set current: use_strict.transform_source_file(current)
+        let es_module Transformer.create(host, TransformerTagESModule, opts)
+        set current: es_module.transform_source_file(current)
+        if eraser.unported_count > 0
+            this.record_unported(eraser.unported_tag, eraser.unported_detail)
+        if use_strict.unported_count > 0
+            this.record_unported(use_strict.unported_tag, use_strict.unported_detail)
+        if es_module.unported_count > 0
+            this.record_unported(es_module.unported_tag, es_module.unported_detail)
+        if unported_count > 0
+            return
+        ; the printer, over the TRANSFORMED file (its record's node is the one it prints)
+        set info.node: current
+        let printer_options PrinterOptions(options.remove_comments, options.new_line, options.no_emit_helpers, options.target, false, false, false, false, false, false, false, false)
+        let printer Printer.create(host, printer_options, context)
+        let writer TextWriter.create(host, printer_options.new_line_character(), 0)
+        printer.write_node(current, info, writer, null)
+        ; printSourceFile: no source maps, so a line, then the text
+        writer.write_line()
+        if printer.unported_count > 0
+        {
+            this.record_unported(printer.unported_tag, printer.unported_detail)
+            return
+        }
+        let text writer.to_string()
+        out.append(text.get_buffer(), text.get_length())
+    }
+}

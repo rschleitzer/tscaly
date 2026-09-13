@@ -128,6 +128,12 @@ FILTER=${1:-}
 STAGE=${TSCALY_STAGE:-1}
 
 LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
+# ★ The port recurses where the reference's Go stack grows (slice 236): a 6 452-term
+# binary expression (binderBinaryExpressionStress) is ~10 frames per term through the
+# printer, and the default 8 MB stack faults at rc -11 — a crash, and one process writes
+# all seven artifacts, so every yardstick of that unit turns UNEXPLAINED. 64 MB is the
+# macOS hard limit; the batch inherits it.
+ulimit -s 65520 2>/dev/null || true
 SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
