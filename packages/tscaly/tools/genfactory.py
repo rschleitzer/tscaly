@@ -158,7 +158,13 @@ FACTORY_TAIL = """
         if visit_tag = VisitTagDeepClone
             return this.deep_clone_visit(node)
         if visit_tag = VisitTagTransformer
+        {
+            ; a transformer's SECOND and further visitors (the reference's
+            ; per-transformer closures) are told apart by `sub_tag` (slice 240)
+            if sub_tag <> 0
+                return (transformer as ref[Transformer]).visit_sub(node, sub_tag)
             return (transformer as ref[Transformer]).visit(node)
+        }
         node
     }
 
@@ -1763,10 +1769,11 @@ define NodeVisitor
     synthetic_location: bool
     context: ref[EmitContext]?
     transformer: ref[Transformer]?
+    sub_tag: int
 )
 {
     function create(host: ref[Page], factory: ref[NodeFactory], visit_tag: int, hooks_tag: int) returns ref[NodeVisitor]
-        &NodeVisitor^host(host, factory, visit_tag, hooks_tag, false, null, null)
+        &NodeVisitor^host(host, factory, visit_tag, hooks_tag, false, null, null, 0)
 
     ; VisitEachChild: the per-kind dispatch (generated).
     procedure visit_each_child(this, node: ref[AstNode]?) returns ref[AstNode]?
@@ -1779,7 +1786,7 @@ define NodeVisitor
         ; SourceFile: its VisitEachChild is hand-written in the reference (ast.go),
         ; not generated — the statements, then the end-of-file token
         if n.kind = KindSourceFile
-            return factory.update_source_file(n, this.visit_nodes_h(AstNode.statements_of(n)), this.visit_token_h(AstNode.end_of_file_token_of(n)))
+            return factory.update_source_file(n, this.visit_top_level_statements_h(AstNode.statements_of(n)), this.visit_token_h(AstNode.end_of_file_token_of(n)))
         choose n.data''')
 for arm, rec in arms.items():
     # find the Go struct whose visit applies to this arm
