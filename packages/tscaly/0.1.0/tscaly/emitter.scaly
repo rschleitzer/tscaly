@@ -62,6 +62,11 @@ define TransformerTagModifierVisitor: int 5
 define TransformerTagImportElision: int 6
 define TransformerTagRuntimeSyntax: int 7
 define TransformerTagConstEnumInlining: int 8
+define TransformerTagUsing: int 9
+; estransforms/using.go usingKind
+define UsingKindNone:  int 0
+define UsingKindSync:  int 1
+define UsingKindAsync: int 2
 ; ast.ModifierFlagsTypeScriptModifier
 define ModifierFlagsTypeScriptModifier: int ModifierFlagsAmbient | ModifierFlagsPublic | ModifierFlagsPrivate | ModifierFlagsProtected | ModifierFlagsReadonly | ModifierFlagsAbstract | ModifierFlagsConst | ModifierFlagsOverride | ModifierFlagsIn | ModifierFlagsOut
 
@@ -238,6 +243,11 @@ define Transformer
     current_scope_first_declarations: ref[Array[NameNode]]?
     current_enum: ref[AstNode]?
     current_namespace: ref[AstNode]?
+    ; using.go's hoisting state (slice 239)
+    export_bindings: ref[Array[NameNode]]?
+    export_vars: ref[Array[ref[AstNode]?]]?
+    default_export_binding: ref[AstNode]?
+    export_equals_binding: ref[AstNode]?
     unported_count: int
     unported_tag: Slice[char]
     unported_detail: int
@@ -249,7 +259,7 @@ define Transformer
     {
         let comps &Array[ref[Transformer]?]^host()
         let no_tag: Slice[char] ""
-        let t &Transformer^host(host, tag, opts.context, opts.context.the_factory(), null, opts, null, null, comps, 0, null, null, null, null, null, null, null, 0, no_tag, 0)
+        let t &Transformer^host(host, tag, opts.context, opts.context.the_factory(), null, opts, null, null, comps, 0, null, null, null, null, null, null, null, null, null, null, null, 0, no_tag, 0)
         let v opts.context.new_node_visitor(VisitTagTransformer)
         set v.transformer: t
         set t.visitor: v
@@ -302,6 +312,8 @@ define Transformer
             return this.visit_runtime_syntax(node)
         if tag = TransformerTagConstEnumInlining
             return this.visit_const_enum_inlining(node)
+        if tag = TransformerTagUsing
+            return this.visit_using(node)
         this.record_unported("transformer-tag", tag)
         node
     }
@@ -1681,6 +1693,1127 @@ define Transformer
         }
         b.append(" " as char)
         Printer.slice_on(host, b.to_string())
+    }
+
+    ; ═══ estransforms/using.go (slice 239) ═══
+    ;
+    ; `using` / `await using` declarations into the `env` record, the
+    ; `__addDisposableResource` calls and the try/catch/finally that disposes;
+    ; the top-level statements after the first `using` move into the `try`,
+    ; imports, exports, functions and classes hoisted out of it.
+
+    procedure visit_using(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if (Emitter.subtree_facts(node) & SubtreeContainsUsing) = 0
+            return node
+        let k node.kind
+        if k = KindSourceFile
+            return this.us_visit_source_file(node)
+        if k = KindBlock
+            return this.us_visit_block(node)
+        if k = KindForStatement
+            return this.us_visit_for_statement(node)
+        if k = KindForOfStatement
+            return this.us_visit_for_of_statement(node)
+        this.the_visitor().visit_each_child(node)
+    }
+
+    procedure us_visit_source_file(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if opts.file_info.is_declaration_file
+            return node
+        let v this.the_visitor()
+        var visited: ref[AstNode]? null
+        let statements AstNode.statements_of(node) as ref[Array[ref[AstNode]?]]
+        let using_kind Transformer.get_using_kind_of_statements(statements)
+        if using_kind <> UsingKindNone
+        {
+            context.start_variable_environment()
+            set this.export_bindings: &Array[NameNode]^host()
+            set this.export_vars: null
+            let prologue_end factory.split_standard_prologue(statements)
+            let top_level &Array[ref[AstNode]?]^host()
+            var changed false
+            Transformer.add_all(top_level, v.visit_slice(Transformer.sub_list(host, statements, 0, prologue_end), &changed))
+            ; Collect and transform any leading statements up to the first `using` or `await using`.
+            let rest Transformer.sub_list(host, statements, prologue_end, statements.get_length() as int)
+            var pos 0
+            while pos < (rest.get_length() as int)
+            {
+                let statement rest[pos as size_t]
+                if Transformer.get_using_kind(statement) <> UsingKindNone
+                {
+                    if pos > 0
+                        Transformer.add_all(top_level, v.visit_slice(Transformer.sub_list(host, rest, 0, pos), &changed))
+                    break
+                }
+                set pos: pos + 1
+            }
+            ; transform the rest of the body
+            let env_binding this.us_create_env_binding()
+            let body_statements this.us_transform_using_declarations(Transformer.sub_list(host, rest, pos, rest.get_length() as int), env_binding, top_level)
+            ; add `export {}` declarations for any hoisted bindings.
+            let bindings export_bindings as ref[Array[NameNode]]
+            if bindings.get_length() > 0
+            {
+                let specifiers &Array[ref[AstNode]?]^host()
+                var i 0
+                while i < (bindings.get_length() as int)
+                {
+                    let binding bindings[i as size_t]
+                    specifiers.add(binding.node)
+                    set i: i + 1
+                }
+                top_level.add(factory.new_export_declaration(null, false, factory.new_named_exports(specifiers), null, null))
+            }
+            Transformer.add_all(top_level, context.end_variable_environment())
+            if export_vars <> null
+            {
+                let modifiers &Array[ref[AstNode]?]^host()
+                modifiers.add(factory.new_token(KindExportKeyword))
+                top_level.add(factory.new_variable_statement(modifiers, factory.new_variable_declaration_list(export_vars, NodeFlagsLet)))
+            }
+            Transformer.add_all(top_level, this.us_create_downlevel_using_statements(body_statements, env_binding, using_kind = UsingKindAsync))
+            if export_equals_binding <> null
+                top_level.add(factory.new_export_assignment(null, true, null, export_equals_binding))
+            set visited: factory.update_source_file(node, top_level, AstNode.end_of_file_token_of(node))
+        }
+        else
+            set visited: v.visit_each_child(node)
+        let result visited as ref[AstNode]
+        let helpers context.read_emit_helpers()
+        var h 0
+        while h < (helpers.get_length() as int)
+        {
+            let helper helpers[h as size_t]
+            if helper <> null
+                context.add_emit_helper(result, helper as ref[EmitHelper])
+            set h: h + 1
+        }
+        set this.export_vars: null
+        set this.export_bindings: null
+        set this.default_export_binding: null
+        set this.export_equals_binding: null
+        result
+    }
+
+    procedure us_visit_block(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let v this.the_visitor()
+        let statements AstNode.statements_of(node) as ref[Array[ref[AstNode]?]]
+        let using_kind Transformer.get_using_kind_of_statements(statements)
+        if using_kind = UsingKindNone
+            return v.visit_each_child(node)
+        let prologue_end factory.split_standard_prologue(statements)
+        let env_binding this.us_create_env_binding()
+        let out &Array[ref[AstNode]?]^host()
+        var changed false
+        Transformer.add_all(out, v.visit_slice(Transformer.sub_list(host, statements, 0, prologue_end), &changed))
+        let rest Transformer.sub_list(host, statements, prologue_end, statements.get_length() as int)
+        Transformer.add_all(out, this.us_create_downlevel_using_statements(this.us_transform_using_declarations(rest, env_binding, null), env_binding, using_kind = UsingKindAsync))
+        var sp 0 - 1
+        var se 0 - 1
+        AstNode.list_range_of(current_source_file, statements, &sp, &se)
+        factory.set_list_range(out, sp, se)
+        factory.update_block(node, out, AstNode.multi_line_of(node))
+    }
+
+    ; `for (using x = expr; cond; incr) { ... }` → `{ using x = expr; for (; cond; incr) { ... } }`
+    procedure us_visit_for_statement(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let v this.the_visitor()
+        let initializer AstNode.initializer_of(node)
+        if initializer = null
+            return v.visit_each_child(node)
+        if Transformer.is_using_variable_declaration_list(initializer as ref[AstNode]) = false
+            return v.visit_each_child(node)
+        let statements &Array[ref[AstNode]?]^host()
+        statements.add(factory.new_variable_statement(null, initializer))
+        statements.add(factory.update_for_statement(node, null, AstNode.for_condition_of(node), AstNode.for_incrementor_of(node), Printer.statement_body_of(node)))
+        v.visit_node(factory.new_block(statements, false))
+    }
+
+    ; `for (using x of y) { ... }` → `for (const x_1 of y) { using x = x_1; ... }`
+    procedure us_visit_for_of_statement(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let v this.the_visitor()
+        let initializer AstNode.initializer_of(node)
+        if initializer = null
+            return v.visit_each_child(node)
+        let init_node initializer as ref[AstNode]
+        if Transformer.is_using_variable_declaration_list(init_node) = false
+            return v.visit_each_child(node)
+        let decls Printer.declarations_of(init_node)
+        var for_decl: ref[AstNode]? null
+        if decls <> null
+        {
+            let dl decls as ref[Array[ref[AstNode]?]]
+            if dl.get_length() > 0
+                set for_decl: dl[0]
+        }
+        if for_decl = null
+            set for_decl: factory.new_variable_declaration(factory.new_temp_variable(), null, null, null)
+        let fd for_decl as ref[AstNode]
+        let is_await_using Transformer.get_using_kind_of_variable_declaration_list(init_node) = UsingKindAsync
+        let fd_name Printer.declaration_name_of(fd) as ref[AstNode]
+        let temp factory.new_generated_name_for_node(fd_name)
+        let using_var factory.update_variable_declaration(fd, fd_name, null, null, temp)
+        let one &Array[ref[AstNode]?]^host()
+        one.add(using_var)
+        var flags NodeFlagsUsing
+        if is_await_using
+            set flags: NodeFlagsAwaitUsing
+        let using_var_statement factory.new_variable_statement(null, factory.new_variable_declaration_list(one, flags))
+        let body Printer.statement_body_of(node) as ref[AstNode]
+        var statement: ref[AstNode]? null
+        if body.kind = KindBlock
+        {
+            let inner &Array[ref[AstNode]?]^host()
+            inner.add(using_var_statement)
+            Transformer.add_all(inner, AstNode.statements_of(body))
+            set statement: factory.update_block(body, inner, AstNode.multi_line_of(body))
+        }
+        else
+        {
+            let inner &Array[ref[AstNode]?]^host()
+            inner.add(using_var_statement)
+            inner.add(body)
+            set statement: factory.new_block(inner, true)
+        }
+        let temp_decls &Array[ref[AstNode]?]^host()
+        temp_decls.add(factory.new_variable_declaration(temp, null, null, null))
+        v.visit_node(factory.update_for_in_or_of_statement(node, AstNode.for_await_modifier_of(node), factory.new_variable_declaration_list(temp_decls, NodeFlagsConst), AstNode.expression_of(node), statement))
+    }
+
+    ; transformUsingDeclarations: the body statements, each `using` replaced by
+    ; `const x = __addDisposableResource(env, init_node, async)`, the rest visited and
+    ; — at the top level — hoisted
+    procedure us_transform_using_declarations(this, statements_in: ref[Array[ref[AstNode]?]], env_binding: ref[AstNode], top_level: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]
+    {
+        let v this.the_visitor()
+        let statements &Array[ref[AstNode]?]^host()
+        var i 0
+        while i < (statements_in.get_length() as int)
+        {
+            let statement statements_in[i as size_t]
+            set i: i + 1
+            if statement = null
+                continue
+            let s statement as ref[AstNode]
+            let using_kind Transformer.get_using_kind(s)
+            if using_kind <> UsingKindNone
+            {
+                let declaration_list Printer.declaration_list_of(s) as ref[AstNode]
+                let declarations &Array[ref[AstNode]?]^host()
+                var valid true
+                let dl Printer.declarations_of(declaration_list)
+                if dl <> null
+                {
+                    let list dl as ref[Array[ref[AstNode]?]]
+                    var d 0
+                    while d < (list.get_length() as int)
+                    {
+                        var declaration list[d as size_t] as ref[AstNode]
+                        set d: d + 1
+                        if AstNode.kind_of(Printer.declaration_name_of(declaration)) <> KindIdentifier
+                        {
+                            ; Since binding patterns are a grammar error, we reset `declarations` so we don't process this as a `using`.
+                            set valid: false
+                            break
+                        }
+                        ; perform a shallow transform for any named evaluation
+                        if Transformer.is_named_evaluation(context, declaration)
+                        {
+                            let empty: Slice[char] ""
+                            set declaration: Transformer.transform_named_evaluation(context, declaration, false, empty)
+                        }
+                        var initializer v.visit_node(AstNode.initializer_of(declaration))
+                        if initializer = null
+                            set initializer: factory.new_void_zero_expression()
+                        declarations.add(factory.update_variable_declaration(declaration, Printer.declaration_name_of(declaration), null, null, factory.new_add_disposable_resource_helper(env_binding, initializer as ref[AstNode], using_kind = UsingKindAsync)))
+                    }
+                }
+                ; Only replace the statement if it was valid.
+                if valid and (declarations.get_length() > 0)
+                {
+                    let var_list factory.new_variable_declaration_list(declarations, NodeFlagsConst)
+                    context.set_original(var_list, declaration_list)
+                    set var_list.pos: declaration_list.pos
+                    set var_list.end: declaration_list.end
+                    this.us_hoist_or_append(statements, factory.update_variable_statement(s, null, var_list), top_level)
+                    continue
+                }
+            }
+            let result this.visit_using(s)
+            if result = null
+                continue
+            let r result as ref[AstNode]
+            if r.kind = KindSyntaxList
+            {
+                let children AstNode.elements_of(r)
+                if children <> null
+                {
+                    let cl children as ref[Array[ref[AstNode]?]]
+                    var c 0
+                    while c < (cl.get_length() as int)
+                    {
+                        let child cl[c as size_t]
+                        set c: c + 1
+                        if child <> null
+                            this.us_hoist_or_append(statements, child as ref[AstNode], top_level)
+                    }
+                }
+            }
+            else
+                this.us_hoist_or_append(statements, r, top_level)
+        }
+        statements
+    }
+
+    ; hoistOrAppendNode: `hoist` answers the statement that stays in the body
+    ; (or null), the top-level ones go out through `top_level`
+    procedure us_hoist_or_append(this, statements: ref[Array[ref[AstNode]?]], node: ref[AstNode], top_level: ref[Array[ref[AstNode]?]]?)
+    {
+        var kept: ref[AstNode]? node
+        if top_level <> null
+        {
+            let tl top_level as ref[Array[ref[AstNode]?]]
+            let k node.kind
+            if (k = KindImportDeclaration) or (k = KindImportEqualsDeclaration) or (k = KindExportDeclaration) or (k = KindFunctionDeclaration)
+            {
+                ; NOTE: `node` has already been visited
+                tl.add(node)
+                set kept: null
+            }
+            if k = KindExportAssignment
+                set kept: this.us_hoist_export_assignment(node)
+            if k = KindClassDeclaration
+                set kept: this.us_hoist_class_declaration(node)
+            if k = KindVariableStatement
+                set kept: this.us_hoist_variable_statement(node)
+        }
+        if kept <> null
+            statements.add(kept)
+    }
+
+    procedure us_hoist_export_assignment(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if AstNode.is_export_equals_of(node)
+            return this.us_hoist_export_equals(node)
+        this.us_hoist_export_default(node)
+    }
+
+    ; `export default expr;` → `var default_1; export { default_1 as default };` up top, `default_1 = expr;` in the body
+    procedure us_hoist_export_default(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if default_export_binding <> null
+            return node
+        let default_text: Slice[char] "_default"
+        let empty: Slice[char] ""
+        set this.default_export_binding: factory.new_unique_name_ex(default_text, GeneratedIdentifierFlagsReservedInNestedScopes | GeneratedIdentifierFlagsFileLevel | GeneratedIdentifierFlagsOptimistic, empty, empty)
+        let default_name: Slice[char] "default"
+        this.us_hoist_binding_identifier(default_export_binding as ref[AstNode], true, factory.new_identifier(default_name), node)
+        ; give a class or function expression an assigned name, if needed.
+        var expression Checker.export_assignment_expression_of(node) as ref[AstNode]
+        var inner Parser.skip_outer_expressions(expression, OEKAll) as ref[AstNode]
+        if Transformer.is_named_evaluation(context, inner)
+        {
+            set inner: Transformer.transform_named_evaluation(context, inner, false, default_name)
+            set expression: factory.restore_outer_expressions(expression, inner, OEKAll) as ref[AstNode]
+        }
+        factory.new_expression_statement(factory.new_assignment_expression(default_export_binding, expression))
+    }
+
+    ; `export = expr;` → `var default_1;` up top, `default_1 = expr;` in the body, `export = default_1;` after
+    procedure us_hoist_export_equals(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if export_equals_binding <> null
+            return node
+        let default_text: Slice[char] "_default"
+        let empty: Slice[char] ""
+        set this.export_equals_binding: factory.new_unique_name_ex(default_text, GeneratedIdentifierFlagsReservedInNestedScopes | GeneratedIdentifierFlagsFileLevel | GeneratedIdentifierFlagsOptimistic, empty, empty)
+        context.add_variable_declaration(export_equals_binding as ref[AstNode])
+        factory.new_expression_statement(factory.new_assignment_expression(export_equals_binding, Checker.export_assignment_expression_of(node)))
+    }
+
+    ; a class declaration at the top level of a file with a top-level `using`
+    ; becomes `C = class {}` in the body, its binding hoisted
+    procedure us_hoist_class_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let name Printer.declaration_name_of(node)
+        if (name = null) and (default_export_binding <> null)
+            return node
+        let is_exported Transformer.has_syntactic_modifier(node, ModifierFlagsExport)
+        let is_default Transformer.has_syntactic_modifier(node, ModifierFlagsDefault)
+        var expression this.convert_class_declaration_to_class_expression(node)
+        let empty: Slice[char] ""
+        if name <> null
+        {
+            this.us_hoist_binding_identifier(factory.get_local_name(node), is_exported and (is_default = false), null, node)
+            set expression: factory.new_assignment_expression(factory.get_declaration_name(node), expression)
+            context.set_original(expression, node)
+            context.set_source_map_range(expression, TextRange.of_node(node))
+            context.set_comment_range(expression, TextRange.of_node(node))
+            if Transformer.is_named_evaluation(context, expression)
+                set expression: Transformer.transform_named_evaluation(context, expression, false, empty)
+        }
+        if is_default and (default_export_binding = null)
+        {
+            let default_text: Slice[char] "_default"
+            set this.default_export_binding: factory.new_unique_name_ex(default_text, GeneratedIdentifierFlagsReservedInNestedScopes | GeneratedIdentifierFlagsFileLevel | GeneratedIdentifierFlagsOptimistic, empty, empty)
+            let default_name: Slice[char] "default"
+            this.us_hoist_binding_identifier(default_export_binding as ref[AstNode], true, factory.new_identifier(default_name), node)
+            set expression: factory.new_assignment_expression(default_export_binding, expression)
+            context.set_original(expression, node)
+            if Transformer.is_named_evaluation(context, expression)
+                set expression: Transformer.transform_named_evaluation(context, expression, false, default_name)
+        }
+        factory.new_expression_statement(expression)
+    }
+
+    procedure us_hoist_variable_statement(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let expressions &Array[ref[AstNode]?]^host()
+        let is_exported Transformer.has_syntactic_modifier(node, ModifierFlagsExport)
+        let dl Printer.declarations_of(Printer.declaration_list_of(node) as ref[AstNode])
+        if dl <> null
+        {
+            let list dl as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (list.get_length() as int)
+            {
+                let variable list[i as size_t] as ref[AstNode]
+                set i: i + 1
+                this.us_hoist_binding_element(variable, is_exported, variable)
+                if AstNode.initializer_of(variable) <> null
+                    expressions.add(this.us_hoist_initialized_variable(variable))
+            }
+        }
+        if expressions.get_length() = 0
+            return null
+        let statement factory.new_expression_statement(factory.inline_expressions(expressions))
+        context.set_original(statement, node)
+        context.set_comment_range(statement, TextRange.of_node(node))
+        context.set_source_map_range(statement, TextRange.of_node(node))
+        statement
+    }
+
+    procedure us_hoist_initialized_variable(this, node: ref[AstNode]) returns ref[AstNode]
+    {
+        let name Printer.declaration_name_of(node) as ref[AstNode]
+        var target: ref[AstNode]? null
+        if name.kind = KindIdentifier
+        {
+            let t factory.clone(name)
+            context.set_emit_flags(t, context.emit_flags(t) & (SubtreeFactsAllBits xor (EFLocalName | EFExportName)))
+            set target: t
+        }
+        else
+            set target: Transformer.convert_binding_pattern_to_assignment_pattern(context, name)
+        let assignment factory.new_assignment_expression(target, AstNode.initializer_of(node))
+        context.set_original(assignment, node)
+        context.set_comment_range(assignment, TextRange.of_node(node))
+        context.set_source_map_range(assignment, TextRange.of_node(node))
+        assignment
+    }
+
+    procedure us_hoist_binding_element(this, node: ref[AstNode], is_exported_declaration: bool, original: ref[AstNode])
+    {
+        let name Printer.declaration_name_of(node)
+        if name = null
+            return
+        let nm name as ref[AstNode]
+        if AstNode.is_binding_pattern(nm)
+        {
+            let elements AstNode.elements_of(nm)
+            if elements = null
+                return
+            let el elements as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (el.get_length() as int)
+            {
+                let element el[i as size_t]
+                set i: i + 1
+                if element = null
+                    continue
+                if Printer.declaration_name_of(element as ref[AstNode]) <> null
+                    this.us_hoist_binding_element(element as ref[AstNode], is_exported_declaration, original)
+            }
+            return
+        }
+        this.us_hoist_binding_identifier(nm, is_exported_declaration, null, original)
+    }
+
+    procedure us_hoist_binding_identifier(this, node: ref[AstNode], is_export: bool, export_alias: ref[AstNode]?, original: ref[AstNode]?)
+    {
+        var name node
+        if context.has_auto_generate_info(node) = false
+            set name: factory.clone(node)
+        if is_export
+        {
+            if (export_alias = null) and ((context.emit_flags(name) & EFLocalName) = 0)
+            {
+                let var_decl factory.new_variable_declaration(name, null, null, null)
+                if original <> null
+                    context.set_original(var_decl, original as ref[AstNode])
+                if export_vars = null
+                    set this.export_vars: &Array[ref[AstNode]?]^host()
+                (export_vars as ref[Array[ref[AstNode]?]]).add(var_decl)
+                return
+            }
+            var local_name: ref[AstNode]? null
+            var export_name: ref[AstNode]? name
+            if export_alias <> null
+            {
+                set local_name: name
+                set export_name: export_alias
+            }
+            let specifier factory.new_export_specifier(false, local_name, export_name)
+            if original <> null
+                context.set_original(specifier, original as ref[AstNode])
+            if export_bindings = null
+                set this.export_bindings: &Array[NameNode]^host()
+            let table export_bindings as ref[Array[NameNode]]
+            let text AstNode.identifier_text_of(name)
+            var found false
+            var i 0
+            while i < (table.get_length() as int)
+            {
+                let entry table[i as size_t]
+                if entry.name.equals(text)
+                {
+                    table.put(i as size_t, NameNode(text, specifier))
+                    set found: true
+                }
+                set i: i + 1
+            }
+            if found = false
+                table.add(NameNode(text, specifier))
+        }
+        context.add_variable_declaration(name)
+    }
+
+    procedure us_create_env_binding(this) returns ref[AstNode]
+    {
+        let env: Slice[char] "env"
+        factory.new_unique_name(env)
+    }
+
+    ; createDownlevelUsingStatements: the `env` record and the try/catch/finally
+    procedure us_create_downlevel_using_statements(this, body_statements: ref[Array[ref[AstNode]?]], env_binding: ref[AstNode], async: bool) returns ref[Array[ref[AstNode]?]]
+    {
+        let statements &Array[ref[AstNode]?]^host()
+        ;  const env_1 = { stack: [], error: void 0, hasError: false };
+        let stack_name: Slice[char] "stack"
+        let error_name: Slice[char] "error"
+        let has_error_name: Slice[char] "hasError"
+        let props &Array[ref[AstNode]?]^host()
+        let empty_stack &Array[ref[AstNode]?]^host()
+        props.add(factory.new_property_assignment(null, factory.new_identifier(stack_name), null, null, factory.new_array_literal_expression(empty_stack, false)))
+        props.add(factory.new_property_assignment(null, factory.new_identifier(error_name), null, null, factory.new_void_zero_expression()))
+        props.add(factory.new_property_assignment(null, factory.new_identifier(has_error_name), null, null, factory.new_false_expression()))
+        let env_object factory.new_object_literal_expression(props, false)
+        let env_decls &Array[ref[AstNode]?]^host()
+        env_decls.add(factory.new_variable_declaration(env_binding, null, null, env_object))
+        statements.add(factory.new_variable_statement(null, factory.new_variable_declaration_list(env_decls, NodeFlagsConst)))
+        ;  try { <body> } catch (e_1) { env_1.error = e_1; env_1.hasError = true; } finally { __disposeResources(env_1); }
+        let try_block factory.new_block(body_statements, true)
+        let e_name: Slice[char] "e"
+        let body_catch_binding factory.new_unique_name(e_name)
+        let catch_statements &Array[ref[AstNode]?]^host()
+        catch_statements.add(factory.new_expression_statement(factory.new_assignment_expression(factory.new_property_access_expression(env_binding, null, factory.new_identifier(error_name), NodeFlagsNone), body_catch_binding)))
+        catch_statements.add(factory.new_expression_statement(factory.new_assignment_expression(factory.new_property_access_expression(env_binding, null, factory.new_identifier(has_error_name), NodeFlagsNone), factory.new_true_expression())))
+        let catch_clause factory.new_catch_clause(factory.new_variable_declaration(body_catch_binding, null, null, null), factory.new_block(catch_statements, true))
+        let finally_statements &Array[ref[AstNode]?]^host()
+        if async
+        {
+            let result_name: Slice[char] "result"
+            let result factory.new_unique_name(result_name)
+            let result_decls &Array[ref[AstNode]?]^host()
+            result_decls.add(factory.new_variable_declaration(result, null, null, factory.new_dispose_resources_helper(env_binding)))
+            finally_statements.add(factory.new_variable_statement(null, factory.new_variable_declaration_list(result_decls, NodeFlagsConst)))
+            finally_statements.add(factory.new_if_statement(result, factory.new_expression_statement(factory.new_await_expression(result)), null))
+        }
+        else
+            finally_statements.add(factory.new_expression_statement(factory.new_dispose_resources_helper(env_binding)))
+        let finally_block factory.new_block(finally_statements, true)
+        statements.add(factory.new_try_statement(try_block, catch_clause, finally_block))
+        statements
+    }
+
+    function is_using_variable_declaration_list(node: ref[AstNode]) returns bool
+    {
+        if node.kind <> KindVariableDeclarationList
+            return false
+        Transformer.get_using_kind_of_variable_declaration_list(node) <> UsingKindNone
+    }
+
+    function get_using_kind_of_variable_declaration_list(node: ref[AstNode]) returns int
+    {
+        let scoped node.flags & NodeFlagsBlockScoped
+        if scoped = NodeFlagsAwaitUsing
+            return UsingKindAsync
+        if scoped = NodeFlagsUsing
+            return UsingKindSync
+        UsingKindNone
+    }
+
+    function get_using_kind(statement: ref[AstNode]?) returns int
+    {
+        if AstNode.kind_of(statement) <> KindVariableStatement
+            return UsingKindNone
+        let dl Printer.declaration_list_of(statement as ref[AstNode])
+        if dl = null
+            return UsingKindNone
+        Transformer.get_using_kind_of_variable_declaration_list(dl as ref[AstNode])
+    }
+
+    function get_using_kind_of_statements(statements: ref[Array[ref[AstNode]?]]) returns int
+    {
+        var result UsingKindNone
+        var i 0
+        while i < (statements.get_length() as int)
+        {
+            let k Transformer.get_using_kind(statements[i as size_t])
+            set i: i + 1
+            if k = UsingKindAsync
+                return UsingKindAsync
+            if k > result
+                set result: k
+        }
+        result
+    }
+
+    ; ═══ estransforms/utilities.go convertClassDeclarationToClassExpression ═══
+    procedure convert_class_declaration_to_class_expression(this, node: ref[AstNode]) returns ref[AstNode]
+    {
+        let updated factory.new_class_expression(Transformer.extract_modifiers(host, opts, Printer.modifier_list_of(node), ModifierFlagsAll xor ModifierFlagsExportDefault), Printer.declaration_name_of(node), AstNode.type_parameters_of(node), AstNode.heritage_clauses_of(node), Printer.member_list_of(node))
+        context.set_original(updated, node)
+        set updated.pos: node.pos
+        set updated.end: node.end
+        updated
+    }
+
+    ; ═══ transformers/utilities.go ConvertBindingPatternToAssignmentPattern ═══
+    function convert_binding_pattern_to_assignment_pattern(ctx: ref[EmitContext], element: ref[AstNode]) returns ref[AstNode]
+    {
+        if element.kind = KindArrayBindingPattern
+            return Transformer.convert_binding_element_to_array_assignment_pattern(ctx, element)
+        Transformer.convert_binding_element_to_object_assignment_pattern(ctx, element)
+    }
+
+    function convert_binding_element_to_object_assignment_pattern(ctx: ref[EmitContext], element: ref[AstNode]) returns ref[AstNode]
+    {
+        let f ctx.the_factory()
+        let h ctx.host
+        let properties &Array[ref[AstNode]?]^h()
+        let elements AstNode.elements_of(element)
+        if elements <> null
+        {
+            let el elements as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (el.get_length() as int)
+            {
+                let e el[i as size_t]
+                set i: i + 1
+                if e <> null
+                    properties.add(Transformer.convert_binding_element_to_object_assignment_element(ctx, e as ref[AstNode]))
+            }
+        }
+        var ep 0 - 1
+        var ee 0 - 1
+        AstNode.list_range_of(Checker.source_file_of_node(element), elements, &ep, &ee)
+        f.set_list_range(properties, ep, ee)
+        let object f.new_object_literal_expression(properties, false)
+        ctx.set_original(object, element)
+        ctx.assign_comment_and_source_map_ranges(object, element)
+        object
+    }
+
+    function convert_binding_element_to_array_assignment_pattern(ctx: ref[EmitContext], element: ref[AstNode]) returns ref[AstNode]
+    {
+        let f ctx.the_factory()
+        let h ctx.host
+        let out &Array[ref[AstNode]?]^h()
+        let elements AstNode.elements_of(element)
+        if elements <> null
+        {
+            let el elements as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (el.get_length() as int)
+            {
+                let e el[i as size_t]
+                set i: i + 1
+                if e <> null
+                    out.add(Transformer.convert_binding_element_to_array_assignment_element(ctx, e as ref[AstNode]))
+            }
+        }
+        var ep 0 - 1
+        var ee 0 - 1
+        AstNode.list_range_of(Checker.source_file_of_node(element), elements, &ep, &ee)
+        f.set_list_range(out, ep, ee)
+        let array f.new_array_literal_expression(out, false)
+        ctx.set_original(array, element)
+        ctx.assign_comment_and_source_map_ranges(array, element)
+        array
+    }
+
+    function convert_binding_element_to_array_assignment_element(ctx: ref[EmitContext], element: ref[AstNode]) returns ref[AstNode]
+    {
+        let f ctx.the_factory()
+        let name Printer.declaration_name_of(element)
+        if name = null
+        {
+            let elision f.new_omitted_expression()
+            ctx.set_original(elision, element)
+            ctx.assign_comment_and_source_map_ranges(elision, element)
+            return elision
+        }
+        if AstNode.dot_dot_dot_token_of(element) <> null
+        {
+            let spread f.new_spread_element(name)
+            ctx.set_original(spread, element)
+            ctx.assign_comment_and_source_map_ranges(spread, element)
+            return spread
+        }
+        let expression Transformer.convert_binding_name_to_assignment_element_target(ctx, name as ref[AstNode])
+        let initializer AstNode.initializer_of(element)
+        if initializer <> null
+        {
+            let assignment f.new_assignment_expression(expression, initializer)
+            ctx.set_original(assignment, element)
+            ctx.assign_comment_and_source_map_ranges(assignment, element)
+            return assignment
+        }
+        expression
+    }
+
+    function convert_binding_element_to_object_assignment_element(ctx: ref[EmitContext], element: ref[AstNode]) returns ref[AstNode]
+    {
+        let f ctx.the_factory()
+        let name Printer.declaration_name_of(element)
+        if AstNode.dot_dot_dot_token_of(element) <> null
+        {
+            let spread f.new_spread_assignment(name)
+            ctx.set_original(spread, element)
+            ctx.assign_comment_and_source_map_ranges(spread, element)
+            return spread
+        }
+        let property_name AstNode.property_name_of(element)
+        let initializer AstNode.initializer_of(element)
+        if property_name <> null
+        {
+            var expression Transformer.convert_binding_name_to_assignment_element_target(ctx, name as ref[AstNode])
+            if initializer <> null
+                set expression: f.new_assignment_expression(expression, initializer)
+            let assignment f.new_property_assignment(null, property_name, null, null, expression)
+            ctx.set_original(assignment, element)
+            ctx.assign_comment_and_source_map_ranges(assignment, element)
+            return assignment
+        }
+        var equals_token: ref[AstNode]? null
+        if initializer <> null
+            set equals_token: f.new_token(KindEqualsToken)
+        let assignment f.new_shorthand_property_assignment(null, name, null, null, equals_token, initializer)
+        ctx.set_original(assignment, element)
+        ctx.assign_comment_and_source_map_ranges(assignment, element)
+        assignment
+    }
+
+    function convert_binding_name_to_assignment_element_target(ctx: ref[EmitContext], element: ref[AstNode]) returns ref[AstNode]
+    {
+        if AstNode.is_binding_pattern(element)
+            return Transformer.convert_binding_pattern_to_assignment_pattern(ctx, element)
+        element
+    }
+
+    ; ═══ estransforms/namedevaluation.go ═══
+
+    ; isClassNamedEvaluationHelperBlock: a `static {}` block holding only
+    ; `__setFunctionName(this, <assignedName>)`
+    function is_class_named_evaluation_helper_block(ctx: ref[EmitContext], node: ref[AstNode]) returns bool
+    {
+        if node.kind <> KindClassStaticBlockDeclaration
+            return false
+        let body Printer.statement_body_of(node)
+        if body = null
+            return false
+        let statements AstNode.statements_of(body as ref[AstNode])
+        if statements = null
+            return false
+        let sl statements as ref[Array[ref[AstNode]?]]
+        if sl.get_length() <> 1
+            return false
+        let statement sl[0]
+        if AstNode.kind_of(statement) <> KindExpressionStatement
+            return false
+        let expression Printer.statement_expression_of(statement as ref[AstNode])
+        if expression = null
+            return false
+        let helper_name: Slice[char] "__setFunctionName"
+        if ctx.is_call_to_helper(expression as ref[AstNode], helper_name) = false
+            return false
+        let arguments AstNode.call_arguments_of(expression as ref[AstNode])
+        if arguments = null
+            return false
+        let al arguments as ref[Array[ref[AstNode]?]]
+        if al.get_length() < 2
+            return false
+        al[1] = ctx.assigned_name(node)
+    }
+
+    function class_has_explicitly_assigned_name(ctx: ref[EmitContext], node: ref[AstNode]) returns bool
+    {
+        if ctx.assigned_name(node) = null
+            return false
+        let members Printer.member_list_of(node)
+        if members = null
+            return false
+        let ml members as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (ml.get_length() as int)
+        {
+            let m ml[i as size_t]
+            set i: i + 1
+            if m <> null
+            {
+                if Transformer.is_class_named_evaluation_helper_block(ctx, m as ref[AstNode])
+                    return true
+            }
+        }
+        false
+    }
+
+    function class_has_declared_or_explicitly_assigned_name(ctx: ref[EmitContext], node: ref[AstNode]) returns bool
+    {
+        if Printer.declaration_name_of(node) <> null
+            return true
+        Transformer.class_has_explicitly_assigned_name(ctx, node)
+    }
+
+    ; IsAnonymousFunctionDefinition (no callback)
+    function is_anonymous_function_definition(ctx: ref[EmitContext], node_in: ref[AstNode]?) returns bool
+    {
+        let skipped Parser.skip_outer_expressions(node_in, OEKAll)
+        if skipped = null
+            return false
+        let node skipped as ref[AstNode]
+        let k node.kind
+        if k = KindClassExpression
+            return Transformer.class_has_declared_or_explicitly_assigned_name(ctx, node) = false
+        if k = KindFunctionExpression
+            return Printer.declaration_name_of(node) = null
+        if k = KindArrowFunction
+            return true
+        false
+    }
+
+    ; ast.IsNamedEvaluationSource
+    function is_named_evaluation_source(node: ref[AstNode]) returns bool
+    {
+        let k node.kind
+        if k = KindPropertyAssignment
+            return Transformer.is_proto_setter(Printer.declaration_name_of(node)) = false
+        if k = KindShorthandPropertyAssignment
+            return AstNode.shorthand_object_assignment_initializer_of(node) <> null
+        if k = KindVariableDeclaration
+            return (AstNode.kind_of(Printer.declaration_name_of(node)) = KindIdentifier) and (AstNode.initializer_of(node) <> null)
+        if (k = KindParameter) or (k = KindBindingElement)
+            return (AstNode.kind_of(Printer.declaration_name_of(node)) = KindIdentifier) and (AstNode.initializer_of(node) <> null) and (AstNode.dot_dot_dot_token_of(node) = null)
+        if k = KindPropertyDeclaration
+            return AstNode.initializer_of(node) <> null
+        if k = KindBinaryExpression
+        {
+            let op AstNode.kind_of(AstNode.binary_operator_token_of(node))
+            if (op = KindEqualsToken) or (op = KindAmpersandAmpersandEqualsToken) or (op = KindBarBarEqualsToken) or (op = KindQuestionQuestionEqualsToken)
+                return AstNode.kind_of(AstNode.binary_left_of(node)) = KindIdentifier
+            return false
+        }
+        if k = KindExportAssignment
+            return true
+        false
+    }
+
+    function is_proto_setter(node: ref[AstNode]?) returns bool
+    {
+        let k AstNode.kind_of(node)
+        if (k <> KindIdentifier) and (k <> KindStringLiteral)
+            return false
+        let proto: Slice[char] "__proto__"
+        if k = KindIdentifier
+            return AstNode.identifier_text_of(node).equals(proto)
+        AstNode.literal_text_of(node).equals(proto)
+    }
+
+    function is_named_evaluation(ctx: ref[EmitContext], node: ref[AstNode]) returns bool
+    {
+        if Transformer.is_named_evaluation_source(node) = false
+            return false
+        let k node.kind
+        if k = KindShorthandPropertyAssignment
+            return Transformer.is_anonymous_function_definition(ctx, AstNode.shorthand_object_assignment_initializer_of(node))
+        if (k = KindPropertyAssignment) or (k = KindVariableDeclaration) or (k = KindParameter) or (k = KindBindingElement) or (k = KindPropertyDeclaration)
+            return Transformer.is_anonymous_function_definition(ctx, AstNode.initializer_of(node))
+        if k = KindBinaryExpression
+            return Transformer.is_anonymous_function_definition(ctx, AstNode.binary_right_of(node))
+        if k = KindExportAssignment
+            return Transformer.is_anonymous_function_definition(ctx, Checker.export_assignment_expression_of(node))
+        false
+    }
+
+    ; getAssignedNameOfIdentifier
+    function assigned_name_of_identifier(ctx: ref[EmitContext], name: ref[AstNode], expression: ref[AstNode]?) returns ref[AstNode]
+    {
+        let f ctx.the_factory()
+        let original ctx.most_original(Parser.skip_outer_expressions(expression, OEKAll))
+        if original <> null
+        {
+            let o original as ref[AstNode]
+            if (o.kind = KindClassDeclaration) or (o.kind = KindFunctionDeclaration)
+            {
+                if (Printer.declaration_name_of(o) = null) and Transformer.has_syntactic_modifier(o, ModifierFlagsDefault)
+                {
+                    let default_name: Slice[char] "default"
+                    return f.new_string_literal(default_name, TokenFlagsNone)
+                }
+            }
+        }
+        f.new_string_literal_from_node(name)
+    }
+
+    ; getAssignedNameOfPropertyName: (assignedName, updatedName) through the out-cell
+    function assigned_name_of_property_name(ctx: ref[EmitContext], name: ref[AstNode], assigned_name_text: Slice[char], updated_name: ref[ref[AstNode]?]) returns ref[AstNode]
+    {
+        let f ctx.the_factory()
+        set updated_name: name
+        if assigned_name_text.length > 0
+            return f.new_string_literal(assigned_name_text, TokenFlagsNone)
+        if Checker.is_property_name_literal(name.kind) or (name.kind = KindPrivateIdentifier)
+            return f.new_string_literal_from_node(name)
+        let expression AstNode.expression_of(name) as ref[AstNode]
+        if Checker.is_property_name_literal(expression.kind) and (expression.kind <> KindIdentifier)
+            return f.new_string_literal_from_node(expression)
+        let assigned_name f.new_generated_name_for_node(name)
+        ctx.add_variable_declaration(assigned_name)
+        let key f.new_prop_key_helper(expression)
+        let assignment f.new_assignment_expression(assigned_name, key)
+        set updated_name: f.update_computed_property_name(name, assignment)
+        assigned_name
+    }
+
+    ; createClassNamedEvaluationHelperBlock: `static { __setFunctionName(this, "C"); }`
+    function create_class_named_evaluation_helper_block(ctx: ref[EmitContext], assigned_name: ref[AstNode], this_expression_in: ref[AstNode]?) returns ref[AstNode]
+    {
+        let f ctx.the_factory()
+        var this_expression this_expression_in
+        if this_expression = null
+            set this_expression: f.new_this_expression()
+        let empty: Slice[char] ""
+        let expression f.new_set_function_name_helper(this_expression as ref[AstNode], assigned_name, empty)
+        let statement f.new_expression_statement(expression)
+        let h ctx.host
+        let statements &Array[ref[AstNode]?]^h()
+        statements.add(statement)
+        let body f.new_block(statements, false)
+        let block f.new_class_static_block_declaration(null, body)
+        ctx.set_assigned_name(block, assigned_name)
+        block
+    }
+
+    ; injectClassNamedEvaluationHelperBlockIfMissing
+    function inject_class_named_evaluation_helper_block_if_missing(ctx: ref[EmitContext], node: ref[AstNode], assigned_name: ref[AstNode], this_expression: ref[AstNode]?) returns ref[AstNode]
+    {
+        if Transformer.class_has_explicitly_assigned_name(ctx, node)
+            return node
+        let f ctx.the_factory()
+        let block Transformer.create_class_named_evaluation_helper_block(ctx, assigned_name, this_expression)
+        let name Printer.declaration_name_of(node)
+        if name <> null
+        {
+            let body Printer.statement_body_of(block) as ref[AstNode]
+            let first (AstNode.statements_of(body) as ref[Array[ref[AstNode]?]])[0] as ref[AstNode]
+            ctx.set_source_map_range(first, TextRange.of_node(name as ref[AstNode]))
+        }
+        let members Printer.member_list_of(node)
+        let h ctx.host
+        let new_members &Array[ref[AstNode]?]^h()
+        var insertion_index 0
+        if members <> null
+        {
+            let ml members as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (ml.get_length() as int)
+            {
+                let m ml[i as size_t]
+                if m <> null
+                {
+                    if Transformer.is_class_this_assignment_block(ctx, m as ref[AstNode])
+                        set insertion_index: i + 1
+                }
+                set i: i + 1
+            }
+            set i: 0
+            while i < (ml.get_length() as int)
+            {
+                if i = insertion_index
+                    new_members.add(block)
+                new_members.add(ml[i as size_t])
+                set i: i + 1
+            }
+            if insertion_index >= (ml.get_length() as int)
+                new_members.add(block)
+        }
+        else
+            new_members.add(block)
+        var mp 0 - 1
+        var me 0 - 1
+        AstNode.list_range_of(Checker.source_file_of_node(node), members, &mp, &me)
+        f.set_list_range(new_members, mp, me)
+        var updated: ref[AstNode]? null
+        if node.kind = KindClassDeclaration
+            set updated: f.update_class_declaration(node, Printer.modifier_list_of(node), name, AstNode.type_parameters_of(node), AstNode.heritage_clauses_of(node), new_members)
+        else
+            set updated: f.update_class_expression(node, Printer.modifier_list_of(node), name, AstNode.type_parameters_of(node), AstNode.heritage_clauses_of(node), new_members)
+        let u updated as ref[AstNode]
+        ctx.set_assigned_name(u, assigned_name)
+        let ct ctx.class_this(node)
+        if ct <> null
+            ctx.set_class_this(u, ct)
+        u
+    }
+
+    ; estransforms/classthis.go isClassThisAssignmentBlock: `static { _classThis = this; }`
+    function is_class_this_assignment_block(ctx: ref[EmitContext], node: ref[AstNode]) returns bool
+    {
+        if node.kind <> KindClassStaticBlockDeclaration
+            return false
+        let body Printer.statement_body_of(node)
+        if body = null
+            return false
+        let statements AstNode.statements_of(body as ref[AstNode])
+        if statements = null
+            return false
+        let sl statements as ref[Array[ref[AstNode]?]]
+        if sl.get_length() <> 1
+            return false
+        let statement sl[0]
+        if AstNode.kind_of(statement) <> KindExpressionStatement
+            return false
+        let expression Printer.statement_expression_of(statement as ref[AstNode])
+        if expression = null
+            return false
+        let e expression as ref[AstNode]
+        if Emitter.is_assignment_expression(e, true) = false
+            return false
+        let left AstNode.binary_left_of(e)
+        if AstNode.kind_of(left) <> KindIdentifier
+            return false
+        if ctx.class_this(node) <> left
+            return false
+        AstNode.kind_of(AstNode.binary_right_of(e)) = KindThisKeyword
+    }
+
+    function finish_transform_named_evaluation(ctx: ref[EmitContext], expression: ref[AstNode], assigned_name: ref[AstNode], ignore_empty_string_literal: bool) returns ref[AstNode]
+    {
+        if ignore_empty_string_literal and (assigned_name.kind = KindStringLiteral)
+        {
+            if AstNode.literal_text_of(assigned_name).length = 0
+                return expression
+        }
+        let f ctx.the_factory()
+        let inner Parser.skip_outer_expressions(expression, OEKAll) as ref[AstNode]
+        var updated: ref[AstNode]? null
+        if inner.kind = KindClassExpression
+            set updated: Transformer.inject_class_named_evaluation_helper_block_if_missing(ctx, inner, assigned_name, null)
+        else
+        {
+            let empty: Slice[char] ""
+            set updated: f.new_set_function_name_helper(inner, assigned_name, empty)
+        }
+        f.restore_outer_expressions(expression, updated, OEKAll) as ref[AstNode]
+    }
+
+    ; transformNamedEvaluation: a shallow transformation of a NamedEvaluation node
+    function transform_named_evaluation(ctx: ref[EmitContext], node: ref[AstNode], ignore_empty_string_literal: bool, assigned_name_text: Slice[char]) returns ref[AstNode]
+    {
+        let f ctx.the_factory()
+        let k node.kind
+        if k = KindPropertyAssignment
+        {
+            var updated_name: ref[AstNode]? null
+            let assigned_name Transformer.assigned_name_of_property_name(ctx, Printer.declaration_name_of(node) as ref[AstNode], assigned_name_text, &updated_name)
+            let initializer Transformer.finish_transform_named_evaluation(ctx, AstNode.initializer_of(node) as ref[AstNode], assigned_name, ignore_empty_string_literal)
+            return f.update_property_assignment(node, null, updated_name, null, null, initializer)
+        }
+        if k = KindShorthandPropertyAssignment
+        {
+            let name Printer.declaration_name_of(node) as ref[AstNode]
+            let oai AstNode.shorthand_object_assignment_initializer_of(node) as ref[AstNode]
+            var assigned_name: ref[AstNode]? null
+            if assigned_name_text.length > 0
+                set assigned_name: f.new_string_literal(assigned_name_text, TokenFlagsNone)
+            else
+                set assigned_name: Transformer.assigned_name_of_identifier(ctx, name, oai)
+            let initializer Transformer.finish_transform_named_evaluation(ctx, oai, assigned_name as ref[AstNode], ignore_empty_string_literal)
+            return f.update_shorthand_property_assignment(node, null, name, null, null, AstNode.shorthand_equals_token_of(node), initializer)
+        }
+        if (k = KindVariableDeclaration) or (k = KindParameter) or (k = KindBindingElement)
+        {
+            let name Printer.declaration_name_of(node) as ref[AstNode]
+            let init_node AstNode.initializer_of(node) as ref[AstNode]
+            var assigned_name: ref[AstNode]? null
+            if assigned_name_text.length > 0
+                set assigned_name: f.new_string_literal(assigned_name_text, TokenFlagsNone)
+            else
+                set assigned_name: Transformer.assigned_name_of_identifier(ctx, name, init_node)
+            let initializer Transformer.finish_transform_named_evaluation(ctx, init_node, assigned_name as ref[AstNode], ignore_empty_string_literal)
+            if k = KindVariableDeclaration
+                return f.update_variable_declaration(node, name, null, null, initializer)
+            if k = KindParameter
+                return f.update_parameter_declaration(node, null, AstNode.dot_dot_dot_token_of(node), name, null, null, initializer)
+            return f.update_binding_element(node, AstNode.dot_dot_dot_token_of(node), AstNode.property_name_of(node), name, initializer)
+        }
+        if k = KindPropertyDeclaration
+        {
+            var updated_name: ref[AstNode]? null
+            let assigned_name Transformer.assigned_name_of_property_name(ctx, Printer.declaration_name_of(node) as ref[AstNode], assigned_name_text, &updated_name)
+            let initializer Transformer.finish_transform_named_evaluation(ctx, AstNode.initializer_of(node) as ref[AstNode], assigned_name, ignore_empty_string_literal)
+            return f.update_property_declaration(node, Printer.modifier_list_of(node), updated_name, null, null, initializer)
+        }
+        if k = KindBinaryExpression
+        {
+            let left AstNode.binary_left_of(node) as ref[AstNode]
+            let right AstNode.binary_right_of(node) as ref[AstNode]
+            var assigned_name: ref[AstNode]? null
+            if assigned_name_text.length > 0
+                set assigned_name: f.new_string_literal(assigned_name_text, TokenFlagsNone)
+            else
+                set assigned_name: Transformer.assigned_name_of_identifier(ctx, left, right)
+            let new_right Transformer.finish_transform_named_evaluation(ctx, right, assigned_name as ref[AstNode], ignore_empty_string_literal)
+            return f.update_binary_expression(node, null, left, null, AstNode.binary_operator_token_of(node), new_right)
+        }
+        if k = KindExportAssignment
+        {
+            var assigned_name: ref[AstNode]? null
+            if assigned_name_text.length > 0
+                set assigned_name: f.new_string_literal(assigned_name_text, TokenFlagsNone)
+            else
+            {
+                if AstNode.is_export_equals_of(node)
+                {
+                    let empty: Slice[char] ""
+                    set assigned_name: f.new_string_literal(empty, TokenFlagsNone)
+                }
+                else
+                {
+                    let default_name: Slice[char] "default"
+                    set assigned_name: f.new_string_literal(default_name, TokenFlagsNone)
+                }
+            }
+            let expression Transformer.finish_transform_named_evaluation(ctx, Checker.export_assignment_expression_of(node) as ref[AstNode], assigned_name as ref[AstNode], ignore_empty_string_literal)
+            return f.update_export_assignment(node, null, AstNode.is_export_equals_of(node), null, expression)
+        }
+        node
     }
 
     ; ── the AST questions the transformers ask (ast/utilities.go) ──
@@ -3321,8 +4454,6 @@ define Emitter
         let target options.get_emit_script_target()
         if target < ScriptTargetES2021
             this.record_unported("transform-es-downlevel", target)
-        if facts.has_using
-            this.record_unported("transform-using", 0)
         if facts.has_decorator and (target < ScriptTargetLatest)
             this.record_unported("transform-es-decorators", 0)
         if facts.has_auto_accessor and (target < ScriptTargetLatest)
@@ -3357,6 +4488,10 @@ define Emitter
         ; transform `enum`, `namespace`, and parameter properties
         let runtime Transformer.create(host, TransformerTagRuntimeSyntax, opts)
         set current: runtime.transform_source_file(current)
+        ; estransforms.GetESTransformer at ES2025 (NewESNextTransformer): `using`
+        ; first, then ES decorators and class fields (their gates stand above)
+        let using_tx Transformer.create(host, TransformerTagUsing, opts)
+        set current: using_tx.transform_source_file(current)
         let use_strict Transformer.create(host, TransformerTagUseStrict, opts)
         set current: use_strict.transform_source_file(current)
         let es_module Transformer.create(host, TransformerTagESModule, opts)
@@ -3371,6 +4506,8 @@ define Emitter
             this.record_unported(elision.unported_tag, elision.unported_detail)
         if runtime.unported_count > 0
             this.record_unported(runtime.unported_tag, runtime.unported_detail)
+        if using_tx.unported_count > 0
+            this.record_unported(using_tx.unported_tag, using_tx.unported_detail)
         if use_strict.unported_count > 0
             this.record_unported(use_strict.unported_tag, use_strict.unported_detail)
         if es_module.unported_count > 0
