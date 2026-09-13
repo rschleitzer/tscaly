@@ -32,6 +32,8 @@ use tscaly.checker.EvalResult
 use tscaly.printer.EmitContext
 use tscaly.printer.NameGenerator
 use tscaly.printer.EmitHelper
+use tscaly.printer.EmitHelpers
+use tscaly.printer.AutoGenerateInfo
 use tscaly.printer.Printer
 use tscaly.printer.PrinterOptions
 use tscaly.printer.SourceFileInfo
@@ -305,6 +307,99 @@ define EmitOptions
     }
 }
 
+define TransformerTagCommonJS: int 11
+
+; commonjsmodule.go's four visitors, as sub tags on the NodeVisitor (§3.41)
+define CjsSubTopLevel: int 1
+define CjsSubTopLevelNested: int 2
+define CjsSubDiscarded: int 3
+define CjsSubAssignmentPattern: int 4
+
+; transformers/destructuring.go
+define FlattenLevelAll: int 0
+define FlattenLevelObjectRest: int 1
+; CreateAssignmentCallback as a tag: none (a plain assignment), the CommonJS
+; export expressions
+define FlattenCallbackNone: int 0
+define FlattenCallbackCommonJS: int 1
+
+; externalmoduleinfo.go: exportSpecifiers (local name → specifiers) and
+; exportedBindings (declaration → export names), both ORDERED multimaps
+define CjsExportSpecifierEntry
+(
+    name: Slice[char]
+    specifier: ref[AstNode]
+)
+
+define CjsExportedBinding
+(
+    decl: ref[AstNode]
+    name: ref[AstNode]
+)
+
+define ExternalModuleInfo
+(
+    external_imports: ref[Array[ref[AstNode]?]]
+    export_specifiers: ref[Array[CjsExportSpecifierEntry]]
+    exported_bindings: ref[Array[CjsExportedBinding]]
+    exported_names: ref[Array[ref[AstNode]?]]
+    exported_functions: ref[Array[ref[AstNode]?]]
+    export_equals: ref[AstNode]?
+    has_export_stars_to_export_values: bool
+)
+{
+    function create(host: ref[Page]) returns ref[ExternalModuleInfo]
+    {
+        let imports &Array[ref[AstNode]?]^host()
+        let specifiers &Array[CjsExportSpecifierEntry]^host()
+        let bindings &Array[CjsExportedBinding]^host()
+        let names &Array[ref[AstNode]?]^host()
+        let functions &Array[ref[AstNode]?]^host()
+        &ExternalModuleInfo^host(imports, specifiers, bindings, names, functions, null, false)
+    }
+
+    ; exportSpecifiers.Get(name)
+    function export_specifiers_of(this, host: ref[Page], name: Slice[char]) returns ref[Array[ref[AstNode]?]]
+    {
+        let out &Array[ref[AstNode]?]^host()
+        var i 0
+        while i < (export_specifiers.get_length() as int)
+        {
+            let e export_specifiers[i as size_t]
+            if e.name.equals(name)
+                out.add(e.specifier)
+            set i: i + 1
+        }
+        out
+    }
+
+    ; exportedBindings.Get(decl)
+    function exported_bindings_of(this, host: ref[Page], decl: ref[AstNode]) returns ref[Array[ref[AstNode]?]]
+    {
+        let out &Array[ref[AstNode]?]^host()
+        var i 0
+        while i < (exported_bindings.get_length() as int)
+        {
+            let e exported_bindings[i as size_t]
+            if Transformer.same_node(e.decl, decl)
+                out.add(e.name)
+            set i: i + 1
+        }
+        out
+    }
+}
+
+; destructuring.go's pendingDecl
+define PendingDecl
+(
+    pending_expressions: ref[Array[ref[AstNode]?]]?
+    name: ref[AstNode]
+    value: ref[AstNode]?
+    pos: int
+    end: int
+    original: ref[AstNode]?
+)
+
 ; transformers.TransformOptions: the context, the options, and the resolver —
 ; which is the checker here (§3.41), beside the binder for the file's flags.
 define TransformOptions
@@ -350,6 +445,11 @@ define Transformer
     esd_outer_this: ref[AstNode]?
     esd_private_static_in_file: bool
     esd_visitors: ref[Array[ref[NodeVisitor]?]]?
+    ; commonjsmodule.go's state (slice 241)
+    cjs_info: ref[ExternalModuleInfo]?
+    cjs_unique_exports: ref[Array[Slice[char]]]?
+    cjs_has_export_default: bool
+    cjs_visitors: ref[Array[ref[NodeVisitor]?]]?
     unported_count: int
     unported_tag: Slice[char]
     unported_detail: int
@@ -361,7 +461,7 @@ define Transformer
     {
         let comps &Array[ref[Transformer]?]^host()
         let no_tag: Slice[char] ""
-        let t &Transformer^host(host, tag, opts.context, opts.context.the_factory(), null, opts, null, null, comps, 0, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, false, null, 0, no_tag, 0)
+        let t &Transformer^host(host, tag, opts.context, opts.context.the_factory(), null, opts, null, null, comps, 0, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, false, null, null, null, false, null, 0, no_tag, 0)
         let v opts.context.new_node_visitor(VisitTagTransformer)
         set v.transformer: t
         set t.visitor: v
@@ -418,6 +518,8 @@ define Transformer
             return this.visit_using(node)
         if tag = TransformerTagESDecorator
             return this.visit_es_decorator(node)
+        if tag = TransformerTagCommonJS
+            return this.visit_common_js(node)
         this.record_unported("transformer-tag", tag)
         node
     }
@@ -2973,6 +3075,17 @@ define Transformer
     ; the sub visitors' `Visit`
     procedure visit_sub(this, node: ref[AstNode], sub: int) returns ref[AstNode]?
     {
+        if tag = TransformerTagCommonJS
+        {
+            if sub = CjsSubTopLevel
+                return this.cjs_visit_top_level(node)
+            if sub = CjsSubTopLevelNested
+                return this.cjs_visit_top_level_nested(node)
+            if sub = CjsSubDiscarded
+                return this.cjs_visit_discarded_value(node)
+            if sub = CjsSubAssignmentPattern
+                return this.cjs_visit_assignment_pattern(node)
+        }
         if tag = TransformerTagESDecorator
         {
             if sub = EsdSubOuterThis
@@ -6297,6 +6410,2966 @@ define Transformer
         }
         this.the_visitor().visit_each_child(node)
     }
+
+    ; ═══ moduletransforms/commonjsmodule.go + externalmoduleinfo.go (slice 241) ═══
+
+    ; the four visitors of NewCommonJSModuleTransformer, as sub tags, made on first use
+    function cjs_visitor(this, sub: int) returns ref[NodeVisitor]
+    {
+        if cjs_visitors = null
+        {
+            let table &Array[ref[NodeVisitor]?]^host()
+            var i 0
+            while i <= 4
+            {
+                table.add(null)
+                set i: i + 1
+            }
+            set this.cjs_visitors: table
+        }
+        let visitors cjs_visitors as ref[Array[ref[NodeVisitor]?]]
+        let existing visitors[sub as size_t]
+        if existing <> null
+            return existing as ref[NodeVisitor]
+        let v context.new_node_visitor(VisitTagTransformer)
+        set v.transformer: this
+        set v.sub_tag: sub
+        visitors.put(sub as size_t, v)
+        v
+    }
+
+    ; visitTopLevel
+    procedure cjs_visit_top_level(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let grandparent this.push_node(node)
+        let result this.cjs_visit_top_level_no_stack(node)
+        this.pop_node(grandparent)
+        result
+    }
+
+    procedure cjs_visit_top_level_no_stack(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let k node.kind
+        if k = KindImportDeclaration
+            return this.cjs_visit_top_level_import_declaration(node)
+        if k = KindImportEqualsDeclaration
+            return this.cjs_visit_top_level_import_equals_declaration(node)
+        if k = KindExportDeclaration
+            return this.cjs_visit_top_level_export_declaration(node)
+        if k = KindExportAssignment
+            return this.cjs_visit_top_level_export_assignment(node)
+        if k = KindFunctionDeclaration
+            return this.cjs_visit_top_level_function_declaration(node)
+        if k = KindClassDeclaration
+            return this.cjs_visit_top_level_class_declaration(node)
+        if k = KindVariableStatement
+            return this.cjs_visit_top_level_variable_statement(node)
+        this.cjs_visit_top_level_nested_no_stack(node)
+    }
+
+    ; visitTopLevelNested
+    procedure cjs_visit_top_level_nested(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let grandparent this.push_node(node)
+        let result this.cjs_visit_top_level_nested_no_stack(node)
+        this.pop_node(grandparent)
+        result
+    }
+
+    procedure cjs_visit_top_level_nested_no_stack(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let k node.kind
+        if k = KindVariableStatement
+            return this.cjs_visit_top_level_variable_statement(node)
+        if k = KindForStatement
+            return this.cjs_visit_top_level_nested_for_statement(node)
+        if (k = KindForInStatement) or (k = KindForOfStatement)
+            return this.cjs_visit_top_level_nested_for_in_or_of_statement(node)
+        if k = KindDoStatement
+            return this.cjs_visit_top_level_nested_do_statement(node)
+        if k = KindWhileStatement
+            return this.cjs_visit_top_level_nested_while_statement(node)
+        if k = KindLabeledStatement
+            return this.cjs_visit_top_level_nested_labeled_statement(node)
+        if k = KindWithStatement
+            return this.cjs_visit_top_level_nested_with_statement(node)
+        if k = KindIfStatement
+            return this.cjs_visit_top_level_nested_if_statement(node)
+        if k = KindSwitchStatement
+            return this.cjs_visit_top_level_nested_switch_statement(node)
+        if k = KindCaseBlock
+            return this.cjs_visit_top_level_nested_case_block(node)
+        if (k = KindCaseClause) or (k = KindDefaultClause)
+            return this.cjs_visit_top_level_nested_case_or_default_clause(node)
+        if k = KindTryStatement
+            return this.cjs_visit_top_level_nested_try_statement(node)
+        if k = KindCatchClause
+            return this.cjs_visit_top_level_nested_catch_clause(node)
+        if k = KindBlock
+            return this.cjs_visit_top_level_nested_block(node)
+        this.cjs_visit_no_stack(node, false)
+    }
+
+    ; visit: source elements that are not top-level or top-level nested statements
+    procedure visit_common_js(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let grandparent this.push_node(node)
+        let result this.cjs_visit_no_stack(node, false)
+        this.pop_node(grandparent)
+        result
+    }
+
+    procedure cjs_visit_no_stack(this, node: ref[AstNode], result_is_discarded: bool) returns ref[AstNode]?
+    {
+        ; no dynamic imports or identifiers in the subtree: nothing to do
+        if (node.kind <> KindSourceFile) and ((Emitter.subtree_facts(node) & (SubtreeContainsDynamicImport | SubtreeContainsIdentifier)) = 0)
+            return node
+        let k node.kind
+        if k = KindSourceFile
+            return this.cjs_visit_source_file(node)
+        if k = KindForStatement
+            return this.cjs_visit_for_statement(node)
+        if (k = KindForInStatement) or (k = KindForOfStatement)
+            return this.cjs_visit_for_in_or_of_statement(node)
+        if (k = KindExpressionStatement) or (k = KindVoidExpression)
+        {
+            let dv this.cjs_visitor(CjsSubDiscarded)
+            return dv.visit_each_child(node)
+        }
+        if k = KindParenthesizedExpression
+            return factory.update_parenthesized_expression(node, this.cjs_visit_maybe_discarded(AstNode.expression_of(node), result_is_discarded))
+        if k = KindPartiallyEmittedExpression
+            return factory.update_partially_emitted_expression(node, this.cjs_visit_maybe_discarded(AstNode.expression_of(node), result_is_discarded))
+        if k = KindCallExpression
+            return this.cjs_visit_call_expression(node)
+        if k = KindTaggedTemplateExpression
+            return this.cjs_visit_tagged_template_expression(node)
+        if k = KindBinaryExpression
+            return this.cjs_visit_binary_expression(node, result_is_discarded)
+        if k = KindPrefixUnaryExpression
+            return this.cjs_visit_prefix_unary_expression(node)
+        if k = KindPostfixUnaryExpression
+            return this.cjs_visit_postfix_unary_expression(node, result_is_discarded)
+        if k = KindShorthandPropertyAssignment
+            return this.cjs_visit_shorthand_property_assignment(node)
+        if k = KindIdentifier
+            return this.cjs_visit_identifier(node)
+        this.the_visitor().visit_each_child(node)
+    }
+
+    ; core.IfElse(resultIsDiscarded, tx.discardedValueVisitor, tx.Visitor()).VisitNode(x)
+    procedure cjs_visit_maybe_discarded(this, node: ref[AstNode]?, result_is_discarded: bool) returns ref[AstNode]?
+    {
+        if result_is_discarded
+        {
+            let dv this.cjs_visitor(CjsSubDiscarded)
+            return dv.visit_node(node)
+        }
+        this.the_visitor().visit_node(node)
+    }
+
+    ; visitDiscardedValue
+    procedure cjs_visit_discarded_value(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let grandparent this.push_node(node)
+        let result this.cjs_visit_no_stack(node, true)
+        this.pop_node(grandparent)
+        result
+    }
+
+    ; visitAssignmentPattern
+    procedure cjs_visit_assignment_pattern(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let grandparent this.push_node(node)
+        let result this.cjs_visit_assignment_pattern_no_stack(node)
+        this.pop_node(grandparent)
+        result
+    }
+
+    procedure cjs_visit_assignment_pattern_no_stack(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let k node.kind
+        if (k = KindObjectLiteralExpression) or (k = KindArrayLiteralExpression)
+        {
+            let av this.cjs_visitor(CjsSubAssignmentPattern)
+            return av.visit_each_child(node)
+        }
+        if k = KindPropertyAssignment
+            return this.cjs_visit_assignment_property(node)
+        if k = KindShorthandPropertyAssignment
+            return this.cjs_visit_shorthand_assignment_property(node)
+        if k = KindSpreadAssignment
+            return factory.update_spread_assignment(node, this.cjs_visit_destructuring_assignment_target(AstNode.expression_of(node) as ref[AstNode]))
+        if k = KindSpreadElement
+            return factory.update_spread_element(node, this.cjs_visit_destructuring_assignment_target(AstNode.expression_of(node) as ref[AstNode]))
+        if AstNode.is_expression_node(node)
+            return this.cjs_visit_assignment_element(node)
+        this.cjs_visit_no_stack(node, false)
+    }
+
+    procedure cjs_visit_source_file(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let info opts.file_info
+        if info.is_declaration_file
+            return node
+        ; IsEffectiveExternalModule: the stored indicator — the file info carries
+        ; the forced-by-format arm (a .cts/.mts file) the parser cannot see
+        var effective info.is_external_module
+        if this.the_checker().is_effective_external_module()
+            set effective: true
+        if (effective = false) and ((Emitter.subtree_facts(node) & SubtreeContainsDynamicImport) = 0)
+            return node
+        set this.current_source_file: node
+        set this.cjs_info: this.collect_external_module_info(node)
+        let updated this.cjs_transform_common_js_module(node)
+        set this.current_source_file: null
+        set this.cjs_info: null
+        updated
+    }
+
+    ; shouldEmitUnderscoreUnderscoreESModule
+    function cjs_should_emit_underscore_underscore_es_module(this) returns bool
+    {
+        let b opts.binder as ref[Binder]
+        let info cjs_info as ref[ExternalModuleInfo]
+        let file_name opts.file_info.file_name
+        let is_js file_name.ends_with(".js") or file_name.ends_with(".jsx") or file_name.ends_with(".mjs") or file_name.ends_with(".cjs")
+        let cjs_indicator b.common_js_module_indicator_of()
+        let is_external b.is_external_module_of()
+        ; ExternalModuleIndicator == nil || its Kind == KindSourceFile: the second
+        ; arm is the FORCE arm, unreachable under the oracle's zeroed options
+        if is_js and (cjs_indicator <> null) and (is_external = false)
+            return false
+        if (info.export_equals = null) and opts.file_info.is_external_module
+            return true
+        false
+    }
+
+    ; createUnderscoreUnderscoreESModule:
+    ;   Object.defineProperty(exports, "__esModule", { value: true });
+    procedure cjs_create_underscore_underscore_es_module(this) returns ref[AstNode]
+    {
+        let f factory
+        let props &Array[ref[AstNode]?]^host()
+        props.add(f.new_property_assignment(null, f.new_identifier("value"), null, null, f.new_true_expression()))
+        let args &Array[ref[AstNode]?]^host()
+        args.add(f.new_identifier("exports"))
+        args.add(f.new_string_literal("__esModule", TokenFlagsNone))
+        args.add(f.new_object_literal_expression(props, false))
+        let statement f.new_expression_statement(f.new_call_expression(f.new_property_access_expression(f.new_identifier("Object"), null, f.new_identifier("defineProperty"), NodeFlagsNone), null, null, args, NodeFlagsNone))
+        context.set_emit_flags(statement, EFCustomPrologue)
+        statement
+    }
+
+    ; exports.<name> / exports["<name>"] as an assignment target
+    procedure cjs_exports_access(this, name: ref[AstNode]) returns ref[AstNode]
+    {
+        let f factory
+        if name.kind = KindStringLiteral
+            return f.new_element_access_expression(f.new_identifier("exports"), null, f.new_string_literal_from_node(name), NodeFlagsNone)
+        let cloned f.clone(name)
+        context.set_emit_flags(cloned, EFNoSourceMap | EFNoComments)
+        f.new_property_access_expression(f.new_identifier("exports"), null, cloned, NodeFlagsNone)
+    }
+
+    ; transformCommonJSModule
+    procedure cjs_transform_common_js_module(this, node: ref[AstNode]) returns ref[AstNode]
+    {
+        let f factory
+        let info cjs_info as ref[ExternalModuleInfo]
+        let tv this.cjs_visitor(CjsSubTopLevel)
+        context.start_variable_environment()
+        let source AstNode.statements_of(node) as ref[Array[ref[AstNode]?]]
+        let n source.get_length() as int
+        ; the standard prologue directives (e.g. "use strict")
+        let prologue_end Transformer.standard_prologue_end(source)
+        let statements &Array[ref[AstNode]?]^host()
+        var i 0
+        while i < prologue_end
+        {
+            statements.add(source[i as size_t])
+            set i: i + 1
+        }
+        ; custom prologues from other transformations
+        let custom_end this.custom_prologue_end(source, prologue_end)
+        var changed false
+        Transformer.add_all(statements, tv.visit_slice(Transformer.sub_list(host, source, prologue_end, custom_end), &changed))
+        ; `Object.defineProperty(exports, "__esModule", { value: true });`
+        if this.cjs_should_emit_underscore_underscore_es_module()
+            statements.add(this.cjs_create_underscore_underscore_es_module())
+        ; initialize all exports to `undefined`: exports.a = exports.b = void 0;
+        let names info.exported_names
+        let l names.get_length() as int
+        var start 0
+        while start < l
+        {
+            var right f.new_void_zero_expression()
+            var stop start + 50
+            if stop > l
+                set stop: l
+            var j start
+            while j < stop
+            {
+                let next_id names[j as size_t] as ref[AstNode]
+                let left this.cjs_exports_access(next_id)
+                set right: f.new_assignment_expression(left, right)
+                set j: j + 1
+            }
+            let statement f.new_expression_statement(right)
+            context.add_emit_flags(statement, EFCustomPrologue)
+            statements.add(statement)
+            set start: start + 50
+        }
+        ; exports for function declarations: exports.f = f; — custom prologue so
+        ; they sort before the external helpers import
+        let exported_functions_start statements.get_length() as int
+        let funcs info.exported_functions
+        var fi 0
+        while fi < (funcs.get_length() as int)
+        {
+            this.cjs_append_exports_of_class_or_function_declaration(statements, funcs[fi as size_t] as ref[AstNode])
+            set fi: fi + 1
+        }
+        var si exported_functions_start
+        while si < (statements.get_length() as int)
+        {
+            context.add_emit_flags(statements[si as size_t] as ref[AstNode], EFCustomPrologue)
+            set si: si + 1
+        }
+        ; the remaining statements
+        Transformer.add_all(statements, tv.visit_slice(Transformer.sub_list(host, source, custom_end, n), &changed))
+        ; `module.exports = ...` if needed
+        this.cjs_append_export_equals_if_needed(statements)
+        ; merge temp variables into the statement list
+        let merged context.end_and_merge_variable_environment(statements) as ref[Array[ref[AstNode]?]]
+        var sp 0
+        var se 0
+        if AstNode.list_range_of(node, source, &sp, &se)
+            f.set_list_range(merged, sp, se)
+        var result f.update_source_file(node, merged, AstNode.end_of_file_token_of(node))
+        let helpers context.read_emit_helpers()
+        var h 0
+        while h < (helpers.get_length() as int)
+        {
+            let helper helpers[h as size_t]
+            if helper <> null
+                context.add_emit_helper(result, helper as ref[EmitHelper])
+            set h: h + 1
+        }
+        let external_helpers_import_declaration this.create_external_helpers_import_declaration_if_needed(result, opts.options.get_emit_module_format_of_file(opts.file_info.file_name))
+        if external_helpers_import_declaration <> null
+        {
+            let rs AstNode.statements_of(result) as ref[Array[ref[AstNode]?]]
+            let pe Transformer.standard_prologue_end(rs)
+            let ce this.custom_prologue_end(rs, pe)
+            let out &Array[ref[AstNode]?]^host()
+            Transformer.add_all(out, Transformer.sub_list(host, rs, 0, ce))
+            out.add(tv.visit_node(external_helpers_import_declaration))
+            Transformer.add_all(out, Transformer.sub_list(host, rs, ce, rs.get_length() as int))
+            var rp 0
+            var re 0
+            if AstNode.list_range_of(result, rs, &rp, &re)
+                f.set_list_range(out, rp, re)
+            set result: f.update_source_file(result, out, AstNode.end_of_file_token_of(node))
+        }
+        result
+    }
+
+    ; appendExportEqualsIfNeeded: `module.exports = <expression>;`
+    procedure cjs_append_export_equals_if_needed(this, statements: ref[Array[ref[AstNode]?]])
+    {
+        let info cjs_info as ref[ExternalModuleInfo]
+        if info.export_equals = null
+            return
+        let ee info.export_equals as ref[AstNode]
+        let expression_result this.cjs_visit_export_equals(ee)
+        if expression_result = null
+            return
+        let f factory
+        let statement f.new_expression_statement(f.new_assignment_expression(f.new_property_access_expression(f.new_identifier("module"), null, f.new_identifier("exports"), NodeFlagsNone), expression_result))
+        context.assign_comment_and_source_map_ranges(statement, ee)
+        context.add_emit_flags(statement, EFNoComments)
+        statements.add(statement)
+    }
+
+    procedure cjs_visit_export_equals(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let grandparent this.push_node(node)
+        let result this.the_visitor().visit_node(AstNode.expression_of(node))
+        this.pop_node(grandparent)
+        result
+    }
+
+    ; appendExportsOfImportDeclaration
+    procedure cjs_append_exports_of_import_declaration(this, statements: ref[Array[ref[AstNode]?]], decl: ref[AstNode])
+    {
+        let info cjs_info as ref[ExternalModuleInfo]
+        if info.export_equals <> null
+            return
+        let import_clause AstNode.import_clause_of(decl)
+        if import_clause = null
+            return
+        let ic import_clause as ref[AstNode]
+        let seen &Array[Slice[char]]^host()
+        if AstNode.name_of(ic) <> null
+            this.cjs_append_exports_of_declaration(statements, ic, seen, false)
+        let named_bindings AstNode.named_bindings_of(ic)
+        if named_bindings = null
+            return
+        let nb named_bindings as ref[AstNode]
+        if nb.kind = KindNamespaceImport
+            this.cjs_append_exports_of_declaration(statements, nb, seen, false)
+        if nb.kind = KindNamedImports
+        {
+            let elements AstNode.elements_of(nb)
+            if elements <> null
+            {
+                let es elements as ref[Array[ref[AstNode]?]]
+                var i 0
+                while i < (es.get_length() as int)
+                {
+                    this.cjs_append_exports_of_declaration(statements, es[i as size_t] as ref[AstNode], seen, true)
+                    set i: i + 1
+                }
+            }
+        }
+    }
+
+    ; appendExportsOfVariableStatement
+    procedure cjs_append_exports_of_variable_statement(this, statements: ref[Array[ref[AstNode]?]], node: ref[AstNode])
+        this.cjs_append_exports_of_variable_declaration_list(statements, Printer.declaration_list_of(node) as ref[AstNode], false)
+
+    ; appendExportsOfVariableDeclarationList
+    procedure cjs_append_exports_of_variable_declaration_list(this, statements: ref[Array[ref[AstNode]?]], node: ref[AstNode], is_for_in_or_of_initializer: bool)
+    {
+        let info cjs_info as ref[ExternalModuleInfo]
+        if info.export_equals <> null
+            return
+        let decls Printer.declarations_of(node)
+        if decls = null
+            return
+        let ds decls as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (ds.get_length() as int)
+        {
+            this.cjs_append_exports_of_binding_element(statements, ds[i as size_t] as ref[AstNode], is_for_in_or_of_initializer)
+            set i: i + 1
+        }
+    }
+
+    ; appendExportsOfBindingElement
+    procedure cjs_append_exports_of_binding_element(this, statements: ref[Array[ref[AstNode]?]], decl: ref[AstNode], is_for_in_or_of_initializer: bool)
+    {
+        let info cjs_info as ref[ExternalModuleInfo]
+        if info.export_equals <> null
+            return
+        let name AstNode.name_of(decl)
+        if name = null
+            return
+        let nm name as ref[AstNode]
+        if AstNode.is_binding_pattern(nm)
+        {
+            let elements AstNode.elements_of(nm) as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (elements.get_length() as int)
+            {
+                let element elements[i as size_t] as ref[AstNode]
+                if element.kind <> KindOmittedExpression
+                    this.cjs_append_exports_of_binding_element(statements, element, is_for_in_or_of_initializer)
+                set i: i + 1
+            }
+            return
+        }
+        if context.has_auto_generate_info(nm)
+            return
+        if (decl.kind = KindVariableDeclaration) and (AstNode.initializer_of(decl) = null) and (is_for_in_or_of_initializer = false)
+            return
+        this.cjs_append_exports_of_declaration(statements, decl, null, false)
+    }
+
+    ; appendExportsOfClassOrFunctionDeclaration
+    procedure cjs_append_exports_of_class_or_function_declaration(this, statements: ref[Array[ref[AstNode]?]], decl: ref[AstNode])
+    {
+        let info cjs_info as ref[ExternalModuleInfo]
+        if info.export_equals <> null
+            return
+        let f factory
+        let seen &Array[Slice[char]]^host()
+        if Transformer.has_syntactic_modifier(decl, ModifierFlagsExport)
+        {
+            var export_name: ref[AstNode]? null
+            if Transformer.has_syntactic_modifier(decl, ModifierFlagsDefault)
+                set export_name: f.new_identifier("default")
+            else
+                set export_name: f.get_declaration_name(decl)
+            let export_value f.get_local_name(decl)
+            this.cjs_append_export_statement(statements, seen, export_name as ref[AstNode], export_value, true, TextRange(decl.pos, decl.end), false, false)
+        }
+        if AstNode.name_of(decl) <> null
+            this.cjs_append_exports_of_declaration(statements, decl, seen, false)
+    }
+
+    ; appendExportsOfDeclaration
+    procedure cjs_append_exports_of_declaration(this, statements: ref[Array[ref[AstNode]?]], decl: ref[AstNode], seen_in: ref[Array[Slice[char]]]?, live_binding: bool)
+    {
+        let info cjs_info as ref[ExternalModuleInfo]
+        if info.export_equals <> null
+            return
+        var seen: ref[Array[Slice[char]]]? seen_in
+        if seen = null
+            set seen: &Array[Slice[char]]^host()
+        let s seen as ref[Array[Slice[char]]]
+        let name AstNode.name_of(decl)
+        if info.export_specifiers.get_length() = 0
+            return
+        if name = null
+            return
+        if AstNode.kind_of(name) <> KindIdentifier
+            return
+        let decl_name factory.get_declaration_name(decl)
+        let export_specifiers info.export_specifiers_of(host, AstNode.identifier_text_of(decl_name))
+        if export_specifiers.get_length() = 0
+            return
+        let export_value this.cjs_visit_expression_identifier(decl_name)
+        var i 0
+        while i < (export_specifiers.get_length() as int)
+        {
+            let export_specifier export_specifiers[i as size_t] as ref[AstNode]
+            let sn AstNode.name_of(export_specifier) as ref[AstNode]
+            this.cjs_append_export_statement(statements, s, sn, export_value, true, TextRange(sn.pos, sn.end), false, live_binding)
+            set i: i + 1
+        }
+    }
+
+    ; appendExportStatement
+    procedure cjs_append_export_statement(this, statements: ref[Array[ref[AstNode]?]], seen: ref[Array[Slice[char]]], export_name: ref[AstNode], expression: ref[AstNode], has_location: bool, location: TextRange, allow_comments: bool, live_binding: bool)
+    {
+        if export_name.kind <> KindStringLiteral
+        {
+            let text Checker.module_export_name_text(export_name)
+            if Transformer.names_contain(seen, text)
+                return
+            seen.add(text)
+        }
+        statements.add(this.cjs_create_export_statement(export_name, expression, has_location, location, allow_comments, live_binding))
+    }
+
+    ; createExportStatement
+    procedure cjs_create_export_statement(this, name: ref[AstNode], value: ref[AstNode], has_location: bool, location: TextRange, allow_comments: bool, live_binding: bool) returns ref[AstNode]
+    {
+        let statement factory.new_expression_statement(this.cjs_create_export_expression(name, value, false, location, live_binding))
+        if has_location
+            context.set_comment_range(statement, location)
+        context.add_emit_flags(statement, EFStartOnNewLine)
+        if allow_comments = false
+            context.add_emit_flags(statement, EFNoComments)
+        statement
+    }
+
+    ; createExportExpression
+    procedure cjs_create_export_expression(this, name: ref[AstNode], value: ref[AstNode], has_location: bool, location: TextRange, live_binding: bool) returns ref[AstNode]
+    {
+        let f factory
+        var expression: ref[AstNode]? null
+        if live_binding
+        {
+            ; Object.defineProperty(exports, "<name>", { enumerable: true, get: function () { return <value>; } });
+            let body_statements &Array[ref[AstNode]?]^host()
+            body_statements.add(f.new_return_statement(value))
+            let no_params &Array[ref[AstNode]?]^host()
+            let getter f.new_function_expression(null, null, null, null, no_params, null, null, f.new_block(body_statements, false))
+            let props &Array[ref[AstNode]?]^host()
+            props.add(f.new_property_assignment(null, f.new_identifier("enumerable"), null, null, f.new_true_expression()))
+            props.add(f.new_property_assignment(null, f.new_identifier("get"), null, null, getter))
+            let args &Array[ref[AstNode]?]^host()
+            args.add(f.new_identifier("exports"))
+            args.add(f.new_string_literal_from_node(name))
+            args.add(f.new_object_literal_expression(props, false))
+            set expression: f.new_call_expression(f.new_property_access_expression(f.new_identifier("Object"), null, f.new_identifier("defineProperty"), NodeFlagsNone), null, null, args, NodeFlagsNone)
+        }
+        else
+        {
+            var left: ref[AstNode]? null
+            if name.kind = KindStringLiteral
+                set left: f.new_element_access_expression(f.new_identifier("exports"), null, f.new_string_literal_from_node(name), NodeFlagsNone)
+            else
+                set left: f.new_property_access_expression(f.new_identifier("exports"), null, f.clone(name), NodeFlagsNone)
+            set expression: f.new_assignment_expression(left, value)
+        }
+        let e expression as ref[AstNode]
+        if has_location
+            context.set_comment_range(e, location)
+        e
+    }
+
+    ; getExternalModuleNameLiteral: the module specifier as a fresh string literal
+    ; (the amd-module / outFile / renamedDependencies renames are all nil here)
+    procedure cjs_external_module_name_literal(this, import_node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let module_name AstNode.get_external_module_name(import_node)
+        if module_name = null
+            return null
+        let mn module_name as ref[AstNode]
+        if mn.kind <> KindStringLiteral
+            return null
+        factory.new_string_literal(AstNode.literal_text_of(mn), TokenFlagsNone)
+    }
+
+    ; createRequireCall
+    procedure cjs_create_require_call(this, node: ref[AstNode]) returns ref[AstNode]
+    {
+        let args &Array[ref[AstNode]?]^host()
+        let module_name this.cjs_external_module_name_literal(node)
+        if module_name <> null
+            args.add(this.rewrite_module_specifier(module_name))
+        factory.new_call_expression(factory.new_identifier("require"), null, null, args, NodeFlagsNone)
+    }
+
+    ; ast.GetNamespaceDeclarationNode, all three arms (the checker's own reads
+    ; the import clause only)
+    function cjs_namespace_declaration_node(node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let k node.kind
+        if (k = KindImportDeclaration) or (k = KindJSImportDeclaration)
+        {
+            let clause AstNode.import_clause_of(node)
+            if clause = null
+                return null
+            let nb AstNode.named_bindings_of(clause)
+            if AstNode.kind_of(nb) = KindNamespaceImport
+                return nb
+            return null
+        }
+        if k = KindImportEqualsDeclaration
+            return node
+        if k = KindExportDeclaration
+        {
+            let ec AstNode.export_clause_of(node)
+            if AstNode.kind_of(ec) = KindNamespaceExport
+                return ec
+        }
+        null
+    }
+
+    ; ast.IsDefaultImport
+    function cjs_is_default_import(node: ref[AstNode]) returns bool
+    {
+        let k node.kind
+        if (k = KindImportDeclaration) or (k = KindJSImportDeclaration)
+        {
+            let clause AstNode.import_clause_of(node)
+            if clause = null
+                return false
+            return AstNode.name_of(clause) <> null
+        }
+        false
+    }
+
+    ; isNamedDefaultReference
+    function cjs_is_named_default_reference(e: ref[AstNode]) returns bool
+        Checker.module_export_name_is_default(Checker.property_name_or_name_of(e))
+
+    ; containsDefaultReference
+    function cjs_contains_default_reference(node: ref[AstNode]?) returns bool
+    {
+        if node = null
+            return false
+        let n node as ref[AstNode]
+        if (n.kind <> KindNamedImports) and (n.kind <> KindNamedExports)
+            return false
+        let elements AstNode.elements_of(n)
+        if elements = null
+            return false
+        let es elements as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (es.get_length() as int)
+        {
+            if Transformer.cjs_is_named_default_reference(es[i as size_t] as ref[AstNode])
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    ; getExportNeedsImportStarHelper
+    function cjs_export_needs_import_star_helper(node: ref[AstNode]) returns bool
+        Transformer.cjs_namespace_declaration_node(node) <> null
+
+    ; getImportNeedsImportStarHelper
+    function cjs_import_needs_import_star_helper(node: ref[AstNode]) returns bool
+    {
+        if Transformer.cjs_namespace_declaration_node(node) <> null
+            return true
+        let clause AstNode.import_clause_of(node)
+        if clause = null
+            return false
+        let bindings AstNode.named_bindings_of(clause)
+        if bindings = null
+            return false
+        let b bindings as ref[AstNode]
+        if b.kind <> KindNamedImports
+            return false
+        let elements AstNode.elements_of(b) as ref[Array[ref[AstNode]?]]
+        let n elements.get_length() as int
+        var default_ref_count 0
+        var i 0
+        while i < n
+        {
+            if Transformer.cjs_is_named_default_reference(elements[i as size_t] as ref[AstNode])
+                set default_ref_count: default_ref_count + 1
+            set i: i + 1
+        }
+        ; import star is required if there are default named refs mixed with
+        ; non-default refs, or non-default refs beside a default import
+        if (default_ref_count > 0) and (default_ref_count <> n)
+            return true
+        if ((n - default_ref_count) <> 0) and Transformer.cjs_is_default_import(node)
+            return true
+        false
+    }
+
+    ; getImportNeedsImportDefaultHelper
+    function cjs_import_needs_import_default_helper(node: ref[AstNode]) returns bool
+    {
+        if Transformer.cjs_import_needs_import_star_helper(node)
+            return false
+        if Transformer.cjs_is_default_import(node)
+            return true
+        let clause AstNode.import_clause_of(node)
+        if clause = null
+            return false
+        let bindings AstNode.named_bindings_of(clause)
+        if AstNode.kind_of(bindings) <> KindNamedImports
+            return false
+        Transformer.cjs_contains_default_reference(bindings)
+    }
+
+    procedure cjs_helper_expression_for_export(this, node: ref[AstNode], inner_expr: ref[AstNode]) returns ref[AstNode]
+    {
+        if Transformer.cjs_export_needs_import_star_helper(node)
+            return this.the_visitor().visit_node(factory.new_import_star_helper(inner_expr)) as ref[AstNode]
+        inner_expr
+    }
+
+    procedure cjs_helper_expression_for_import(this, node: ref[AstNode], inner_expr: ref[AstNode]) returns ref[AstNode]
+    {
+        if Transformer.cjs_import_needs_import_star_helper(node)
+            return this.the_visitor().visit_node(factory.new_import_star_helper(inner_expr)) as ref[AstNode]
+        if Transformer.cjs_import_needs_import_default_helper(node)
+            return this.the_visitor().visit_node(factory.new_import_default_helper(inner_expr)) as ref[AstNode]
+        inner_expr
+    }
+
+    ; visitTopLevelImportDeclaration
+    procedure cjs_visit_top_level_import_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        let import_clause AstNode.import_clause_of(node)
+        if import_clause = null
+        {
+            ; import "mod";
+            let statement f.new_expression_statement(this.cjs_create_require_call(node))
+            context.set_original(statement, node)
+            context.assign_comment_and_source_map_ranges(statement, node)
+            return statement
+        }
+        let statements &Array[ref[AstNode]?]^host()
+        let variables &Array[ref[AstNode]?]^host()
+        let namespace_declaration Transformer.cjs_namespace_declaration_node(node)
+        let is_default Transformer.cjs_is_default_import(node)
+        if (namespace_declaration <> null) and (is_default = false)
+        {
+            ; import * as n from "mod";
+            let ns_name AstNode.name_of(namespace_declaration) as ref[AstNode]
+            variables.add(f.new_variable_declaration(f.clone(ns_name), null, null, this.cjs_helper_expression_for_import(node, this.cjs_create_require_call(node))))
+        }
+        else
+        {
+            ; import d from "mod"; import { x, y } from "mod"; import d, { x, y } from "mod"; import d, * as n from "mod";
+            variables.add(f.new_variable_declaration(f.new_generated_name_for_node(node), null, null, this.cjs_helper_expression_for_import(node, this.cjs_create_require_call(node))))
+            if (namespace_declaration <> null) and is_default
+            {
+                let ns_name AstNode.name_of(namespace_declaration) as ref[AstNode]
+                variables.add(f.new_variable_declaration(f.clone(ns_name), null, null, f.new_generated_name_for_node(node)))
+            }
+        }
+        let var_statement f.new_variable_statement(null, f.new_variable_declaration_list(variables, NodeFlagsConst))
+        context.set_original(var_statement, node)
+        context.assign_comment_and_source_map_ranges(var_statement, node)
+        statements.add(var_statement)
+        this.cjs_append_exports_of_import_declaration(statements, node)
+        this.single_or_many(statements)
+    }
+
+    ; visitTopLevelImportEqualsDeclaration
+    procedure cjs_visit_top_level_import_equals_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        if AstNode.kind_of(AstNode.module_reference_of(node)) <> KindExternalModuleReference
+        {
+            ; import m = n; — handled by the runtime-syntax transformer before this one
+            this.record_unported("commonjs-internal-import-equals", 0)
+            return node
+        }
+        let statements &Array[ref[AstNode]?]^host()
+        let name AstNode.name_of(node) as ref[AstNode]
+        if Transformer.has_syntactic_modifier(node, ModifierFlagsExport)
+        {
+            ; export import m = require("mod");
+            let statement f.new_expression_statement(this.cjs_create_export_expression(name, this.cjs_create_require_call(node), true, TextRange(node.pos, node.end), false))
+            context.set_original(statement, node)
+            context.assign_comment_and_source_map_ranges(statement, node)
+            statements.add(statement)
+        }
+        else
+        {
+            ; import m = require("mod");
+            let variables &Array[ref[AstNode]?]^host()
+            variables.add(f.new_variable_declaration(f.clone(name), null, null, this.cjs_create_require_call(node)))
+            let statement f.new_variable_statement(null, f.new_variable_declaration_list(variables, NodeFlagsConst))
+            context.set_original(statement, node)
+            context.assign_comment_and_source_map_ranges(statement, node)
+            statements.add(statement)
+        }
+        this.cjs_append_exports_of_declaration(statements, node, null, false)
+        this.single_or_many(statements)
+    }
+
+    ; visitTopLevelExportDeclaration
+    procedure cjs_visit_top_level_export_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        if AstNode.module_specifier_of(node) = null
+            return null
+        let generated_name f.new_generated_name_for_node(node)
+        let export_clause AstNode.export_clause_of(node)
+        if AstNode.kind_of(export_clause) = KindNamedExports
+        {
+            ; export { x, y } from "mod";
+            let statements &Array[ref[AstNode]?]^host()
+            let variables &Array[ref[AstNode]?]^host()
+            variables.add(f.new_variable_declaration(generated_name, null, null, this.cjs_create_require_call(node)))
+            let var_statement f.new_variable_statement(null, f.new_variable_declaration_list(variables, NodeFlagsNone))
+            context.set_original(var_statement, node)
+            context.assign_comment_and_source_map_ranges(var_statement, node)
+            statements.add(var_statement)
+            let elements AstNode.elements_of(export_clause) as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (elements.get_length() as int)
+            {
+                let specifier elements[i as size_t] as ref[AstNode]
+                let specifier_name Checker.property_name_or_name_of(specifier) as ref[AstNode]
+                let export_needs_import_default Checker.module_export_name_is_default(specifier_name)
+                var target generated_name
+                if export_needs_import_default
+                    set target: f.new_import_default_helper(generated_name)
+                let sn AstNode.name_of(specifier) as ref[AstNode]
+                var export_name: ref[AstNode]? null
+                if sn.kind = KindStringLiteral
+                    set export_name: f.new_string_literal_from_node(sn)
+                else
+                    set export_name: f.get_export_name(specifier)
+                var exported_value: ref[AstNode]? null
+                if specifier_name.kind = KindStringLiteral
+                    set exported_value: f.new_element_access_expression(target, null, specifier_name, NodeFlagsNone)
+                else
+                    set exported_value: f.new_property_access_expression(target, null, specifier_name, NodeFlagsNone)
+                let statement f.new_expression_statement(this.cjs_create_export_expression(export_name as ref[AstNode], exported_value as ref[AstNode], false, TextRange(0, 0), true))
+                context.set_original(statement, specifier)
+                context.assign_comment_and_source_map_ranges(statement, specifier)
+                statements.add(statement)
+                set i: i + 1
+            }
+            return this.single_or_many(statements)
+        }
+        if export_clause <> null
+        {
+            ; export * as ns from "mod"; export * as default from "mod";
+            let ec_name AstNode.name_of(export_clause) as ref[AstNode]
+            var export_name: ref[AstNode]? null
+            if ec_name.kind = KindStringLiteral
+                set export_name: f.new_string_literal_from_node(ec_name)
+            else
+                set export_name: f.clone(ec_name)
+            let statement f.new_expression_statement(this.cjs_create_export_expression(export_name as ref[AstNode], this.cjs_helper_expression_for_export(node, this.cjs_create_require_call(node)), false, TextRange(0, 0), false))
+            context.set_original(statement, node)
+            context.assign_comment_and_source_map_ranges(statement, node)
+            return statement
+        }
+        ; export * from "mod";
+        let statement f.new_expression_statement(this.the_visitor().visit_node(f.new_export_star_helper(this.cjs_create_require_call(node), f.new_identifier("exports"))))
+        context.set_original(statement, node)
+        context.assign_comment_and_source_map_ranges(statement, node)
+        statement
+    }
+
+    ; visitTopLevelExportAssignment
+    procedure cjs_visit_top_level_export_assignment(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if AstNode.is_export_equals_of(node)
+            return null
+        let visited this.the_visitor().visit_node(AstNode.expression_of(node)) as ref[AstNode]
+        this.cjs_create_export_statement(factory.new_identifier("default"), visited, true, TextRange(node.pos, node.end), true, false)
+    }
+
+    ; visitTopLevelFunctionDeclaration
+    procedure cjs_visit_top_level_function_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let v this.the_visitor()
+        if Transformer.has_syntactic_modifier(node, ModifierFlagsExport) = false
+            return v.visit_each_child(node)
+        let modifiers Transformer.extract_modifiers(host, opts, Printer.modifier_list_of(node), ModifierFlagsAll xor ModifierFlagsExportDefault)
+        factory.update_function_declaration(node, modifiers, AstNode.asterisk_token_of(node), factory.get_declaration_name(node), null, v.visit_nodes(AstNode.parameters_of(node)), null, null, v.visit_node(AstNode.body_of(node)))
+    }
+
+    ; visitTopLevelClassDeclaration
+    procedure cjs_visit_top_level_class_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let v this.the_visitor()
+        let statements &Array[ref[AstNode]?]^host()
+        if Transformer.has_syntactic_modifier(node, ModifierFlagsExport)
+        {
+            let modifiers Transformer.extract_modifiers(host, opts, Printer.modifier_list_of(node), ModifierFlagsAll xor ModifierFlagsExportDefault)
+            statements.add(factory.update_class_declaration(node, v.visit_modifiers(modifiers), factory.get_declaration_name(node), null, v.visit_nodes(AstNode.heritage_clauses_of(node)), v.visit_nodes(Printer.member_list_of(node))))
+        }
+        else
+            statements.add(v.visit_each_child(node))
+        this.cjs_append_exports_of_class_or_function_declaration(statements, node)
+        this.single_or_many(statements)
+    }
+
+    ; the two commit closures of visitTopLevelVariableStatement
+    procedure cjs_commit_pending_variables(this, node: ref[AstNode], statements: ref[Array[ref[AstNode]?]], variables: ref[Array[ref[AstNode]?]], modifiers: ref[Array[ref[AstNode]?]]?)
+    {
+        if variables.get_length() = 0
+            return
+        let f factory
+        let list Printer.declaration_list_of(node) as ref[AstNode]
+        let statement f.update_variable_statement(node, modifiers, f.update_variable_declaration_list(list, variables, list.flags))
+        if statements.get_length() > 0
+            context.add_emit_flags(statement, EFNoComments)
+        statements.add(statement)
+    }
+
+    procedure cjs_commit_pending_expressions(this, node: ref[AstNode], statements: ref[Array[ref[AstNode]?]], expressions: ref[Array[ref[AstNode]?]])
+    {
+        if expressions.get_length() = 0
+            return
+        let f factory
+        let statement f.new_expression_statement(f.inline_expressions(expressions) as ref[AstNode])
+        context.assign_comment_and_source_map_ranges(statement, node)
+        if statements.get_length() > 0
+            context.add_emit_flags(statement, EFNoComments)
+        statements.add(statement)
+    }
+
+    ; visitTopLevelVariableStatement
+    procedure cjs_visit_top_level_variable_statement(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if Transformer.has_syntactic_modifier(node, ModifierFlagsExport) = false
+            return this.cjs_visit_top_level_nested_variable_statement(node)
+        ; export var a = b;
+        let f factory
+        let v this.the_visitor()
+        let statements &Array[ref[AstNode]?]^host()
+        var variables &Array[ref[AstNode]?]^host()
+        var expressions &Array[ref[AstNode]?]^host()
+        var modifiers: ref[Array[ref[AstNode]?]]? null
+        let list Printer.declaration_list_of(node) as ref[AstNode]
+        let decls Printer.declarations_of(list) as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (decls.get_length() as int)
+        {
+            let variable decls[i as size_t] as ref[AstNode]
+            let name AstNode.name_of(variable) as ref[AstNode]
+            let init_node AstNode.initializer_of(variable)
+            var handled false
+            if (name.kind = KindIdentifier) and ((context.emit_flags(name) & EFLocalName) <> 0)
+            {
+                ; a "local name": a class or function declaration converted into a
+                ; variable declaration, which an `export { x }` will follow
+                set handled: true
+                if modifiers = null
+                    set modifiers: Transformer.extract_modifiers(host, opts, Printer.modifier_list_of(node), ModifierFlagsAll xor ModifierFlagsExportDefault)
+                var updated variable
+                if init_node <> null
+                    set updated: f.update_variable_declaration(variable, name, null, null, this.cjs_create_export_expression(name, v.visit_node(init_node) as ref[AstNode], false, TextRange(0, 0), false))
+                ; pushVariable
+                if expressions.get_length() > 0
+                {
+                    this.cjs_commit_pending_expressions(node, statements, expressions)
+                    set expressions: &Array[ref[AstNode]?]^host()
+                }
+                variables.add(updated)
+            }
+            if (handled = false) and (init_node <> null) and (AstNode.is_binding_pattern(name) = false)
+            {
+                let ik AstNode.kind_of(init_node)
+                if (ik = KindArrowFunction) or (ik = KindFunctionExpression) or (ik = KindClassExpression)
+                {
+                    ; preserve variable declarations for functions and classes to assign names
+                    set handled: true
+                    if expressions.get_length() > 0
+                    {
+                        this.cjs_commit_pending_expressions(node, statements, expressions)
+                        set expressions: &Array[ref[AstNode]?]^host()
+                    }
+                    variables.add(f.new_variable_declaration(name, AstNode.exclamation_token_of(variable), null, v.visit_node(init_node)))
+                    let property_access f.new_property_access_expression(f.new_identifier("exports"), null, name, NodeFlagsNone)
+                    context.assign_comment_and_source_map_ranges(property_access, name)
+                    ; pushExpression
+                    if variables.get_length() > 0
+                    {
+                        this.cjs_commit_pending_variables(node, statements, variables, modifiers)
+                        set variables: &Array[ref[AstNode]?]^host()
+                    }
+                    expressions.add(f.new_assignment_expression(property_access, f.clone(name)))
+                }
+            }
+            if handled = false
+            {
+                var expression: ref[AstNode]? null
+                if name.kind = KindIdentifier
+                {
+                    let e this.cjs_transform_initialized_variable(variable)
+                    if e <> null
+                        set expression: v.visit_node(e)
+                }
+                else
+                {
+                    if AstNode.is_binding_pattern(name)
+                        set expression: this.cjs_transform_initialized_variable(variable)
+                    else
+                    {
+                        let e Transformer.convert_variable_declaration_to_assignment_expression(context, variable)
+                        if e <> null
+                            set expression: v.visit_node(e)
+                    }
+                }
+                if expression <> null
+                {
+                    if variables.get_length() > 0
+                    {
+                        this.cjs_commit_pending_variables(node, statements, variables, modifiers)
+                        set variables: &Array[ref[AstNode]?]^host()
+                    }
+                    expressions.add(expression)
+                }
+            }
+            set i: i + 1
+        }
+        this.cjs_commit_pending_variables(node, statements, variables, modifiers)
+        this.cjs_commit_pending_expressions(node, statements, expressions)
+        this.cjs_append_exports_of_variable_statement(statements, node)
+        this.single_or_many(statements)
+    }
+
+    ; transformInitializedVariable
+    procedure cjs_transform_initialized_variable(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let init_node AstNode.initializer_of(node)
+        if init_node = null
+            return null
+        let name AstNode.name_of(node) as ref[AstNode]
+        if AstNode.is_binding_pattern(name)
+        {
+            ; the binding pattern as a destructuring assignment, visited as one
+            let assignment Transformer.convert_variable_declaration_to_assignment_expression(context, node) as ref[AstNode]
+            let grandparent this.push_node(assignment)
+            let result this.cjs_visit_destructuring_assignment(assignment, true)
+            this.pop_node(grandparent)
+            return result
+        }
+        let property_access factory.new_property_access_expression(factory.new_identifier("exports"), null, name, NodeFlagsNone)
+        context.assign_comment_and_source_map_ranges(property_access, name)
+        factory.new_assignment_expression(property_access, init_node)
+    }
+
+    ; visitTopLevelNestedVariableStatement
+    procedure cjs_visit_top_level_nested_variable_statement(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let statements &Array[ref[AstNode]?]^host()
+        statements.add(this.the_visitor().visit_each_child(node))
+        this.cjs_append_exports_of_variable_statement(statements, node)
+        this.single_or_many(statements)
+    }
+
+    ; visitTopLevelNestedForStatement
+    procedure cjs_visit_top_level_nested_for_statement(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        let dv this.cjs_visitor(CjsSubDiscarded)
+        let nv this.cjs_visitor(CjsSubTopLevelNested)
+        let initializer AstNode.initializer_of(node)
+        if initializer <> null
+        {
+            let init_node initializer as ref[AstNode]
+            if (init_node.kind = KindVariableDeclarationList) and ((init_node.flags & NodeFlagsBlockScoped) = 0)
+            {
+                let export_statements &Array[ref[AstNode]?]^host()
+                this.cjs_append_exports_of_variable_declaration_list(export_statements, init_node, false)
+                if export_statements.get_length() > 0
+                {
+                    ; export { x }; for (var x = 0; ;) { }  →  var x = 0; exports.x = x; for (; ;) { }
+                    let statements &Array[ref[AstNode]?]^host()
+                    let var_decl_list dv.visit_node(init_node)
+                    statements.add(f.new_variable_statement(null, var_decl_list))
+                    Transformer.add_all(statements, export_statements)
+                    let condition v.visit_node(AstNode.for_condition_of(node))
+                    let incrementor dv.visit_node(AstNode.for_incrementor_of(node))
+                    let body context.visit_iteration_body(Printer.statement_body_of(node), nv)
+                    statements.add(f.update_for_statement(node, null, condition, incrementor, body))
+                    return this.single_or_many(statements)
+                }
+            }
+        }
+        f.update_for_statement(node, dv.visit_node(initializer), v.visit_node(AstNode.for_condition_of(node)), dv.visit_node(AstNode.for_incrementor_of(node)), context.visit_iteration_body(Printer.statement_body_of(node), nv))
+    }
+
+    ; visitTopLevelNestedForInOrOfStatement
+    procedure cjs_visit_top_level_nested_for_in_or_of_statement(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        let dv this.cjs_visitor(CjsSubDiscarded)
+        let nv this.cjs_visitor(CjsSubTopLevelNested)
+        let init_node AstNode.initializer_of(node) as ref[AstNode]
+        if (init_node.kind = KindVariableDeclarationList) and ((init_node.flags & NodeFlagsBlockScoped) = 0)
+        {
+            let export_statements &Array[ref[AstNode]?]^host()
+            this.cjs_append_exports_of_variable_declaration_list(export_statements, init_node, true)
+            if export_statements.get_length() > 0
+            {
+                ; export { x }; for (var x in y) { ... }  →  for (var x in y) { exports.x = x; ... }
+                let initializer dv.visit_node(init_node)
+                let expression v.visit_node(AstNode.expression_of(node))
+                let body_in context.visit_iteration_body(Printer.statement_body_of(node), nv)
+                var body: ref[AstNode]? null
+                if AstNode.kind_of(body_in) = KindBlock
+                {
+                    let block body_in as ref[AstNode]
+                    let old AstNode.statements_of(block)
+                    let body_statements &Array[ref[AstNode]?]^host()
+                    Transformer.add_all(body_statements, export_statements)
+                    Transformer.add_all(body_statements, old)
+                    set body: f.update_block(block, f.new_node_list_like(body_statements, old), AstNode.multi_line_of(block))
+                }
+                else
+                {
+                    let body_statements &Array[ref[AstNode]?]^host()
+                    Transformer.add_all(body_statements, export_statements)
+                    body_statements.add(body_in)
+                    set body: f.new_block(body_statements, true)
+                }
+                return f.update_for_in_or_of_statement(node, AstNode.for_await_modifier_of(node), initializer, expression, body)
+            }
+        }
+        f.update_for_in_or_of_statement(node, AstNode.for_await_modifier_of(node), dv.visit_node(init_node), v.visit_node(AstNode.expression_of(node)), context.visit_iteration_body(Printer.statement_body_of(node), nv))
+    }
+
+    procedure cjs_visit_top_level_nested_do_statement(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let nv this.cjs_visitor(CjsSubTopLevelNested)
+        factory.update_do_statement(node, context.visit_iteration_body(Printer.statement_body_of(node), nv), this.the_visitor().visit_node(AstNode.expression_of(node)))
+    }
+
+    procedure cjs_visit_top_level_nested_while_statement(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let nv this.cjs_visitor(CjsSubTopLevelNested)
+        factory.update_while_statement(node, this.the_visitor().visit_node(AstNode.expression_of(node)), context.visit_iteration_body(Printer.statement_body_of(node), nv))
+    }
+
+    procedure cjs_visit_top_level_nested_labeled_statement(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let nv this.cjs_visitor(CjsSubTopLevelNested)
+        var statement nv.visit_embedded_statement(Printer.statement_body_of(node))
+        if statement = null
+            set statement: factory.new_empty_statement()
+        factory.update_labeled_statement(node, AstNode.label_name_of(node), statement)
+    }
+
+    procedure cjs_visit_top_level_nested_with_statement(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let nv this.cjs_visitor(CjsSubTopLevelNested)
+        factory.update_with_statement(node, this.the_visitor().visit_node(AstNode.expression_of(node)), nv.visit_embedded_statement(Printer.statement_body_of(node)))
+    }
+
+    procedure cjs_visit_top_level_nested_if_statement(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let nv this.cjs_visitor(CjsSubTopLevelNested)
+        let expression this.the_visitor().visit_node(AstNode.expression_of(node))
+        var then_statement nv.visit_embedded_statement(AstNode.then_statement_of(node))
+        if then_statement = null
+            set then_statement: factory.new_block(&Array[ref[AstNode]?]^host(), false)
+        let else_statement nv.visit_embedded_statement(AstNode.else_statement_of(node))
+        factory.update_if_statement(node, expression, then_statement, else_statement)
+    }
+
+    procedure cjs_visit_top_level_nested_switch_statement(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let nv this.cjs_visitor(CjsSubTopLevelNested)
+        factory.update_switch_statement(node, this.the_visitor().visit_node(AstNode.expression_of(node)), nv.visit_node(AstNode.case_block_of(node)))
+    }
+
+    procedure cjs_visit_top_level_nested_case_block(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let nv this.cjs_visitor(CjsSubTopLevelNested)
+        nv.visit_each_child(node)
+    }
+
+    procedure cjs_visit_top_level_nested_case_or_default_clause(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let nv this.cjs_visitor(CjsSubTopLevelNested)
+        factory.update_case_or_default_clause(node, this.the_visitor().visit_node(AstNode.expression_of(node)), nv.visit_nodes(AstNode.statements_of(node)))
+    }
+
+    procedure cjs_visit_top_level_nested_try_statement(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let nv this.cjs_visitor(CjsSubTopLevelNested)
+        nv.visit_each_child(node)
+    }
+
+    procedure cjs_visit_top_level_nested_catch_clause(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let nv this.cjs_visitor(CjsSubTopLevelNested)
+        factory.update_catch_clause(node, AstNode.catch_variable_declaration_of(node), nv.visit_node(AstNode.catch_block_of(node)))
+    }
+
+    procedure cjs_visit_top_level_nested_block(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let nv this.cjs_visitor(CjsSubTopLevelNested)
+        nv.visit_each_child(node)
+    }
+
+    procedure cjs_visit_for_statement(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let dv this.cjs_visitor(CjsSubDiscarded)
+        let nv this.cjs_visitor(CjsSubTopLevelNested)
+        factory.update_for_statement(node, dv.visit_node(AstNode.initializer_of(node)), this.the_visitor().visit_node(AstNode.for_condition_of(node)), dv.visit_node(AstNode.for_incrementor_of(node)), context.visit_iteration_body(Printer.statement_body_of(node), nv))
+    }
+
+    procedure cjs_visit_for_in_or_of_statement(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let dv this.cjs_visitor(CjsSubDiscarded)
+        let nv this.cjs_visitor(CjsSubTopLevelNested)
+        factory.update_for_in_or_of_statement(node, AstNode.for_await_modifier_of(node), dv.visit_node(AstNode.initializer_of(node)), this.the_visitor().visit_node(AstNode.expression_of(node)), context.visit_iteration_body(Printer.statement_body_of(node), nv))
+    }
+
+    ; visitBinaryExpression: a destructuring assignment, an assignment to an
+    ; exported identifier, or a comma expression whose value may be discarded
+    procedure cjs_visit_binary_expression(this, node: ref[AstNode], result_is_discarded: bool) returns ref[AstNode]?
+    {
+        if Binder.is_destructuring_assignment(node)
+            return this.cjs_visit_destructuring_assignment(node, result_is_discarded)
+        if Emitter.is_assignment_expression(node, false)
+            return this.cjs_visit_assignment_expression(node)
+        if AstNode.binary_operator_kind(node) = KindCommaToken
+        {
+            let dv this.cjs_visitor(CjsSubDiscarded)
+            let left dv.visit_node(AstNode.binary_left_of(node))
+            let right this.cjs_visit_maybe_discarded(AstNode.binary_right_of(node), result_is_discarded)
+            return factory.update_binary_expression(node, null, left, null, AstNode.binary_operator_token_of(node), right)
+        }
+        this.the_visitor().visit_each_child(node)
+    }
+
+    ; the identifiers this transformer rewrites: not generated unless file-level
+    ; reserved, and never a local name
+    function cjs_is_rewritable_identifier(this, node: ref[AstNode]) returns bool
+    {
+        if node.kind <> KindIdentifier
+            return false
+        if context.has_auto_generate_info(node)
+        {
+            if this.cjs_is_file_level_reserved_generated_identifier(node) = false
+                return false
+        }
+        (context.emit_flags(node) & EFLocalName) = 0
+    }
+
+    ; visitAssignmentExpression: every export of an assigned exported symbol is updated
+    procedure cjs_visit_assignment_expression(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let left AstNode.binary_left_of(node) as ref[AstNode]
+        if this.cjs_is_rewritable_identifier(left)
+        {
+            let exported_names this.cjs_get_exports(left)
+            if exported_names.get_length() > 0
+            {
+                var expression this.the_visitor().visit_each_child(node) as ref[AstNode]
+                var i 0
+                while i < (exported_names.get_length() as int)
+                {
+                    set expression: this.cjs_create_export_expression(exported_names[i as size_t] as ref[AstNode], expression, true, TextRange(node.pos, node.end), false)
+                    set i: i + 1
+                }
+                return expression
+            }
+        }
+        this.the_visitor().visit_each_child(node)
+    }
+
+    ; visitDestructuringAssignment
+    procedure cjs_visit_destructuring_assignment(this, node: ref[AstNode], value_is_discarded: bool) returns ref[AstNode]?
+    {
+        if this.cjs_destructuring_needs_flattening(AstNode.binary_left_of(node) as ref[AstNode])
+            return Flattener.flatten_destructuring_assignment(host, this, node, value_is_discarded = false, FlattenLevelAll, FlattenCallbackCommonJS)
+        this.the_visitor().visit_each_child(node)
+    }
+
+    ; destructuringNeedsFlattening: does the target hold an exported identifier
+    ; that native destructuring cannot update
+    procedure cjs_destructuring_needs_flattening(this, node: ref[AstNode]) returns bool
+    {
+        if node.kind = KindObjectLiteralExpression
+        {
+            let props AstNode.properties_of(node) as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (props.get_length() as int)
+            {
+                let elem props[i as size_t] as ref[AstNode]
+                let k elem.kind
+                if k = KindPropertyAssignment
+                {
+                    if this.cjs_destructuring_needs_flattening(AstNode.initializer_of(elem) as ref[AstNode])
+                        return true
+                }
+                if k = KindShorthandPropertyAssignment
+                {
+                    if this.cjs_destructuring_needs_flattening(AstNode.name_of(elem) as ref[AstNode])
+                        return true
+                }
+                if k = KindSpreadAssignment
+                {
+                    if this.cjs_destructuring_needs_flattening(AstNode.expression_of(elem) as ref[AstNode])
+                        return true
+                }
+                if (k = KindMethodDeclaration) or (k = KindGetAccessor) or (k = KindSetAccessor)
+                    return false
+                set i: i + 1
+            }
+            return false
+        }
+        if node.kind = KindArrayLiteralExpression
+        {
+            let elements AstNode.elements_of(node) as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (elements.get_length() as int)
+            {
+                let elem elements[i as size_t] as ref[AstNode]
+                if elem.kind = KindSpreadElement
+                {
+                    if this.cjs_destructuring_needs_flattening(AstNode.expression_of(elem) as ref[AstNode])
+                        return true
+                }
+                else
+                {
+                    if this.cjs_destructuring_needs_flattening(elem)
+                        return true
+                }
+                set i: i + 1
+            }
+            return false
+        }
+        if node.kind = KindIdentifier
+        {
+            let exported_names this.cjs_get_exports(node)
+            let count exported_names.get_length() as int
+            if (context.emit_flags(node) & EFExportName) <> 0
+                return count > 1
+            if count = 0
+                return false
+            ; a single direct export under the identifier's own name is rewritten
+            ; to `exports.X` natively; re-aliased or multi-exported names are not
+            if count = 1
+            {
+                let direct this.cjs_is_direct_export(node)
+                if direct
+                {
+                    let first exported_names[0] as ref[AstNode]
+                    if Checker.module_export_name_text(first).equals(AstNode.identifier_text_of(node))
+                        return false
+                }
+            }
+            return true
+        }
+        false
+    }
+
+    ; createAllExportExpressions: the flattener's assignment callback
+    procedure cjs_create_all_export_expressions(this, name: ref[AstNode], value: ref[AstNode], has_location: bool, location: TextRange) returns ref[AstNode]
+    {
+        let f factory
+        let exported_names this.cjs_get_exports(name)
+        let direct this.cjs_is_direct_export(name)
+        if exported_names.get_length() > 0
+        {
+            var expression: ref[AstNode]? null
+            if direct
+            {
+                ; exports.name = value
+                let export_name f.clone(name)
+                context.add_emit_flags(export_name, EFNoComments | EFNoSourceMap)
+                let property_access f.new_property_access_expression(f.new_identifier("exports"), null, export_name, NodeFlagsNone)
+                context.add_emit_flags(property_access, EFNoComments)
+                let e f.new_assignment_expression(property_access, value)
+                context.assign_comment_and_source_map_ranges(e, name)
+                set expression: e
+            }
+            else
+                set expression: f.new_assignment_expression(name, value)
+            var result expression as ref[AstNode]
+            var i 0
+            while i < (exported_names.get_length() as int)
+            {
+                set result: this.cjs_create_export_expression(exported_names[i as size_t] as ref[AstNode], result, has_location, location, false)
+                set i: i + 1
+            }
+            return result
+        }
+        if direct
+        {
+            let export_name f.clone(name)
+            context.add_emit_flags(export_name, EFNoComments | EFNoSourceMap)
+            let property_access f.new_property_access_expression(f.new_identifier("exports"), null, export_name, NodeFlagsNone)
+            context.add_emit_flags(property_access, EFNoComments)
+            let result f.new_assignment_expression(property_access, value)
+            context.assign_comment_and_source_map_ranges(result, name)
+            return result
+        }
+        f.new_assignment_expression(name, value)
+    }
+
+    ; isDirectExport: `export let x` rather than `let x; export { x }`
+    procedure cjs_is_direct_export(this, name: ref[AstNode]) returns bool
+    {
+        let export_container this.the_checker().get_referenced_export_container(context.most_original(name) as ref[AstNode], false)
+        AstNode.kind_of(export_container) = KindSourceFile
+    }
+
+    procedure cjs_visit_assignment_property(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let av this.cjs_visitor(CjsSubAssignmentPattern)
+        factory.update_property_assignment(node, null, this.the_visitor().visit_node(AstNode.name_of(node)), null, null, av.visit_node(AstNode.initializer_of(node)))
+    }
+
+    procedure cjs_visit_shorthand_assignment_property(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        let name AstNode.name_of(node) as ref[AstNode]
+        var target this.cjs_visit_destructuring_assignment_target_no_stack(name) as ref[AstNode]
+        let oai AstNode.shorthand_object_assignment_initializer_of(node)
+        if target.kind = KindIdentifier
+            return f.update_shorthand_property_assignment(node, null, target, null, null, AstNode.shorthand_equals_token_of(node), v.visit_node(oai))
+        if oai <> null
+        {
+            var equals_token AstNode.shorthand_equals_token_of(node)
+            if equals_token = null
+                set equals_token: f.new_token(KindEqualsToken)
+            set target: f.new_binary_expression(null, target, null, equals_token, v.visit_node(oai))
+        }
+        let updated f.new_property_assignment(null, name, null, null, target)
+        context.set_original(updated, node)
+        context.assign_comment_and_source_map_ranges(updated, node)
+        updated
+    }
+
+    procedure cjs_visit_assignment_element(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if node.kind = KindBinaryExpression
+        {
+            if AstNode.binary_operator_kind(node) = KindEqualsToken
+                return factory.update_binary_expression(node, null, this.cjs_visit_destructuring_assignment_target(AstNode.binary_left_of(node) as ref[AstNode]), null, AstNode.binary_operator_token_of(node), this.the_visitor().visit_node(AstNode.binary_right_of(node)))
+        }
+        this.cjs_visit_destructuring_assignment_target_no_stack(node)
+    }
+
+    procedure cjs_visit_destructuring_assignment_target(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let grandparent this.push_node(node)
+        var result: ref[AstNode]? null
+        if (node.kind = KindObjectLiteralExpression) or (node.kind = KindArrayLiteralExpression)
+            set result: this.cjs_visit_assignment_pattern_no_stack(node)
+        else
+            set result: this.cjs_visit_destructuring_assignment_target_no_stack(node)
+        this.pop_node(grandparent)
+        result
+    }
+
+    ; visitDestructuringAssignmentTargetNoStack:
+    ;   { x: x } = y  →  { x: { set value(v) { exports.x = x = v; } }.value } = y
+    procedure cjs_visit_destructuring_assignment_target_no_stack(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if this.cjs_is_rewritable_identifier(node) = false
+            return this.cjs_visit_no_stack(node, false)
+        let f factory
+        var expression this.cjs_visit_expression_identifier(node)
+        let exported_names this.cjs_get_exports(node)
+        if exported_names.get_length() = 0
+            return expression
+        let empty: Slice[char] ""
+        let value_text: Slice[char] "value"
+        let value f.new_unique_name_ex(value_text, GeneratedIdentifierFlagsOptimistic, empty, empty)
+        set expression: f.new_assignment_expression(expression, value)
+        var i 0
+        while i < (exported_names.get_length() as int)
+        {
+            set expression: this.cjs_create_export_expression(exported_names[i as size_t] as ref[AstNode], expression, false, TextRange(0, 0), false)
+            set i: i + 1
+        }
+        let statement_list &Array[ref[AstNode]?]^host()
+        statement_list.add(f.new_expression_statement(expression))
+        let params &Array[ref[AstNode]?]^host()
+        params.add(f.new_parameter_declaration(null, null, value, null, null, null))
+        let value_setter f.new_set_accessor_declaration(null, f.new_identifier("value"), null, params, null, null, f.new_block(statement_list, false))
+        let property_list &Array[ref[AstNode]?]^host()
+        property_list.add(value_setter)
+        let obj f.new_object_literal_expression(property_list, false)
+        f.new_property_access_expression(obj, null, f.new_identifier("value"), NodeFlagsNone)
+    }
+
+    ; visitPrefixUnaryExpression: ++x on an exported x updates every export
+    procedure cjs_visit_prefix_unary_expression(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let op AstNode.prefix_unary_operator_kind(node)
+        let operand AstNode.prefix_unary_operand_of(node) as ref[AstNode]
+        if ((op = KindPlusPlusToken) or (op = KindMinusMinusToken)) and (operand.kind = KindIdentifier) and ((context.emit_flags(operand) & EFLocalName) = 0)
+        {
+            let exported_names this.cjs_get_exports(operand)
+            if exported_names.get_length() > 0
+            {
+                var expression factory.update_prefix_unary_expression(node, op, this.the_visitor().visit_node(operand))
+                var i 0
+                while i < (exported_names.get_length() as int)
+                {
+                    set expression: this.cjs_create_export_expression(exported_names[i as size_t] as ref[AstNode], expression, false, TextRange(0, 0), false)
+                    context.assign_comment_and_source_map_ranges(expression, node)
+                    set i: i + 1
+                }
+                return expression
+            }
+        }
+        this.the_visitor().visit_each_child(node)
+    }
+
+    ; visitPostfixUnaryExpression:
+    ;   x++ (discarded)  →  exports.x = (x++, x)
+    ;   y = x++          →  y = (exports.x = (_a = x++, x), _a)
+    procedure cjs_visit_postfix_unary_expression(this, node: ref[AstNode], result_is_discarded: bool) returns ref[AstNode]?
+    {
+        let f factory
+        let op AstNode.postfix_unary_operator_of(node)
+        let operand AstNode.postfix_unary_operand_of(node) as ref[AstNode]
+        if ((op = KindPlusPlusToken) or (op = KindMinusMinusToken)) and (operand.kind = KindIdentifier) and ((context.emit_flags(operand) & EFLocalName) = 0)
+        {
+            let exported_names this.cjs_get_exports(operand)
+            if exported_names.get_length() > 0
+            {
+                var temp: ref[AstNode]? null
+                var expression f.update_postfix_unary_expression(node, this.the_visitor().visit_node(operand), op)
+                if result_is_discarded = false
+                {
+                    let t f.new_temp_variable()
+                    context.add_variable_declaration(t)
+                    set temp: t
+                    set expression: f.new_assignment_expression(t, expression)
+                    context.assign_comment_and_source_map_ranges(expression, node)
+                }
+                set expression: f.new_comma_expression(expression, f.clone(operand))
+                context.assign_comment_and_source_map_ranges(expression, node)
+                var i 0
+                while i < (exported_names.get_length() as int)
+                {
+                    set expression: this.cjs_create_export_expression(exported_names[i as size_t] as ref[AstNode], expression, false, TextRange(0, 0), false)
+                    context.assign_comment_and_source_map_ranges(expression, node)
+                    set i: i + 1
+                }
+                if temp <> null
+                {
+                    set expression: f.new_comma_expression(expression, temp)
+                    context.assign_comment_and_source_map_ranges(expression, node)
+                }
+                return expression
+            }
+        }
+        this.the_visitor().visit_each_child(node)
+    }
+
+    ; ast.ShouldTransformImportCall
+    function cjs_should_transform_import_call(this) returns bool
+    {
+        let module_kind opts.options.get_emit_module_kind()
+        if ((module_kind >= ModuleKindNode16) and (module_kind <= ModuleKindNodeNext)) or (module_kind = ModuleKindPreserve)
+            return false
+        opts.options.get_emit_module_format_of_file(opts.file_info.file_name) < ModuleKindES2015
+    }
+
+    ; visitCallExpression: an indirect call of an imported binding, `import()`
+    ; and `require()` rewrites
+    procedure cjs_visit_call_expression(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        var needs_rewrite false
+        if opts.options.rewrite_relative_import_extensions = TristateTrue
+        {
+            if AstNode.is_import_call(node) and (Transformer.list_is_empty(AstNode.call_arguments_of(node)) = false)
+                set needs_rewrite: true
+            if Parser.is_in_js_file(node) and Parser.is_require_call(node, false)
+                set needs_rewrite: true
+        }
+        if AstNode.is_import_call(node) and this.cjs_should_transform_import_call()
+            return this.cjs_visit_import_call_expression(node, needs_rewrite)
+        if needs_rewrite
+            return this.cjs_shim_or_rewrite_import_or_require_call(node)
+        let callee AstNode.expression_of(node) as ref[AstNode]
+        if callee.kind = KindIdentifier
+        {
+            ; import { f } from "mod"; f();  →  (0, mod_1.f)();  — the printer applies
+            ; the indirection by way of EFIndirectCall
+            let expression this.cjs_visit_expression_identifier(callee)
+            let updated f.update_call_expression(node, expression, AstNode.question_dot_token_of(node), null, v.visit_nodes(AstNode.call_arguments_of(node)), node.flags)
+            if (expression.kind <> KindIdentifier) and ((context.emit_flags(callee) & EFHelperName) = 0)
+                context.add_emit_flags(updated, EFIndirectCall)
+            return updated
+        }
+        v.visit_each_child(node)
+    }
+
+    ; visitImportCallExpression
+    procedure cjs_visit_import_call_expression(this, node: ref[AstNode], rewrite_or_shim: bool) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        if (opts.options.get_emit_module_kind() = ModuleKindNone) and (opts.options.get_emit_script_target() >= ScriptTargetES2020)
+            return v.visit_each_child(node)
+        let external_module_name this.cjs_external_module_name_literal(node)
+        var first_in: ref[AstNode]? null
+        let args AstNode.call_arguments_of(node)
+        if args <> null
+        {
+            let a args as ref[Array[ref[AstNode]?]]
+            if a.get_length() > 0
+                set first_in: a[0]
+        }
+        let first_argument v.visit_node(first_in)
+        ; the external module name only where it differs from the first argument,
+        ; so the argument's quote style survives
+        var argument: ref[AstNode]? null
+        var use_external false
+        if external_module_name <> null
+        {
+            let emn external_module_name as ref[AstNode]
+            if first_argument = null
+                set use_external: true
+            else
+            {
+                let fa first_argument as ref[AstNode]
+                if fa.kind <> KindStringLiteral
+                    set use_external: true
+                else
+                {
+                    if AstNode.literal_text_of(fa).equals(AstNode.literal_text_of(emn)) = false
+                        set use_external: true
+                }
+            }
+        }
+        if use_external
+            set argument: external_module_name
+        else
+        {
+            if (first_argument <> null) and rewrite_or_shim
+            {
+                let fa first_argument as ref[AstNode]
+                if fa.kind = KindStringLiteral
+                    set argument: this.rewrite_module_specifier(fa)
+                else
+                    set argument: f.new_rewrite_relative_import_extensions_helper(fa, opts.options.jsx = JsxEmitPreserve)
+            }
+            else
+                set argument: first_argument
+        }
+        this.cjs_create_import_call_expression_common_js(argument)
+    }
+
+    ; createImportCallExpressionCommonJS:
+    ;   import(x)  →  Promise.resolve(`${x}`).then((s) => require(s))
+    procedure cjs_create_import_call_expression_common_js(this, arg: ref[AstNode]?) returns ref[AstNode]
+    {
+        let f factory
+        var need_sync_eval false
+        if arg <> null
+        {
+            if Transformer.is_simple_inlineable_expression(arg as ref[AstNode]) = false
+                set need_sync_eval: true
+        }
+        let promise_resolve_arguments &Array[ref[AstNode]?]^host()
+        let empty: Slice[char] ""
+        if need_sync_eval
+        {
+            let spans &Array[ref[AstNode]?]^host()
+            spans.add(f.new_template_span(arg, f.new_template_tail(empty, empty, TokenFlagsNone)))
+            promise_resolve_arguments.add(f.new_template_expression(f.new_template_head(empty, empty, TokenFlagsNone), spans))
+        }
+        let promise_resolve_call f.new_call_expression(f.new_property_access_expression(f.new_identifier("Promise"), null, f.new_identifier("resolve"), NodeFlagsNone), null, null, promise_resolve_arguments, NodeFlagsNone)
+        let require_arguments &Array[ref[AstNode]?]^host()
+        if need_sync_eval
+            require_arguments.add(f.new_identifier("s"))
+        else
+        {
+            if arg <> null
+                require_arguments.add(arg)
+        }
+        let require_call f.new_import_star_helper(f.new_call_expression(f.new_identifier("require"), null, null, require_arguments, NodeFlagsNone))
+        let parameters &Array[ref[AstNode]?]^host()
+        if need_sync_eval
+            parameters.add(f.new_parameter_declaration(null, null, f.new_identifier("s"), null, null, null))
+        let fn f.new_arrow_function(null, null, parameters, null, null, f.new_token(KindEqualsGreaterThanToken), require_call)
+        let then_args &Array[ref[AstNode]?]^host()
+        then_args.add(fn)
+        f.new_call_expression(f.new_property_access_expression(promise_resolve_call, null, f.new_identifier("then"), NodeFlagsNone), null, null, then_args, NodeFlagsNone)
+    }
+
+    ; shimOrRewriteImportOrRequireCall
+    procedure cjs_shim_or_rewrite_import_or_require_call(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        let expression v.visit_node(AstNode.expression_of(node))
+        var arguments_list AstNode.call_arguments_of(node)
+        let args arguments_list as ref[Array[ref[AstNode]?]]
+        if args.get_length() > 0
+        {
+            var first_argument args[0] as ref[AstNode]
+            var first_argument_changed false
+            if Parser.is_string_literal_like(first_argument)
+            {
+                let rewritten this.rewrite_module_specifier(first_argument) as ref[AstNode]
+                set first_argument_changed: Transformer.same_node(rewritten, first_argument) = false
+                set first_argument: rewritten
+            }
+            else
+            {
+                set first_argument: f.new_rewrite_relative_import_extensions_helper(first_argument, opts.options.jsx = JsxEmitPreserve)
+                set first_argument_changed: true
+            }
+            var rest_changed false
+            let rest v.visit_slice(Transformer.sub_list(host, args, 1, args.get_length() as int), &rest_changed)
+            if first_argument_changed or rest_changed
+            {
+                let out &Array[ref[AstNode]?]^host()
+                out.add(first_argument)
+                Transformer.add_all(out, rest)
+                set arguments_list: f.new_node_list_like(out, args)
+            }
+        }
+        f.update_call_expression(node, expression, AstNode.question_dot_token_of(node), null, arguments_list, node.flags)
+    }
+
+    ; visitTaggedTemplateExpression: f`` on an imported f is an indirect call
+    procedure cjs_visit_tagged_template_expression(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let tag AstNode.tagged_template_tag_of(node) as ref[AstNode]
+        if tag.kind = KindIdentifier
+        {
+            let expression this.cjs_visit_expression_identifier(tag)
+            let updated factory.update_tagged_template_expression(node, expression, null, null, this.the_visitor().visit_node(AstNode.tagged_template_template_of(node)), node.flags)
+            if (expression.kind <> KindIdentifier) and ((context.emit_flags(tag) & EFHelperName) = 0)
+                context.add_emit_flags(updated, EFIndirectCall)
+            return updated
+        }
+        this.the_visitor().visit_each_child(node)
+    }
+
+    ; visitShorthandPropertyAssignment: a shorthand of an imported or exported name
+    procedure cjs_visit_shorthand_property_assignment(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        let name AstNode.name_of(node) as ref[AstNode]
+        let exported_or_imported_name this.cjs_visit_expression_identifier(name)
+        let oai AstNode.shorthand_object_assignment_initializer_of(node)
+        if Transformer.same_node(exported_or_imported_name, name) = false
+        {
+            ; a shorthand with an assignment initializer is probably part of a
+            ; destructuring assignment
+            var expression exported_or_imported_name
+            if oai <> null
+                set expression: f.new_assignment_expression(expression, v.visit_node(oai))
+            let assignment f.new_property_assignment(null, name, null, null, expression)
+            set assignment.pos: node.pos
+            set assignment.end: node.end
+            context.assign_comment_and_source_map_ranges(assignment, node)
+            return assignment
+        }
+        f.update_shorthand_property_assignment(node, null, exported_or_imported_name, null, null, AstNode.shorthand_equals_token_of(node), v.visit_node(oai))
+    }
+
+    ; visitIdentifier: an identifier in an expression position
+    procedure cjs_visit_identifier(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if parent_node <> null
+        {
+            if Transformer.is_identifier_reference(node, parent_node as ref[AstNode])
+                return this.cjs_visit_expression_identifier(node)
+        }
+        node
+    }
+
+    ; visitExpressionIdentifier: an identifier that might reference an imported
+    ; or exported symbol
+    procedure cjs_visit_expression_identifier(this, node: ref[AstNode]) returns ref[AstNode]
+    {
+        let f factory
+        let info context.get_auto_generate_info(node)
+        if info <> null
+        {
+            let ag info as ref[AutoGenerateInfo]
+            if (ag.flags & GeneratedIdentifierFlagsAllowNameSubstitution) = 0
+                return node
+        }
+        let flags context.emit_flags(node)
+        if (flags & EFHelperName) <> 0
+            return node
+        if (flags & EFLocalName) <> 0
+            return node
+        if this.cjs_is_declaration_name_of_enum_or_namespace(node)
+            return node
+        let original context.most_original(node) as ref[AstNode]
+        let export_container this.the_checker().get_referenced_export_container(original, (flags & EFExportName) <> 0)
+        if AstNode.kind_of(export_container) = KindSourceFile
+        {
+            let reference f.new_property_access_expression(f.new_identifier("exports"), null, f.clone(node), NodeFlagsNone)
+            context.assign_comment_and_source_map_ranges(reference, node)
+            set reference.pos: node.pos
+            set reference.end: node.end
+            return reference
+        }
+        let import_declaration this.the_checker().get_referenced_import_declaration(original)
+        if import_declaration = null
+            return node
+        let id import_declaration as ref[AstNode]
+        if id.kind = KindImportClause
+        {
+            ; the resolver answers parse-tree declarations; the parent is the import declaration
+            let reference f.new_property_access_expression(f.new_generated_name_for_node(AstNode.parent_node_of(id) as ref[AstNode]), null, f.new_identifier("default"), NodeFlagsNone)
+            context.assign_comment_and_source_map_ranges(reference, node)
+            set reference.pos: node.pos
+            set reference.end: node.end
+            return reference
+        }
+        if id.kind = KindImportSpecifier
+        {
+            let name Checker.property_name_or_name_of(id) as ref[AstNode]
+            var decl: ref[AstNode]? Checker.find_ancestor_kind(id, KindImportDeclaration)
+            if decl = null
+                set decl: id
+            let target f.new_generated_name_for_node(decl as ref[AstNode])
+            var reference: ref[AstNode]? null
+            if name.kind = KindStringLiteral
+                set reference: f.new_element_access_expression(target, null, f.new_string_literal_from_node(name), NodeFlagsNone)
+            else
+            {
+                let reference_name f.clone(name)
+                context.add_emit_flags(reference_name, EFNoSourceMap | EFNoComments)
+                set reference: f.new_property_access_expression(target, null, reference_name, NodeFlagsNone)
+            }
+            let r reference as ref[AstNode]
+            context.assign_comment_and_source_map_ranges(r, node)
+            set r.pos: node.pos
+            set r.end: node.end
+            return r
+        }
+        node
+    }
+
+    ; isDeclarationNameOfEnumOrNamespace (moduletransforms/utilities.go)
+    procedure cjs_is_declaration_name_of_enum_or_namespace(this, node: ref[AstNode]) returns bool
+    {
+        let original context.most_original(node)
+        if original = null
+            return false
+        let o original as ref[AstNode]
+        let parent AstNode.parent_node_of(o)
+        if parent = null
+            return false
+        let p parent as ref[AstNode]
+        if (p.kind = KindEnumDeclaration) or (p.kind = KindModuleDeclaration)
+            return AstNode.name_of(p) = original
+        false
+    }
+
+    ; isFileLevelReservedGeneratedIdentifier
+    function cjs_is_file_level_reserved_generated_identifier(this, name: ref[AstNode]) returns bool
+    {
+        let info context.get_auto_generate_info(name)
+        if info = null
+            return false
+        let ag info as ref[AutoGenerateInfo]
+        let wanted GeneratedIdentifierFlagsFileLevel | GeneratedIdentifierFlagsOptimistic | GeneratedIdentifierFlagsReservedInNestedScopes
+        (ag.flags & wanted) = wanted
+    }
+
+    ; getExports: the exported names of an identifier
+    procedure cjs_get_exports(this, name: ref[AstNode]) returns ref[Array[ref[AstNode]?]]
+    {
+        let info cjs_info as ref[ExternalModuleInfo]
+        if context.has_auto_generate_info(name) = false
+        {
+            let original context.most_original(name) as ref[AstNode]
+            let import_declaration this.the_checker().get_referenced_import_declaration(original)
+            if import_declaration <> null
+                return info.exported_bindings_of(host, import_declaration as ref[AstNode])
+            ; an exported namespace or enum may merge with an ambient declaration
+            ; that has no JS emit, so every value export of the symbol is read
+            let bindings &Array[ref[AstNode]?]^host()
+            let declarations this.the_checker().get_referenced_value_declarations(original)
+            if declarations <> null
+            {
+                let ds declarations as ref[Array[ref[AstNode]?]]
+                var i 0
+                while i < (ds.get_length() as int)
+                {
+                    let exported_bindings info.exported_bindings_of(host, ds[i as size_t] as ref[AstNode])
+                    var j 0
+                    while j < (exported_bindings.get_length() as int)
+                    {
+                        let binding exported_bindings[j as size_t] as ref[AstNode]
+                        if Transformer.list_contains(bindings, binding) = false
+                            bindings.add(binding)
+                        set j: j + 1
+                    }
+                    set i: i + 1
+                }
+            }
+            return bindings
+        }
+        let exported_names &Array[ref[AstNode]?]^host()
+        if this.cjs_is_file_level_reserved_generated_identifier(name)
+        {
+            let export_specifiers info.export_specifiers_of(host, AstNode.identifier_text_of(name))
+            var i 0
+            while i < (export_specifiers.get_length() as int)
+            {
+                exported_names.add(AstNode.name_of(export_specifiers[i as size_t]))
+                set i: i + 1
+            }
+        }
+        exported_names
+    }
+
+    ; ── externalmoduleinfo.go ──
+
+    ; collectExternalModuleInfo
+    procedure collect_external_module_info(this, source_file: ref[AstNode]) returns ref[ExternalModuleInfo]
+    {
+        let out ExternalModuleInfo.create(host)
+        set this.cjs_info: out
+        set this.cjs_unique_exports: &Array[Slice[char]]^host()
+        set this.cjs_has_export_default: false
+        var has_import_star false
+        var has_import_default false
+        let statements AstNode.statements_of(source_file) as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (statements.get_length() as int)
+        {
+            let node statements[i as size_t] as ref[AstNode]
+            set i: i + 1
+            let k node.kind
+            if k = KindNotEmittedStatement
+            {
+                ; an elided `declare export = x` must still be collected
+                let original context.most_original(node)
+                if AstNode.kind_of(original) = KindExportAssignment
+                {
+                    let o original as ref[AstNode]
+                    if AstNode.is_export_equals_of(o) and (out.export_equals = null)
+                        set out.export_equals: o
+                }
+                continue
+            }
+            if k = KindImportDeclaration
+            {
+                out.external_imports.add(node)
+                if (has_import_star = false) and Transformer.cjs_import_needs_import_star_helper(node)
+                    set has_import_star: true
+                if (has_import_default = false) and Transformer.cjs_import_needs_import_default_helper(node)
+                    set has_import_default: true
+                continue
+            }
+            if k = KindImportEqualsDeclaration
+            {
+                if AstNode.kind_of(AstNode.module_reference_of(node)) = KindExternalModuleReference
+                    out.external_imports.add(node)
+                continue
+            }
+            if k = KindExportDeclaration
+            {
+                let export_clause AstNode.export_clause_of(node)
+                if AstNode.module_specifier_of(node) <> null
+                {
+                    out.external_imports.add(node)
+                    if export_clause = null
+                        set out.has_export_stars_to_export_values: true
+                    else
+                    {
+                        let ec export_clause as ref[AstNode]
+                        if ec.kind = KindNamedExports
+                        {
+                            this.cjs_add_exported_names_for_export_declaration(node)
+                            if has_import_default = false
+                                set has_import_default: Transformer.cjs_contains_default_reference(ec)
+                        }
+                        else
+                        {
+                            ; export * as ns from "mod"
+                            let name AstNode.name_of(ec) as ref[AstNode]
+                            if this.cjs_add_unique_export(Checker.module_export_name_text(name))
+                            {
+                                this.cjs_add_exported_binding(node, name)
+                                out.exported_names.add(name)
+                            }
+                            set has_import_star: true
+                        }
+                    }
+                }
+                else
+                    this.cjs_add_exported_names_for_export_declaration(node)
+                continue
+            }
+            if k = KindExportAssignment
+            {
+                if AstNode.is_export_equals_of(node) and (out.export_equals = null)
+                    set out.export_equals: node
+                continue
+            }
+            if k = KindVariableStatement
+            {
+                if Transformer.has_syntactic_modifier(node, ModifierFlagsExport)
+                {
+                    let decls Printer.declarations_of(Printer.declaration_list_of(node) as ref[AstNode]) as ref[Array[ref[AstNode]?]]
+                    var d 0
+                    while d < (decls.get_length() as int)
+                    {
+                        this.cjs_collect_exported_variable_info(decls[d as size_t] as ref[AstNode])
+                        set d: d + 1
+                    }
+                }
+                continue
+            }
+            if k = KindFunctionDeclaration
+            {
+                if Transformer.has_syntactic_modifier(node, ModifierFlagsExport)
+                    this.cjs_add_exported_function_declaration(node, null, Transformer.has_syntactic_modifier(node, ModifierFlagsDefault))
+                continue
+            }
+            if k = KindClassDeclaration
+            {
+                if Transformer.has_syntactic_modifier(node, ModifierFlagsExport)
+                {
+                    if Transformer.has_syntactic_modifier(node, ModifierFlagsDefault)
+                    {
+                        ; export default class { }
+                        if cjs_has_export_default = false
+                        {
+                            var name AstNode.name_of(node)
+                            if name = null
+                                set name: factory.new_generated_name_for_node(node)
+                            this.cjs_add_exported_binding(node, name as ref[AstNode])
+                            set this.cjs_has_export_default: true
+                        }
+                    }
+                    else
+                    {
+                        ; export class x { }
+                        let name AstNode.name_of(node)
+                        if name <> null
+                        {
+                            let nm name as ref[AstNode]
+                            if this.cjs_add_unique_export(AstNode.identifier_text_of(nm))
+                            {
+                                this.cjs_add_exported_binding(node, nm)
+                                out.exported_names.add(nm)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    function cjs_add_unique_export(this, name: Slice[char]) returns bool
+    {
+        let u cjs_unique_exports as ref[Array[Slice[char]]]
+        if Transformer.names_contain(u, name)
+            return false
+        u.add(name)
+        true
+    }
+
+    procedure cjs_remove_unique_export(this, name: Slice[char])
+    {
+        let u cjs_unique_exports as ref[Array[Slice[char]]]
+        let kept &Array[Slice[char]]^host()
+        var i 0
+        while i < (u.get_length() as int)
+        {
+            let e u[i as size_t]
+            if e.equals(name) = false
+                kept.add(e)
+            set i: i + 1
+        }
+        set this.cjs_unique_exports: kept
+    }
+
+    procedure cjs_add_exported_binding(this, decl: ref[AstNode], name: ref[AstNode])
+    {
+        let info cjs_info as ref[ExternalModuleInfo]
+        info.exported_bindings.add(CjsExportedBinding(context.most_original(decl) as ref[AstNode], name))
+    }
+
+    ; addExportedNamesForExportDeclaration
+    procedure cjs_add_exported_names_for_export_declaration(this, node: ref[AstNode])
+    {
+        let info cjs_info as ref[ExternalModuleInfo]
+        let elements AstNode.elements_of(AstNode.export_clause_of(node))
+        if elements = null
+            return
+        let es elements as ref[Array[ref[AstNode]?]]
+        let has_module_specifier AstNode.module_specifier_of(node) <> null
+        var i 0
+        while i < (es.get_length() as int)
+        {
+            let specifier es[i as size_t] as ref[AstNode]
+            set i: i + 1
+            let specifier_name AstNode.name_of(specifier) as ref[AstNode]
+            let specifier_name_text Checker.module_export_name_text(specifier_name)
+            if this.cjs_add_unique_export(specifier_name_text) = false
+                continue
+            let name Checker.property_name_or_name_of(specifier) as ref[AstNode]
+            if name.kind <> KindStringLiteral
+            {
+                if has_module_specifier = false
+                    info.export_specifiers.add(CjsExportSpecifierEntry(AstNode.identifier_text_of(name), specifier))
+                let original context.most_original(name) as ref[AstNode]
+                var decl this.the_checker().get_referenced_import_declaration(original)
+                if decl = null
+                    set decl: this.the_checker().get_referenced_value_declaration(original)
+                if decl <> null
+                {
+                    let d decl as ref[AstNode]
+                    if d.kind = KindFunctionDeclaration
+                    {
+                        this.cjs_remove_unique_export(specifier_name_text)
+                        this.cjs_add_exported_function_declaration(d, specifier_name, Checker.module_export_name_is_default(specifier_name))
+                        continue
+                    }
+                    this.cjs_add_exported_binding(d, specifier_name)
+                }
+            }
+            info.exported_names.add(specifier_name)
+        }
+    }
+
+    ; addExportedFunctionDeclaration
+    procedure cjs_add_exported_function_declaration(this, node: ref[AstNode], name_in: ref[AstNode]?, is_default: bool)
+    {
+        let info cjs_info as ref[ExternalModuleInfo]
+        let original context.most_original(node) as ref[AstNode]
+        if Transformer.list_contains(info.exported_functions, original) = false
+            info.exported_functions.add(original)
+        var name: ref[AstNode]? name_in
+        if is_default
+        {
+            ; export default function() { }  →  function x() { } + export { x as default };
+            if cjs_has_export_default
+                return
+            if name = null
+                set name: factory.new_generated_name_for_node(node)
+            this.cjs_add_exported_binding(node, name as ref[AstNode])
+            set this.cjs_has_export_default: true
+            return
+        }
+        ; export function x() { }  →  function x() { } + export { x }
+        if name = null
+            set name: AstNode.name_of(node)
+        let nm name as ref[AstNode]
+        if this.cjs_add_unique_export(Checker.module_export_name_text(nm))
+            this.cjs_add_exported_binding(node, nm)
+    }
+
+    ; collectExportedVariableInfo
+    procedure cjs_collect_exported_variable_info(this, decl: ref[AstNode])
+    {
+        let info cjs_info as ref[ExternalModuleInfo]
+        let name AstNode.name_of(decl) as ref[AstNode]
+        if AstNode.is_binding_pattern(name)
+        {
+            let elements AstNode.elements_of(name) as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (elements.get_length() as int)
+            {
+                let element elements[i as size_t] as ref[AstNode]
+                if element.kind = KindBindingElement
+                {
+                    if AstNode.name_of(element) <> null
+                        this.cjs_collect_exported_variable_info(element)
+                }
+                set i: i + 1
+            }
+            return
+        }
+        if context.has_auto_generate_info(name)
+            return
+        let text AstNode.identifier_text_of(name)
+        if this.cjs_add_unique_export(text)
+        {
+            info.exported_names.add(name)
+            if (context.emit_flags(name) & EFLocalName) <> 0
+                this.cjs_add_exported_binding(decl, name)
+        }
+    }
+
+    ; ── transformers/destructuring.go: the assignment callback and the helpers
+    ;    the flattener asks the transformer for ──
+
+    procedure flatten_create_assignment(this, callback: int, name: ref[AstNode], value: ref[AstNode], has_location: bool, location: TextRange) returns ref[AstNode]
+    {
+        if callback = FlattenCallbackCommonJS
+            return this.cjs_create_all_export_expressions(name, value, has_location, location)
+        let expression factory.new_assignment_expression(name, value)
+        if has_location
+        {
+            set expression.pos: location.pos
+            set expression.end: location.end
+        }
+        expression
+    }
+
+    ; NewRestHelper (printer/factory.go): __rest(value, ["a", "b", ...])
+    procedure new_rest_helper(this, value: ref[AstNode], elements: ref[Array[ref[AstNode]?]], computed_temp_variables: ref[Array[ref[AstNode]?]], pos: int, end: int) returns ref[AstNode]
+    {
+        let f factory
+        context.request_emit_helper(context.helpers.rest_helper)
+        let property_names &Array[ref[AstNode]?]^host()
+        var computed_temp_variable_offset 0
+        let n elements.get_length() as int
+        var i 0
+        while i < (n - 1)
+        {
+            let element elements[i as size_t] as ref[AstNode]
+            let property_name Transformer.try_get_property_name_of_binding_or_assignment_element(element)
+            if property_name <> null
+            {
+                let pn property_name as ref[AstNode]
+                if pn.kind = KindComputedPropertyName
+                {
+                    let temp computed_temp_variables[computed_temp_variable_offset as size_t] as ref[AstNode]
+                    set computed_temp_variable_offset: computed_temp_variable_offset + 1
+                    ; typeof _tmp === "symbol" ? _tmp : _tmp + ""
+                    let symbol_text: Slice[char] "symbol"
+                    let empty: Slice[char] ""
+                    property_names.add(f.new_conditional_expression(f.new_type_check(temp, symbol_text), f.new_token(KindQuestionToken), temp, f.new_token(KindColonToken), f.new_binary_expression(null, temp, null, f.new_token(KindPlusToken), f.new_string_literal(empty, TokenFlagsNone))))
+                }
+                else
+                    property_names.add(f.new_string_literal_from_node(pn))
+            }
+            set i: i + 1
+        }
+        let prop_names f.new_array_literal_expression(property_names, false)
+        set prop_names.pos: pos
+        set prop_names.end: end
+        let args &Array[ref[AstNode]?]^host()
+        args.add(value)
+        args.add(prop_names)
+        f.helper_call("__rest", args)
+    }
+
+    ; ast.TryGetPropertyNameOfBindingOrAssignmentElement
+    function try_get_property_name_of_binding_or_assignment_element(binding_element: ref[AstNode]) returns ref[AstNode]?
+    {
+        let k binding_element.kind
+        if k = KindBindingElement
+        {
+            ; `a` in `let { a: b } = ...`, `[a]`, `"a"`, `1`
+            let property_name AstNode.property_name_of(binding_element)
+            if property_name <> null
+            {
+                let pn property_name as ref[AstNode]
+                if (pn.kind = KindComputedPropertyName) and Binder.is_string_or_numeric_literal_like(AstNode.expression_of(pn))
+                    return AstNode.expression_of(pn)
+                return pn
+            }
+        }
+        if k = KindPropertyAssignment
+        {
+            let property_name AstNode.name_of(binding_element)
+            if property_name <> null
+            {
+                let pn property_name as ref[AstNode]
+                if (pn.kind = KindComputedPropertyName) and Binder.is_string_or_numeric_literal_like(AstNode.expression_of(pn))
+                    return AstNode.expression_of(pn)
+                return pn
+            }
+        }
+        if k = KindSpreadAssignment
+            return AstNode.name_of(binding_element)
+        let target Emitter.target_of_binding_or_assignment_element(binding_element)
+        if target <> null
+        {
+            if Checker.is_property_name_kind(AstNode.kind_of(target))
+                return target
+        }
+        null
+    }
+
+    ; ast.GetRestIndicatorOfBindingOrAssignmentElement
+    function rest_indicator_of_binding_or_assignment_element(binding_element: ref[AstNode]) returns ref[AstNode]?
+    {
+        let k binding_element.kind
+        if (k = KindParameter) or (k = KindBindingElement)
+            return AstNode.dot_dot_dot_token_of(binding_element)
+        if (k = KindSpreadElement) or (k = KindSpreadAssignment)
+            return binding_element
+        null
+    }
+
+    ; GetInitializerOfBindingOrAssignmentElement
+    function get_initializer_of_binding_or_assignment_element(binding_element: ref[AstNode]?) returns ref[AstNode]?
+    {
+        if binding_element = null
+            return null
+        let be binding_element as ref[AstNode]
+        if Emitter.is_declaration_binding_element(be)
+            return AstNode.initializer_of(be)
+        if be.kind = KindPropertyAssignment
+        {
+            let initializer AstNode.initializer_of(be)
+            if initializer <> null
+            {
+                let init_node initializer as ref[AstNode]
+                if Emitter.is_assignment_expression(init_node, true)
+                    return AstNode.binary_right_of(init_node)
+            }
+            return null
+        }
+        if be.kind = KindShorthandPropertyAssignment
+            return AstNode.shorthand_object_assignment_initializer_of(be)
+        if Emitter.is_assignment_expression(be, true)
+            return AstNode.binary_right_of(be)
+        if be.kind = KindSpreadElement
+            return Transformer.get_initializer_of_binding_or_assignment_element(AstNode.expression_of(be))
+        null
+    }
+
+    ; BindingOrAssignmentElementAssignsToName
+    function binding_or_assignment_element_assigns_to_name(element: ref[AstNode], name: Slice[char]) returns bool
+    {
+        let target Emitter.target_of_binding_or_assignment_element(element)
+        if target = null
+            return false
+        let t target as ref[AstNode]
+        if AstNode.is_binding_pattern(t) or Emitter.is_assignment_pattern(t)
+        {
+            let elements Emitter.pattern_elements_of(t)
+            if elements = null
+                return false
+            let es elements as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (es.get_length() as int)
+            {
+                if Transformer.binding_or_assignment_element_assigns_to_name(es[i as size_t] as ref[AstNode], name)
+                    return true
+                set i: i + 1
+            }
+            return false
+        }
+        if t.kind = KindIdentifier
+            return AstNode.identifier_text_of(t).equals(name)
+        false
+    }
+
+    ; BindingOrAssignmentElementContainsNonLiteralComputedName
+    function binding_or_assignment_element_contains_non_literal_computed_name(element: ref[AstNode]) returns bool
+    {
+        let property_name Transformer.try_get_property_name_of_binding_or_assignment_element(element)
+        if property_name <> null
+        {
+            let pn property_name as ref[AstNode]
+            if (pn.kind = KindComputedPropertyName) and (Printer.is_literal_kind(AstNode.kind_of(AstNode.expression_of(pn))) = false)
+                return true
+        }
+        let target Emitter.target_of_binding_or_assignment_element(element)
+        if target = null
+            return false
+        let t target as ref[AstNode]
+        if (AstNode.is_binding_pattern(t) = false) and (Emitter.is_assignment_pattern(t) = false)
+            return false
+        let elements Emitter.pattern_elements_of(t)
+        if elements = null
+            return false
+        let es elements as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (es.get_length() as int)
+        {
+            if Transformer.binding_or_assignment_element_contains_non_literal_computed_name(es[i as size_t] as ref[AstNode])
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    ; isSimpleBindingOrAssignmentElement
+    function is_simple_binding_or_assignment_element(element: ref[AstNode]) returns bool
+    {
+        let target Emitter.target_of_binding_or_assignment_element(element)
+        if target = null
+            return true
+        let t target as ref[AstNode]
+        if t.kind = KindOmittedExpression
+            return true
+        let property_name Transformer.try_get_property_name_of_binding_or_assignment_element(element)
+        if property_name <> null
+        {
+            if Checker.is_property_name_literal(AstNode.kind_of(property_name)) = false
+                return false
+        }
+        let initializer Transformer.get_initializer_of_binding_or_assignment_element(element)
+        if initializer <> null
+        {
+            if Transformer.is_simple_inlineable_expression(initializer as ref[AstNode]) = false
+                return false
+        }
+        if AstNode.is_binding_pattern(t) or Emitter.is_assignment_pattern(t)
+        {
+            let elements Emitter.pattern_elements_of(t)
+            if elements = null
+                return true
+            let es elements as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (es.get_length() as int)
+            {
+                if Transformer.is_simple_binding_or_assignment_element(es[i as size_t] as ref[AstNode]) = false
+                    return false
+                set i: i + 1
+            }
+            return true
+        }
+        t.kind = KindIdentifier
+    }
+
+    ; IsEmptyArrayLiteral || IsEmptyObjectLiteral
+    function is_empty_array_or_object_literal(node: ref[AstNode]) returns bool
+    {
+        if node.kind = KindArrayLiteralExpression
+            return Transformer.list_is_empty(AstNode.elements_of(node))
+        if node.kind = KindObjectLiteralExpression
+            return Transformer.list_is_empty(AstNode.properties_of(node))
+        false
+    }
+
+    function names_contain(list: ref[Array[Slice[char]]], name: Slice[char]) returns bool
+    {
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            let e list[i as size_t]
+            if e.equals(name)
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    ; strconv.Itoa
+    function decimal_slice(host: ref[Page], value: int) returns Slice[char]
+    {
+        let buf allocate_slice[char](host, 24)
+        let n Parser.write_decimal(buf, value)
+        buf.subslice(0, n as size_t)
+    }
+}
+
+; transformers/destructuring.go's flattener: the state of one flattening, with
+; the two MODES (assignment / binding) as a flag where the reference installs
+; four callbacks, and the assignment callback as a tag the transformer dispatches
+; (`Transformer.flatten_create_assignment`).
+define Flattener
+(
+    host: ref[Page]
+    tx: ref[Transformer]
+    level: int
+    callback: int
+    binding_mode: bool
+    expressions: ref[Array[ref[AstNode]?]]
+    declarations: ref[Array[ref[PendingDecl]?]]
+    has_transformed_prior_element: bool
+    hoist_temp_variables: bool
+)
+{
+    function create(host: ref[Page], tx: ref[Transformer], level: int, callback: int, binding_mode: bool, hoist_temp_variables: bool) returns ref[Flattener]
+    {
+        let expressions &Array[ref[AstNode]?]^host()
+        let declarations &Array[ref[PendingDecl]?]^host()
+        &Flattener^host(host, tx, level, callback, binding_mode, expressions, declarations, false, hoist_temp_variables)
+    }
+
+    ; FlattenDestructuringAssignment
+    function flatten_destructuring_assignment(host: ref[Page], tx: ref[Transformer], node: ref[AstNode], needs_value: bool, level: int, callback: int) returns ref[AstNode]
+    {
+        let f Flattener.create(host, tx, level, callback, false, true)
+        f.flatten_assignment(node, needs_value)
+    }
+
+    ; FlattenDestructuringBinding: one VariableDeclaration, a SyntaxList of them, or null
+    function flatten_destructuring_binding(host: ref[Page], tx: ref[Transformer], node: ref[AstNode], rval: ref[AstNode]?, level: int, hoist_temp_variables: bool, skip_initializer: bool) returns ref[AstNode]?
+    {
+        let f Flattener.create(host, tx, level, FlattenCallbackNone, true, hoist_temp_variables)
+        f.flatten_binding(node, rval, skip_initializer)
+    }
+
+    function the_factory(this) returns ref[NodeFactory]
+        tx.factory
+
+    function the_context(this) returns ref[EmitContext]
+        tx.context
+
+    ; createArrayBindingOrAssignmentPattern / createObjectBindingOrAssignmentPattern
+    procedure create_array_pattern(this, elements: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
+    {
+        let f this.the_factory()
+        if binding_mode
+            return f.new_binding_pattern(KindArrayBindingPattern, elements)
+        f.new_array_literal_expression(elements, false)
+    }
+
+    procedure create_object_pattern(this, elements: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
+    {
+        let f this.the_factory()
+        if binding_mode
+            return f.new_binding_pattern(KindObjectBindingPattern, elements)
+        f.new_object_literal_expression(elements, false)
+    }
+
+    ; createArrayBindingOrAssignmentElement
+    procedure create_array_element(this, expr: ref[AstNode]) returns ref[AstNode]
+    {
+        if binding_mode
+            return this.the_factory().new_binding_element(null, null, expr, null)
+        expr
+    }
+
+    ; emitBindingOrAssignment: emitAssignment / emitBinding
+    procedure emit_binding_or_assignment(this, target: ref[AstNode], value_in: ref[AstNode]?, pos: int, end: int, original: ref[AstNode]?)
+    {
+        let f this.the_factory()
+        let ctx this.the_context()
+        if binding_mode
+        {
+            var value value_in
+            if expressions.get_length() > 0
+            {
+                expressions.add(value_in)
+                set value: f.inline_expressions(expressions)
+                set this.expressions: &Array[ref[AstNode]?]^host()
+            }
+            declarations.add(&PendingDecl^host(null, target, value, pos, end, original))
+            return
+        }
+        var expression: ref[AstNode]? null
+        if (callback <> FlattenCallbackNone) and (target.kind = KindIdentifier)
+            set expression: tx.flatten_create_assignment(callback, target, value_in as ref[AstNode], true, TextRange(pos, end))
+        else
+        {
+            let e f.new_assignment_expression(tx.the_visitor().visit_node(target), value_in)
+            set e.pos: pos
+            set e.end: end
+            set expression: e
+        }
+        let ex expression as ref[AstNode]
+        if original <> null
+            ctx.set_original(ex, original as ref[AstNode])
+        expressions.add(ex)
+    }
+
+    ; ensureIdentifier
+    procedure ensure_identifier(this, value: ref[AstNode], reuse_identifier_expressions: bool, pos: int, end: int) returns ref[AstNode]
+    {
+        if reuse_identifier_expressions and (value.kind = KindIdentifier)
+            return value
+        let f this.the_factory()
+        let temp f.new_temp_variable()
+        if hoist_temp_variables
+        {
+            this.the_context().add_variable_declaration(temp)
+            let assign f.new_assignment_expression(temp, value)
+            set assign.pos: pos
+            set assign.end: end
+            expressions.add(assign)
+        }
+        else
+            this.emit_binding_or_assignment(temp, value, pos, end, null)
+        temp
+    }
+
+    ; createDefaultValueCheck: value === void 0 ? defaultValue : value
+    procedure create_default_value_check(this, value_in: ref[AstNode], default_value: ref[AstNode], pos: int, end: int) returns ref[AstNode]
+    {
+        let f this.the_factory()
+        let value this.ensure_identifier(value_in, true, pos, end)
+        let undefined_text: Slice[char] "undefined"
+        f.new_conditional_expression(f.new_type_check(value, undefined_text), f.new_token(KindQuestionToken), default_value, f.new_token(KindColonToken), value)
+    }
+
+    ; createDestructuringPropertyAccess
+    procedure create_destructuring_property_access(this, value: ref[AstNode], property_name: ref[AstNode]) returns ref[AstNode]
+    {
+        let f this.the_factory()
+        if property_name.kind = KindComputedPropertyName
+        {
+            let visited tx.the_visitor().visit_node(AstNode.expression_of(property_name)) as ref[AstNode]
+            let argument_expression this.ensure_identifier(visited, false, property_name.pos, property_name.end)
+            return f.new_element_access_expression(value, null, argument_expression, NodeFlagsNone)
+        }
+        if Binder.is_string_or_numeric_literal_like(property_name) or (property_name.kind = KindBigIntLiteral)
+            return f.new_element_access_expression(value, null, f.clone(property_name), NodeFlagsNone)
+        f.new_property_access_expression(value, null, f.new_identifier(AstNode.identifier_text_of(property_name)), NodeFlagsNone)
+    }
+
+    ; flattenDestructuringAssignment (the entry point's body)
+    procedure flatten_assignment(this, node_in: ref[AstNode], needs_value: bool) returns ref[AstNode]
+    {
+        let f this.the_factory()
+        let v tx.the_visitor()
+        var node node_in
+        var pos node.pos
+        var end node.end
+        var value: ref[AstNode]? null
+        if Binder.is_destructuring_assignment(node)
+        {
+            set value: AstNode.binary_right_of(node)
+            ; `[] = x` and `{} = x` peel down to the innermost assignment
+            while Transformer.is_empty_array_or_object_literal(AstNode.binary_left_of(node) as ref[AstNode])
+            {
+                if Binder.is_destructuring_assignment(value)
+                {
+                    set node: value as ref[AstNode]
+                    set pos: node.pos
+                    set end: node.end
+                    set value: AstNode.binary_right_of(node)
+                }
+                else
+                    return v.visit_node(value) as ref[AstNode]
+            }
+        }
+        if value <> null
+        {
+            let visited v.visit_node(value) as ref[AstNode]
+            set value: visited
+            var must_copy false
+            if visited.kind = KindIdentifier
+            {
+                if Transformer.binding_or_assignment_element_assigns_to_name(node, AstNode.identifier_text_of(visited))
+                    set must_copy: true
+            }
+            if Transformer.binding_or_assignment_element_contains_non_literal_computed_name(node)
+                set must_copy: true
+            if must_copy
+                set value: this.ensure_identifier(visited, false, pos, end)
+            else
+            {
+                if needs_value
+                    set value: this.ensure_identifier(visited, true, pos, end)
+                else
+                {
+                    if Printer.node_is_synthesized(node)
+                    {
+                        set pos: visited.pos
+                        set end: visited.end
+                    }
+                }
+            }
+        }
+        this.flatten_binding_or_assignment_element(node, value, pos, end, Binder.is_destructuring_assignment(node))
+        if (value <> null) and needs_value
+        {
+            if expressions.get_length() = 0
+                return value as ref[AstNode]
+            expressions.add(value)
+        }
+        let res f.inline_expressions(expressions)
+        if res <> null
+            return res as ref[AstNode]
+        f.new_omitted_expression()
+    }
+
+    ; flattenDestructuringBinding (the entry point's body)
+    procedure flatten_binding(this, node_in: ref[AstNode], rval: ref[AstNode]?, skip_initializer: bool) returns ref[AstNode]?
+    {
+        let f this.the_factory()
+        let v tx.the_visitor()
+        let ctx this.the_context()
+        var node node_in
+        if node.kind = KindVariableDeclaration
+        {
+            let initializer Transformer.get_initializer_of_binding_or_assignment_element(node)
+            if initializer <> null
+            {
+                let init_node initializer as ref[AstNode]
+                var must_copy false
+                if init_node.kind = KindIdentifier
+                {
+                    if Transformer.binding_or_assignment_element_assigns_to_name(node, AstNode.identifier_text_of(init_node))
+                        set must_copy: true
+                }
+                if Transformer.binding_or_assignment_element_contains_non_literal_computed_name(node)
+                    set must_copy: true
+                if must_copy
+                {
+                    let visited v.visit_node(init_node) as ref[AstNode]
+                    let temp this.ensure_identifier(visited, false, init_node.pos, init_node.end)
+                    set node: f.update_variable_declaration(node, AstNode.name_of(node), null, null, temp)
+                }
+            }
+        }
+        this.flatten_binding_or_assignment_element(node, rval, node.pos, node.end, skip_initializer)
+        if expressions.get_length() > 0
+        {
+            let temp f.new_temp_variable()
+            if hoist_temp_variables
+            {
+                let value f.inline_expressions(expressions)
+                set this.expressions: &Array[ref[AstNode]?]^host()
+                this.emit_binding_or_assignment(temp, value, 0 - 1, 0 - 1, null)
+            }
+            else
+            {
+                ctx.add_variable_declaration(temp)
+                let last declarations[(declarations.get_length() - 1) as size_t] as ref[PendingDecl]
+                let pending &Array[ref[AstNode]?]^host()
+                Transformer.add_all(pending, last.pending_expressions)
+                pending.add(f.new_assignment_expression(temp, last.value))
+                Transformer.add_all(pending, expressions)
+                set last.pending_expressions: pending
+                set last.value: temp
+            }
+        }
+        let decls &Array[ref[AstNode]?]^host()
+        var i 0
+        while i < (declarations.get_length() as int)
+        {
+            let pending declarations[i as size_t] as ref[PendingDecl]
+            var expr pending.value
+            if pending.pending_expressions <> null
+            {
+                let pe pending.pending_expressions as ref[Array[ref[AstNode]?]]
+                if pe.get_length() > 0
+                {
+                    let all &Array[ref[AstNode]?]^host()
+                    Transformer.add_all(all, pe)
+                    all.add(pending.value)
+                    set expr: f.inline_expressions(all)
+                }
+            }
+            let decl f.new_variable_declaration(pending.name, null, null, expr)
+            set decl.pos: pending.pos
+            set decl.end: pending.end
+            if pending.original <> null
+                ctx.set_original(decl, pending.original as ref[AstNode])
+            decls.add(decl)
+            set i: i + 1
+        }
+        if decls.get_length() = 1
+            return decls[0]
+        if decls.get_length() = 0
+            return null
+        f.new_syntax_list(decls)
+    }
+
+    ; flattenBindingOrAssignmentElement
+    procedure flatten_binding_or_assignment_element(this, element: ref[AstNode], value_in: ref[AstNode]?, pos: int, end: int, skip_initializer: bool)
+    {
+        let f this.the_factory()
+        let v tx.the_visitor()
+        let binding_target_opt Emitter.target_of_binding_or_assignment_element(element)
+        if binding_target_opt = null
+            return
+        let binding_target binding_target_opt as ref[AstNode]
+        var value value_in
+        if skip_initializer = false
+        {
+            let initializer v.visit_node(Transformer.get_initializer_of_binding_or_assignment_element(element))
+            if initializer <> null
+            {
+                let init_node initializer as ref[AstNode]
+                if value <> null
+                {
+                    let checked this.create_default_value_check(value as ref[AstNode], init_node, pos, end)
+                    set value: checked
+                    if (Transformer.is_simple_copiable_expression(init_node) = false) and (AstNode.is_binding_pattern(binding_target) or Emitter.is_assignment_pattern(binding_target))
+                        set value: this.ensure_identifier(checked, true, pos, end)
+                }
+                else
+                    set value: init_node
+            }
+            else
+            {
+                if value = null
+                    set value: f.new_void_zero_expression()
+            }
+        }
+        let tk binding_target.kind
+        if (tk = KindObjectBindingPattern) or (tk = KindObjectLiteralExpression)
+        {
+            this.flatten_object_pattern(element, binding_target, value as ref[AstNode], pos, end)
+            return
+        }
+        if (tk = KindArrayBindingPattern) or (tk = KindArrayLiteralExpression)
+        {
+            this.flatten_array_pattern(element, binding_target, value as ref[AstNode], pos, end)
+            return
+        }
+        this.emit_binding_or_assignment(binding_target, value, pos, end, element)
+    }
+
+    ; flattenObjectBindingOrAssignmentPattern
+    procedure flatten_object_pattern(this, parent: ref[AstNode], pattern: ref[AstNode], value_in: ref[AstNode], pos: int, end: int)
+    {
+        let f this.the_factory()
+        let v tx.the_visitor()
+        let elements Emitter.pattern_elements_of(pattern) as ref[Array[ref[AstNode]?]]
+        let num_elements elements.get_length() as int
+        var value value_in
+        if num_elements <> 1
+        {
+            let reuse_identifier_expressions (Emitter.is_declaration_binding_element(parent) = false) or (num_elements <> 0)
+            set value: this.ensure_identifier(value_in, reuse_identifier_expressions, pos, end)
+        }
+        var binding_elements &Array[ref[AstNode]?]^host()
+        let computed_temp_variables &Array[ref[AstNode]?]^host()
+        var i 0
+        while i < num_elements
+        {
+            let element elements[i as size_t] as ref[AstNode]
+            if Transformer.rest_indicator_of_binding_or_assignment_element(element) = null
+            {
+                let property_name Transformer.try_get_property_name_of_binding_or_assignment_element(element) as ref[AstNode]
+                let target Emitter.target_of_binding_or_assignment_element(element) as ref[AstNode]
+                let rest_facts SubtreeContainsRestOrSpread | SubtreeContainsObjectRestOrSpread
+                if (level >= FlattenLevelObjectRest) and ((Emitter.subtree_facts(element) & rest_facts) = 0) and ((Emitter.subtree_facts(target) & rest_facts) = 0) and (property_name.kind <> KindComputedPropertyName)
+                    binding_elements.add(v.visit_node(element))
+                else
+                {
+                    if binding_elements.get_length() > 0
+                    {
+                        this.emit_binding_or_assignment(this.create_object_pattern(binding_elements), value, pos, end, pattern)
+                        set binding_elements: &Array[ref[AstNode]?]^host()
+                    }
+                    let rhs_value this.create_destructuring_property_access(value, property_name)
+                    if property_name.kind = KindComputedPropertyName
+                        computed_temp_variables.add(AstNode.element_access_argument_of(rhs_value))
+                    this.flatten_binding_or_assignment_element(element, rhs_value, element.pos, element.end, false)
+                }
+            }
+            else
+            {
+                if i = (num_elements - 1)
+                {
+                    if binding_elements.get_length() > 0
+                    {
+                        this.emit_binding_or_assignment(this.create_object_pattern(binding_elements), value, pos, end, pattern)
+                        set binding_elements: &Array[ref[AstNode]?]^host()
+                    }
+                    let rhs_value tx.new_rest_helper(value, elements, computed_temp_variables, pattern.pos, pattern.end)
+                    this.flatten_binding_or_assignment_element(element, rhs_value, element.pos, element.end, false)
+                }
+            }
+            set i: i + 1
+        }
+        if binding_elements.get_length() > 0
+            this.emit_binding_or_assignment(this.create_object_pattern(binding_elements), value, pos, end, pattern)
+    }
+
+    ; flattenArrayBindingOrAssignmentPattern
+    procedure flatten_array_pattern(this, parent: ref[AstNode], pattern: ref[AstNode], value_in: ref[AstNode], pos: int, end: int)
+    {
+        let f this.the_factory()
+        let elements Emitter.pattern_elements_of(pattern) as ref[Array[ref[AstNode]?]]
+        let num_elements elements.get_length() as int
+        var value value_in
+        var all_omitted true
+        var oi 0
+        while oi < num_elements
+        {
+            if AstNode.kind_of(elements[oi as size_t]) <> KindOmittedExpression
+                set all_omitted: false
+            set oi: oi + 1
+        }
+        if ((num_elements <> 1) and ((level < FlattenLevelObjectRest) or (num_elements = 0))) or all_omitted
+        {
+            let reuse_identifier_expressions (Emitter.is_declaration_binding_element(parent) = false) or (num_elements <> 0)
+            set value: this.ensure_identifier(value_in, reuse_identifier_expressions, pos, end)
+        }
+        let binding_elements &Array[ref[AstNode]?]^host()
+        let rest_ids &Array[ref[AstNode]?]^host()
+        let rest_elements &Array[ref[AstNode]?]^host()
+        var i 0
+        while i < num_elements
+        {
+            let element elements[i as size_t] as ref[AstNode]
+            if level >= FlattenLevelObjectRest
+            {
+                var needs_temp (Emitter.subtree_facts(element) & SubtreeContainsObjectRestOrSpread) <> 0
+                if has_transformed_prior_element and (Transformer.is_simple_binding_or_assignment_element(element) = false)
+                    set needs_temp: true
+                if needs_temp
+                {
+                    set this.has_transformed_prior_element: true
+                    let temp f.new_temp_variable()
+                    if hoist_temp_variables
+                        this.the_context().add_variable_declaration(temp)
+                    rest_ids.add(temp)
+                    rest_elements.add(element)
+                    binding_elements.add(this.create_array_element(temp))
+                }
+                else
+                    binding_elements.add(element)
+            }
+            else
+            {
+                if element.kind <> KindOmittedExpression
+                {
+                    if Transformer.rest_indicator_of_binding_or_assignment_element(element) = null
+                    {
+                        let index_text Transformer.decimal_slice(host, i)
+                        let rhs_value f.new_element_access_expression(value, null, f.new_numeric_literal(index_text, TokenFlagsNone), NodeFlagsNone)
+                        this.flatten_binding_or_assignment_element(element, rhs_value, element.pos, element.end, false)
+                    }
+                    else
+                    {
+                        if i = (num_elements - 1)
+                        {
+                            let rhs_value f.new_array_slice_call(value, i)
+                            this.flatten_binding_or_assignment_element(element, rhs_value, element.pos, element.end, false)
+                        }
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        if binding_elements.get_length() > 0
+            this.emit_binding_or_assignment(this.create_array_pattern(binding_elements), value, pos, end, pattern)
+        var r 0
+        while r < (rest_ids.get_length() as int)
+        {
+            let element rest_elements[r as size_t] as ref[AstNode]
+            this.flatten_binding_or_assignment_element(element, rest_ids[r as size_t], element.pos, element.end, false)
+            set r: r + 1
+        }
+    }
 }
 
 ; ═══ compiler/emitter.go, the JS half, over the corpus's default options ═══
@@ -7138,9 +10211,13 @@ define Emitter
 
     function is_file_forced_to_be_module_by_format(file_name: Slice[char], options: EmitOptions) returns bool
     {
+        ; a declaration file still needs an explicit `export {}` (the caller's
+        ; IsDeclarationFileName guard in ast/parseoptions.go)
+        if file_name.ends_with(".d.ts") or file_name.ends_with(".d.mts") or file_name.ends_with(".d.cts")
+            return false
         if options.get_emit_module_format_of_file(file_name) = ModuleKindESNext
             return true
-        file_name.ends_with(".mts") or file_name.ends_with(".mjs")
+        file_name.ends_with(".mts") or file_name.ends_with(".mjs") or file_name.ends_with(".cts") or file_name.ends_with(".cjs")
     }
 
     ; the file's identifier table (sourceFile.Identifiers): every Identifier and
@@ -7262,17 +10339,11 @@ define Emitter
             this.record_unported("transform-module-preserve", 0)
         else
         {
-            if (module_kind >= ModuleKindES2015) and (module_kind <= ModuleKindNodeNext) and (module_kind <> ModuleKindSystem)
-            {
-                ; the implied module transformer: ESM by format, else CommonJS
-                if format < ModuleKindES2015
-                    this.record_unported("transform-commonjs", format)
-            }
-            else
-                this.record_unported("transform-commonjs", module_kind)
+            ; getModuleTransformer: ES2015..NodeNext → the implied module transformer,
+            ; Preserve → ESM, System → its own transformer, the rest → CommonJS
+            if module_kind = ModuleKindSystem
+                this.record_unported("transform-system", module_kind)
         }
-        if facts.has_dynamic_import and (format < ModuleKindES2015)
-            this.record_unported("transform-commonjs", format)
         if unported_count > 0
             return
         let context EmitContext.create(host, AstNode.list_ranges_of(file))
@@ -7302,7 +10373,12 @@ define Emitter
             this.record_unported("transform-class-fields", 1)
         let use_strict Transformer.create(host, TransformerTagUseStrict, opts)
         set current: use_strict.transform_source_file(current)
-        let es_module Transformer.create(host, TransformerTagESModule, opts)
+        ; the implied module transformer: ESM by the file's format, else CommonJS
+        ; (moduletransforms/impliedmodule.go; ES2015..NodeNext, Preserve → ESM)
+        var module_tag TransformerTagESModule
+        if format < ModuleKindES2015
+            set module_tag: TransformerTagCommonJS
+        let es_module Transformer.create(host, module_tag, opts)
         set current: es_module.transform_source_file(current)
         ; inlining (formerly done via substitutions)
         let inliner Transformer.create(host, TransformerTagConstEnumInlining, opts)
