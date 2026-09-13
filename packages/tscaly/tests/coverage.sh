@@ -95,7 +95,7 @@ for f, (d, t) in sorted(per.items(), key=lambda kv: -(kv[1][1] - kv[1][0])):
 print()
 print("THE EMITTER CHAPTER — reference functions with a port, per package:")
 ROOT = os.path.dirname(os.path.dirname(TS))
-chapters = (('internal/printer',        ['printer.scaly'],       False),
+chapters = (('internal/printer',        ['printer.scaly', 'factory.scaly'], False),
             ('internal/transformers',   ['transformers.scaly'],  True),
             ('internal/compiler',       ['emitter.scaly'],       False),
             ('internal/outputpaths',    ['emitter.scaly'],       False),

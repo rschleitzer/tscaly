@@ -303,13 +303,25 @@ FACTORY_TAIL = """
         this.visit_node(node)
 
     procedure visit_embedded_statement_h(this, node: ref[AstNode]?) returns ref[AstNode]?
+    {
+        if hooks_tag = HooksTagEmitContext
+            return (context as ref[EmitContext]).visit_embedded_statement(node, this)
         this.visit_embedded_statement(node)
+    }
 
     procedure visit_iteration_body_h(this, node: ref[AstNode]?) returns ref[AstNode]?
+    {
+        if hooks_tag = HooksTagEmitContext
+            return (context as ref[EmitContext]).visit_iteration_body(node, this)
         this.visit_embedded_statement_h(node)
+    }
 
     procedure visit_function_body_h(this, node: ref[AstNode]?) returns ref[AstNode]?
+    {
+        if hooks_tag = HooksTagEmitContext
+            return (context as ref[EmitContext]).visit_function_body(node, this)
         this.visit_node_h(node)
+    }
 
     procedure visit_token_h(this, node: ref[AstNode]?) returns ref[AstNode]?
         this.visit_node(node)
@@ -329,10 +341,18 @@ FACTORY_TAIL = """
     }
 
     procedure visit_parameters_h(this, nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    {
+        if hooks_tag = HooksTagEmitContext
+            return (context as ref[EmitContext]).visit_parameters(nodes, this)
         this.visit_nodes_h(nodes)
+    }
 
     procedure visit_top_level_statements_h(this, nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    {
+        if hooks_tag = HooksTagEmitContext
+            return (context as ref[EmitContext]).visit_variable_environment(nodes, this)
         this.visit_nodes_h(nodes)
+    }
 
     ; ── deepclone.go ─────────────────────────────────────────────────────────
 
@@ -348,8 +368,9 @@ FACTORY_TAIL = """
             {
                 if synthetic_location
                 {
-                    set (visited as ref[AstNode]).pos: 0 - 1
-                    set (visited as ref[AstNode]).end: 0 - 1
+                    let vn visited as ref[AstNode]
+                    set vn.pos: 0 - 1
+                    set vn.end: 0 - 1
                 }
                 return visited
             }
@@ -396,8 +417,9 @@ FACTORY_TAIL = """
                     let last nl[(n - 1) as size_t]
                     if last <> null
                     {
-                        set (last as ref[AstNode]).pos: 0 - 2
-                        set (last as ref[AstNode]).end: 0 - 2
+                        let ln last as ref[AstNode]
+                        set ln.pos: 0 - 2
+                        set ln.end: 0 - 2
                     }
                 }
             }
@@ -440,6 +462,948 @@ define DeepClone
 }
 """
 
+FACTORY_EXTRAS = """
+    ; ══ printer/factory.go — the emit-context factory's own constructors (slice 232),
+    ; hand-written in the generator (this block is FACTORY_EXTRAS there). ═══════
+
+    function the_context(this) returns ref[EmitContext]
+        context as ref[EmitContext]
+
+    function next_auto_id(this) returns int
+        this.the_context().next_auto_id()
+
+    ; The placeholder text of a generated identifier: `(auto@N)` or the
+    ; original node's text or `(generated@N)`; the reference's N is a node id,
+    ; this port's the node's address — never printed, only a key.
+    function placeholder_text(this, tag: Slice[char], n: int) returns Slice[char]
+    {
+        let b StringBuilder^host()
+        b.append("(" as char)
+        b.append(tag.data, tag.length)
+        b.append("@" as char)
+        b.append(n)
+        b.append(")" as char)
+        Printer.slice_of(b.to_string())
+    }
+
+    procedure new_generated_identifier(this, kind: int, text_in: Slice[char], node: ref[AstNode]?, flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
+    {
+        let id this.next_auto_id()
+        var text text_in
+        if (text.length as int) = 0
+        {
+            if node = null
+                set text: this.placeholder_text("auto", id)
+            else
+            {
+                let n node as ref[AstNode]
+                if (n.kind = KindIdentifier) or (n.kind = KindPrivateIdentifier)
+                    set text: AstNode.identifier_text_of(n)
+                else
+                    set text: this.placeholder_text("generated", this.the_context().get_node_for_generated_name_worker(n, id) as int)
+            }
+            set text: Printer.slice_of(Printer.format_generated_name(host, false, prefix, text, suffix))
+        }
+        let name this.new_identifier(text)
+        let info &AutoGenerateInfo^host(kind | (flags & ~GeneratedIdentifierFlagsKindMask), id, prefix, suffix, node)
+        this.the_context().set_auto_generate_info(name, info)
+        name
+    }
+
+    procedure new_temp_variable(this) returns ref[AstNode]
+        this.new_generated_identifier(GeneratedIdentifierFlagsAuto, "", null, 0, "", "")
+
+    procedure new_temp_variable_ex(this, flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
+        this.new_generated_identifier(GeneratedIdentifierFlagsAuto, "", null, flags, prefix, suffix)
+
+    procedure new_loop_variable(this) returns ref[AstNode]
+        this.new_generated_identifier(GeneratedIdentifierFlagsLoop, "", null, 0, "", "")
+
+    procedure new_loop_variable_ex(this, flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
+        this.new_generated_identifier(GeneratedIdentifierFlagsLoop, "", null, flags, prefix, suffix)
+
+    procedure new_unique_name(this, text: Slice[char]) returns ref[AstNode]
+        this.new_generated_identifier(GeneratedIdentifierFlagsUnique, text, null, 0, "", "")
+
+    procedure new_unique_name_ex(this, text: Slice[char], flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
+        this.new_generated_identifier(GeneratedIdentifierFlagsUnique, text, null, flags, prefix, suffix)
+
+    procedure new_generated_name_for_node(this, node: ref[AstNode]) returns ref[AstNode]
+        this.new_generated_identifier(GeneratedIdentifierFlagsNode, "", node, 0, "", "")
+
+    procedure new_generated_name_for_node_ex(this, node: ref[AstNode], flags_in: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
+    {
+        var flags flags_in
+        if ((prefix.length as int) > 0) or ((suffix.length as int) > 0)
+            set flags: flags | GeneratedIdentifierFlagsOptimistic
+        this.new_generated_identifier(GeneratedIdentifierFlagsNode, "", node, flags, prefix, suffix)
+    }
+
+    procedure new_generated_private_identifier(this, kind: int, text_in: Slice[char], node: ref[AstNode]?, flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
+    {
+        let id this.next_auto_id()
+        var text text_in
+        if (text.length as int) = 0
+        {
+            if node = null
+                set text: this.placeholder_text("auto", id)
+            else
+            {
+                let n node as ref[AstNode]
+                if (n.kind = KindIdentifier) or (n.kind = KindPrivateIdentifier)
+                    set text: AstNode.identifier_text_of(n)
+                else
+                    set text: this.placeholder_text("generated", this.the_context().get_node_for_generated_name_worker(n, id) as int)
+            }
+            set text: Printer.slice_of(Printer.format_generated_name(host, true, prefix, text, suffix))
+        }
+        let name this.new_private_identifier(text)
+        let info &AutoGenerateInfo^host(kind | (flags & ~GeneratedIdentifierFlagsKindMask), id, prefix, suffix, node)
+        this.the_context().set_auto_generate_info(name, info)
+        name
+    }
+
+    procedure new_unique_private_name(this, text: Slice[char]) returns ref[AstNode]
+        this.new_generated_private_identifier(GeneratedIdentifierFlagsUnique, text, null, 0, "", "")
+
+    procedure new_unique_private_name_ex(this, text: Slice[char], flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
+        this.new_generated_private_identifier(GeneratedIdentifierFlagsUnique, text, null, flags, prefix, suffix)
+
+    procedure new_generated_private_name_for_node(this, node: ref[AstNode]) returns ref[AstNode]
+        this.new_generated_private_identifier(GeneratedIdentifierFlagsNode, "", node, 0, "", "")
+
+    procedure new_generated_private_name_for_node_ex(this, node: ref[AstNode], flags_in: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
+    {
+        var flags flags_in
+        if ((prefix.length as int) > 0) or ((suffix.length as int) > 0)
+            set flags: flags | GeneratedIdentifierFlagsOptimistic
+        this.new_generated_private_identifier(GeneratedIdentifierFlagsNode, "", node, flags, prefix, suffix)
+    }
+
+    ; NewStringLiteralFromNode: a string literal whose text is the node's, with
+    ; the node recorded as its text source.
+    procedure new_string_literal_from_node(this, text_source_node: ref[AstNode]) returns ref[AstNode]
+    {
+        var text: Slice[char] ""
+        let k text_source_node.kind
+        if (k = KindIdentifier) or (k = KindPrivateIdentifier)
+            set text: AstNode.identifier_text_of(text_source_node)
+        else
+        {
+            if k = KindJsxNamespacedName
+            {
+                ; Node.Text() of a namespaced name: "ns:name".
+                let b StringBuilder^host()
+                let ns AstNode.identifier_text_of(AstNode.namespaced_namespace_of(text_source_node))
+                b.append(ns.data, ns.length)
+                b.append(":" as char)
+                let nm AstNode.identifier_text_of(AstNode.namespaced_name_of(text_source_node))
+                b.append(nm.data, nm.length)
+                set text: Printer.slice_of(b.to_string())
+            }
+            else
+            {
+                if (k = KindStringLiteral) or (k = KindNumericLiteral) or (k = KindBigIntLiteral) or (k = KindNoSubstitutionTemplateLiteral) or (k = KindTemplateHead) or (k = KindTemplateMiddle) or (k = KindTemplateTail) or (k = KindRegularExpressionLiteral)
+                    set text: AstNode.literal_text_of(text_source_node)
+            }
+        }
+        let node this.new_string_literal(text, TokenFlagsNone)
+        this.the_context().set_text_source(node, text_source_node)
+        node
+    }
+
+    procedure new_this_expression(this) returns ref[AstNode]
+        this.new_keyword_expression(KindThisKeyword)
+
+    procedure new_true_expression(this) returns ref[AstNode]
+        this.new_keyword_expression(KindTrueKeyword)
+
+    procedure new_false_expression(this) returns ref[AstNode]
+        this.new_keyword_expression(KindFalseKeyword)
+
+    procedure new_comma_expression(this, left: ref[AstNode]?, right: ref[AstNode]?) returns ref[AstNode]
+        this.new_binary_expression(null, left, null, this.new_token(KindCommaToken), right)
+
+    procedure new_assignment_expression(this, left: ref[AstNode]?, right: ref[AstNode]?) returns ref[AstNode]
+        this.new_binary_expression(null, left, null, this.new_token(KindEqualsToken), right)
+
+    procedure new_logical_or_expression(this, left: ref[AstNode]?, right: ref[AstNode]?) returns ref[AstNode]
+        this.new_binary_expression(null, left, null, this.new_token(KindBarBarToken), right)
+
+    procedure new_logical_and_expression(this, left: ref[AstNode]?, right: ref[AstNode]?) returns ref[AstNode]
+        this.new_binary_expression(null, left, null, this.new_token(KindAmpersandAmpersandToken), right)
+
+    procedure new_strict_equality_expression(this, left: ref[AstNode]?, right: ref[AstNode]?) returns ref[AstNode]
+        this.new_binary_expression(null, left, null, this.new_token(KindEqualsEqualsEqualsToken), right)
+
+    procedure new_strict_inequality_expression(this, left: ref[AstNode]?, right: ref[AstNode]?) returns ref[AstNode]
+        this.new_binary_expression(null, left, null, this.new_token(KindExclamationEqualsEqualsToken), right)
+
+    procedure new_void_zero_expression(this) returns ref[AstNode]
+        this.new_void_expression(this.new_numeric_literal("0", TokenFlagsNone))
+
+    ; flattenCommaElements: synthesized comma expressions flattened.
+    procedure flatten_comma_element(this, node: ref[AstNode], expressions: ref[Array[ref[AstNode]?]])
+    {
+        var comma false
+        if node.kind = KindBinaryExpression
+        {
+            if node.pos < 0
+            {
+                let op AstNode.binary_operator_token_of(node)
+                if op <> null
+                {
+                    if (op as ref[AstNode]).kind = KindCommaToken
+                        set comma: true
+                }
+            }
+        }
+        if comma
+        {
+            let left AstNode.binary_left_of(node)
+            let right AstNode.binary_right_of(node)
+            if left <> null
+                this.flatten_comma_element(left as ref[AstNode], expressions)
+            if right <> null
+                this.flatten_comma_element(right as ref[AstNode], expressions)
+            return
+        }
+        expressions.add(node)
+    }
+
+    procedure inline_expressions(this, expressions: ref[Array[ref[AstNode]?]]) returns ref[AstNode]?
+    {
+        let n expressions.get_length() as int
+        if n = 0
+            return null
+        if n = 1
+            return expressions[0 as size_t]
+        let flat &Array[ref[AstNode]?]^host()
+        var i 0
+        while i < n
+        {
+            let e expressions[i as size_t]
+            if e <> null
+                this.flatten_comma_element(e as ref[AstNode], flat)
+            set i: i + 1
+        }
+        var expression flat[0 as size_t]
+        set i: 1
+        while i < (flat.get_length() as int)
+        {
+            set expression: this.new_comma_expression(expression, flat[i as size_t])
+            set i: i + 1
+        }
+        expression
+    }
+
+    ; CreateExpressionFromEntityName: `a.b.c` from a qualified name, the parts
+    ; cloned at their original locations and parents.
+    procedure create_expression_from_entity_name(this, node: ref[AstNode]) returns ref[AstNode]
+    {
+        if node.kind = KindQualifiedName
+        {
+            let left this.create_expression_from_entity_name(AstNode.qualified_left_of(node) as ref[AstNode])
+            let right_src AstNode.qualified_right_of(node) as ref[AstNode]
+            let right this.clone(right_src)
+            set right.pos: right_src.pos
+            set right.end: right_src.end
+            set right.parent: right_src.parent
+            let prop_access this.new_property_access_expression(left, null, right, NodeFlagsNone)
+            set prop_access.pos: node.pos
+            set prop_access.end: node.end
+            return prop_access
+        }
+        let res this.clone(node)
+        set res.pos: node.pos
+        set res.end: node.end
+        set res.parent: node.parent
+        res
+    }
+
+    procedure restore_enclosing_label(this, node: ref[AstNode], outermost_labeled_statement: ref[AstNode]?) returns ref[AstNode]
+    {
+        if outermost_labeled_statement = null
+            return node
+        let outer outermost_labeled_statement as ref[AstNode]
+        var inner_label node
+        let stmt AstNode.statement_of(outer)
+        if stmt <> null
+        {
+            if (stmt as ref[AstNode]).kind = KindLabeledStatement
+                set inner_label: this.restore_enclosing_label(node, stmt)
+        }
+        this.update_labeled_statement(outer, AstNode.label_name_of(outer), inner_label)
+    }
+
+    procedure create_for_of_binding_statement(this, node: ref[AstNode], bound_value: ref[AstNode]) returns ref[AstNode]
+    {
+        if node.kind = KindVariableDeclarationList
+        {
+            let decls AstNode.variable_declarations_of(node) as ref[Array[ref[AstNode]?]]
+            let first_declaration decls[0 as size_t] as ref[AstNode]
+            let updated_declaration this.update_variable_declaration(first_declaration, AstNode.name_of(first_declaration), null, null, bound_value)
+            let one &Array[ref[AstNode]?]^host()
+            one.add(updated_declaration)
+            let statement this.new_variable_statement(null, this.update_variable_declaration_list(node, one, node.flags))
+            set statement.pos: node.pos
+            set statement.end: node.end
+            return statement
+        }
+        let updated_expression this.new_assignment_expression(node, bound_value)
+        set updated_expression.pos: node.pos
+        set updated_expression.end: node.end
+        let statement this.new_expression_statement(updated_expression)
+        set statement.pos: node.pos
+        set statement.end: node.end
+        statement
+    }
+
+    ; NewTypeCheck: `value === null`, `value === void 0`, or `typeof value === "tag"`.
+    procedure new_type_check(this, value: ref[AstNode], tag: Slice[char]) returns ref[AstNode]
+    {
+        if tag = "null"
+            return this.new_strict_equality_expression(value, this.new_keyword_expression(KindNullKeyword))
+        if tag = "undefined"
+            return this.new_strict_equality_expression(value, this.new_void_zero_expression())
+        this.new_strict_equality_expression(this.new_type_of_expression(value), this.new_string_literal(tag, TokenFlagsNone))
+    }
+
+    procedure new_method_call(this, object: ref[AstNode], method_name: ref[AstNode], arguments_list: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
+    {
+        var flags NodeFlagsNone
+        if object.kind = KindCallExpression
+        {
+            if (object.flags & NodeFlagsOptionalChain) <> 0
+                set flags: NodeFlagsOptionalChain
+        }
+        this.new_call_expression(this.new_property_access_expression(object, null, method_name, NodeFlagsNone), null, null, arguments_list, flags)
+    }
+
+    procedure new_global_method_call(this, global_object_name: Slice[char], method_name: Slice[char], arguments_list: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
+        this.new_method_call(this.new_identifier(global_object_name), this.new_identifier(method_name), arguments_list)
+
+    procedure new_function_call_call(this, target: ref[AstNode], this_arg: ref[AstNode], arguments_list: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
+    {
+        let args &Array[ref[AstNode]?]^host()
+        args.add(this_arg)
+        var i 0
+        while i < (arguments_list.get_length() as int)
+        {
+            args.add(arguments_list[i as size_t])
+            set i: i + 1
+        }
+        this.new_method_call(target, this.new_identifier("call"), args)
+    }
+
+    procedure new_array_slice_call(this, array: ref[AstNode], start: int) returns ref[AstNode]
+    {
+        let args &Array[ref[AstNode]?]^host()
+        if start <> 0
+        {
+            let b StringBuilder^host()
+            b.append(start)
+            args.add(this.new_numeric_literal(Printer.slice_of(b.to_string()), TokenFlagsNone))
+        }
+        this.new_method_call(array, this.new_identifier("slice"), args)
+    }
+
+    function is_ignorable_paren(this, node: ref[AstNode]) returns bool
+    {
+        if node.kind <> KindParenthesizedExpression
+            return false
+        if node.pos >= 0
+            return false
+        let ctx this.the_context()
+        if ctx.source_map_range(node).pos >= 0
+            return false
+        ctx.comment_range(node).pos < 0
+    }
+
+    procedure update_outer_expression(this, outer_expression: ref[AstNode], expression: ref[AstNode]?) returns ref[AstNode]
+    {
+        let k outer_expression.kind
+        if k = KindParenthesizedExpression
+            return this.update_parenthesized_expression(outer_expression, expression)
+        if k = KindTypeAssertionExpression
+            return this.update_type_assertion(outer_expression, AstNode.type_of(outer_expression), expression)
+        if k = KindAsExpression
+            return this.update_as_expression(outer_expression, expression, AstNode.type_of(outer_expression))
+        if k = KindSatisfiesExpression
+            return this.update_satisfies_expression(outer_expression, expression, AstNode.type_of(outer_expression))
+        if k = KindNonNullExpression
+            return this.update_non_null_expression(outer_expression, expression, outer_expression.flags)
+        if k = KindExpressionWithTypeArguments
+            return this.update_expression_with_type_arguments(outer_expression, expression, AstNode.type_arguments_of(outer_expression))
+        if k = KindPartiallyEmittedExpression
+            return this.update_partially_emitted_expression(outer_expression, expression)
+        outer_expression
+    }
+
+    procedure restore_outer_expressions(this, outer_expression: ref[AstNode]?, inner_expression: ref[AstNode]?, kinds: int) returns ref[AstNode]?
+    {
+        if outer_expression <> null
+        {
+            let outer outer_expression as ref[AstNode]
+            if Parser.is_outer_expression(outer, kinds)
+            {
+                if this.is_ignorable_paren(outer) = false
+                    return this.update_outer_expression(outer, this.restore_outer_expressions(AstNode.expression_of(outer), inner_expression, OEKAll))
+            }
+        }
+        inner_expression
+    }
+
+    ; EnsureUseStrict: a `"use strict"` prologue unless the first statement is one.
+    procedure ensure_use_strict(this, statements: ref[Array[ref[AstNode]?]]) returns ref[Array[ref[AstNode]?]]
+    {
+        if (statements.get_length() as int) > 0
+        {
+            let first statements[0 as size_t]
+            if EmitContext.is_prologue_directive(first)
+            {
+                if EmitContext.prologue_text(first as ref[AstNode]) = "use strict"
+                    return statements
+            }
+        }
+        let use_strict_prologue this.new_expression_statement(this.new_string_literal("use strict", TokenFlagsNone))
+        let out &Array[ref[AstNode]?]^host()
+        out.add(use_strict_prologue)
+        var i 0
+        while i < (statements.get_length() as int)
+        {
+            out.add(statements[i as size_t])
+            set i: i + 1
+        }
+        out
+    }
+
+    ; SplitStandardPrologue / SplitCustomPrologue: the index where the rest begins.
+    function split_standard_prologue(this, source: ref[Array[ref[AstNode]?]]) returns int
+    {
+        var i 0
+        while i < (source.get_length() as int)
+        {
+            if EmitContext.is_prologue_directive(source[i as size_t]) = false
+                return i
+            set i: i + 1
+        }
+        i
+    }
+
+    function split_custom_prologue(this, source: ref[Array[ref[AstNode]?]]) returns int
+    {
+        let ctx this.the_context()
+        var i 0
+        while i < (source.get_length() as int)
+        {
+            let s source[i as size_t]
+            if EmitContext.is_prologue_directive(s)
+                return i
+            if s <> null
+            {
+                if (ctx.emit_flags(s as ref[AstNode]) & EFCustomPrologue) = 0
+                    return i
+            }
+            set i: i + 1
+        }
+        i
+    }
+
+    ; ast.GetNameOfDeclaration / GetNonAssignedNameOfDeclaration over the port's
+    ; name slot; a function or class expression falls back to its assigned name.
+    function name_of_declaration(node: ref[AstNode]?, ignore_assigned: bool) returns ref[AstNode]?
+    {
+        if node = null
+            return null
+        let name AstNode.name_of(node)
+        if name <> null
+            return name
+        if ignore_assigned
+            return null
+        let k (node as ref[AstNode]).kind
+        if (k = KindFunctionExpression) or (k = KindArrowFunction) or (k = KindClassExpression)
+            return Binder.get_assigned_name(node)
+        null
+    }
+
+    procedure get_name(this, node: ref[AstNode]?, emit_flags_in: int, allow_comments: bool, allow_source_maps: bool, ignore_assigned_name: bool) returns ref[AstNode]
+    {
+        let node_name NodeFactory.name_of_declaration(node, ignore_assigned_name)
+        if node_name <> null
+        {
+            let name this.clone(node_name as ref[AstNode])
+            var emit_flags emit_flags_in
+            if allow_comments = false
+                set emit_flags: emit_flags | EFNoComments
+            if allow_source_maps = false
+                set emit_flags: emit_flags | EFNoSourceMap
+            this.the_context().add_emit_flags(name, emit_flags)
+            return name
+        }
+        this.new_generated_name_for_node(node as ref[AstNode])
+    }
+
+    procedure get_local_name(this, node: ref[AstNode]?) returns ref[AstNode]
+        this.get_name(node, EFLocalName, false, false, false)
+
+    procedure get_local_name_ex(this, node: ref[AstNode]?, allow_comments: bool, allow_source_maps: bool, ignore_assigned_name: bool) returns ref[AstNode]
+        this.get_name(node, EFLocalName, allow_comments, allow_source_maps, ignore_assigned_name)
+
+    procedure get_export_name(this, node: ref[AstNode]?) returns ref[AstNode]
+        this.get_name(node, EFExportName, false, false, false)
+
+    procedure get_export_name_ex(this, node: ref[AstNode]?, allow_comments: bool, allow_source_maps: bool, ignore_assigned_name: bool) returns ref[AstNode]
+        this.get_name(node, EFExportName, allow_comments, allow_source_maps, ignore_assigned_name)
+
+    procedure get_declaration_name(this, node: ref[AstNode]?) returns ref[AstNode]
+        this.get_name(node, EFNone, false, false, false)
+
+    procedure get_declaration_name_ex(this, node: ref[AstNode]?, allow_comments: bool, allow_source_maps: bool) returns ref[AstNode]
+        this.get_name(node, EFNone, allow_comments, allow_source_maps, false)
+
+    procedure get_namespace_member_name(this, ns: ref[AstNode], name_in: ref[AstNode], allow_comments: bool, allow_source_maps: bool) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        var name name_in
+        if ctx.has_auto_generate_info(name) = false
+            set name: this.clone(name)
+        let qualified_name this.new_property_access_expression(ns, null, name, NodeFlagsNone)
+        ctx.assign_comment_and_source_map_ranges(qualified_name, name)
+        if allow_comments = false
+            ctx.add_emit_flags(qualified_name, EFNoComments)
+        if allow_source_maps = false
+            ctx.add_emit_flags(qualified_name, EFNoSourceMap)
+        qualified_name
+    }
+
+    ; ast.HasSyntacticModifier(node, Export): a modifier of the kind is present.
+    function has_export_modifier(node: ref[AstNode]) returns bool
+    {
+        let modifiers AstNode.modifiers_of(node)
+        if modifiers = null
+            return false
+        let list modifiers as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            let m list[i as size_t]
+            if m <> null
+            {
+                if (m as ref[AstNode]).kind = KindExportKeyword
+                    return true
+            }
+            set i: i + 1
+        }
+        false
+    }
+
+    procedure get_external_module_or_namespace_export_name(this, ns: ref[AstNode]?, node: ref[AstNode], allow_comments: bool, allow_source_maps: bool) returns ref[AstNode]
+    {
+        if ns <> null
+        {
+            if NodeFactory.has_export_modifier(node)
+                return this.get_namespace_member_name(ns as ref[AstNode], this.get_declaration_name_ex(node, allow_comments, allow_source_maps), allow_comments, allow_source_maps)
+        }
+        this.get_export_name_ex(node, allow_comments, allow_source_maps, false)
+    }
+
+    procedure new_unscoped_helper_name(this, name: Slice[char]) returns ref[AstNode]
+    {
+        let node this.new_identifier(name)
+        this.the_context().set_emit_flags(node, EFHelperName)
+        node
+    }
+
+    procedure helper_call(this, name: Slice[char], args: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
+        this.new_call_expression(this.new_unscoped_helper_name(name), null, null, args, NodeFlagsNone)
+
+    function list1(this, a: ref[AstNode]?) returns ref[Array[ref[AstNode]?]]
+    {
+        let l &Array[ref[AstNode]?]^host()
+        l.add(a)
+        l
+    }
+
+    function list2(this, a: ref[AstNode]?, b: ref[AstNode]?) returns ref[Array[ref[AstNode]?]]
+    {
+        let l &Array[ref[AstNode]?]^host()
+        l.add(a)
+        l.add(b)
+        l
+    }
+
+    function list3(this, a: ref[AstNode]?, b: ref[AstNode]?, c: ref[AstNode]?) returns ref[Array[ref[AstNode]?]]
+    {
+        let l &Array[ref[AstNode]?]^host()
+        l.add(a)
+        l.add(b)
+        l.add(c)
+        l
+    }
+
+    procedure new_decorate_helper(this, decorator_expressions: ref[Array[ref[AstNode]?]], target: ref[AstNode], member_name: ref[AstNode]?, descriptor: ref[AstNode]?) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.decorate_helper)
+        let args &Array[ref[AstNode]?]^host()
+        args.add(this.new_array_literal_expression(decorator_expressions, true))
+        args.add(target)
+        if member_name <> null
+        {
+            args.add(member_name)
+            if descriptor <> null
+                args.add(descriptor)
+        }
+        this.helper_call("__decorate", args)
+    }
+
+    procedure new_metadata_helper(this, metadata_key: Slice[char], metadata_value: ref[AstNode]) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.metadata_helper)
+        this.helper_call("__metadata", this.list2(this.new_string_literal(metadata_key, TokenFlagsNone), metadata_value))
+    }
+
+    procedure new_param_helper(this, expression: ref[AstNode], parameter_offset: int, location: TextRange) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.param_helper)
+        let b StringBuilder^host()
+        b.append(parameter_offset)
+        let helper this.helper_call("__param", this.list2(this.new_numeric_literal(Printer.slice_of(b.to_string()), TokenFlagsNone), expression))
+        set helper.pos: location.pos
+        set helper.end: location.end
+        helper
+    }
+
+    procedure new_add_disposable_resource_helper(this, env_binding: ref[AstNode], value: ref[AstNode], async: bool) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.add_disposable_resource_helper)
+        var flag KindFalseKeyword
+        if async
+            set flag: KindTrueKeyword
+        this.helper_call("__addDisposableResource", this.list3(env_binding, value, this.new_keyword_expression(flag)))
+    }
+
+    procedure new_dispose_resources_helper(this, env_binding: ref[AstNode]) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.dispose_resources_helper)
+        this.helper_call("__disposeResources", this.list1(env_binding))
+    }
+
+    ; The private-identifier kinds are the strings "f", "m", "a", "untransformed".
+    procedure new_class_private_field_get_helper(this, receiver: ref[AstNode], state: ref[AstNode], kind: Slice[char], fn: ref[AstNode]?) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.class_private_field_get_helper)
+        let args this.list3(receiver, state, this.new_string_literal(kind, TokenFlagsNone))
+        if fn <> null
+            args.add(fn)
+        this.helper_call("__classPrivateFieldGet", args)
+    }
+
+    procedure new_class_private_field_set_helper(this, receiver: ref[AstNode], state: ref[AstNode], value: ref[AstNode], kind: Slice[char], fn: ref[AstNode]?) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.class_private_field_set_helper)
+        let args this.list3(receiver, state, value)
+        args.add(this.new_string_literal(kind, TokenFlagsNone))
+        if fn <> null
+            args.add(fn)
+        this.helper_call("__classPrivateFieldSet", args)
+    }
+
+    procedure new_class_private_field_in_helper(this, state: ref[AstNode], receiver: ref[AstNode]) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.class_private_field_in_helper)
+        this.helper_call("__classPrivateFieldIn", this.list2(state, receiver))
+    }
+
+    procedure new_object_define_property_call(this, target: ref[AstNode], name: ref[AstNode], descriptor: ref[AstNode]) returns ref[AstNode]
+        this.new_call_expression(this.new_property_access_expression(this.new_identifier("Object"), null, this.new_identifier("defineProperty"), NodeFlagsNone), null, null, this.list3(target, name, descriptor), NodeFlagsNone)
+
+    procedure new_reflect_get_call(this, target: ref[AstNode], property_key: ref[AstNode], receiver: ref[AstNode]) returns ref[AstNode]
+        this.new_call_expression(this.new_property_access_expression(this.new_identifier("Reflect"), null, this.new_identifier("get"), NodeFlagsNone), null, null, this.list3(target, property_key, receiver), NodeFlagsNone)
+
+    procedure new_reflect_set_call(this, target: ref[AstNode], property_key: ref[AstNode], value: ref[AstNode], receiver: ref[AstNode]) returns ref[AstNode]
+    {
+        let args this.list3(target, property_key, value)
+        args.add(receiver)
+        this.new_call_expression(this.new_property_access_expression(this.new_identifier("Reflect"), null, this.new_identifier("set"), NodeFlagsNone), null, null, args, NodeFlagsNone)
+    }
+
+    procedure new_function_bind_call(this, target: ref[AstNode], this_arg: ref[AstNode], arguments_list: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
+    {
+        let args this.list1(this_arg)
+        var i 0
+        while i < (arguments_list.get_length() as int)
+        {
+            args.add(arguments_list[i as size_t])
+            set i: i + 1
+        }
+        this.new_method_call(target, this.new_identifier("bind"), args)
+    }
+
+    procedure new_immediately_invoked_arrow_function(this, statements: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
+    {
+        let no_params &Array[ref[AstNode]?]^host()
+        let arrow this.new_arrow_function(null, null, no_params, null, null, this.new_token(KindEqualsGreaterThanToken), this.new_block(statements, true))
+        let no_args &Array[ref[AstNode]?]^host()
+        this.new_call_expression(this.new_parenthesized_expression(arrow), null, null, no_args, NodeFlagsNone)
+    }
+
+    procedure new_export_default(this, expression: ref[AstNode]) returns ref[AstNode]
+        this.new_export_assignment(null, false, null, expression)
+
+    procedure new_external_module_export(this, name: ref[AstNode]) returns ref[AstNode]
+    {
+        let specifier this.new_export_specifier(false, null, name)
+        let named_exports this.new_named_exports(this.list1(specifier))
+        this.new_export_declaration(null, false, named_exports, null, null)
+    }
+
+    procedure new_assign_helper(this, attributes_segments: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
+        this.new_call_expression(this.new_property_access_expression(this.new_identifier("Object"), null, this.new_identifier("assign"), NodeFlagsNone), null, null, attributes_segments, NodeFlagsNone)
+
+    procedure new_await_helper(this, expression: ref[AstNode]) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.await_helper)
+        this.helper_call("__await", this.list1(expression))
+    }
+
+    procedure new_async_generator_helper(this, generator_func: ref[AstNode], has_lexical_this: bool) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.await_helper)
+        ctx.request_emit_helper(ctx.helpers.async_generator_helper)
+        ctx.add_emit_flags(generator_func, EFAsyncFunctionBody | EFReuseTempVariableScope)
+        var this_arg this.new_void_zero_expression()
+        if has_lexical_this
+            set this_arg: this.new_keyword_expression(KindThisKeyword)
+        this.helper_call("__asyncGenerator", this.list3(this_arg, this.new_identifier("arguments"), generator_func))
+    }
+
+    procedure new_async_delegator_helper(this, expression: ref[AstNode]) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.await_helper)
+        ctx.request_emit_helper(ctx.helpers.async_delegator_helper)
+        this.helper_call("__asyncDelegator", this.list1(expression))
+    }
+
+    procedure new_async_values_helper(this, expression: ref[AstNode]) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.async_values_helper)
+        this.helper_call("__asyncValues", this.list1(expression))
+    }
+
+    procedure new_awaiter_helper(this, has_lexical_this: bool, arguments_expression: ref[AstNode]?, parameters: ref[Array[ref[AstNode]?]]?, body: ref[AstNode]) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.awaiter_helper)
+        var params: ref[Array[ref[AstNode]?]]? parameters
+        if params = null
+            set params: &Array[ref[AstNode]?]^host()
+        let generator_func this.new_function_expression(null, this.new_token(KindAsteriskToken), null, null, params, null, null, body)
+        ctx.add_emit_flags(generator_func, EFAsyncFunctionBody | EFReuseTempVariableScope)
+        var this_arg this.new_void_zero_expression()
+        if has_lexical_this
+            set this_arg: this.new_keyword_expression(KindThisKeyword)
+        var args_arg this.new_void_zero_expression()
+        if arguments_expression <> null
+            set args_arg: arguments_expression as ref[AstNode]
+        let args this.list3(this_arg, args_arg, this.new_void_zero_expression())
+        args.add(generator_func)
+        this.helper_call("__awaiter", args)
+    }
+
+    procedure new_es_decorate_class_context_object(this, name_expr: ref[AstNode]?, metadata: ref[AstNode]?) returns ref[AstNode]
+    {
+        let props this.list3(
+            this.new_property_assignment(null, this.new_identifier("kind"), null, null, this.new_string_literal("class", TokenFlagsNone)),
+            this.new_property_assignment(null, this.new_identifier("name"), null, null, name_expr),
+            this.new_property_assignment(null, this.new_identifier("metadata"), null, null, metadata))
+        this.new_object_literal_expression(props, false)
+    }
+
+    procedure es_decorate_accessor(this, name_computed: bool, name_expr: ref[AstNode]?) returns ref[AstNode]
+    {
+        if name_computed
+            return this.new_element_access_expression(this.new_identifier("obj"), null, name_expr, NodeFlagsNone)
+        this.new_property_access_expression(this.new_identifier("obj"), null, name_expr, NodeFlagsNone)
+    }
+
+    procedure new_es_decorate_class_element_access_get_method(this, name_computed: bool, name_expr: ref[AstNode]?) returns ref[AstNode]
+    {
+        let accessor this.es_decorate_accessor(name_computed, name_expr)
+        let obj_param this.new_parameter_declaration(null, null, this.new_identifier("obj"), null, null, null)
+        let arrow this.new_arrow_function(null, null, this.list1(obj_param), null, null, this.new_token(KindEqualsGreaterThanToken), accessor)
+        this.new_property_assignment(null, this.new_identifier("get"), null, null, arrow)
+    }
+
+    procedure new_es_decorate_class_element_access_set_method(this, name_computed: bool, name_expr: ref[AstNode]?) returns ref[AstNode]
+    {
+        let accessor this.es_decorate_accessor(name_computed, name_expr)
+        let assignment this.new_assignment_expression(accessor, this.new_identifier("value"))
+        let stmt this.new_expression_statement(assignment)
+        let body this.new_block(this.list1(stmt), false)
+        let obj_param this.new_parameter_declaration(null, null, this.new_identifier("obj"), null, null, null)
+        let value_param this.new_parameter_declaration(null, null, this.new_identifier("value"), null, null, null)
+        let arrow this.new_arrow_function(null, null, this.list2(obj_param, value_param), null, null, this.new_token(KindEqualsGreaterThanToken), body)
+        this.new_property_assignment(null, this.new_identifier("set"), null, null, arrow)
+    }
+
+    procedure new_es_decorate_class_element_access_has_method(this, name_computed: bool, name_expr: ref[AstNode]?) returns ref[AstNode]
+    {
+        var property_name name_expr
+        if name_computed = false
+        {
+            if name_expr <> null
+            {
+                if (name_expr as ref[AstNode]).kind = KindIdentifier
+                    set property_name: this.new_string_literal_from_node(name_expr as ref[AstNode])
+            }
+        }
+        let obj_param this.new_parameter_declaration(null, null, this.new_identifier("obj"), null, null, null)
+        let in_expr this.new_binary_expression(null, property_name, null, this.new_token(KindInKeyword), this.new_identifier("obj"))
+        let arrow this.new_arrow_function(null, null, this.list1(obj_param), null, null, this.new_token(KindEqualsGreaterThanToken), in_expr)
+        this.new_property_assignment(null, this.new_identifier("has"), null, null, arrow)
+    }
+
+    procedure new_es_decorate_class_element_access_object(this, name_computed: bool, name_expr: ref[AstNode]?, has_get: bool, has_set: bool) returns ref[AstNode]
+    {
+        let access_props this.list1(this.new_es_decorate_class_element_access_has_method(name_computed, name_expr))
+        if has_get
+            access_props.add(this.new_es_decorate_class_element_access_get_method(name_computed, name_expr))
+        if has_set
+            access_props.add(this.new_es_decorate_class_element_access_set_method(name_computed, name_expr))
+        this.new_object_literal_expression(access_props, false)
+    }
+
+    procedure new_es_decorate_class_element_context_object(this, kind: Slice[char], name_computed: bool, name_expr: ref[AstNode]?, is_static: bool, is_private: bool, has_get: bool, has_set: bool, metadata: ref[AstNode]?) returns ref[AstNode]
+    {
+        var name_value name_expr
+        if name_computed = false
+        {
+            if name_expr <> null
+            {
+                let nk (name_expr as ref[AstNode]).kind
+                if (nk = KindPrivateIdentifier) or (nk = KindIdentifier)
+                    set name_value: this.new_string_literal_from_node(name_expr as ref[AstNode])
+            }
+        }
+        let access_obj this.new_es_decorate_class_element_access_object(name_computed, name_expr, has_get, has_set)
+        var static_expr this.new_false_expression()
+        if is_static
+            set static_expr: this.new_true_expression()
+        var private_expr this.new_false_expression()
+        if is_private
+            set private_expr: this.new_true_expression()
+        let props this.list3(
+            this.new_property_assignment(null, this.new_identifier("kind"), null, null, this.new_string_literal(kind, TokenFlagsNone)),
+            this.new_property_assignment(null, this.new_identifier("name"), null, null, name_value),
+            this.new_property_assignment(null, this.new_identifier("static"), null, null, static_expr))
+        props.add(this.new_property_assignment(null, this.new_identifier("private"), null, null, private_expr))
+        props.add(this.new_property_assignment(null, this.new_identifier("access"), null, null, access_obj))
+        props.add(this.new_property_assignment(null, this.new_identifier("metadata"), null, null, metadata))
+        this.new_object_literal_expression(props, false)
+    }
+
+    procedure new_es_decorate_helper(this, ctor: ref[AstNode], descriptor_in: ref[AstNode], decorators: ref[AstNode], context_in: ref[AstNode], initializers: ref[AstNode], extra_initializers: ref[AstNode]) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.es_decorate_helper)
+        let args this.list3(ctor, descriptor_in, decorators)
+        args.add(context_in)
+        args.add(initializers)
+        args.add(extra_initializers)
+        this.helper_call("__esDecorate", args)
+    }
+
+    procedure new_run_initializers_helper(this, this_arg: ref[AstNode], initializers: ref[AstNode], value: ref[AstNode]?) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.run_initializers_helper)
+        let args this.list2(this_arg, initializers)
+        if value <> null
+            args.add(value)
+        this.helper_call("__runInitializers", args)
+    }
+
+    procedure new_template_object_helper(this, cooked_array: ref[AstNode], raw_array: ref[AstNode]) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.make_template_object_helper)
+        this.helper_call("__makeTemplateObject", this.list2(cooked_array, raw_array))
+    }
+
+    procedure new_prop_key_helper(this, expr: ref[AstNode]) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.prop_key_helper)
+        this.helper_call("__propKey", this.list1(expr))
+    }
+
+    procedure new_set_function_name_helper(this, fn: ref[AstNode], name: ref[AstNode], prefix: Slice[char]) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.set_function_name_helper)
+        let args this.list2(fn, name)
+        if (prefix.length as int) > 0
+            args.add(this.new_string_literal(prefix, TokenFlagsNone))
+        this.helper_call("__setFunctionName", args)
+    }
+
+    procedure new_import_default_helper(this, expression: ref[AstNode]) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.import_default_helper)
+        this.helper_call("__importDefault", this.list1(expression))
+    }
+
+    procedure new_import_star_helper(this, expression: ref[AstNode]) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.import_star_helper)
+        this.helper_call("__importStar", this.list1(expression))
+    }
+
+    procedure new_export_star_helper(this, module_expression: ref[AstNode], exports_expression: ref[AstNode]) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.export_star_helper)
+        this.helper_call("__exportStar", this.list2(module_expression, exports_expression))
+    }
+
+    procedure new_assignment_target_wrapper(this, param_name: ref[AstNode], expression: ref[AstNode]) returns ref[AstNode]
+    {
+        let param this.new_parameter_declaration(null, null, param_name, null, null, null)
+        let body this.new_block(this.list1(this.new_expression_statement(expression)), false)
+        let set_accessor this.new_set_accessor_declaration(null, this.new_identifier("value"), null, this.list1(param), null, null, body)
+        let obj_literal this.new_object_literal_expression(this.list1(set_accessor), false)
+        this.new_property_access_expression(this.new_parenthesized_expression(obj_literal), null, this.new_identifier("value"), NodeFlagsNone)
+    }
+
+    procedure new_rewrite_relative_import_extensions_helper(this, first_argument: ref[AstNode], preserve_jsx: bool) returns ref[AstNode]
+    {
+        let ctx this.the_context()
+        ctx.request_emit_helper(ctx.helpers.rewrite_relative_import_extensions_helper)
+        let args this.list1(first_argument)
+        if preserve_jsx
+            args.add(this.new_token(KindTrueKeyword))
+        this.helper_call("__rewriteRelativeImportExtension", args)
+    }
+
+    ; NewRestHelper needs TryGetPropertyNameOfBindingOrAssignmentElement, which
+    ; lands with the destructuring transform's slice.
+"""
+
 lines = []
 def out(s=''): lines.append(s)
 
@@ -467,6 +1431,15 @@ use scaly.memory.Page
 use scaly.containers.Array
 use tscaly.ast.*
 use tscaly.printer.EmitContext
+use tscaly.printer.EmitHelper
+use tscaly.printer.EmitHelpers
+use tscaly.printer.EmitNode
+use tscaly.printer.AutoGenerateInfo
+use tscaly.printer.Printer
+use tscaly.printer.TextRange
+use tscaly.parser.Parser
+use tscaly.binder.Binder
+use scaly.containers.StringBuilder
 
 define NodeFactory
 (
@@ -702,7 +1675,8 @@ for name in order:
         out('    }')
         out()
 
-# clone is a method of the factory (generated below into the same define)
+# the hand-written printer/factory.go block, then clone (both inside NodeFactory)
+out(FACTORY_EXTRAS)
 out("""    ; Clone, per kind (generated): a new node over the same children, then cloneNode.
     procedure clone(this, node: ref[AstNode]) returns ref[AstNode]
     {
@@ -744,9 +1718,6 @@ out('''; ast.NodeVisitor. `visit_tag` names the callback the reference passes as
 ; `hooks_tag` names the hook set: none, the emit context's, the deep clone's.
 define VisitTagNone: int 0
 define VisitTagDeepClone: int 1
-define HooksTagNone: int 0
-define HooksTagEmitContext: int 1
-define HooksTagDeepClone: int 2
 
 define NodeVisitor
 (
@@ -755,10 +1726,11 @@ define NodeVisitor
     visit_tag: int
     hooks_tag: int
     synthetic_location: bool
+    context: ref[EmitContext]?
 )
 {
     function create(host: ref[Page], factory: ref[NodeFactory], visit_tag: int, hooks_tag: int) returns ref[NodeVisitor]
-        &NodeVisitor^host(host, factory, visit_tag, hooks_tag, false)
+        &NodeVisitor^host(host, factory, visit_tag, hooks_tag, false, null)
 
     ; VisitEachChild: the per-kind dispatch (generated).
     procedure visit_each_child(this, node: ref[AstNode]?) returns ref[AstNode]?
