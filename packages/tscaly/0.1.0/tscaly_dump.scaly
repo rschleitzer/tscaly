@@ -109,7 +109,14 @@ procedure fill(from: int, message: String)
 ; lower-cased), against the reference's own `.js` baseline per CASE
 ; (tests/casejs.py). Nothing but the emit is printed; a stop is the same
 ; `UNPORTED n tag d` line the emit section prints.
-function run_unit_emit(options_text: String, arg: String, text: String) returns int
+; the lib chain a batch shares: the files and their binders, the program's order
+define LibChain
+(
+    files: ref[Array[ref[AstNode]?]]
+    binders: ref[Array[ref[Binder]?]]
+)
+
+function run_unit_emit(options_text: String, arg: String, text: String, chain: ref[LibChain]?) returns int
 {
     let anchor String("tscaly")
     let host Page.get(anchor.get_buffer())
@@ -161,14 +168,52 @@ function run_unit_emit(options_text: String, arg: String, text: String) returns 
         Console.println(m.to_c_string())
         return 0
     }
+    ; the lib chain of the configuration (by target, or the `lib` option), the
+    ; program's order; TSCALY_LIB still names ONE file for the older instruments
     var lib_file: ref[AstNode]? null
     var lib_b: ref[Binder]? null
-    if Checker.load_lib(host, &lib_file, &lib_b) = false
+    var lib_files &Array[ref[AstNode]?]^host()
+    var lib_binders &Array[ref[Binder]?]^host()
+    if chain <> null
     {
-        Console.println("UNPORTED 0 lib 0")
-        return 0
+        ; a batch loads its chain once (run_batch) and lends it to every unit
+        let ch chain as ref[LibChain]
+        set lib_files: ch.files
+        set lib_binders: ch.binders
     }
-    let cd Checker.create(host, file, path, b, p, lib_file, lib_b)
+    else
+    {
+        let seen_libs &Array[Slice[char]]^host()
+        if Checker.load_lib_chain(host, emit_options.lib_names(host), lib_files, lib_binders, seen_libs) = false
+        {
+            Console.println("UNPORTED 0 lib 0")
+            return 0
+        }
+    }
+    if lib_files.get_length() > 0
+    {
+        set lib_file: lib_files[0]
+        set lib_b: lib_binders[0]
+    }
+    ; the rest of the chain goes in with the constructor: initialize_checker merges
+    ; the globals there, and an extra set afterwards is never merged
+    var extra_files: ref[Array[ref[AstNode]?]]? null
+    var extra_binders: ref[Array[ref[Binder]?]]? null
+    if lib_files.get_length() > 1
+    {
+        let ef &Array[ref[AstNode]?]^host()
+        let eb &Array[ref[Binder]?]^host()
+        var li 1
+        while li < (lib_files.get_length() as int)
+        {
+            ef.add(lib_files[li as size_t])
+            eb.add(lib_binders[li as size_t])
+            set li: li + 1
+        }
+        set extra_files: ef
+        set extra_binders: eb
+    }
+    let cd Checker.create_ex(host, file, path, b, p, lib_file, lib_b, extra_files, extra_binders)
     ; the checker reads the configuration too (the resolver's answers depend on it)
     set cd.module_kind: emit_options.get_emit_module_kind()
     set cd.language_version: emit_options.get_emit_script_target()
@@ -204,10 +249,10 @@ function run_unit_emit(options_text: String, arg: String, text: String) returns 
     0
 }
 
-function run_unit(flag: String, arg: String, text: String) returns int
+function run_unit(flag: String, arg: String, text: String, chain: ref[LibChain]?) returns int
 {
     if flag.starts_with("--emit=")
-        return run_unit_emit(flag.substring(7 as size_t, (flag.get_length() - 7) as size_t), arg, text)
+        return run_unit_emit(flag.substring(7 as size_t, (flag.get_length() - 7) as size_t), arg, text, chain)
 
     let anchor String("tscaly")
     let host Page.get(anchor.get_buffer())
@@ -408,13 +453,13 @@ function run_unit(flag: String, arg: String, text: String) returns int
 ; reference side needs an explicit reset for the same reason (tests/oracle/batch.go).
 ; Measured on landing: byte-identical to the per-process answers over the whole
 ; stage-1 tree. Console writes are unbuffered syscalls, so a crash loses nothing.
-procedure run_unit_at(flag: String, text: String, path_start: int, path_len: int, body_start: int, body_len: int)
+procedure run_unit_at(flag: String, text: String, path_start: int, path_len: int, body_start: int, body_len: int, chain: ref[LibChain]?)
 {
     let path text.substring(path_start as size_t, path_len as size_t)
     let content text.substring(body_start as size_t, body_len as size_t)
     let hdr String("==== TSCALY-UNIT `path`")
     Console.println(hdr.to_c_string())
-    run_unit(flag, path, content)
+    run_unit(flag, path, content, chain)
     Console.println("==== TSCALY-END")
 }
 
@@ -427,6 +472,21 @@ procedure run_batch(flag: String, units_path: String) returns int
         return 1
     }
     let text File.read_to_string(units_path)
+    ; the emit's lib chain, loaded ONCE for the batch (one option string per batch)
+    ; on this frame's page — the lib symbols are never mutated by a unit (mergeSymbol
+    ; clones a non-transient target), so every unit may borrow them
+    var chain: ref[LibChain]? null
+    if flag.starts_with("--emit=")
+    {
+        let anchor String("lib-chain")
+        let host Page.get(anchor.get_buffer())
+        let emit_options EmitOptions.parse(host, Slice[char]((flag.get_length() - 7) as int, (flag.get_buffer() as pointer[char]) + 7))
+        let files &Array[ref[AstNode]?]^host()
+        let binders &Array[ref[Binder]?]^host()
+        let seen &Array[Slice[char]]^host()
+        if Checker.load_lib_chain(host, emit_options.lib_names(host), files, binders, seen)
+            set chain: &LibChain^host(files, binders)
+    }
     let n text.get_length() as int
     var pos 0
     while pos < n
@@ -447,7 +507,7 @@ procedure run_batch(flag: String, units_path: String) returns int
         let path_start p + 1
         let path_len eol - path_start
         let body_start eol + 1
-        run_unit_at(flag, text, path_start, path_len, body_start, bytes)
+        run_unit_at(flag, text, path_start, path_len, body_start, bytes, chain)
         set pos: body_start + bytes + 1
     }
     0
@@ -522,5 +582,5 @@ function main(argc: int, argv: pointer[pointer[char]]) returns int
         return 1
     }
     let text File.read_to_string(path)
-    run_unit(flag, path, text)
+    run_unit(flag, path, text, null)
 }

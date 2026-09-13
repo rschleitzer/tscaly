@@ -584,10 +584,9 @@ define TextWriter
 ; the binder and the parser, not on the node, so the printer takes the things
 ; it reads as one record the emitter builds.
 ;
-; ★ The source-map generator is a said stop: `SourceMapGenerator`'s three
-; methods count their calls and write nothing until the sourcemap chapter
-; lands. The JS-only yardstick hands the printer no generator, and every
-; reference site is nil-guarded, so the count stays 0 on that route.
+; ★ The source-map generator is internal/sourcemap/generator.go (slice 247):
+; the VLQ mappings, the sources relative to the map's directory, the JSON and
+; its base64 data URL. The JS-only yardstick hands the printer no generator.
 
 define WriteKindNone: int 0
 define WriteKindKeyword: int 1
@@ -776,22 +775,323 @@ define SourceMapGenerator
 (
     host: ref[Page]
     unported_calls: int
+    file: Slice[char]
+    source_root: Slice[char]
+    sources_directory_path: Slice[char]
+    current_directory: Slice[char]
+    raw_sources: ref[Array[Slice[char]]]
+    sources: ref[Array[Slice[char]]]
+    sources_content: ref[Array[Slice[char]]]
+    has_sources_content: bool
+    mappings: ref[StringBuilder]
+    last_generated_line: int
+    last_generated_character: int
+    last_source_index: int
+    last_source_line: int
+    last_source_character: int
+    last_name_index: int
+    has_last: bool
+    pending_generated_line: int
+    pending_generated_character: int
+    pending_source_index: int
+    pending_source_line: int
+    pending_source_character: int
+    pending_name_index: int
+    has_pending: bool
+    has_pending_source: bool
+    has_pending_name: bool
 )
 {
-    function create(host: ref[Page]) returns ref[SourceMapGenerator]
-        &SourceMapGenerator^host(host, 0)
+    ; sourcemap.NewGenerator(file, sourceRoot, sourcesDirectoryPath, options) — the
+    ; names table stays empty (the printer never adds one) and the JSON leaves it `[]`
+    function create(host: ref[Page], file: Slice[char], source_root: Slice[char], sources_directory_path: Slice[char], current_directory: Slice[char]) returns ref[SourceMapGenerator]
+        &SourceMapGenerator^host(host, 0, file, source_root, sources_directory_path, current_directory, &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), false, StringBuilder^host(), 0, 0, 0, 0, 0, 0, false, 0, 0, 0, 0, 0, 0, false, false, false)
 
+    ; AddSource: the file relative to the sources directory, once per file
     procedure add_source(this, file_name: Slice[char]) returns int
     {
-        set unported_calls: unported_calls + 1
-        0
+        let source get_relative_path_to_directory_or_url(host, sources_directory_path, file_name, true, current_directory)
+        var i 0
+        while i < (sources.get_length() as int)
+        {
+            let existing sources[i as size_t]
+            if existing.equals(source)
+                return i
+            set i: i + 1
+        }
+        sources.add(source)
+        raw_sources.add(file_name)
+        sources.get_length() as int - 1
     }
 
     procedure set_source_content(this, index: int, text: Slice[char])
-        set unported_calls: unported_calls + 1
+    {
+        if (index < 0) or (index >= (sources.get_length() as int))
+            return
+        while (sources_content.get_length() as int) <= index
+            sources_content.add(Slice[char]())
+        sources_content.put(index as size_t, text)
+        set this.has_sources_content: true
+    }
+
+    function is_new_generated_position(this, generated_line: int, generated_character: int) returns bool
+    {
+        if has_pending = false
+            return true
+        (pending_generated_line <> generated_line) or (pending_generated_character <> generated_character)
+    }
+
+    function is_backtracking_source_position(this, source_index: int, source_line: int, source_character: int) returns bool
+    {
+        if (source_index < 0) or (source_line < 0) or (source_character < 0)
+            return false
+        if pending_source_index <> source_index
+            return false
+        if pending_source_line > source_line
+            return true
+        (pending_source_line = source_line) and (pending_source_character > source_character)
+    }
+
+    function should_commit_mapping(this) returns bool
+    {
+        if has_pending = false
+            return false
+        if has_last = false
+            return true
+        (last_generated_line <> pending_generated_line) or (last_generated_character <> pending_generated_character) or (last_source_index <> pending_source_index) or (last_source_line <> pending_source_line) or (last_source_character <> pending_source_character) or (last_name_index <> pending_name_index)
+    }
+
+    function base64_format_encode(value: int) returns char
+    {
+        if value < 26
+            return (("A" as char) as int + value) as char
+        if value < 52
+            return (("a" as char) as int + value - 26) as char
+        if value < 62
+            return (("0" as char) as int + value - 52) as char
+        if value = 62
+            return "+" as char
+        "/" as char
+    }
+
+    procedure append_base64_vlq(this, in_value: int)
+    {
+        var value in_value
+        if value < 0
+            set value: ((0 - value) << 1) + 1
+        else
+            set value: value << 1
+        while true
+        {
+            var current_digit value & 31
+            set value: value >> 5
+            if value > 0
+                set current_digit: current_digit | 32
+            mappings.append(SourceMapGenerator.base64_format_encode(current_digit))
+            if value <= 0
+                break
+        }
+    }
+
+    procedure commit_pending_mapping(this)
+    {
+        if this.should_commit_mapping() = false
+            return
+        if last_generated_line < pending_generated_line
+        {
+            while true
+            {
+                mappings.append(";" as char)
+                set this.last_generated_line: last_generated_line + 1
+                if last_generated_line >= pending_generated_line
+                    break
+            }
+            set this.last_generated_character: 0
+        }
+        else
+        {
+            if has_last
+                mappings.append("," as char)
+        }
+        this.append_base64_vlq(pending_generated_character - last_generated_character)
+        set this.last_generated_character: pending_generated_character
+        if has_pending_source
+        {
+            this.append_base64_vlq(pending_source_index - last_source_index)
+            set this.last_source_index: pending_source_index
+            this.append_base64_vlq(pending_source_line - last_source_line)
+            set this.last_source_line: pending_source_line
+            this.append_base64_vlq(pending_source_character - last_source_character)
+            set this.last_source_character: pending_source_character
+            if has_pending_name
+            {
+                this.append_base64_vlq(pending_name_index - last_name_index)
+                set this.last_name_index: pending_name_index
+            }
+        }
+        set this.has_last: true
+    }
+
+    procedure add_mapping(this, generated_line: int, generated_character: int, source_index: int, source_line: int, source_character: int, name_index: int)
+    {
+        if this.is_new_generated_position(generated_line, generated_character) or this.is_backtracking_source_position(source_index, source_line, source_character)
+        {
+            this.commit_pending_mapping()
+            set this.pending_generated_line: generated_line
+            set this.pending_generated_character: generated_character
+            set this.has_pending_source: false
+            set this.has_pending_name: false
+            set this.has_pending: true
+        }
+        if (source_index >= 0) and (source_line >= 0) and (source_character >= 0)
+        {
+            set this.pending_source_index: source_index
+            set this.pending_source_line: source_line
+            set this.pending_source_character: source_character
+            set this.has_pending_source: true
+            if name_index >= 0
+            {
+                set this.pending_name_index: name_index
+                set this.has_pending_name: true
+            }
+        }
+    }
+
+    procedure add_generated_mapping(this, generated_line: int, generated_character: int)
+    {
+        if (generated_line < pending_generated_line) or (generated_character < 0)
+            return
+        this.add_mapping(generated_line, generated_character, 0 - 1, 0 - 1, 0 - 1, 0 - 1)
+    }
 
     procedure add_source_mapping(this, generated_line: int, generated_character: int, source_index: int, source_line: int, source_character: int)
-        set unported_calls: unported_calls + 1
+    {
+        if (generated_line < pending_generated_line) or (generated_character < 0)
+            return
+        if (source_index < 0) or (source_index >= (sources.get_length() as int)) or (source_line < 0) or (source_character < 0)
+            return
+        this.add_mapping(generated_line, generated_character, source_index, source_line, source_character, 0 - 1)
+    }
+
+    ; a JSON string: `"` `\` and the control characters escaped (go-json-experiment's
+    ; default: no HTML escaping)
+    function append_json_string(sb: ref[StringBuilder], s: Slice[char])
+    {
+        let hex: Slice[char] "0123456789abcdef"
+        sb.append("\"" as char)
+        var i 0
+        while i < (s.length as int)
+        {
+            let c (s[i as size_t] as int) & 255
+            if c = ("\"" as char) as int
+                sb.append("\\\"")
+            else
+            {
+                if c = ("\\" as char) as int
+                    sb.append("\\\\")
+                else
+                {
+                    if c = 10
+                        sb.append("\\n")
+                    else
+                    {
+                        if c = 13
+                            sb.append("\\r")
+                        else
+                        {
+                            if c = 9
+                                sb.append("\\t")
+                            else
+                            {
+                                if c < 32
+                                {
+                                    sb.append("\\u00")
+                                    sb.append(hex[(c >> 4) as size_t])
+                                    sb.append(hex[(c & 15) as size_t])
+                                }
+                                else
+                                    sb.append(c as char)
+                            }
+                        }
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        sb.append("\"" as char)
+    }
+
+    ; RawSourceMap as JSON, in the reference's field order
+    procedure to_json(this) returns String
+    {
+        this.commit_pending_mapping()
+        let sb StringBuilder^host()
+        sb.append("{\"version\":3,\"file\":")
+        SourceMapGenerator.append_json_string(sb, file)
+        sb.append(",\"sourceRoot\":")
+        SourceMapGenerator.append_json_string(sb, source_root)
+        sb.append(",\"sources\":[")
+        var i 0
+        while i < (sources.get_length() as int)
+        {
+            if i > 0
+                sb.append("," as char)
+            SourceMapGenerator.append_json_string(sb, sources[i as size_t])
+            set i: i + 1
+        }
+        sb.append("],\"names\":[],\"mappings\":")
+        let m mappings.to_string()
+        SourceMapGenerator.append_json_string(sb, Slice[char](m.get_length() as int, m.get_buffer() as pointer[char]))
+        if has_sources_content
+        {
+            sb.append(",\"sourcesContent\":[")
+            var j 0
+            while j < (sources_content.get_length() as int)
+            {
+                if j > 0
+                    sb.append("," as char)
+                SourceMapGenerator.append_json_string(sb, sources_content[j as size_t])
+                set j: j + 1
+            }
+            sb.append("]" as char)
+        }
+        sb.append("}" as char)
+        sb.to_string()
+    }
+
+    ; Base64DataURL: `data:application/json;base64,` + the JSON, standard alphabet, padded
+    procedure base64_data_url(this) returns String
+    {
+        let data this.to_json()
+        let n data.get_length() as int
+        let bytes Slice[char](n as size_t, data.get_buffer() as pointer[char])
+        let sb StringBuilder^host()
+        sb.append("data:application/json;base64,")
+        var i 0
+        while i < n
+        {
+            let b0 (bytes[i as size_t] as int) & 255
+            var b1 0
+            var b2 0
+            if (i + 1) < n
+                set b1: (bytes[(i + 1) as size_t] as int) & 255
+            if (i + 2) < n
+                set b2: (bytes[(i + 2) as size_t] as int) & 255
+            let triple (b0 << 16) | (b1 << 8) | b2
+            sb.append(SourceMapGenerator.base64_format_encode((triple >> 18) & 63))
+            sb.append(SourceMapGenerator.base64_format_encode((triple >> 12) & 63))
+            if (i + 1) < n
+                sb.append(SourceMapGenerator.base64_format_encode((triple >> 6) & 63))
+            else
+                sb.append("=" as char)
+            if (i + 2) < n
+                sb.append(SourceMapGenerator.base64_format_encode(triple & 63))
+            else
+                sb.append("=" as char)
+            set i: i + 3
+        }
+        sb.to_string()
+    }
 }
 
 define DetachedCommentsInfo
