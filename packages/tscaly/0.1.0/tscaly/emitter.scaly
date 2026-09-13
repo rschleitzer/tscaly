@@ -259,10 +259,12 @@ define EmitOptions
     emit_declaration_only: int
     no_emit: int
     allow_js: int
+    strict: int
+    strict_null_checks: int
 )
 {
     function defaults() returns EmitOptions
-        EmitOptions(ScriptTargetNone, ModuleKindNone, 0, false, false, NewLineKindNone, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, ModuleDetectionKindAuto, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown)
+        EmitOptions(ScriptTargetNone, ModuleKindNone, 0, false, false, NewLineKindNone, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, ModuleDetectionKindAuto, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown, TristateUnknown)
 
     ; the options of one test configuration, `name=value;name=value` with the
     ; names lower-cased by the runner (tests/casejs.py); an unknown name is
@@ -437,7 +439,19 @@ define EmitOptions
             set o.no_emit: EmitOptions.tristate(value)
         if key.equals("allowjs")
             set o.allow_js: EmitOptions.tristate(value)
+        if key.equals("strict")
+            set o.strict: EmitOptions.tristate(value)
+        if key.equals("strictnullchecks")
+            set o.strict_null_checks: EmitOptions.tristate(value)
         o
+    }
+
+    ; GetStrictOptionValue: an unset strict-family option follows `strict`
+    function get_strict_option_value(this, value: int) returns bool
+    {
+        if value <> TristateUnknown
+            return value = TristateTrue
+        strict <> TristateFalse
     }
 
     function get_emit_script_target(this) returns int
@@ -630,6 +644,27 @@ define FaFactsIterationStatementExcludes: int 0
 define AsContextNonTopLevel: int 1
 define AsContextHasLexicalThis: int 2
 
+define TransformerTagLegacyDecorators: int 22
+define TransformerTagMetadata: int 23
+define LdSubStaticSelfReferenceCheck: int 1
+
+; legacydecorators.go allDecorators: the decorators of a declaration and, per
+; parameter, the parameter's (null where none)
+define AllDecorators
+(
+    decorators: ref[Array[ref[AstNode]?]]?
+    parameters: ref[Array[ref[Array[ref[AstNode]?]]?]]?
+)
+
+; ast.AllAccessorDeclarations
+define AccessorPair
+(
+    first_accessor: ref[AstNode]
+    second_accessor: ref[AstNode]?
+    get_accessor: ref[AstNode]?
+    set_accessor: ref[AstNode]?
+)
+
 ; classfields.go's nine visitors as sub tags, and a tenth for the walk
 ; memberContainsConstructorReference does with a closure
 define CfSubModifier: int 1
@@ -818,6 +853,17 @@ define Transformer
     as_lexical_arguments_binding: ref[AstNode]?
     as_lexical_arguments_used: bool
     es_visitors: ref[Array[ref[NodeVisitor]?]]?
+    ; legacy decorators and metadata (slice 245)
+    ld_class_aliases: ref[Array[ClassAliasEntry]]?
+    ld_enclosing_classes: ref[Array[ref[AstNode]?]]?
+    ld_check_found: bool
+    ld_check_class_original: ref[AstNode]?
+    ld_visitors: ref[Array[ref[NodeVisitor]?]]?
+    md_parent: ref[AstNode]?
+    md_current_lexical_scope: ref[AstNode]?
+    md_current_name_scope: ref[AstNode]?
+    md_strict_null_checks: bool
+    md_serializing_conditional_type_branch: bool
     unported_count: int
     unported_tag: Slice[char]
     unported_detail: int
@@ -829,7 +875,7 @@ define Transformer
     {
         let comps &Array[ref[Transformer]?]^host()
         let no_tag: Slice[char] ""
-        let t &Transformer^host(host, tag, opts.context, opts.context.the_factory(), null, opts, null, null, comps, 0, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, false, null, null, null, false, null, false, false, false, false, false, false, false, false, false, null, null, null, null, null, null, null, false, false, null, false, null, null, false, false, null, null, 0, 0, null, false, false, null, null, 0, null, null, false, null, 0, no_tag, 0)
+        let t &Transformer^host(host, tag, opts.context, opts.context.the_factory(), null, opts, null, null, comps, 0, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, false, null, null, null, false, null, false, false, false, false, false, false, false, false, false, null, null, null, null, null, null, null, false, false, null, false, null, null, false, false, null, null, 0, 0, null, false, false, null, null, 0, null, null, false, null, null, null, false, null, null, null, null, null, false, false, 0, no_tag, 0)
         let v opts.context.new_node_visitor(VisitTagTransformer)
         set v.transformer: t
         set t.visitor: v
@@ -908,6 +954,10 @@ define Transformer
             return this.visit_async(node)
         if tag = TransformerTagExponentiation
             return this.visit_exponentiation(node)
+        if tag = TransformerTagLegacyDecorators
+            return this.visit_legacy_decorators(node)
+        if tag = TransformerTagMetadata
+            return this.visit_metadata(node)
         this.record_unported("transformer-tag", tag)
         node
     }
@@ -3762,6 +3812,1787 @@ define Transformer
         v
     }
 
+    ; ═══ tstransforms/legacydecorators.go (slice 245) ═══
+
+    procedure visit_legacy_decorators(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        ; we have to visit all identifiers in classes, just in case they require substitution
+        if ((Emitter.subtree_facts(node) & SubtreeContainsDecorators) = 0) and (this.ld_enclosing_count() = 0)
+            return node
+        let k node.kind
+        if k = KindIdentifier
+            return this.ld_visit_identifier(node)
+        if k = KindPropertyAccessExpression
+            return this.ld_visit_property_access_expression(node)
+        if k = KindDecorator
+            return null
+        if k = KindClassDeclaration
+            return this.ld_visit_class_declaration(node)
+        if k = KindClassExpression
+            return this.ld_visit_class_expression(node)
+        if k = KindConstructor
+            return this.ld_visit_constructor_declaration(node)
+        if k = KindMethodDeclaration
+            return this.ld_visit_method_declaration(node)
+        if k = KindSetAccessor
+            return this.ld_visit_accessor_declaration(node, false)
+        if k = KindGetAccessor
+            return this.ld_visit_accessor_declaration(node, true)
+        if k = KindPropertyDeclaration
+            return this.ld_visit_property_declaration(node)
+        if k = KindParameter
+            return this.ld_visit_parameter_declaration(node)
+        if k = KindSourceFile
+        {
+            set this.ld_class_aliases: &Array[ClassAliasEntry]^host()
+            set this.ld_enclosing_classes: null
+            let result this.the_visitor().visit_each_child(node) as ref[AstNode]
+            let helpers context.read_emit_helpers()
+            var h 0
+            while h < (helpers.get_length() as int)
+            {
+                let helper helpers[h as size_t]
+                if helper <> null
+                    context.add_emit_helper(result, helper as ref[EmitHelper])
+                set h: h + 1
+            }
+            set this.ld_class_aliases: null
+            set this.ld_enclosing_classes: null
+            return result
+        }
+        this.the_visitor().visit_each_child(node)
+    }
+
+    function ld_enclosing_count(this) returns int
+    {
+        if ld_enclosing_classes = null
+            return 0
+        (ld_enclosing_classes as ref[Array[ref[AstNode]?]]).get_length() as int
+    }
+
+    function ld_class_alias_of(this, declaration: ref[AstNode]) returns ref[AstNode]?
+    {
+        if ld_class_aliases = null
+            return null
+        let aliases ld_class_aliases as ref[Array[ClassAliasEntry]]
+        var i 0
+        while i < (aliases.get_length() as int)
+        {
+            let e aliases[i as size_t]
+            if Transformer.same_node(e.node, declaration)
+                return e.alias
+            set i: i + 1
+        }
+        null
+    }
+
+    ; visitIdentifier: takes the place of `substituteIdentifier` in the strada transform
+    procedure ld_visit_identifier(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if ld_enclosing_classes = null
+            return node
+        let enclosing ld_enclosing_classes as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (enclosing.get_length() as int)
+        {
+            let d enclosing[i as size_t] as ref[AstNode]
+            let alias this.ld_class_alias_of(d)
+            if alias <> null
+            {
+                let decl this.the_checker().get_referenced_value_declaration(context.most_original(node) as ref[AstNode])
+                if decl <> null
+                {
+                    if Transformer.same_node(decl as ref[AstNode], context.most_original(d) as ref[AstNode])
+                        return alias
+                }
+            }
+            set i: i + 1
+        }
+        node
+    }
+
+    ; visitPropertyAccessExpression: the expression but not the name, since property
+    ; access names should not be substituted
+    procedure ld_visit_property_access_expression(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let expression this.the_visitor().visit_node(AstNode.expression_of(node))
+        if Transformer.same_optional_node(expression, AstNode.expression_of(node)) = false
+            return factory.update_property_access_expression(node, expression, AstNode.question_dot_token_of(node), AstNode.name_of(node), node.flags)
+        node
+    }
+
+    function same_optional_node(a: ref[AstNode]?, b: ref[AstNode]?) returns bool
+    {
+        if a = null
+            return b = null
+        if b = null
+            return false
+        Transformer.same_node(a as ref[AstNode], b as ref[AstNode])
+    }
+
+    ; elideModifiers / elideNodes: an empty list keeping the original's range
+    procedure ld_elide_list(this, nodes: ref[Array[ref[AstNode]?]]?, owner: ref[AstNode]) returns ref[Array[ref[AstNode]?]]?
+    {
+        if nodes = null
+            return null
+        let ns nodes as ref[Array[ref[AstNode]?]]
+        if ns.get_length() = 0
+            return nodes
+        let replacement &Array[ref[AstNode]?]^host()
+        var pos 0
+        var end 0
+        if AstNode.list_range_of(owner, ns, &pos, &end)
+            factory.set_list_range(replacement, pos, end)
+        replacement
+    }
+
+    ; finishClassElement: the comments for the original range, the source map after
+    ; the decorators and modifiers
+    procedure ld_finish_class_element(this, updated: ref[AstNode], original: ref[AstNode]) returns ref[AstNode]
+    {
+        if Transformer.same_node(updated, original) = false
+        {
+            context.set_comment_range(updated, TextRange(original.pos, original.end))
+            context.set_source_map_range(updated, Transformer.move_range_past_modifiers(original))
+        }
+        updated
+    }
+
+    procedure ld_visit_parameter_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        let updated f.update_parameter_declaration(node, this.ld_elide_list(Printer.modifier_list_of(node), node), AstNode.dot_dot_dot_token_of(node), v.visit_node(AstNode.name_of(node)), null, null, v.visit_node(AstNode.initializer_of(node)))
+        if Transformer.same_node(updated, node) = false
+        {
+            context.set_comment_range(updated, TextRange(node.pos, node.end))
+            let new_loc Transformer.move_range_past_modifiers(node)
+            set updated.pos: new_loc.pos
+            set updated.end: new_loc.end
+            context.set_source_map_range(updated, new_loc)
+            context.set_emit_flags(AstNode.name_of(updated) as ref[AstNode], EFNoTrailingSourceMap)
+        }
+        updated
+    }
+
+    ; visitPropertyNameOfClassElement: a computed property on a decorated member is
+    ; kept in a temporary for the decoration statements
+    procedure ld_visit_property_name_of_class_element(this, member: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        let name AstNode.name_of(member) as ref[AstNode]
+        if (name.kind = KindComputedPropertyName) and Transformer.has_decorators(member)
+        {
+            let expression v.visit_node(AstNode.expression_of(name)) as ref[AstNode]
+            let inner_expression Printer.skip_partially_emitted_expressions(expression)
+            if Transformer.is_simple_inlineable_expression(inner_expression) = false
+            {
+                let generated_name f.new_generated_name_for_node(name)
+                context.add_variable_declaration(generated_name)
+                return f.update_computed_property_name(name, f.new_assignment_expression(generated_name, expression))
+            }
+        }
+        v.visit_node(name)
+    }
+
+    procedure ld_visit_property_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        if (node.flags & NodeFlagsAmbient) <> 0
+            return null
+        if Transformer.has_syntactic_modifier(node, ModifierFlagsAmbient | ModifierFlagsAbstract)
+            return null
+        this.ld_finish_class_element(f.update_property_declaration(node, v.visit_modifiers(Printer.modifier_list_of(node)), this.ld_visit_property_name_of_class_element(node), null, null, v.visit_node(AstNode.initializer_of(node))), node)
+    }
+
+    procedure ld_visit_accessor_declaration(this, node: ref[AstNode], is_get: bool) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        var updated: ref[AstNode]? null
+        if is_get
+            set updated: f.update_get_accessor_declaration(node, v.visit_modifiers(Printer.modifier_list_of(node)), this.ld_visit_property_name_of_class_element(node), null, v.visit_nodes(AstNode.parameters_of(node)), null, null, v.visit_node(AstNode.body_of(node)))
+        else
+            set updated: f.update_set_accessor_declaration(node, v.visit_modifiers(Printer.modifier_list_of(node)), this.ld_visit_property_name_of_class_element(node), null, v.visit_nodes(AstNode.parameters_of(node)), null, null, v.visit_node(AstNode.body_of(node)))
+        this.ld_finish_class_element(updated as ref[AstNode], node)
+    }
+
+    procedure ld_visit_method_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        this.ld_finish_class_element(f.update_method_declaration(node, v.visit_modifiers(Printer.modifier_list_of(node)), AstNode.asterisk_token_of(node), this.ld_visit_property_name_of_class_element(node), null, null, v.visit_nodes(AstNode.parameters_of(node)), null, null, v.visit_node(AstNode.body_of(node))), node)
+    }
+
+    procedure ld_visit_constructor_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        f.update_constructor_declaration(node, v.visit_modifiers(Printer.modifier_list_of(node)), null, v.visit_nodes(AstNode.parameters_of(node)), null, null, v.visit_node(AstNode.body_of(node)))
+    }
+
+    ; legacy decorators were not supported on class expressions
+    procedure ld_visit_class_expression(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        f.update_class_expression(node, v.visit_modifiers(Printer.modifier_list_of(node)), AstNode.name_of(node), null, v.visit_nodes(AstNode.heritage_clauses_of(node)), v.visit_nodes(Printer.member_list_of(node)))
+    }
+
+    procedure ld_visit_class_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let ck this.the_checker()
+        let decorated ck.class_or_constructor_parameter_is_decorated(true, node)
+        if (decorated = false) and (ck.child_is_decorated(true, node, null) = false)
+            return this.the_visitor().visit_each_child(node)
+        if decorated
+            return this.ld_transform_class_declaration_with_class_decorators(node, AstNode.name_of(node))
+        this.ld_transform_class_declaration_without_class_decorators(node, AstNode.name_of(node))
+    }
+
+    ; transformClassDeclarationWithoutClassDecorators
+    procedure ld_transform_class_declaration_without_class_decorators(this, node: ref[AstNode], name_in: ref[AstNode]?) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        let modifiers v.visit_modifiers(Printer.modifier_list_of(node))
+        let heritage_clauses v.visit_nodes(AstNode.heritage_clauses_of(node))
+        let initial_members v.visit_nodes(Printer.member_list_of(node))
+        let decoration_statements &Array[ref[AstNode]?]^host()
+        let members this.ld_transform_decorators_of_class_elements(node, initial_members, decoration_statements)
+        var name name_in
+        if (name = null) and (decoration_statements.get_length() > 0)
+            set name: f.new_generated_name_for_node(node)
+        let updated f.update_class_declaration(node, modifiers, name, null, heritage_clauses, members)
+        if decoration_statements.get_length() = 0
+            return updated
+        let list &Array[ref[AstNode]?]^host()
+        list.add(updated)
+        Transformer.add_all(list, decoration_statements)
+        f.new_syntax_list(list)
+    }
+
+    procedure ld_pop_enclosing_class(this)
+    {
+        let enclosing ld_enclosing_classes as ref[Array[ref[AstNode]?]]
+        let n enclosing.get_length() as int
+        let copy &Array[ref[AstNode]?]^host()
+        var i 0
+        while i < (n - 1)
+        {
+            copy.add(enclosing[i as size_t])
+            set i: i + 1
+        }
+        set this.ld_enclosing_classes: copy
+    }
+
+    procedure ld_push_enclosing_class(this, cls: ref[AstNode])
+    {
+        if ld_enclosing_classes = null
+            set this.ld_enclosing_classes: &Array[ref[AstNode]?]^host()
+        (ld_enclosing_classes as ref[Array[ref[AstNode]?]]).add(cls)
+    }
+
+    function ld_is_not_export_or_default_or_decorator(node: ref[AstNode]) returns bool
+    {
+        let k node.kind
+        (k <> KindDecorator) and (k <> KindExportKeyword) and (k <> KindDefaultKeyword)
+    }
+
+    function ld_is_class_static_block_declaration_or_static_property(node: ref[AstNode]) returns bool
+    {
+        if node.kind = KindClassStaticBlockDeclaration
+            return true
+        (node.kind = KindPropertyDeclaration) and Transformer.has_static_modifier(node)
+    }
+
+    ; transformClassDeclarationWithClassDecorators: `let C = class C {}; C = __decorate([dec], C);`
+    ; with the alias and the export placement the four examples of the reference show
+    procedure ld_transform_class_declaration_with_class_decorators(this, node: ref[AstNode], name: ref[AstNode]?) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        let is_export Transformer.has_syntactic_modifier(node, ModifierFlagsExport)
+        let is_default Transformer.has_syntactic_modifier(node, ModifierFlagsDefault)
+        var modifiers: ref[Array[ref[AstNode]?]]? null
+        let original_modifiers Printer.modifier_list_of(node)
+        if original_modifiers <> null
+        {
+            let oms original_modifiers as ref[Array[ref[AstNode]?]]
+            if oms.get_length() > 0
+            {
+                let kept &Array[ref[AstNode]?]^host()
+                var i 0
+                while i < (oms.get_length() as int)
+                {
+                    let m oms[i as size_t] as ref[AstNode]
+                    if Transformer.ld_is_not_export_or_default_or_decorator(m)
+                        kept.add(m)
+                    set i: i + 1
+                }
+                if kept.get_length() <> oms.get_length()
+                {
+                    var pos 0
+                    var end 0
+                    if AstNode.list_range_of(node, oms, &pos, &end)
+                        f.set_list_range(kept, pos, end)
+                    set modifiers: kept
+                }
+                else
+                    set modifiers: original_modifiers
+            }
+        }
+        let location Transformer.move_range_past_modifiers(node)
+        let class_alias this.ld_get_class_alias_if_needed(node)
+        if class_alias <> null
+            this.ld_push_enclosing_class(node)
+        ; always the local name for the class (the ES5 IIFE is not supported any more)
+        let decl_name f.get_local_name_ex(node, false, true, false)
+        let heritage_clauses v.visit_nodes(AstNode.heritage_clauses_of(node))
+        var members v.visit_nodes(Printer.member_list_of(node))
+        let decoration_statements &Array[ref[AstNode]?]^host()
+        set members: this.ld_transform_decorators_of_class_elements(node, members, decoration_statements)
+        ; at ES2022 or later the class alias is reassigned before static initializers run
+        var assign_class_alias_in_static_block false
+        if (opts.options.get_emit_script_target() >= ScriptTargetES2022) and (class_alias <> null) and (members <> null)
+        {
+            let ms members as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (ms.get_length() as int)
+            {
+                if Transformer.ld_is_class_static_block_declaration_or_static_property(ms[i as size_t] as ref[AstNode])
+                    set assign_class_alias_in_static_block: true
+                set i: i + 1
+            }
+        }
+        if assign_class_alias_in_static_block
+        {
+            let ms members as ref[Array[ref[AstNode]?]]
+            let block_statements &Array[ref[AstNode]?]^host()
+            block_statements.add(f.new_expression_statement(f.new_assignment_expression(class_alias as ref[AstNode], f.new_keyword_expression(KindThisKeyword))))
+            let member_list &Array[ref[AstNode]?]^host()
+            member_list.add(f.new_class_static_block_declaration(null, f.new_block(block_statements, false)))
+            Transformer.add_all(member_list, ms)
+            var pos 0
+            var end 0
+            if AstNode.list_range_of(node, ms, &pos, &end)
+                f.set_list_range(member_list, pos, end)
+            set members: member_list
+        }
+        var expr_name name
+        if name <> null
+        {
+            if context.has_auto_generate_info(name)
+                set expr_name: null
+        }
+        let class_expression f.new_class_expression(modifiers, expr_name, null, heritage_clauses, members)
+        context.set_original(class_expression, node)
+        set class_expression.pos: location.pos
+        set class_expression.end: location.end
+        ; let ${name} = ${classExpression}, or `= alias = classExpression` when the class
+        ; refers to itself
+        var var_initializer class_expression
+        if (class_alias <> null) and (assign_class_alias_in_static_block = false)
+            set var_initializer: f.new_assignment_expression(class_alias as ref[AstNode], class_expression)
+        let var_decl f.new_variable_declaration(decl_name, null, null, var_initializer)
+        context.set_original(var_decl, node)
+        let decls &Array[ref[AstNode]?]^host()
+        decls.add(var_decl)
+        let var_decl_list f.new_variable_declaration_list(decls, NodeFlagsLet)
+        let var_statement f.new_variable_statement(null, var_decl_list)
+        context.set_original(var_statement, node)
+        set var_statement.pos: location.pos
+        set var_statement.end: location.end
+        context.set_comment_range(var_statement, TextRange(node.pos, node.end))
+        let statements &Array[ref[AstNode]?]^host()
+        statements.add(var_statement)
+        Transformer.add_all(statements, decoration_statements)
+        let constructor_decoration this.ld_get_constructor_decoration_statement(node)
+        if constructor_decoration <> null
+            statements.add(constructor_decoration)
+        if is_export
+        {
+            if is_default
+                statements.add(f.new_export_default(decl_name))
+            else
+                statements.add(f.new_external_module_export(f.get_declaration_name(node)))
+        }
+        if class_alias <> null
+            this.ld_pop_enclosing_class()
+        if statements.get_length() = 1
+            return statements[0]
+        f.new_syntax_list(statements)
+    }
+
+    ; hasInternalStaticReference: a member that refers to the class by name
+    procedure ld_has_internal_static_reference(this, node: ref[AstNode]) returns bool
+    {
+        set this.ld_check_class_original: context.most_original(node)
+        set this.ld_check_found: false
+        let members Printer.member_list_of(node)
+        if members = null
+            return false
+        let ms members as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (ms.get_length() as int)
+        {
+            let member ms[i as size_t] as ref[AstNode]
+            let cv this.ld_visitor(LdSubStaticSelfReferenceCheck)
+            cv.visit_each_child(member)
+            if ld_check_found
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    ; isOrContainsStaticSelfReference, as the walk's callback
+    procedure ld_check_static_self_reference(this, n: ref[AstNode])
+    {
+        if ld_check_found
+            return
+        if n.kind = KindIdentifier
+        {
+            let decl this.the_checker().get_referenced_value_declaration(context.most_original(n) as ref[AstNode])
+            if (decl <> null) and (ld_check_class_original <> null)
+            {
+                if Transformer.same_node(decl as ref[AstNode], ld_check_class_original as ref[AstNode])
+                    set this.ld_check_found: true
+            }
+            return
+        }
+        ; a property access: the expression only, never the name
+        if n.kind = KindPropertyAccessExpression
+        {
+            this.ld_check_static_self_reference(AstNode.expression_of(n) as ref[AstNode])
+            return
+        }
+        let cv this.ld_visitor(LdSubStaticSelfReferenceCheck)
+        cv.visit_each_child(n)
+    }
+
+    procedure ld_visit_for_static_self_reference_check(this, n: ref[AstNode]) returns ref[AstNode]?
+    {
+        this.ld_check_static_self_reference(n)
+        n
+    }
+
+    function ld_visitor(this, sub: int) returns ref[NodeVisitor]
+    {
+        if ld_visitors = null
+        {
+            let table &Array[ref[NodeVisitor]?]^host()
+            var i 0
+            while i <= 2
+            {
+                table.add(null)
+                set i: i + 1
+            }
+            set this.ld_visitors: table
+        }
+        let visitors ld_visitors as ref[Array[ref[NodeVisitor]?]]
+        let existing visitors[sub as size_t]
+        if existing <> null
+            return existing as ref[NodeVisitor]
+        let v context.new_node_visitor(VisitTagTransformer)
+        set v.transformer: this
+        set v.sub_tag: sub
+        visitors.put(sub as size_t, v)
+        v
+    }
+
+    ; getClassAliasIfNeeded: a local alias for a decorated class with an internal
+    ; reference to its static side (the double-binding of the class name)
+    procedure ld_get_class_alias_if_needed(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        if this.ld_has_internal_static_reference(node) = false
+            return null
+        var name_text: Slice[char] "default"
+        let name AstNode.name_of(node)
+        if name <> null
+        {
+            if context.has_auto_generate_info(name) = false
+                set name_text: AstNode.identifier_text_of(name as ref[AstNode])
+        }
+        let class_alias f.new_unique_name(name_text)
+        context.add_variable_declaration(class_alias)
+        if ld_class_aliases = null
+            set this.ld_class_aliases: &Array[ClassAliasEntry]^host()
+        (ld_class_aliases as ref[Array[ClassAliasEntry]]).add(ClassAliasEntry(node, class_alias))
+        class_alias
+    }
+
+    procedure ld_get_constructor_decoration_statement(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let expression this.ld_generate_constructor_decoration_expression(node)
+        if expression = null
+            return null
+        let result factory.new_expression_statement(expression as ref[AstNode])
+        context.set_original(result, node)
+        result
+    }
+
+    ; generateConstructorDecorationExpression: `C = __decorate([dec], C)`; decorator
+    ; expressions are evaluated outside the class body, so the enclosing class is
+    ; popped while they are visited
+    procedure ld_generate_constructor_decoration_expression(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        let all_decorators this.ld_get_all_decorators_of_class(node)
+        var has_alias false
+        if ld_enclosing_classes <> null
+        {
+            let enclosing ld_enclosing_classes as ref[Array[ref[AstNode]?]]
+            let n enclosing.get_length() as int
+            if n > 0
+            {
+                if Transformer.same_node(enclosing[(n - 1) as size_t] as ref[AstNode], node)
+                    set has_alias: true
+            }
+        }
+        if has_alias
+            this.ld_pop_enclosing_class()
+        let decorator_expressions this.ld_transform_all_decorators_of_declaration(all_decorators)
+        if has_alias
+            this.ld_push_enclosing_class(node)
+        if decorator_expressions.get_length() = 0
+            return null
+        let class_alias this.ld_class_alias_of(node)
+        let local_name f.get_declaration_name_ex(node, false, true)
+        let decorate f.new_decorate_helper(decorator_expressions, local_name, null, null)
+        var assignment_target decorate
+        if class_alias <> null
+            set assignment_target: f.new_assignment_expression(class_alias as ref[AstNode], decorate)
+        let expression f.new_assignment_expression(local_name, assignment_target)
+        context.set_emit_flags(expression, EFNoComments)
+        context.set_source_map_range(expression, Transformer.move_range_past_modifiers(node))
+        expression
+    }
+
+    function ld_decorator_contains_private_identifier_in_expression(decorator: ref[AstNode]) returns bool
+        (Emitter.subtree_facts(decorator) & SubtreeContainsPrivateIdentifierInExpression) <> 0
+
+    function ld_decorators_contain_private_identifier(decorators: ref[Array[ref[AstNode]?]]?) returns bool
+    {
+        if decorators = null
+            return false
+        let ds decorators as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (ds.get_length() as int)
+        {
+            if Transformer.ld_decorator_contains_private_identifier_in_expression(ds[i as size_t] as ref[AstNode])
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    procedure ld_has_class_element_with_decorator_containing_private_identifier_in_expression(this, node: ref[AstNode]) returns bool
+    {
+        let members Printer.member_list_of(node)
+        if members = null
+            return false
+        let ms members as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (ms.get_length() as int)
+        {
+            let member ms[i as size_t] as ref[AstNode]
+            set i: i + 1
+            if AstNode.can_have_decorators(member) = false
+                continue
+            let all this.ld_get_all_decorators_of_class_element(member, node)
+            if all = null
+                continue
+            let ad all as ref[AllDecorators]
+            if Transformer.ld_decorators_contain_private_identifier(ad.decorators)
+                return true
+            if ad.parameters <> null
+            {
+                let ps ad.parameters as ref[Array[ref[Array[ref[AstNode]?]]?]]
+                var p 0
+                while p < (ps.get_length() as int)
+                {
+                    if Transformer.ld_decorators_contain_private_identifier(ps[p as size_t])
+                        return true
+                    set p: p + 1
+                }
+            }
+        }
+        false
+    }
+
+    ; getAllDecoratorsOfClass: the class's decorators and its constructor's parameter decorators
+    procedure ld_get_all_decorators_of_class(this, node: ref[AstNode]) returns ref[AllDecorators]?
+    {
+        let decorators Transformer.decorators_of(host, node)
+        let parameters this.ld_get_decorators_of_parameters(Transformer.get_first_constructor_with_body(node))
+        if (decorators.get_length() = 0) and (parameters = null)
+            return null
+        &AllDecorators^host(decorators, parameters)
+    }
+
+    ; getAllDecoratorsOfClassElement(member, parent, useLegacyDecorators = true)
+    procedure ld_get_all_decorators_of_class_element(this, member: ref[AstNode], parent: ref[AstNode]) returns ref[AllDecorators]?
+    {
+        let k member.kind
+        if (k = KindGetAccessor) or (k = KindSetAccessor)
+            return this.ld_get_all_decorators_of_accessors(member, parent)
+        if k = KindMethodDeclaration
+            return this.ld_get_all_decorators_of_method(member)
+        if k = KindPropertyDeclaration
+            return this.ld_get_all_decorators_of_property(member)
+        null
+    }
+
+    procedure ld_get_all_decorators_of_accessors(this, accessor: ref[AstNode], parent: ref[AstNode]) returns ref[AllDecorators]?
+    {
+        if AstNode.body_of(accessor) = null
+            return null
+        let decls this.get_all_accessor_declarations(Printer.member_list_of(parent), accessor)
+        var first_accessor_with_decorators: ref[AstNode]? null
+        if Transformer.has_decorators(decls.first_accessor)
+            set first_accessor_with_decorators: decls.first_accessor
+        else
+        {
+            if decls.second_accessor <> null
+            {
+                if Transformer.has_decorators(decls.second_accessor as ref[AstNode])
+                    set first_accessor_with_decorators: decls.second_accessor
+            }
+        }
+        if first_accessor_with_decorators = null
+            return null
+        if Transformer.same_node(accessor, first_accessor_with_decorators as ref[AstNode]) = false
+            return null
+        let decorators Transformer.decorators_of(host, first_accessor_with_decorators as ref[AstNode])
+        var parameters: ref[Array[ref[Array[ref[AstNode]?]]?]]? null
+        if decls.set_accessor <> null
+            set parameters: this.ld_get_decorators_of_parameters(decls.set_accessor)
+        if (decorators.get_length() = 0) and (parameters = null)
+            return null
+        &AllDecorators^host(decorators, parameters)
+    }
+
+    procedure ld_get_all_decorators_of_property(this, property: ref[AstNode]) returns ref[AllDecorators]?
+    {
+        let decorators Transformer.decorators_of(host, property)
+        if decorators.get_length() = 0
+            return null
+        &AllDecorators^host(decorators, null)
+    }
+
+    procedure ld_get_all_decorators_of_method(this, method: ref[AstNode]) returns ref[AllDecorators]?
+    {
+        if AstNode.body_of(method) = null
+            return null
+        let decorators Transformer.decorators_of(host, method)
+        let parameters this.ld_get_decorators_of_parameters(method)
+        if (decorators.get_length() = 0) and (parameters = null)
+            return null
+        &AllDecorators^host(decorators, parameters)
+    }
+
+    ; getDecoratorsOfParameters: one list per parameter (null where none), null when no
+    ; parameter is decorated; a leading `this` parameter is skipped
+    procedure ld_get_decorators_of_parameters(this, node: ref[AstNode]?) returns ref[Array[ref[Array[ref[AstNode]?]]?]]?
+    {
+        if node = null
+            return null
+        let parameters AstNode.parameters_of(node)
+        if parameters = null
+            return null
+        let ps parameters as ref[Array[ref[AstNode]?]]
+        var first_parameter_offset 0
+        var num_parameters ps.get_length() as int
+        if num_parameters > 0
+        {
+            if AstNode.is_this_parameter(ps[0] as ref[AstNode])
+            {
+                set first_parameter_offset: 1
+                set num_parameters: num_parameters - 1
+            }
+        }
+        var decorators: ref[Array[ref[Array[ref[AstNode]?]]?]]? null
+        var i 0
+        while i < num_parameters
+        {
+            let p ps[(i + first_parameter_offset) as size_t] as ref[AstNode]
+            if (decorators <> null) or Transformer.has_decorators(p)
+            {
+                if decorators = null
+                {
+                    let table &Array[ref[Array[ref[AstNode]?]]?]^host()
+                    var j 0
+                    while j < num_parameters
+                    {
+                        table.add(null)
+                        set j: j + 1
+                    }
+                    set decorators: table
+                }
+                (decorators as ref[Array[ref[Array[ref[AstNode]?]]?]]).put(i as size_t, Transformer.decorators_of(host, p))
+            }
+            set i: i + 1
+        }
+        decorators
+    }
+
+    ; transformDecoratorsOfClassElements: the decoration statements of the instance
+    ; members then the static ones; into a static block when a decorator names a
+    ; private identifier
+    procedure ld_transform_decorators_of_class_elements(this, node: ref[AstNode], members: ref[Array[ref[AstNode]?]]?, decoration_statements: ref[Array[ref[AstNode]?]]) returns ref[Array[ref[AstNode]?]]?
+    {
+        let f factory
+        this.ld_add_class_element_decoration_statements(node, false, decoration_statements)
+        this.ld_add_class_element_decoration_statements(node, true, decoration_statements)
+        if this.ld_has_class_element_with_decorator_containing_private_identifier_in_expression(node)
+        {
+            let new_members &Array[ref[AstNode]?]^host()
+            Transformer.add_all(new_members, members)
+            let block_statements &Array[ref[AstNode]?]^host()
+            Transformer.add_all(block_statements, decoration_statements)
+            new_members.add(f.new_class_static_block_declaration(null, f.new_block(block_statements, true)))
+            decoration_statements.clear()
+            return new_members
+        }
+        members
+    }
+
+    procedure ld_add_class_element_decoration_statements(this, node: ref[AstNode], is_static: bool, statements: ref[Array[ref[AstNode]?]])
+    {
+        let members Printer.member_list_of(node)
+        if members = null
+            return
+        let ms members as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (ms.get_length() as int)
+        {
+            let member ms[i as size_t] as ref[AstNode]
+            set i: i + 1
+            ; isDecoratedClassElement
+            if (opts.binder as ref[Binder]).is_static(member) <> is_static
+                continue
+            if this.the_checker().node_or_child_is_decorated(true, member, node, null) = false
+                continue
+            let expr this.ld_generate_class_element_decoration_expression(node, member)
+            if expr <> null
+                statements.add(factory.new_expression_statement(expr as ref[AstNode]))
+        }
+    }
+
+    ; generateClassElementDecorationExpression: `__decorate([...], C.prototype, "method", null)`
+    procedure ld_generate_class_element_decoration_expression(this, node: ref[AstNode], member: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        let all_decorators this.ld_get_all_decorators_of_class_element(member, node)
+        let decorator_expressions this.ld_transform_all_decorators_of_declaration(all_decorators)
+        if decorator_expressions.get_length() = 0
+            return null
+        let prefix this.ld_get_class_member_prefix(node, member)
+        let member_name this.ld_get_expression_for_property_name(member, (member.flags & NodeFlagsAmbient) = 0)
+        var descriptor: ref[AstNode]? null
+        if (member.kind = KindPropertyDeclaration) and (Transformer.has_accessor_modifier(member) = false)
+            set descriptor: f.new_void_zero_expression()
+        else
+            set descriptor: f.new_keyword_expression(KindNullKeyword)
+        let helper f.new_decorate_helper(decorator_expressions, prefix, member_name, descriptor)
+        context.set_emit_flags(helper, EFNoComments)
+        context.set_source_map_range(helper, Transformer.move_range_past_modifiers(member))
+        helper
+    }
+
+    function ld_is_synthetic_metadata_decorator(this, node: ref[AstNode]) returns bool
+        context.is_call_to_helper(AstNode.expression_of(node) as ref[AstNode], "__metadata")
+
+    ; transformAllDecoratorsOfDeclaration: the decorators, the parameter decorators,
+    ; then the metadata decorators last
+    procedure ld_transform_all_decorators_of_declaration(this, all_decorators: ref[AllDecorators]?) returns ref[Array[ref[AstNode]?]]
+    {
+        let results &Array[ref[AstNode]?]^host()
+        if all_decorators = null
+            return results
+        let ad all_decorators as ref[AllDecorators]
+        let metadata &Array[ref[AstNode]?]^host()
+        let decorators &Array[ref[AstNode]?]^host()
+        if ad.decorators <> null
+        {
+            let ds ad.decorators as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (ds.get_length() as int)
+            {
+                let d ds[i as size_t] as ref[AstNode]
+                if this.ld_is_synthetic_metadata_decorator(d)
+                    metadata.add(d)
+                else
+                    decorators.add(d)
+                set i: i + 1
+            }
+        }
+        this.ld_transform_decorators(decorators, results)
+        this.ld_transform_decorators_of_parameters(ad.parameters, results)
+        this.ld_transform_decorators(metadata, results)
+        results
+    }
+
+    procedure ld_transform_decorators_of_parameters(this, parameters: ref[Array[ref[Array[ref[AstNode]?]]?]]?, results: ref[Array[ref[AstNode]?]])
+    {
+        if parameters = null
+            return
+        let ps parameters as ref[Array[ref[Array[ref[AstNode]?]]?]]
+        var i 0
+        while i < (ps.get_length() as int)
+        {
+            let decorators ps[i as size_t]
+            if decorators <> null
+            {
+                let ds decorators as ref[Array[ref[AstNode]?]]
+                var j 0
+                while j < (ds.get_length() as int)
+                {
+                    let decorator ds[j as size_t] as ref[AstNode]
+                    let expression AstNode.expression_of(decorator) as ref[AstNode]
+                    let helper factory.new_param_helper(this.the_visitor().visit_node(expression) as ref[AstNode], i, TextRange(expression.pos, expression.end))
+                    context.set_emit_flags(helper, EFNoComments)
+                    results.add(helper)
+                    set j: j + 1
+                }
+            }
+            set i: i + 1
+        }
+    }
+
+    procedure ld_transform_decorators(this, decorators: ref[Array[ref[AstNode]?]], results: ref[Array[ref[AstNode]?]])
+    {
+        var i 0
+        while i < (decorators.get_length() as int)
+        {
+            let d decorators[i as size_t] as ref[AstNode]
+            results.add(this.the_visitor().visit_node(AstNode.expression_of(d)))
+            set i: i + 1
+        }
+    }
+
+    procedure ld_get_class_member_prefix(this, node: ref[AstNode], member: ref[AstNode]) returns ref[AstNode]
+    {
+        if (opts.binder as ref[Binder]).is_static(member)
+            return factory.get_declaration_name(node)
+        factory.new_property_access_expression(factory.get_declaration_name(node), null, factory.new_identifier("prototype"), NodeFlagsNone)
+    }
+
+    procedure ld_get_expression_for_property_name(this, member: ref[AstNode], generate_name_for_computed_property_name: bool) returns ref[AstNode]
+    {
+        let f factory
+        let name AstNode.name_of(member) as ref[AstNode]
+        if name.kind = KindPrivateIdentifier
+        {
+            let empty: Slice[char] ""
+            return f.new_identifier(empty)
+        }
+        if name.kind = KindComputedPropertyName
+        {
+            let expression AstNode.expression_of(name) as ref[AstNode]
+            if generate_name_for_computed_property_name and (Transformer.is_simple_inlineable_expression(expression) = false)
+                return f.new_generated_name_for_node(name)
+            return expression
+        }
+        if name.kind = KindIdentifier
+            return f.new_string_literal(AstNode.identifier_text_of(name), TokenFlagsNone)
+        DeepClone.deep_clone_node(host, f, name) as ref[AstNode]
+    }
+
+    ; ═══ tstransforms/metadata.go + typeserializer.go (slice 245) ═══
+    ; the `design:type` / `design:paramtypes` / `design:returntype` decorators
+    ; under emitDecoratorMetadata (the old format; USE_NEW_TYPE_METADATA_FORMAT is false)
+
+    procedure visit_metadata(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if (Emitter.subtree_facts(node) & SubtreeContainsDecorators) = 0
+            return node
+        let k node.kind
+        if k = KindClassDeclaration
+            return this.md_visit_class_like(node, true)
+        if k = KindClassExpression
+            return this.md_visit_class_like(node, false)
+        if k = KindPropertyDeclaration
+            return this.md_visit_property_declaration(node)
+        if k = KindMethodDeclaration
+            return this.md_visit_method_declaration(node)
+        if k = KindSetAccessor
+            return this.md_visit_accessor(node, false)
+        if k = KindGetAccessor
+            return this.md_visit_accessor(node, true)
+        if k = KindSourceFile
+        {
+            set this.md_parent: null
+            set this.md_current_lexical_scope: node
+            let updated this.the_visitor().visit_each_child(node) as ref[AstNode]
+            let helpers context.read_emit_helpers()
+            var h 0
+            while h < (helpers.get_length() as int)
+            {
+                let helper helpers[h as size_t]
+                if helper <> null
+                    context.add_emit_helper(updated, helper as ref[EmitHelper])
+                set h: h + 1
+            }
+            set this.md_parent: null
+            set this.md_current_lexical_scope: null
+            return updated
+        }
+        if (k = KindModuleBlock) or (k = KindBlock) or (k = KindCaseBlock)
+        {
+            let old_scope md_current_lexical_scope
+            set this.md_current_lexical_scope: node
+            let result this.the_visitor().visit_each_child(node)
+            set this.md_current_lexical_scope: old_scope
+            return result
+        }
+        this.the_visitor().visit_each_child(node)
+    }
+
+    function md_legacy_decorators(this) returns bool
+        opts.options.experimental_decorators = TristateTrue
+
+    procedure md_visit_class_like(this, node: ref[AstNode], is_declaration: bool) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        let old_parent md_parent
+        set this.md_parent: node
+        var result: ref[AstNode]? null
+        if this.the_checker().class_or_constructor_parameter_is_decorated(this.md_legacy_decorators(), node) = false
+            set result: v.visit_each_child(node)
+        else
+        {
+            let modifiers this.md_inject_class_type_metadata(v.visit_modifiers(Printer.modifier_list_of(node)), node)
+            if is_declaration
+                set result: f.update_class_declaration(node, modifiers, v.visit_node(AstNode.name_of(node)), v.visit_nodes(AstNode.type_parameters_of(node)), v.visit_nodes(AstNode.heritage_clauses_of(node)), v.visit_nodes(Printer.member_list_of(node)))
+            else
+                set result: f.update_class_expression(node, modifiers, v.visit_node(AstNode.name_of(node)), v.visit_nodes(AstNode.type_parameters_of(node)), v.visit_nodes(AstNode.heritage_clauses_of(node)), v.visit_nodes(Printer.member_list_of(node)))
+        }
+        set this.md_parent: old_parent
+        result
+    }
+
+    procedure md_visit_property_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        if Transformer.has_decorators(node) = false
+            return v.visit_each_child(node)
+        let modifiers this.md_inject_class_element_type_metadata(v.visit_modifiers(Printer.modifier_list_of(node)), node, md_parent)
+        f.update_property_declaration(node, modifiers, v.visit_node(AstNode.name_of(node)), v.visit_node(AstNode.postfix_token_of(node)), v.visit_node(AstNode.type_of(node)), v.visit_node(AstNode.initializer_of(node)))
+    }
+
+    procedure md_visit_method_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        if (Transformer.has_decorators(node) = false) and (this.ld_get_decorators_of_parameters(node) = null)
+            return v.visit_each_child(node)
+        let modifiers this.md_inject_class_element_type_metadata(v.visit_modifiers(Printer.modifier_list_of(node)), node, md_parent)
+        f.update_method_declaration(node, modifiers, v.visit_node(AstNode.asterisk_token_of(node)), v.visit_node(AstNode.name_of(node)), v.visit_node(AstNode.postfix_token_of(node)), v.visit_nodes(AstNode.type_parameters_of(node)), v.visit_nodes(AstNode.parameters_of(node)), v.visit_node(AstNode.type_of(node)), v.visit_node(AstNode.full_signature_of(node)), v.visit_node(AstNode.body_of(node)))
+    }
+
+    procedure md_visit_accessor(this, node: ref[AstNode], is_get: bool) returns ref[AstNode]?
+    {
+        let f factory
+        let v this.the_visitor()
+        var skip Transformer.has_decorators(node) = false
+        if skip and (is_get = false)
+        {
+            if this.ld_get_decorators_of_parameters(node) <> null
+                set skip: false
+        }
+        if skip
+            return v.visit_each_child(node)
+        let modifiers this.md_inject_class_element_type_metadata(v.visit_modifiers(Printer.modifier_list_of(node)), node, md_parent)
+        if is_get
+            return f.update_get_accessor_declaration(node, modifiers, v.visit_node(AstNode.name_of(node)), v.visit_nodes(AstNode.type_parameters_of(node)), v.visit_nodes(AstNode.parameters_of(node)), v.visit_node(AstNode.type_of(node)), v.visit_node(AstNode.full_signature_of(node)), v.visit_node(AstNode.body_of(node)))
+        f.update_set_accessor_declaration(node, modifiers, v.visit_node(AstNode.name_of(node)), v.visit_nodes(AstNode.type_parameters_of(node)), v.visit_nodes(AstNode.parameters_of(node)), v.visit_node(AstNode.type_of(node)), v.visit_node(AstNode.full_signature_of(node)), v.visit_node(AstNode.body_of(node)))
+    }
+
+    function md_is_export_or_default(node: ref[AstNode]) returns bool
+        (node.kind = KindDefaultKeyword) or (node.kind = KindExportKeyword)
+
+    ; injectClassTypeMetadata: `export default` first, then the decorators, the
+    ; metadata, the other modifiers
+    procedure md_inject_class_type_metadata(this, list: ref[Array[ref[AstNode]?]]?, node: ref[AstNode]) returns ref[Array[ref[AstNode]?]]?
+    {
+        let f factory
+        let metadata this.md_get_type_metadata(node, node)
+        if metadata.get_length() = 0
+            return list
+        var original: ref[Array[ref[AstNode]?]]? list
+        if (list = null) or ((list as ref[Array[ref[AstNode]?]]).get_length() = 0)
+        {
+            if list <> null
+            {
+                var pos 0
+                var end 0
+                if AstNode.list_range_of(node, list, &pos, &end)
+                    f.set_list_range(metadata, pos, end)
+            }
+            return metadata
+        }
+        let originals list as ref[Array[ref[AstNode]?]]
+        let result &Array[ref[AstNode]?]^host()
+        var rest_start 0
+        let first originals[0] as ref[AstNode]
+        if Printer.is_modifier_kind(first.kind) and Transformer.md_is_export_or_default(first)
+        {
+            result.add(first)
+            set rest_start: 1
+            if originals.get_length() > 1
+            {
+                let second originals[1] as ref[AstNode]
+                if Transformer.md_is_export_or_default(second)
+                {
+                    result.add(second)
+                    set rest_start: 2
+                }
+            }
+        }
+        var i 0
+        while i < (originals.get_length() as int)
+        {
+            let m originals[i as size_t] as ref[AstNode]
+            if m.kind = KindDecorator
+                result.add(m)
+            set i: i + 1
+        }
+        Transformer.add_all(result, metadata)
+        set i: rest_start
+        while i < (originals.get_length() as int)
+        {
+            let m originals[i as size_t] as ref[AstNode]
+            if Printer.is_modifier_kind(m.kind) and (m.kind <> KindDecorator)
+                result.add(m)
+            set i: i + 1
+        }
+        var pos 0
+        var end 0
+        if AstNode.list_range_of(node, originals, &pos, &end)
+            f.set_list_range(result, pos, end)
+        result
+    }
+
+    ; injectClassElementTypeMetadata: the decorators, the metadata, the modifiers
+    procedure md_inject_class_element_type_metadata(this, list: ref[Array[ref[AstNode]?]]?, node: ref[AstNode], container: ref[AstNode]?) returns ref[Array[ref[AstNode]?]]?
+    {
+        let f factory
+        if container = null
+            return list
+        let c container as ref[AstNode]
+        if Checker.is_class_like(c) = false
+            return list
+        if this.class_element_or_class_element_parameter_is_decorated(this.md_legacy_decorators(), node, c) = false
+            return list
+        let metadata this.md_get_type_metadata(node, c)
+        if metadata.get_length() = 0
+            return list
+        if (list = null) or ((list as ref[Array[ref[AstNode]?]]).get_length() = 0)
+        {
+            if list <> null
+            {
+                var pos 0
+                var end 0
+                if AstNode.list_range_of(node, list, &pos, &end)
+                    f.set_list_range(metadata, pos, end)
+            }
+            return metadata
+        }
+        let originals list as ref[Array[ref[AstNode]?]]
+        let result &Array[ref[AstNode]?]^host()
+        var i 0
+        while i < (originals.get_length() as int)
+        {
+            let m originals[i as size_t] as ref[AstNode]
+            if m.kind = KindDecorator
+                result.add(m)
+            set i: i + 1
+        }
+        Transformer.add_all(result, metadata)
+        set i: 0
+        while i < (originals.get_length() as int)
+        {
+            let m originals[i as size_t] as ref[AstNode]
+            if Printer.is_modifier_kind(m.kind) and (m.kind <> KindDecorator)
+                result.add(m)
+            set i: i + 1
+        }
+        var pos 0
+        var end 0
+        if AstNode.list_range_of(node, originals, &pos, &end)
+            f.set_list_range(result, pos, end)
+        result
+    }
+
+    ; getTypeMetadata → getOldTypeMetadata (decorator metadata is not yet supported
+    ; for ES decorators)
+    procedure md_get_type_metadata(this, node: ref[AstNode], container: ref[AstNode]) returns ref[Array[ref[AstNode]?]]
+    {
+        let f factory
+        let decorators &Array[ref[AstNode]?]^host()
+        if this.md_legacy_decorators() = false
+            return decorators
+        if Transformer.md_should_add_type_metadata(node)
+        {
+            let type_metadata f.new_metadata_helper("design:type", this.ms_serialize_type_of_node_in(container, node, container))
+            decorators.add(f.new_decorator(type_metadata))
+        }
+        if Transformer.md_should_add_param_types_metadata(node)
+        {
+            let param_types_metadata f.new_metadata_helper("design:paramtypes", this.ms_serialize_parameter_types_of_node_in(container, node, container))
+            decorators.add(f.new_decorator(param_types_metadata))
+        }
+        if Transformer.md_should_add_return_type_metadata(node)
+        {
+            let return_type_metadata f.new_metadata_helper("design:returntype", this.ms_serialize_return_type_of_node_in(container, node))
+            decorators.add(f.new_decorator(return_type_metadata))
+        }
+        decorators
+    }
+
+    function md_should_add_type_metadata(node: ref[AstNode]) returns bool
+    {
+        let k node.kind
+        (k = KindMethodDeclaration) or (k = KindGetAccessor) or (k = KindSetAccessor) or (k = KindPropertyDeclaration)
+    }
+
+    function md_should_add_return_type_metadata(node: ref[AstNode]) returns bool
+        node.kind = KindMethodDeclaration
+
+    function md_should_add_param_types_metadata(node: ref[AstNode]) returns bool
+    {
+        let k node.kind
+        if (k = KindClassDeclaration) or (k = KindClassExpression)
+            return Transformer.get_first_constructor_with_body(node) <> null
+        (k = KindMethodDeclaration) or (k = KindGetAccessor) or (k = KindSetAccessor)
+    }
+
+    ; ── the serializer, with its context (currentLexicalScope, currentNameScope,
+    ; serializingConditionalTypeBranch) as fields ──
+
+    procedure ms_serialize_type_of_node_in(this, name_scope: ref[AstNode]?, node: ref[AstNode], container: ref[AstNode]) returns ref[AstNode]
+    {
+        let saved_scope md_current_name_scope
+        let saved_branch md_serializing_conditional_type_branch
+        set this.md_current_name_scope: name_scope
+        set this.md_serializing_conditional_type_branch: false
+        let result this.ms_serialize_type_of_node(node, container)
+        set this.md_current_name_scope: saved_scope
+        set this.md_serializing_conditional_type_branch: saved_branch
+        result
+    }
+
+    procedure ms_serialize_parameter_types_of_node_in(this, name_scope: ref[AstNode]?, node: ref[AstNode], container: ref[AstNode]) returns ref[AstNode]
+    {
+        let saved_scope md_current_name_scope
+        let saved_branch md_serializing_conditional_type_branch
+        set this.md_current_name_scope: name_scope
+        set this.md_serializing_conditional_type_branch: false
+        let result this.ms_serialize_parameter_types_of_node(node, container)
+        set this.md_current_name_scope: saved_scope
+        set this.md_serializing_conditional_type_branch: saved_branch
+        result
+    }
+
+    procedure ms_serialize_return_type_of_node_in(this, name_scope: ref[AstNode]?, node: ref[AstNode]) returns ref[AstNode]
+    {
+        let saved_scope md_current_name_scope
+        let saved_branch md_serializing_conditional_type_branch
+        set this.md_current_name_scope: name_scope
+        set this.md_serializing_conditional_type_branch: false
+        let result this.ms_serialize_return_type_of_node(node)
+        set this.md_current_name_scope: saved_scope
+        set this.md_serializing_conditional_type_branch: saved_branch
+        result
+    }
+
+    ; GetSetAccessorValueParameter
+    function ms_get_set_accessor_value_parameter(node: ref[AstNode]?) returns ref[AstNode]?
+    {
+        if node = null
+            return null
+        let parameters AstNode.parameters_of(node)
+        if parameters = null
+            return null
+        let ps parameters as ref[Array[ref[AstNode]?]]
+        if ps.get_length() = 0
+            return null
+        if ps.get_length() >= 2
+        {
+            if AstNode.is_this_parameter(ps[0] as ref[AstNode])
+                return ps[1]
+        }
+        ps[0]
+    }
+
+    function ms_get_set_accessor_type_annotation_node(node: ref[AstNode]?) returns ref[AstNode]?
+    {
+        let p Transformer.ms_get_set_accessor_value_parameter(node)
+        if p = null
+            return null
+        AstNode.type_of(p)
+    }
+
+    procedure ms_get_accessor_type_node(this, node: ref[AstNode], container: ref[AstNode]) returns ref[AstNode]?
+    {
+        let accessors this.get_all_accessor_declarations(Printer.member_list_of(container), node)
+        if accessors.set_accessor <> null
+            return Transformer.ms_get_set_accessor_type_annotation_node(accessors.set_accessor)
+        if accessors.get_accessor <> null
+            return AstNode.type_of(accessors.get_accessor)
+        null
+    }
+
+    ; serializeTypeOfNode
+    procedure ms_serialize_type_of_node(this, node: ref[AstNode], container: ref[AstNode]) returns ref[AstNode]
+    {
+        let f factory
+        let k node.kind
+        if (k = KindPropertyDeclaration) or (k = KindParameter)
+            return this.ms_serialize_type_node(AstNode.type_of(node))
+        if (k = KindGetAccessor) or (k = KindSetAccessor)
+            return this.ms_serialize_type_node(this.ms_get_accessor_type_node(node, container))
+        if (k = KindClassDeclaration) or (k = KindClassExpression) or (k = KindMethodDeclaration)
+            return f.new_identifier("Function")
+        f.new_void_zero_expression()
+    }
+
+    ; serializeParameterTypesOfNode: `[Type, ...]` of the constructor or method
+    procedure ms_serialize_parameter_types_of_node(this, node: ref[AstNode], container: ref[AstNode]) returns ref[AstNode]
+    {
+        let f factory
+        var value_declaration: ref[AstNode]? null
+        if Checker.is_class_like(node)
+            set value_declaration: Transformer.get_first_constructor_with_body(node)
+        else
+        {
+            if Parser.is_function_like_node(node) and Binder.node_is_present(AstNode.body_of(node))
+                set value_declaration: node
+        }
+        let expressions &Array[ref[AstNode]?]^host()
+        if value_declaration = null
+            return f.new_array_literal_expression(expressions, false)
+        let parameters this.ms_get_parameters_of_decorated_declaration(value_declaration as ref[AstNode], container)
+        if parameters <> null
+        {
+            let ps parameters as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (ps.get_length() as int)
+            {
+                let parameter ps[i as size_t] as ref[AstNode]
+                set i: i + 1
+                let name AstNode.name_of(parameter)
+                if (i = 1) and (AstNode.kind_of(name) = KindIdentifier)
+                {
+                    if AstNode.identifier_text_of(name as ref[AstNode]).equals("this")
+                        continue
+                }
+                if AstNode.dot_dot_dot_token_of(parameter) <> null
+                    expressions.add(this.ms_serialize_type_node(Transformer.get_rest_parameter_element_type(AstNode.type_of(parameter))))
+                else
+                    expressions.add(this.ms_serialize_type_of_node(parameter, container))
+            }
+        }
+        f.new_array_literal_expression(expressions, false)
+    }
+
+    procedure ms_get_parameters_of_decorated_declaration(this, node: ref[AstNode], container: ref[AstNode]?) returns ref[Array[ref[AstNode]?]]?
+    {
+        if (container <> null) and (node.kind = KindGetAccessor)
+        {
+            let acc this.get_all_accessor_declarations(Printer.member_list_of(container as ref[AstNode]), node)
+            if acc.set_accessor <> null
+                return AstNode.parameters_of(acc.set_accessor)
+        }
+        AstNode.parameters_of(node)
+    }
+
+    ; ast.GetRestParameterElementType: `T[]` → T, `Array<T>` → T
+    function get_rest_parameter_element_type(node: ref[AstNode]?) returns ref[AstNode]?
+    {
+        if node = null
+            return null
+        let n node as ref[AstNode]
+        if n.kind = KindArrayType
+            return AstNode.array_element_type_of(n)
+        if n.kind = KindTypeReference
+        {
+            let args AstNode.type_reference_arguments_of(n)
+            if args <> null
+            {
+                let a args as ref[Array[ref[AstNode]?]]
+                if a.get_length() > 0
+                    return a[0]
+            }
+        }
+        null
+    }
+
+    ; ast.IsAsyncFunction
+    function is_async_function(node: ref[AstNode]) returns bool
+    {
+        let k node.kind
+        if (k = KindFunctionDeclaration) or (k = KindFunctionExpression) or (k = KindArrowFunction) or (k = KindMethodDeclaration)
+            return (AstNode.body_of(node) <> null) and (AstNode.asterisk_token_of(node) = null) and Transformer.has_syntactic_modifier(node, ModifierFlagsAsync)
+        false
+    }
+
+    procedure ms_serialize_return_type_of_node(this, node: ref[AstNode]) returns ref[AstNode]
+    {
+        let f factory
+        if Parser.is_function_like_node(node) and (AstNode.type_of(node) <> null)
+            return this.ms_serialize_type_node(AstNode.type_of(node))
+        if Transformer.is_async_function(node)
+            return f.new_identifier("Promise")
+        f.new_void_zero_expression()
+    }
+
+    ; serializeTypeNode: the runtime constructor a type points to
+    procedure ms_serialize_type_node(this, node_in: ref[AstNode]?) returns ref[AstNode]
+    {
+        let f factory
+        if node_in = null
+            return f.new_identifier("Object")
+        let node Checker.skip_type_parentheses(node_in) as ref[AstNode]
+        let k node.kind
+        if (k = KindVoidKeyword) or (k = KindUndefinedKeyword) or (k = KindNeverKeyword)
+            return f.new_void_zero_expression()
+        if (k = KindFunctionType) or (k = KindConstructorType)
+            return f.new_identifier("Function")
+        if (k = KindArrayType) or (k = KindTupleType)
+            return f.new_identifier("Array")
+        if k = KindTypePredicate
+        {
+            if AstNode.type_predicate_asserts_modifier_of(node) <> null
+                return f.new_void_zero_expression()
+            return f.new_identifier("Boolean")
+        }
+        if k = KindBooleanKeyword
+            return f.new_identifier("Boolean")
+        if (k = KindTemplateLiteralType) or (k = KindStringKeyword)
+            return f.new_identifier("String")
+        if k = KindObjectKeyword
+            return f.new_identifier("Object")
+        if k = KindLiteralType
+            return this.ms_serialize_literal_of_literal_type_node(AstNode.literal_type_inner_of(node) as ref[AstNode])
+        if k = KindNumberKeyword
+            return f.new_identifier("Number")
+        if k = KindBigIntKeyword
+            return this.ms_serialize_big_int_constructor()
+        if k = KindSymbolKeyword
+            return f.new_identifier("Symbol")
+        if k = KindTypeReference
+            return this.ms_serialize_type_reference_node(node)
+        if k = KindIntersectionType
+            return this.ms_serialize_union_or_intersection_constituents(AstNode.type_list_of(node), true)
+        if k = KindUnionType
+            return this.ms_serialize_union_or_intersection_constituents(AstNode.type_list_of(node), false)
+        if k = KindConditionalType
+        {
+            let old_state md_serializing_conditional_type_branch
+            set this.md_serializing_conditional_type_branch: true
+            let branches &Array[ref[AstNode]?]^host()
+            branches.add(AstNode.conditional_true_type_of(node))
+            branches.add(AstNode.conditional_false_type_of(node))
+            let result this.ms_serialize_union_or_intersection_constituents(branches, false)
+            set this.md_serializing_conditional_type_branch: old_state
+            return result
+        }
+        if k = KindTypeOperator
+        {
+            if AstNode.type_operator_operator_of(node) = KindReadonlyKeyword
+                return this.ms_serialize_type_node(AstNode.type_operator_inner_of(node))
+            return f.new_identifier("Object")
+        }
+        if (k = KindJSDocNullableType) or (k = KindJSDocNonNullableType) or (k = KindJSDocOptionalType)
+            return this.ms_serialize_type_node(Printer.wrapped_inner_of(node))
+        ; TypeQuery, IndexedAccessType, MappedType, TypeLiteral, any, unknown, this,
+        ; ImportType, the JSDoc all/variadic types — and anything else — are Object
+        f.new_identifier("Object")
+    }
+
+    procedure ms_serialize_union_or_intersection_constituents(this, types: ref[Array[ref[AstNode]?]]?, is_intersection: bool) returns ref[AstNode]
+    {
+        let f factory
+        var serialized_type: ref[AstNode]? null
+        if types <> null
+        {
+            let ts types as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (ts.get_length() as int)
+            {
+                let type_node Checker.skip_type_parentheses(ts[i as size_t]) as ref[AstNode]
+                set i: i + 1
+                let k type_node.kind
+                if k = KindNeverKeyword
+                {
+                    if is_intersection
+                        return f.new_void_zero_expression()
+                    continue
+                }
+                if k = KindUnknownKeyword
+                {
+                    if is_intersection = false
+                        return f.new_identifier("Object")
+                    continue
+                }
+                if k = KindAnyKeyword
+                    return f.new_identifier("Object")
+                if md_strict_null_checks = false
+                {
+                    var elide k = KindUndefinedKeyword
+                    if k = KindLiteralType
+                    {
+                        if AstNode.kind_of(AstNode.literal_type_inner_of(type_node)) = KindNullKeyword
+                            set elide: true
+                    }
+                    if elide
+                        continue
+                }
+                let serialized_constituent this.ms_serialize_type_node(type_node)
+                if serialized_constituent.kind = KindIdentifier
+                {
+                    if AstNode.identifier_text_of(serialized_constituent).equals("Object")
+                        return serialized_constituent
+                }
+                if serialized_type <> null
+                {
+                    if this.ms_equate_serialized_type_nodes(serialized_type as ref[AstNode], serialized_constituent) = false
+                        return f.new_identifier("Object")
+                }
+                else
+                    set serialized_type: serialized_constituent
+            }
+        }
+        if serialized_type <> null
+            return serialized_type as ref[AstNode]
+        f.new_void_zero_expression()
+    }
+
+    procedure ms_serialize_literal_of_literal_type_node(this, node: ref[AstNode]) returns ref[AstNode]
+    {
+        let f factory
+        let k node.kind
+        if (k = KindStringLiteral) or (k = KindNoSubstitutionTemplateLiteral)
+            return f.new_identifier("String")
+        if k = KindPrefixUnaryExpression
+        {
+            let operand AstNode.prefix_unary_operand_of(node) as ref[AstNode]
+            if (operand.kind = KindNumericLiteral) or (operand.kind = KindBigIntLiteral)
+                return this.ms_serialize_literal_of_literal_type_node(operand)
+            return f.new_identifier("Object")
+        }
+        if k = KindNumericLiteral
+            return f.new_identifier("Number")
+        if k = KindBigIntLiteral
+            return this.ms_serialize_big_int_constructor()
+        if (k = KindTrueKeyword) or (k = KindFalseKeyword)
+            return f.new_identifier("Boolean")
+        if k = KindNullKeyword
+            return f.new_void_zero_expression()
+        f.new_identifier("Object")
+    }
+
+    ; serializeTypeReferenceNode: what the checker says the name is at runtime
+    procedure ms_serialize_type_reference_node(this, node: ref[AstNode]) returns ref[AstNode]
+    {
+        let f factory
+        var serial_scope md_current_name_scope
+        if serial_scope = null
+            set serial_scope: md_current_lexical_scope
+        let type_name AstNode.type_reference_name_of(node) as ref[AstNode]
+        let kind this.the_checker().get_type_reference_serialization_kind(context.parse_node(type_name), context.parse_node(serial_scope))
+        if kind = TypeReferenceSerializationKindUnknown
+        {
+            ; a conditional type's unresolved reference is any/unknown
+            if md_serializing_conditional_type_branch
+                return f.new_identifier("Object")
+            let serialized this.ms_serialize_entity_name_as_expression_fallback(type_name)
+            let temp f.new_temp_variable()
+            context.add_variable_declaration(temp)
+            return f.new_conditional_expression(f.new_type_check(f.new_assignment_expression(temp, serialized), "function"), f.new_token(KindQuestionToken), temp, f.new_token(KindColonToken), f.new_identifier("Object"))
+        }
+        if kind = TypeReferenceSerializationKindTypeWithConstructSignatureAndValue
+            return this.ms_serialize_entity_name_as_expression(type_name) as ref[AstNode]
+        if kind = TypeReferenceSerializationKindVoidNullableOrNeverType
+            return f.new_void_zero_expression()
+        if kind = TypeReferenceSerializationKindBigIntLikeType
+            return this.ms_serialize_big_int_constructor()
+        if kind = TypeReferenceSerializationKindBooleanType
+            return f.new_identifier("Boolean")
+        if kind = TypeReferenceSerializationKindNumberLikeType
+            return f.new_identifier("Number")
+        if kind = TypeReferenceSerializationKindStringLikeType
+            return f.new_identifier("String")
+        if kind = TypeReferenceSerializationKindArrayLikeType
+            return f.new_identifier("Array")
+        if kind = TypeReferenceSerializationKindESSymbolType
+            return f.new_identifier("Symbol")
+        if kind = TypeReferenceSerializationKindTypeWithCallSignature
+            return f.new_identifier("Function")
+        if kind = TypeReferenceSerializationKindPromise
+            return f.new_identifier("Promise")
+        f.new_identifier("Object")
+    }
+
+    procedure ms_serialize_big_int_constructor(this) returns ref[AstNode]
+    {
+        let f factory
+        if opts.options.get_emit_script_target() >= ScriptTargetES2020
+            return f.new_identifier("BigInt")
+        f.new_conditional_expression(f.new_type_check(f.new_identifier("BigInt"), "function"), f.new_token(KindQuestionToken), f.new_identifier("BigInt"), f.new_token(KindColonToken), f.new_identifier("Object"))
+    }
+
+    ; serializeEntityNameAsExpression: a clone of the name that emulates a parse node
+    procedure ms_serialize_entity_name_as_expression(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let f factory
+        if node.kind = KindIdentifier
+        {
+            let name f.clone(node)
+            set name.pos: node.pos
+            set name.end: node.end
+            context.unset_original(name)
+            set name.parent: context.parse_node(md_current_lexical_scope)
+            return name
+        }
+        if node.kind = KindQualifiedName
+            return f.new_property_access_expression(this.ms_serialize_entity_name_as_expression(AstNode.qualified_left_of(node) as ref[AstNode]) as ref[AstNode], null, AstNode.qualified_right_of(node), NodeFlagsNone)
+        null
+    }
+
+    ; serializeEntityNameAsExpressionFallback: a name that may not exist at runtime
+    procedure ms_serialize_entity_name_as_expression_fallback(this, node: ref[AstNode]) returns ref[AstNode]
+    {
+        let f factory
+        if node.kind = KindIdentifier
+        {
+            ; A -> typeof A !== "undefined" && A
+            let copied this.ms_serialize_entity_name_as_expression(node) as ref[AstNode]
+            return this.ms_create_checked_value(copied, copied)
+        }
+        let left_name AstNode.qualified_left_of(node) as ref[AstNode]
+        if left_name.kind = KindIdentifier
+        {
+            ; A.B -> typeof A !== "undefined" && A.B
+            return this.ms_create_checked_value(this.ms_serialize_entity_name_as_expression(left_name) as ref[AstNode], this.ms_serialize_entity_name_as_expression(node) as ref[AstNode])
+        }
+        ; A.B.C -> typeof A !== "undefined" && (_a = A.B) !== void 0 && _a.C
+        let left this.ms_serialize_entity_name_as_expression_fallback(left_name)
+        let temp f.new_temp_variable()
+        context.add_variable_declaration(temp)
+        f.new_logical_and_expression(f.new_logical_and_expression(AstNode.binary_left_of(left) as ref[AstNode], f.new_strict_inequality_expression(f.new_assignment_expression(temp, AstNode.binary_right_of(left) as ref[AstNode]), f.new_void_zero_expression())), f.new_property_access_expression(temp, null, AstNode.qualified_right_of(node), NodeFlagsNone))
+    }
+
+    ; `typeof left !== "undefined" && right`
+    procedure ms_create_checked_value(this, left: ref[AstNode], right: ref[AstNode]) returns ref[AstNode]
+    {
+        let f factory
+        f.new_logical_and_expression(f.new_strict_inequality_expression(f.new_type_of_expression(left), f.new_string_literal("undefined", TokenFlagsNone)), right)
+    }
+
+    procedure ms_equate_serialized_type_nodes(this, left: ref[AstNode], right: ref[AstNode]) returns bool
+    {
+        ; temp vars used in fallback
+        if context.has_auto_generate_info(left)
+            return context.has_auto_generate_info(right)
+        let lk left.kind
+        let rk right.kind
+        if lk = KindIdentifier
+        {
+            if rk <> KindIdentifier
+                return false
+            let lt AstNode.identifier_text_of(left)
+            return lt.equals(AstNode.identifier_text_of(right))
+        }
+        if lk = KindPropertyAccessExpression
+        {
+            if rk <> KindPropertyAccessExpression
+                return false
+            if this.ms_equate_serialized_type_nodes(AstNode.expression_of(left) as ref[AstNode], AstNode.expression_of(right) as ref[AstNode]) = false
+                return false
+            return this.ms_equate_serialized_type_nodes(AstNode.name_of(left) as ref[AstNode], AstNode.name_of(right) as ref[AstNode])
+        }
+        if lk = KindVoidExpression
+        {
+            if rk <> KindVoidExpression
+                return false
+            let le AstNode.expression_of(left) as ref[AstNode]
+            let re AstNode.expression_of(right) as ref[AstNode]
+            if (le.kind <> KindNumericLiteral) or (re.kind <> KindNumericLiteral)
+                return false
+            let lz AstNode.literal_text_of(le)
+            if lz.equals("0") = false
+                return false
+            let rz AstNode.literal_text_of(re)
+            return rz.equals("0")
+        }
+        if lk = KindStringLiteral
+        {
+            if rk <> KindStringLiteral
+                return false
+            let ls AstNode.literal_text_of(left)
+            return ls.equals(AstNode.literal_text_of(right))
+        }
+        if lk = KindTypeOfExpression
+            return (rk = KindTypeOfExpression) and this.ms_equate_serialized_type_nodes(AstNode.expression_of(left) as ref[AstNode], AstNode.expression_of(right) as ref[AstNode])
+        if lk = KindParenthesizedExpression
+            return (rk = KindParenthesizedExpression) and this.ms_equate_serialized_type_nodes(AstNode.expression_of(left) as ref[AstNode], AstNode.expression_of(right) as ref[AstNode])
+        if lk = KindConditionalExpression
+        {
+            if rk <> KindConditionalExpression
+                return false
+            if this.ms_equate_serialized_type_nodes(AstNode.conditional_condition_of(left) as ref[AstNode], AstNode.conditional_condition_of(right) as ref[AstNode]) = false
+                return false
+            if this.ms_equate_serialized_type_nodes(AstNode.conditional_when_true_of(left) as ref[AstNode], AstNode.conditional_when_true_of(right) as ref[AstNode]) = false
+                return false
+            return this.ms_equate_serialized_type_nodes(AstNode.conditional_when_false_of(left) as ref[AstNode], AstNode.conditional_when_false_of(right) as ref[AstNode])
+        }
+        if lk = KindBinaryExpression
+        {
+            if rk <> KindBinaryExpression
+                return false
+            if AstNode.binary_operator_kind(left) <> AstNode.binary_operator_kind(right)
+                return false
+            if this.ms_equate_serialized_type_nodes(AstNode.binary_left_of(left) as ref[AstNode], AstNode.binary_left_of(right) as ref[AstNode]) = false
+                return false
+            return this.ms_equate_serialized_type_nodes(AstNode.binary_right_of(left) as ref[AstNode], AstNode.binary_right_of(right) as ref[AstNode])
+        }
+        false
+    }
+
+    ; ── ast/utilities.go: the get/set pair of an accessor, and the decorated-element
+    ; question that needs it (slice 245) ──
+
+    ; GetAllAccessorDeclarations(parentDeclarations, accessor)
+    procedure get_all_accessor_declarations(this, parent_declarations: ref[Array[ref[AstNode]?]]?, accessor: ref[AstNode]) returns AccessorPair
+    {
+        let matches &Array[ref[AstNode]?]^host()
+        if (opts.binder as ref[Binder]).has_dynamic_name(accessor)
+            matches.add(accessor)
+        else
+        {
+            let accessor_name AstNode.property_name_text_of(AstNode.name_of(accessor))
+            let accessor_static (opts.binder as ref[Binder]).is_static(accessor)
+            if parent_declarations <> null
+            {
+                let ms parent_declarations as ref[Array[ref[AstNode]?]]
+                var i 0
+                while i < (ms.get_length() as int)
+                {
+                    let member ms[i as size_t] as ref[AstNode]
+                    set i: i + 1
+                    if (member.kind <> KindGetAccessor) and (member.kind <> KindSetAccessor)
+                        continue
+                    if (opts.binder as ref[Binder]).is_static(member) <> accessor_static
+                        continue
+                    if AstNode.property_name_text_of(AstNode.name_of(member)).equals(accessor_name)
+                        matches.add(member)
+                }
+            }
+        }
+        Transformer.get_all_accessor_declarations_for_declaration(accessor, matches)
+    }
+
+    ; GetAllAccessorDeclarationsForDeclaration
+    function get_all_accessor_declarations_for_declaration(accessor: ref[AstNode], declarations_of_symbol: ref[Array[ref[AstNode]?]]) returns AccessorPair
+    {
+        var other_kind KindGetAccessor
+        if accessor.kind = KindGetAccessor
+            set other_kind: KindSetAccessor
+        var other_accessor: ref[AstNode]? null
+        var i 0
+        while i < (declarations_of_symbol.get_length() as int)
+        {
+            let d declarations_of_symbol[i as size_t] as ref[AstNode]
+            set i: i + 1
+            if d.kind = other_kind
+            {
+                set other_accessor: d
+                break
+            }
+        }
+        var first_accessor accessor
+        var second_accessor other_accessor
+        if other_accessor <> null
+        {
+            if (other_accessor as ref[AstNode]).pos < accessor.pos
+            {
+                set first_accessor: other_accessor as ref[AstNode]
+                set second_accessor: accessor
+            }
+        }
+        var set_accessor: ref[AstNode]? null
+        var get_accessor: ref[AstNode]? null
+        if accessor.kind = KindSetAccessor
+        {
+            set set_accessor: accessor
+            set get_accessor: other_accessor
+        }
+        else
+        {
+            set get_accessor: accessor
+            set set_accessor: other_accessor
+        }
+        AccessorPair(first_accessor, second_accessor, get_accessor, set_accessor)
+    }
+
+    ; ast.ClassElementOrClassElementParameterIsDecorated
+    procedure class_element_or_class_element_parameter_is_decorated(this, use_legacy_decorators: bool, node: ref[AstNode], parent: ref[AstNode]) returns bool
+    {
+        var parameters: ref[Array[ref[AstNode]?]]? null
+        if (node.kind = KindGetAccessor) or (node.kind = KindSetAccessor)
+        {
+            let decls this.get_all_accessor_declarations(Printer.member_list_of(parent), node)
+            var first_accessor_with_decorators: ref[AstNode]? null
+            if Transformer.has_decorators(decls.first_accessor)
+                set first_accessor_with_decorators: decls.first_accessor
+            else
+            {
+                if decls.second_accessor <> null
+                {
+                    if Transformer.has_decorators(decls.second_accessor as ref[AstNode])
+                        set first_accessor_with_decorators: decls.second_accessor
+                }
+            }
+            if first_accessor_with_decorators = null
+                return false
+            if Transformer.same_node(node, first_accessor_with_decorators as ref[AstNode]) = false
+                return false
+            if decls.set_accessor <> null
+                set parameters: AstNode.parameters_of(decls.set_accessor)
+        }
+        else
+        {
+            if node.kind = KindMethodDeclaration
+                set parameters: AstNode.parameters_of(node)
+        }
+        if this.the_checker().node_is_decorated(use_legacy_decorators, node, parent, null)
+            return true
+        if parameters <> null
+        {
+            let ps parameters as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (ps.get_length() as int)
+            {
+                let parameter ps[i as size_t] as ref[AstNode]
+                set i: i + 1
+                if AstNode.is_this_parameter(parameter)
+                    continue
+                if this.the_checker().node_is_decorated(use_legacy_decorators, parameter, node, parent)
+                    return true
+            }
+        }
+        false
+    }
+
     ; ═══ tstransforms/importelision.go (slice 237) ═══
 
     procedure visit_import_elision(this, node: ref[AstNode]) returns ref[AstNode]?
@@ -6314,6 +8145,11 @@ define Transformer
     ; the sub visitors' `Visit`
     procedure visit_sub(this, node: ref[AstNode], sub: int) returns ref[AstNode]?
     {
+        if tag = TransformerTagLegacyDecorators
+        {
+            if sub = LdSubStaticSelfReferenceCheck
+                return this.ld_visit_for_static_self_reference_check(node)
+        }
         if (tag >= TransformerTagLogicalAssignment) and (tag <= TransformerTagExponentiation)
         {
             if sub = EsSubFaFallback
@@ -17300,8 +19136,6 @@ define Emitter
             this.record_unported("emit-declaration", 0)
         if (options.source_map = TristateTrue) or (options.inline_source_map = TristateTrue)
             this.record_unported("emit-sourcemap", 0)
-        if options.experimental_decorators = TristateTrue
-            this.record_unported("transform-legacy-decorators", 0)
         if options.get_jsx_transform_enabled()
             this.record_unported("transform-jsx", 0)
         ; estransforms.GetESTransformer at the default target: using, ES decorators, class fields
@@ -17324,6 +19158,13 @@ define Emitter
         let context EmitContext.create(host, AstNode.list_ranges_of(file))
         let opts TransformOptions(context, options, checker, binder, info)
         var current file
+        ; use type nodes to add metadata decorators
+        let metadata_tx Transformer.create(host, TransformerTagMetadata, opts)
+        if options.emit_decorator_metadata = TristateTrue
+        {
+            set metadata_tx.md_strict_null_checks: options.get_strict_option_value(options.strict_null_checks)
+            set current: metadata_tx.transform_source_file(current)
+        }
         let eraser Transformer.create(host, TransformerTagTypeEraser, opts)
         set current: eraser.transform_source_file(current)
         let elision Transformer.create(host, TransformerTagImportElision, opts)
@@ -17332,6 +19173,9 @@ define Emitter
         ; transform `enum`, `namespace`, and parameter properties
         let runtime Transformer.create(host, TransformerTagRuntimeSyntax, opts)
         set current: runtime.transform_source_file(current)
+        let legacy_tx Transformer.create(host, TransformerTagLegacyDecorators, opts)
+        if options.experimental_decorators = TristateTrue
+            set current: legacy_tx.transform_source_file(current)
         ; estransforms.GetESTransformer: at ESNext only ES decorators and class
         ; fields; from ES2025 down (NewESNextTransformer) `using` runs first
         let using_tx Transformer.create(host, TransformerTagUsing, opts)
@@ -17391,8 +19235,12 @@ define Emitter
         let inliner Transformer.create(host, TransformerTagConstEnumInlining, opts)
         if options.get_isolated_modules() = false
             set current: inliner.transform_source_file(current)
+        if metadata_tx.unported_count > 0
+            this.record_unported(metadata_tx.unported_tag, metadata_tx.unported_detail)
         if eraser.unported_count > 0
             this.record_unported(eraser.unported_tag, eraser.unported_detail)
+        if legacy_tx.unported_count > 0
+            this.record_unported(legacy_tx.unported_tag, legacy_tx.unported_detail)
         if elision.unported_count > 0
             this.record_unported(elision.unported_tag, elision.unported_detail)
         if runtime.unported_count > 0
