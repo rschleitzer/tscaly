@@ -1478,6 +1478,7 @@ define NodeFactory
         set n.original: null
         set n.emit_index: 0
         set n.emit_context_id: 0
+        set n.subtree_facts: 0
         set this.node_count: node_count + 1
         if context <> null
             (context as ref[EmitContext]).on_create(n)
@@ -1513,6 +1514,7 @@ define NodeFactory
                 set d.end_of_file_token: end_of_file_token
                 let c AstNode.alloc(host)
                 set c: node
+                set c.subtree_facts: 0
                 set c.data: NodeData.SourceFile(d)
                 return this.update_node(c, node)
             }

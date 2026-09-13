@@ -23,9 +23,8 @@ use scaly.memory.Page
 use scaly.containers.Array
 use scaly.containers.String
 use scaly.containers.StringBuilder
-use tscaly.ast.AstNode
-use tscaly.ast.NodeData
-use tscaly.ast.SourceFileData
+; the whole ast module: the facts read a field of most of the 134 records
+use tscaly.ast.*
 use tscaly.parser.Parser
 use tscaly.binder.Binder
 use tscaly.checker.Checker
@@ -57,6 +56,66 @@ define TransformerTagUseStrict: int 2
 define TransformerTagESModule: int 3
 define TransformerTagChain: int 4
 define TransformerTagModifierVisitor: int 5
+define TransformerTagImportElision: int 6
+
+; ── ast/subtreefacts.go — the transformers' gate (slice 237) ──────────────────
+;
+; The reference gates EVERY transformer on `node.SubtreeFacts()`: the type
+; eraser returns a subtree without SubtreeContainsTypeScript untouched (so a
+; bodiless overload `function f1(),` prints as `function f1() { }` and a `static
+; constructor() { }` keeps its `static`), the class-fields transformer asks for
+; ContainsClassFields, `using` for ContainsUsing, and so on. The facts are the
+; per-kind computeSubtreeFacts of ast.go / ast_generated.go (110 of them, the
+; scope exclusions of subtreefacts.go applied on the way UP by
+; propagateSubtreeFacts), cached on the node behind SubtreeFactsComputed.
+;
+; ★ The cache slot is `AstNode.subtree_facts` (0 = not yet computed; the
+; reference caches on CompositeBase nodes only and recomputes the leaves — the
+; answer is the same, computeSubtreeFacts being idempotent). A node the FACTORY
+; makes (an updated node) starts at 0 too, so a transformed tree is asked afresh.
+
+define SubtreeContainsTypeScript:                    int 1 << 0
+define SubtreeContainsJsx:                           int 1 << 1
+define SubtreeContainsESDecorators:                  int 1 << 2
+define SubtreeContainsUsing:                         int 1 << 3
+define SubtreeContainsClassStaticBlocks:             int 1 << 4
+define SubtreeContainsESClassFields:                 int 1 << 5
+define SubtreeContainsLogicalAssignments:            int 1 << 6
+define SubtreeContainsNullishCoalescing:             int 1 << 7
+define SubtreeContainsOptionalChaining:              int 1 << 8
+define SubtreeContainsMissingCatchClauseVariable:    int 1 << 9
+define SubtreeContainsESObjectRestOrSpread:          int 1 << 10
+define SubtreeContainsForAwaitOrAsyncGenerator:      int 1 << 11
+define SubtreeContainsAnyAwait:                      int 1 << 12
+define SubtreeContainsExponentiationOperator:        int 1 << 13
+define SubtreeContainsLexicalThis:                   int 1 << 14
+define SubtreeContainsLexicalSuper:                  int 1 << 15
+define SubtreeContainsRestOrSpread:                  int 1 << 16
+define SubtreeContainsObjectRestOrSpread:            int 1 << 17
+define SubtreeContainsAwait:                         int 1 << 18
+define SubtreeContainsDynamicImport:                 int 1 << 19
+define SubtreeContainsClassFields:                   int 1 << 20
+define SubtreeContainsDecorators:                    int 1 << 21
+define SubtreeContainsIdentifier:                    int 1 << 22
+define SubtreeContainsPrivateIdentifierInExpression: int 1 << 23
+define SubtreeContainsInvalidTemplateEscape:         int 1 << 24
+define SubtreeFactsComputed:                         int 1 << 25
+define SubtreeFactsNone:                             int 0
+; every fact bit below the Computed marker
+define SubtreeFactsAllBits:                          int 33554431
+define SubtreeContainsLexicalThisOrSuper:            int SubtreeContainsLexicalThis | SubtreeContainsLexicalSuper
+
+; The scope exclusions, spelled as the bits a scope CLEARS on the way up
+; (subtreefacts.go spells them as the complement; SubtreeExclusionsNode is the
+; Computed marker alone, which `subtree_facts` never hands out)
+define SubtreeClearsFunction:                int SubtreeContainsLexicalThis | SubtreeContainsLexicalSuper | SubtreeContainsAwait | SubtreeContainsObjectRestOrSpread
+define SubtreeClearsArrowFunction:           int SubtreeContainsAwait | SubtreeContainsObjectRestOrSpread
+define SubtreeClearsProperty:                int SubtreeContainsLexicalThis | SubtreeContainsLexicalSuper
+define SubtreeClearsModule:                  int SubtreeContainsLexicalThis | SubtreeContainsLexicalSuper
+define SubtreeClearsObjectLiteral:           int SubtreeContainsObjectRestOrSpread
+define SubtreeClearsVariableDeclarationList: int SubtreeContainsObjectRestOrSpread
+define SubtreeClearsCatchClause:             int SubtreeContainsObjectRestOrSpread
+define SubtreeClearsBindingPattern:          int SubtreeContainsRestOrSpread
 
 ; core.CompilerOptions, the slots the emit reads. Every unset option is its zero
 ; (a Tristate is `TristateUnknown`), as the yardstick's `&core.CompilerOptions{}`.
@@ -225,8 +284,156 @@ define Transformer
             return this.visit_chain(node)
         if tag = TransformerTagModifierVisitor
             return this.visit_modifier(node)
+        if tag = TransformerTagImportElision
+            return this.visit_import_elision(node)
         this.record_unported("transformer-tag", tag)
         node
+    }
+
+    ; ═══ tstransforms/importelision.go (slice 237) ═══
+
+    procedure visit_import_elision(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let v this.the_visitor()
+        let k node.kind
+        if k = KindSourceFile
+        {
+            this.the_checker().mark_linked_references_recursively(context.most_original(node) as ref[AstNode])
+            let saved current_source_file
+            set this.current_source_file: node
+            let visited v.visit_each_child(node)
+            set this.current_source_file: saved
+            return visited
+        }
+        if k = KindImportEqualsDeclaration
+        {
+            if AstNode.kind_of(AstNode.module_reference_of(node)) = KindExternalModuleReference
+            {
+                if this.should_emit_alias_declaration(node) = false
+                    return null
+            }
+            else
+            {
+                if this.should_emit_import_equals_declaration(node) = false
+                    return null
+            }
+            return v.visit_each_child(node)
+        }
+        if k = KindImportDeclaration
+        {
+            let import_clause AstNode.import_clause_of(node)
+            if import_clause <> null
+            {
+                let visited v.visit_node(import_clause)
+                if visited = null
+                    return null
+                return factory.update_import_declaration(node, Printer.modifier_list_of(node), visited, AstNode.module_specifier_of(node), v.visit_node(AstNode.import_attributes_of(node)))
+            }
+            return v.visit_each_child(node)
+        }
+        if k = KindImportClause
+        {
+            var name: ref[AstNode]? null
+            if this.should_emit_alias_declaration(node)
+                set name: Printer.declaration_name_of(node)
+            let named_bindings v.visit_node(AstNode.named_bindings_of(node))
+            if (name = null) and (named_bindings = null)
+                return null
+            return factory.update_import_clause(node, AstNode.import_clause_phase_modifier_of(node), name, named_bindings)
+        }
+        if k = KindNamespaceImport
+        {
+            if this.should_emit_alias_declaration(node) = false
+                return null
+            return node
+        }
+        if k = KindNamedImports
+        {
+            let elements v.visit_nodes(AstNode.elements_of(node))
+            if Transformer.list_is_empty(elements)
+                return null
+            return factory.update_named_imports(node, elements)
+        }
+        if k = KindImportSpecifier
+        {
+            if this.should_emit_alias_declaration(node) = false
+                return null
+            return node
+        }
+        if k = KindExportAssignment
+        {
+            if (opts.options.verbatim_module_syntax <> TristateTrue) and (this.ie_is_value_alias_declaration(node) = false)
+                return null
+            return v.visit_each_child(node)
+        }
+        if k = KindExportDeclaration
+        {
+            var export_clause: ref[AstNode]? null
+            let ec AstNode.export_clause_of(node)
+            if ec <> null
+            {
+                set export_clause: v.visit_node(ec)
+                if export_clause = null
+                    return null
+            }
+            return factory.update_export_declaration(node, null, false, export_clause, v.visit_node(AstNode.module_specifier_of(node)), v.visit_node(AstNode.import_attributes_of(node)))
+        }
+        if k = KindNamedExports
+        {
+            let elements v.visit_nodes(AstNode.elements_of(node))
+            if Transformer.list_is_empty(elements)
+                return null
+            return factory.update_named_exports(node, elements)
+        }
+        if k = KindExportSpecifier
+        {
+            if this.ie_is_value_alias_declaration(node) = false
+                return null
+            return node
+        }
+        if (k = KindModuleDeclaration) or (k = KindModuleBlock)
+            return v.visit_each_child(node)
+        node
+    }
+
+    procedure should_emit_alias_declaration(this, node: ref[AstNode]) returns bool
+    {
+        if (node.flags & NodeFlagsJavaScriptFile) <> 0
+            return true
+        this.ie_is_referenced_alias_declaration(node)
+    }
+
+    procedure should_emit_import_equals_declaration(this, node: ref[AstNode]) returns bool
+    {
+        if this.should_emit_alias_declaration(node)
+            return true
+        if opts.file_info.is_external_module
+            return false
+        this.ie_is_top_level_value_import_equals_with_entity_name(node)
+    }
+
+    procedure ie_is_referenced_alias_declaration(this, node: ref[AstNode]) returns bool
+    {
+        let p context.parse_node(node)
+        if p = null
+            return true
+        this.the_checker().is_referenced_alias_declaration(p as ref[AstNode])
+    }
+
+    procedure ie_is_value_alias_declaration(this, node: ref[AstNode]) returns bool
+    {
+        let p context.parse_node(node)
+        if p = null
+            return true
+        this.the_checker().is_value_alias_declaration(p as ref[AstNode])
+    }
+
+    procedure ie_is_top_level_value_import_equals_with_entity_name(this, node: ref[AstNode]) returns bool
+    {
+        let p context.parse_node(node)
+        if p = null
+            return false
+        this.the_checker().is_top_level_value_import_equals_with_entity_name(p as ref[AstNode])
     }
 
     ; ── the AST questions the transformers ask (ast/utilities.go) ──
@@ -364,8 +571,11 @@ define Transformer
 
     procedure visit_type_eraser(this, node: ref[AstNode]) returns ref[AstNode]?
     {
-        ; the reference skips a subtree without TypeScript by its facts; here
-        ; every node is visited, and an unchanged subtree answers itself
+        ; a subtree without TypeScript facts is left UNTOUCHED — which is why a
+        ; bodiless overload prints as `f() { }` and a `static constructor` keeps
+        ; its modifier (§3.5ji 6)
+        if (Emitter.subtree_facts(node) & SubtreeContainsTypeScript) = 0
+            return node
         if Checker.is_statement(node) and Transformer.has_syntactic_modifier(node, ModifierFlagsAmbient)
             return this.elide(node)
         let grandparent this.push_node(node)
@@ -952,6 +1162,698 @@ define Emitter
     ; file outright, is an external module whatever its statements say. The
     ; parser's `external_module_indicator` reads the statements only; the
     ; emitter's file record ORs this in.
+
+    ; Node.SubtreeFacts(): the cached facts of a node, the Computed marker
+    ; stripped
+    function subtree_facts(n: ref[AstNode]) returns int
+    {
+        var f n.subtree_facts
+        if (f & SubtreeFactsComputed) = 0
+        {
+            set f: Emitter.compute_subtree_facts(n) | SubtreeFactsComputed
+            set n.subtree_facts: f
+        }
+        f & SubtreeFactsAllBits
+    }
+
+    function clear_facts(f: int, mask: int) returns int
+        f & (SubtreeFactsAllBits xor mask)
+
+    ; propagateSubtreeFacts(child): nil → none; a type-syntax node answers
+    ; SubtreeContainsTypeScript whatever it holds; every other kind answers its
+    ; facts minus the bits its scope keeps to itself
+    function sf(c: ref[AstNode]?) returns int
+    {
+        if c = null
+            return SubtreeFactsNone
+        Emitter.propagate_subtree_facts(c as ref[AstNode])
+    }
+
+    function propagate_subtree_facts(n: ref[AstNode]) returns int
+    {
+        let k n.kind
+        if Emitter.is_type_syntax_kind(k)
+            return SubtreeContainsTypeScript
+        let f Emitter.subtree_facts(n)
+        if k = KindCatchClause
+            return Emitter.clear_facts(f, SubtreeClearsCatchClause)
+        if k = KindVariableDeclarationList
+            return Emitter.clear_facts(f, SubtreeClearsVariableDeclarationList)
+        if (k = KindObjectBindingPattern) or (k = KindArrayBindingPattern)
+            return Emitter.clear_facts(f, SubtreeClearsBindingPattern)
+        if (k = KindFunctionDeclaration) or (k = KindFunctionExpression) or (k = KindConstructor)
+            return Emitter.clear_facts(f, SubtreeClearsFunction)
+        if (k = KindMethodDeclaration) or (k = KindGetAccessor) or (k = KindSetAccessor)
+            return Emitter.clear_facts(f, SubtreeClearsFunction) | Emitter.sf(Printer.declaration_name_of(n))
+        if k = KindPropertyDeclaration
+            return Emitter.clear_facts(f, SubtreeClearsProperty) | Emitter.sf(Printer.declaration_name_of(n))
+        if k = KindModuleDeclaration
+            return Emitter.clear_facts(f, SubtreeClearsModule)
+        if k = KindObjectLiteralExpression
+            return Emitter.clear_facts(f, SubtreeClearsObjectLiteral)
+        if k = KindArrowFunction
+            return Emitter.clear_facts(f, SubtreeClearsArrowFunction)
+        f
+    }
+
+    ; propagateNodeListSubtreeFacts(children, propagateSubtreeFacts)
+    function sfl(list: ref[Array[ref[AstNode]?]]?) returns int
+    {
+        if list = null
+            return SubtreeFactsNone
+        let l list as ref[Array[ref[AstNode]?]]
+        var facts SubtreeFactsNone
+        var i 0
+        while i < (l.get_length() as int)
+        {
+            set facts: facts | Emitter.sf(l[i as size_t])
+            set i: i + 1
+        }
+        facts
+    }
+
+    ; propagateEraseableSyntaxSubtreeFacts / propagateEraseableSyntaxListSubtreeFacts
+    function sfe(c: ref[AstNode]?) returns int
+    {
+        if c = null
+            return SubtreeFactsNone
+        SubtreeContainsTypeScript
+    }
+
+    function sfel(list: ref[Array[ref[AstNode]?]]?) returns int
+    {
+        if list = null
+            return SubtreeFactsNone
+        SubtreeContainsTypeScript
+    }
+
+    ; propagateObjectBindingElementSubtreeFacts: a `...rest` inside `{ }` is an
+    ; OBJECT rest
+    function sfobe(c: ref[AstNode]?) returns int
+    {
+        var facts Emitter.sf(c)
+        if (facts & SubtreeContainsRestOrSpread) <> 0
+        {
+            set facts: Emitter.clear_facts(facts, SubtreeContainsRestOrSpread)
+            set facts: facts | SubtreeContainsObjectRestOrSpread | SubtreeContainsESObjectRestOrSpread
+        }
+        facts
+    }
+
+    ; propagateBindingElementSubtreeFacts: an array pattern's rest is cleared
+    function sfbe(c: ref[AstNode]?) returns int
+        Emitter.clear_facts(Emitter.sf(c), SubtreeContainsRestOrSpread)
+
+    function sfl_object_binding(list: ref[Array[ref[AstNode]?]]?) returns int
+    {
+        if list = null
+            return SubtreeFactsNone
+        let l list as ref[Array[ref[AstNode]?]]
+        var facts SubtreeFactsNone
+        var i 0
+        while i < (l.get_length() as int)
+        {
+            set facts: facts | Emitter.sfobe(l[i as size_t])
+            set i: i + 1
+        }
+        facts
+    }
+
+    function sfl_array_binding(list: ref[Array[ref[AstNode]?]]?) returns int
+    {
+        if list = null
+            return SubtreeFactsNone
+        let l list as ref[Array[ref[AstNode]?]]
+        var facts SubtreeFactsNone
+        var i 0
+        while i < (l.get_length() as int)
+        {
+            set facts: facts | Emitter.sfbe(l[i as size_t])
+            set i: i + 1
+        }
+        facts
+    }
+
+    ; The kinds whose record embeds TypeSyntaxBase in the reference (every
+    ; TypeNodeBase kind, the JSDoc types, the five type elements, the type
+    ; parameter, interface, type alias and `export as namespace`): their facts are
+    ; SubtreeContainsTypeScript, computed and propagated alike
+    function is_type_syntax_kind(k: int) returns bool
+    {
+        if (k = KindTypeReference) or (k = KindTypeQuery) or (k = KindImportType) or (k = KindFunctionType) or (k = KindConstructorType) or (k = KindUnionType) or (k = KindIntersectionType) or (k = KindConditionalType) or (k = KindTypeOperator) or (k = KindInferType) or (k = KindArrayType) or (k = KindIndexedAccessType) or (k = KindLiteralType) or (k = KindThisType) or (k = KindTypePredicate) or (k = KindMappedType) or (k = KindTypeLiteral) or (k = KindTupleType) or (k = KindNamedTupleMember) or (k = KindOptionalType) or (k = KindRestType) or (k = KindParenthesizedType) or (k = KindTemplateLiteralType) or (k = KindTemplateLiteralTypeSpan)
+            return true
+        if (k = KindJSDocTypeExpression) or (k = KindJSDocNameReference) or (k = KindJSDocNonNullableType) or (k = KindJSDocNullableType) or (k = KindJSDocAllType) or (k = KindJSDocVariadicType) or (k = KindJSDocOptionalType) or (k = KindJSDocSignature) or (k = KindJSDocTypeLiteral)
+            return true
+        if (k = KindInterfaceDeclaration) or (k = KindTypeAliasDeclaration) or (k = KindNamespaceExportDeclaration) or (k = KindCallSignature) or (k = KindConstructSignature) or (k = KindIndexSignature) or (k = KindMethodSignature) or (k = KindPropertySignature) or (k = KindTypeParameter)
+            return true
+        false
+    }
+
+    ; Token.computeSubtreeFacts
+    function token_subtree_facts(k: int) returns int
+    {
+        if k = KindUsingKeyword
+            return SubtreeContainsUsing
+        if (k = KindPublicKeyword) or (k = KindPrivateKeyword) or (k = KindProtectedKeyword) or (k = KindReadonlyKeyword) or (k = KindAbstractKeyword) or (k = KindDeclareKeyword) or (k = KindConstKeyword) or (k = KindAnyKeyword) or (k = KindNumberKeyword) or (k = KindBigIntKeyword) or (k = KindNeverKeyword) or (k = KindObjectKeyword) or (k = KindInKeyword) or (k = KindOutKeyword) or (k = KindOverrideKeyword) or (k = KindStringKeyword) or (k = KindBooleanKeyword) or (k = KindSymbolKeyword) or (k = KindVoidKeyword) or (k = KindUnknownKeyword) or (k = KindUndefinedKeyword) or (k = KindExportKeyword)
+            return SubtreeContainsTypeScript
+        if k = KindAccessorKeyword
+            return SubtreeContainsClassFields
+        if k = KindAsyncKeyword
+            return SubtreeContainsAnyAwait
+        if k = KindSuperKeyword
+            return SubtreeContainsLexicalSuper
+        if k = KindThisKeyword
+            return SubtreeContainsLexicalThis
+        if (k = KindAsteriskAsteriskToken) or (k = KindAsteriskAsteriskEqualsToken)
+            return SubtreeContainsExponentiationOperator
+        if k = KindQuestionQuestionToken
+            return SubtreeContainsNullishCoalescing
+        if k = KindQuestionDotToken
+            return SubtreeContainsOptionalChaining
+        if (k = KindQuestionQuestionEqualsToken) or (k = KindBarBarEqualsToken) or (k = KindAmpersandAmpersandEqualsToken)
+            return SubtreeContainsLogicalAssignments
+        ; JsxOpeningFragment / JsxClosingFragment are Token-arm nodes here
+        if (k = KindJsxOpeningFragment) or (k = KindJsxClosingFragment)
+            return SubtreeContainsJsx
+        SubtreeFactsNone
+    }
+
+    function async_generator_facts(is_async: bool, is_generator: bool) returns int
+    {
+        if is_async and is_generator
+            return SubtreeContainsForAwaitOrAsyncGenerator
+        if is_async
+            return SubtreeContainsAnyAwait
+        SubtreeFactsNone
+    }
+
+    ; the 110 computeSubtreeFacts, by record and — where records are shared —
+    ; by kind
+    function compute_subtree_facts(n: ref[AstNode]) returns int
+    {
+        let k n.kind
+        if Emitter.is_type_syntax_kind(k)
+            return SubtreeContainsTypeScript
+        choose n.data
+            when d: Token
+                return Emitter.token_subtree_facts(k)
+            when d: Identifier
+                return SubtreeContainsIdentifier
+            when d: PrivateIdentifier
+                return SubtreeContainsClassFields
+            when d: NoSubstitutionTemplateLiteral
+            {
+                if (d.token_flags & TokenFlagsContainsInvalidEscape) <> 0
+                    return SubtreeContainsInvalidTemplateEscape
+                return SubtreeFactsNone
+            }
+            when d: TemplateHead
+            {
+                if (d.token_flags & TokenFlagsContainsInvalidEscape) <> 0
+                    return SubtreeContainsInvalidTemplateEscape
+                return SubtreeFactsNone
+            }
+            when d: TemplateMiddle
+            {
+                if (d.token_flags & TokenFlagsContainsInvalidEscape) <> 0
+                    return SubtreeContainsInvalidTemplateEscape
+                return SubtreeFactsNone
+            }
+            when d: TemplateTail
+            {
+                if (d.token_flags & TokenFlagsContainsInvalidEscape) <> 0
+                    return SubtreeContainsInvalidTemplateEscape
+                return SubtreeFactsNone
+            }
+            when d: SourceFile
+                return Emitter.sfl(d.statements)
+            when d: Block
+                return Emitter.sfl(d.statements)
+            when d: ModuleBlock
+                return Emitter.sfl(d.statements)
+            when d: ExpressionStatement
+                return Emitter.sf(d.expression)
+            when d: ThrowStatement
+                return Emitter.sf(d.expression)
+            when d: VariableStatement
+            {
+                if (Transformer.modifier_flags_of(n) & ModifierFlagsAmbient) <> 0
+                    return SubtreeContainsTypeScript
+                return Emitter.sfl(d.modifiers) | Emitter.sf(d.declaration_list)
+            }
+            when d: VariableDeclarationList
+            {
+                var f Emitter.sfl(d.declarations)
+                if (n.flags & NodeFlagsUsing) <> 0
+                    set f: f | SubtreeContainsUsing
+                return f
+            }
+            when d: VariableDeclaration
+                return Emitter.sf(d.name) | Emitter.sfe(d.exclamation_token) | Emitter.sfe(d.type_node) | Emitter.sf(d.initializer)
+            when d: IfStatement
+                return Emitter.sf(d.expression) | Emitter.sf(d.then_statement) | Emitter.sf(d.else_statement)
+            when d: DoStatement
+                return Emitter.sf(d.statement) | Emitter.sf(d.expression)
+            when d: WhileStatement
+                return Emitter.sf(d.expression) | Emitter.sf(d.statement)
+            when d: WithStatement
+                return Emitter.sf(d.expression) | Emitter.sf(d.statement)
+            when d: ForStatement
+                return Emitter.sf(d.initializer) | Emitter.sf(d.condition) | Emitter.sf(d.incrementor) | Emitter.sf(d.statement)
+            when d: ForInStatement
+                return Emitter.sf(d.initializer) | Emitter.sf(d.expression) | Emitter.sf(d.statement)
+            when d: ForOfStatement
+            {
+                var f Emitter.sf(d.initializer) | Emitter.sf(d.expression) | Emitter.sf(d.statement)
+                if d.await_modifier <> null
+                    set f: f | SubtreeContainsForAwaitOrAsyncGenerator
+                return f
+            }
+            when d: ReturnStatement
+                return Emitter.sf(d.expression) | SubtreeContainsForAwaitOrAsyncGenerator
+            when d: SwitchStatement
+                return Emitter.sf(d.expression) | Emitter.sf(d.case_block)
+            when d: CaseBlock
+                return Emitter.sfl(d.elements)
+            when d: CaseClause
+                return Emitter.sf(d.expression) | Emitter.sfl(d.statements)
+            when d: DefaultClause
+                return Emitter.sf(d.expression) | Emitter.sfl(d.statements)
+            when d: TryStatement
+                return Emitter.sf(d.try_block) | Emitter.sf(d.catch_clause) | Emitter.sf(d.finally_block)
+            when d: CatchClause
+            {
+                var f Emitter.sf(d.variable_declaration) | Emitter.sf(d.block)
+                if d.variable_declaration = null
+                    set f: f | SubtreeContainsMissingCatchClauseVariable
+                return f
+            }
+            when d: LabeledStatement
+                return Emitter.sf(d.label_name) | Emitter.sf(d.statement)
+            when d: ObjectBindingPattern
+                return Emitter.sfl_object_binding(d.elements)
+            when d: ArrayBindingPattern
+                return Emitter.sfl_array_binding(d.elements)
+            when d: Parameter
+            {
+                if AstNode.is_this_identifier(d.name)
+                    return SubtreeContainsTypeScript
+                return Emitter.sfl(d.modifiers) | Emitter.sf(d.name) | Emitter.sfe(d.question_token) | Emitter.sfe(d.type_node) | Emitter.sf(d.initializer)
+            }
+            when d: BindingElement
+            {
+                var f Emitter.sf(d.property_name) | Emitter.sf(d.name) | Emitter.sf(d.initializer)
+                if d.dot_dot_dot_token <> null
+                    set f: f | SubtreeContainsRestOrSpread
+                return f
+            }
+            when d: FunctionDeclaration
+            {
+                let flags Transformer.modifier_flags_of(n)
+                if (d.body = null) or ((flags & ModifierFlagsAmbient) <> 0)
+                    return SubtreeContainsTypeScript
+                let is_async (flags & ModifierFlagsAsync) <> 0
+                let is_generator d.asterisk_token <> null
+                return Emitter.sfl(d.modifiers) | Emitter.sf(d.asterisk_token) | Emitter.sf(d.name) | Emitter.sfel(d.type_parameters) | Emitter.sfl(d.parameters) | Emitter.sfe(d.type_node) | Emitter.sfe(d.full_signature) | Emitter.sf(d.body) | Emitter.async_generator_facts(is_async, is_generator)
+            }
+            when d: ClassDeclaration
+                return Emitter.class_like_subtree_facts(n, d.modifiers, d.name, d.type_parameters, d.heritage_clauses, d.members)
+            when d: ClassExpression
+                return Emitter.class_like_subtree_facts(n, d.modifiers, d.name, d.type_parameters, d.heritage_clauses, d.members)
+            when d: HeritageClause
+            {
+                if d.token = KindExtendsKeyword
+                    return Emitter.sfl(d.types)
+                if d.token = KindImplementsKeyword
+                    return SubtreeContainsTypeScript
+                return SubtreeFactsNone
+            }
+            when d: EnumMember
+                return Emitter.sf(d.name) | Emitter.sf(d.initializer) | SubtreeContainsTypeScript
+            when d: EnumDeclaration
+            {
+                if (Transformer.modifier_flags_of(n) & ModifierFlagsAmbient) <> 0
+                    return SubtreeContainsTypeScript
+                return Emitter.sfl(d.modifiers) | Emitter.sf(d.name) | Emitter.sfl(d.members) | SubtreeContainsTypeScript
+            }
+            when d: ModuleDeclaration
+            {
+                if (Transformer.modifier_flags_of(n) & ModifierFlagsAmbient) <> 0
+                    return SubtreeContainsTypeScript
+                return Emitter.sfl(d.modifiers) | Emitter.sf(d.name) | Emitter.sf(d.body) | SubtreeContainsTypeScript
+            }
+            when d: ImportEqualsDeclaration
+            {
+                if d.is_type_only or (d.module_reference.kind <> KindExternalModuleReference)
+                    return SubtreeContainsTypeScript
+                return Emitter.sfl(d.modifiers) | Emitter.sf(d.name) | Emitter.sf(d.module_reference)
+            }
+            when d: ImportSpecifier
+            {
+                if d.is_type_only
+                    return SubtreeContainsTypeScript
+                return Emitter.sf(d.property_name) | Emitter.sf(d.name)
+            }
+            when d: ExportSpecifier
+            {
+                if d.is_type_only
+                    return SubtreeContainsTypeScript
+                return Emitter.sf(d.property_name) | Emitter.sf(d.name)
+            }
+            when d: ImportClause
+            {
+                if d.phase_modifier = KindTypeKeyword
+                    return SubtreeContainsTypeScript
+                return Emitter.sf(d.name) | Emitter.sf(d.named_bindings)
+            }
+            when d: ImportDeclaration
+                return Emitter.sfl(d.modifiers) | Emitter.sf(d.import_clause) | Emitter.sf(d.module_specifier) | Emitter.sf(d.attributes)
+            when d: ExportAssignment
+            {
+                var f Emitter.sfl(d.modifiers) | Emitter.sf(d.type_node) | Emitter.sf(d.expression)
+                if d.is_export_equals
+                    set f: f | SubtreeContainsTypeScript
+                return f
+            }
+            when d: ExportDeclaration
+            {
+                var f Emitter.sfl(d.modifiers) | Emitter.sf(d.export_clause) | Emitter.sf(d.module_specifier) | Emitter.sf(d.attributes)
+                if d.is_type_only
+                    set f: f | SubtreeContainsTypeScript
+                return f
+            }
+            when d: NamespaceImport
+                return Emitter.sf(d.inner)
+            when d: NamespaceExport
+                return Emitter.sf(d.inner)
+            when d: ExternalModuleReference
+                return Emitter.sf(d.inner)
+            when d: NamedImports
+                return Emitter.sfl(d.elements)
+            when d: NamedExports
+                return Emitter.sfl(d.elements)
+            when d: ImportAttribute
+                return Emitter.sf(d.name) | Emitter.sf(d.value)
+            when d: ImportAttributes
+                return Emitter.sfl(d.attributes)
+            when d: ConstructorDeclaration
+            {
+                if d.body = null
+                    return SubtreeContainsTypeScript
+                return Emitter.sfl(d.modifiers) | Emitter.sfel(d.type_parameters) | Emitter.sfl(d.parameters) | Emitter.sfe(d.type_node) | Emitter.sfe(d.full_signature) | Emitter.sf(d.body)
+            }
+            when d: GetAccessorDeclaration
+                return Emitter.accessor_subtree_facts(d.modifiers, d.name, d.type_parameters, d.parameters, d.type_node, d.full_signature, d.body)
+            when d: SetAccessorDeclaration
+                return Emitter.accessor_subtree_facts(d.modifiers, d.name, d.type_parameters, d.parameters, d.type_node, d.full_signature, d.body)
+            when d: MethodDeclaration
+            {
+                if d.body = null
+                    return SubtreeContainsTypeScript
+                let is_async (Transformer.modifier_flags_of(n) & ModifierFlagsAsync) <> 0
+                let is_generator d.asterisk_token <> null
+                return Emitter.sfl(d.modifiers) | Emitter.sf(d.asterisk_token) | Emitter.sf(d.name) | Emitter.sfe(d.postfix_token) | Emitter.sfel(d.type_parameters) | Emitter.sfl(d.parameters) | Emitter.sf(d.body) | Emitter.sfe(d.type_node) | Emitter.sfe(d.full_signature) | Emitter.async_generator_facts(is_async, is_generator)
+            }
+            when d: PropertyDeclaration
+                return Emitter.sfl(d.modifiers) | Emitter.sf(d.name) | Emitter.sfe(d.postfix_token) | Emitter.sfe(d.type_node) | Emitter.sf(d.initializer) | SubtreeContainsClassFields
+            when d: ClassStaticBlockDeclaration
+                return Emitter.sfl(d.modifiers) | Emitter.sf(d.body) | SubtreeContainsClassFields
+            when d: BinaryExpression
+            {
+                let op d.operator_token.kind
+                var f Emitter.sfl(d.modifiers) | Emitter.sf(d.left) | Emitter.sf(d.type_node) | Emitter.sf(d.operator_token) | Emitter.sf(d.right)
+                if (op = KindInKeyword) and AstNode.is_private_identifier(d.left)
+                    set f: f | SubtreeContainsClassFields | SubtreeContainsPrivateIdentifierInExpression
+                if op = KindEqualsToken
+                {
+                    let lk d.left.kind
+                    if (lk = KindObjectLiteralExpression) or (lk = KindArrayLiteralExpression)
+                    {
+                        if Emitter.contains_object_rest_or_spread(d.left)
+                            set f: f | SubtreeContainsObjectRestOrSpread
+                    }
+                }
+                return f
+            }
+            when d: YieldExpression
+                return Emitter.sf(d.expression) | SubtreeContainsForAwaitOrAsyncGenerator
+            when d: ArrowFunction
+            {
+                var f Emitter.sfl(d.modifiers) | Emitter.sfel(d.type_parameters) | Emitter.sfl(d.parameters) | Emitter.sfe(d.type_node) | Emitter.sfe(d.full_signature) | Emitter.sf(d.body)
+                if (Transformer.modifier_flags_of(n) & ModifierFlagsAsync) <> 0
+                    set f: f | SubtreeContainsAnyAwait
+                return f
+            }
+            when d: FunctionExpression
+            {
+                let is_async (Transformer.modifier_flags_of(n) & ModifierFlagsAsync) <> 0
+                let is_generator d.asterisk_token <> null
+                return Emitter.sfl(d.modifiers) | Emitter.sf(d.asterisk_token) | Emitter.sf(d.name) | Emitter.sfel(d.type_parameters) | Emitter.sfl(d.parameters) | Emitter.sfe(d.type_node) | Emitter.sfe(d.full_signature) | Emitter.sf(d.body) | Emitter.async_generator_facts(is_async, is_generator)
+            }
+            when d: AsExpression
+                return Emitter.sf(d.expression) | SubtreeContainsTypeScript
+            when d: SatisfiesExpression
+                return Emitter.sf(d.expression) | SubtreeContainsTypeScript
+            when d: TypeAssertionExpression
+                return Emitter.sf(d.expression) | SubtreeContainsTypeScript
+            when d: NonNullExpression
+                return Emitter.sf(d.inner) | SubtreeContainsTypeScript
+            when d: PropertyAccessExpression
+            {
+                var f Emitter.sf(d.expression) | Emitter.sf(d.question_dot_token) | Emitter.sf(d.name)
+                if AstNode.kind_of(d.name) <> KindIdentifier
+                    set f: f | SubtreeContainsPrivateIdentifierInExpression
+                return f
+            }
+            when d: ElementAccessExpression
+                return Emitter.sf(d.expression) | Emitter.sf(d.question_dot_token) | Emitter.sf(d.argument_expression)
+            when d: CallExpression
+            {
+                var f Emitter.sf(d.expression) | Emitter.sf(d.question_dot_token) | Emitter.sfel(d.type_arguments) | Emitter.sfl(d.arguments)
+                if AstNode.kind_of(d.expression) = KindImportKeyword
+                    set f: f | SubtreeContainsDynamicImport
+                return f
+            }
+            when d: NewExpression
+                return Emitter.sf(d.expression) | Emitter.sfel(d.type_arguments) | Emitter.sfl(d.arguments)
+            when d: MetaProperty
+                return Emitter.clear_facts(Emitter.sf(d.name), SubtreeContainsIdentifier)
+            when d: SpreadElement
+                return Emitter.sf(d.inner) | SubtreeContainsRestOrSpread
+            when d: TaggedTemplateExpression
+                return Emitter.sf(d.tag) | Emitter.sf(d.question_dot_token) | Emitter.sfel(d.type_arguments) | Emitter.sf(d.template)
+            when d: ArrayLiteralExpression
+                return Emitter.sfl(d.elements)
+            when d: ObjectLiteralExpression
+                return Emitter.sfl(d.elements)
+            when d: SpreadAssignment
+                return Emitter.sf(d.inner) | SubtreeContainsESObjectRestOrSpread | SubtreeContainsObjectRestOrSpread
+            when d: PropertyAssignment
+                return Emitter.sf(d.name) | Emitter.sf(d.type_node) | Emitter.sf(d.initializer)
+            when d: ShorthandPropertyAssignment
+                return Emitter.sf(d.name) | Emitter.sf(d.type_node) | Emitter.sf(d.object_assignment_initializer) | SubtreeContainsTypeScript
+            when d: AwaitExpression
+                return Emitter.sf(d.inner) | SubtreeContainsAwait | SubtreeContainsAnyAwait | SubtreeContainsForAwaitOrAsyncGenerator
+            when d: DeleteExpression
+                return Emitter.sf(d.inner)
+            when d: TypeOfExpression
+                return Emitter.sf(d.inner)
+            when d: VoidExpression
+                return Emitter.sf(d.inner)
+            when d: ParenthesizedExpression
+                return Emitter.sf(d.inner)
+            when d: PartiallyEmittedExpression
+                return Emitter.sf(d.inner)
+            when d: ComputedPropertyName
+                return Emitter.sf(d.inner)
+            when d: PrefixUnaryExpression
+                return Emitter.sf(d.operand)
+            when d: PostfixUnaryExpression
+                return Emitter.sf(d.operand)
+            when d: ConditionalExpression
+                return Emitter.sf(d.condition) | Emitter.sf(d.question_token) | Emitter.sf(d.when_true) | Emitter.sf(d.colon_token) | Emitter.sf(d.when_false)
+            when d: TemplateExpression
+                return Emitter.sf(d.head) | Emitter.sfl(d.template_spans)
+            when d: TemplateSpan
+                return Emitter.sf(d.expression) | Emitter.sf(d.literal)
+            when d: ExpressionWithTypeArguments
+                return Emitter.sf(d.expression) | Emitter.sfel(d.type_arguments)
+            when d: QualifiedName
+                return Emitter.sf(d.left) | Emitter.sf(d.right)
+            when d: SyntheticReferenceExpression
+                return Emitter.sf(d.expression) | Emitter.sf(d.this_arg)
+            when d: Decorator
+                return Emitter.sf(d.inner) | SubtreeContainsTypeScript | SubtreeContainsDecorators
+            when d: JsxElement
+                return Emitter.sf(d.opening_element) | Emitter.sfl(d.children) | Emitter.sf(d.closing_element) | SubtreeContainsJsx
+            when d: JsxAttributes
+                return Emitter.sfl(d.elements) | SubtreeContainsJsx
+            when d: JsxNamespacedName
+                return Emitter.sf(d.namespace_name) | Emitter.sf(d.name) | SubtreeContainsJsx
+            when d: JsxOpeningElement
+                return Emitter.sf(d.tag_name) | Emitter.sfel(d.type_arguments) | Emitter.sf(d.attributes) | SubtreeContainsJsx
+            when d: JsxSelfClosingElement
+                return Emitter.sf(d.tag_name) | Emitter.sfel(d.type_arguments) | Emitter.sf(d.attributes) | SubtreeContainsJsx
+            when d: JsxFragment
+                return Emitter.sfl(d.children) | SubtreeContainsJsx
+            when d: JsxAttribute
+                return Emitter.sf(d.name) | Emitter.sf(d.initializer) | SubtreeContainsJsx
+            when d: JsxSpreadAttribute
+                return Emitter.sf(d.inner) | SubtreeContainsJsx
+            when d: JsxClosingElement
+                return Emitter.sf(d.inner) | SubtreeContainsJsx
+            when d: JsxExpression
+                return Emitter.sf(d.expression) | SubtreeContainsJsx
+            when d: JsxText
+                return SubtreeContainsJsx
+            else
+                return SubtreeFactsNone
+        SubtreeFactsNone
+    }
+
+    ; ClassLikeBase.computeSubtreeFacts
+    function class_like_subtree_facts(n: ref[AstNode], modifiers: ref[Array[ref[AstNode]?]]?, name: ref[AstNode]?, type_parameters: ref[Array[ref[AstNode]?]]?, heritage_clauses: ref[Array[ref[AstNode]?]]?, members: ref[Array[ref[AstNode]?]]?) returns int
+    {
+        if (Transformer.modifier_flags_of(n) & ModifierFlagsAmbient) <> 0
+            return SubtreeContainsTypeScript
+        Emitter.sfl(modifiers) | Emitter.sf(name) | Emitter.sfel(type_parameters) | Emitter.sfl(heritage_clauses) | Emitter.sfl(members)
+    }
+
+    ; AccessorDeclarationBase.computeSubtreeFacts
+    function accessor_subtree_facts(modifiers: ref[Array[ref[AstNode]?]]?, name: ref[AstNode]?, type_parameters: ref[Array[ref[AstNode]?]]?, parameters: ref[Array[ref[AstNode]?]]?, type_node: ref[AstNode]?, full_signature: ref[AstNode]?, body: ref[AstNode]?) returns int
+    {
+        if body = null
+            return SubtreeContainsTypeScript
+        Emitter.sfl(modifiers) | Emitter.sf(name) | Emitter.sfel(type_parameters) | Emitter.sfl(parameters) | Emitter.sfe(type_node) | Emitter.sfe(full_signature) | Emitter.sf(body)
+    }
+
+    ; ── ast/utilities.go: the binding-pattern questions the facts ask ──
+
+    ; IsAssignmentPattern
+    function is_assignment_pattern(n: ref[AstNode]?) returns bool
+    {
+        let k AstNode.kind_of(n)
+        (k = KindArrayLiteralExpression) or (k = KindObjectLiteralExpression)
+    }
+
+    ; GetElementsOfBindingOrAssignmentPattern
+    function elements_of_binding_or_assignment_pattern(n: ref[AstNode]) returns ref[Array[ref[AstNode]?]]?
+    {
+        let k n.kind
+        if (k = KindObjectBindingPattern) or (k = KindArrayBindingPattern) or (k = KindArrayLiteralExpression) or (k = KindObjectLiteralExpression)
+            return Emitter.pattern_elements_of(n)
+        null
+    }
+
+    ; the ElementListData arms a binding or assignment pattern can be
+    function pattern_elements_of(n: ref[AstNode]) returns ref[Array[ref[AstNode]?]]?
+    {
+        choose n.data
+            when d: ObjectBindingPattern
+                return d.elements
+            when d: ArrayBindingPattern
+                return d.elements
+            when d: ArrayLiteralExpression
+                return d.elements
+            when d: ObjectLiteralExpression
+                return d.elements
+        null
+    }
+
+    ; IsDeclarationBindingElement
+    function is_declaration_binding_element(n: ref[AstNode]) returns bool
+    {
+        let k n.kind
+        (k = KindVariableDeclaration) or (k = KindParameter) or (k = KindBindingElement)
+    }
+
+    ; IsObjectLiteralElement
+    function is_object_literal_element(n: ref[AstNode]) returns bool
+    {
+        let k n.kind
+        (k = KindPropertyAssignment) or (k = KindShorthandPropertyAssignment) or (k = KindSpreadAssignment) or (k = KindMethodDeclaration) or (k = KindGetAccessor) or (k = KindSetAccessor)
+    }
+
+    ; GetTargetOfBindingOrAssignmentElement
+    function target_of_binding_or_assignment_element(n: ref[AstNode]?) returns ref[AstNode]?
+    {
+        if n = null
+            return null
+        let e n as ref[AstNode]
+        if Emitter.is_declaration_binding_element(e)
+            return Printer.declaration_name_of(e)
+        if Emitter.is_object_literal_element(e)
+        {
+            let k e.kind
+            if k = KindPropertyAssignment
+                return Emitter.target_of_binding_or_assignment_element(AstNode.initializer_of(e))
+            if k = KindShorthandPropertyAssignment
+                return Printer.declaration_name_of(e)
+            if k = KindSpreadAssignment
+                return Emitter.target_of_binding_or_assignment_element(Printer.wrapped_inner_of(e))
+            return null
+        }
+        if Emitter.is_assignment_expression(e, true)
+            return Emitter.target_of_binding_or_assignment_element(AstNode.binary_left_of(e))
+        if e.kind = KindSpreadElement
+            return Emitter.target_of_binding_or_assignment_element(Printer.wrapped_inner_of(e))
+        e
+    }
+
+    ; IsAssignmentExpression(node, excludeCompoundAssignment)
+    function is_assignment_expression(n: ref[AstNode], exclude_compound: bool) returns bool
+    {
+        if n.kind <> KindBinaryExpression
+            return false
+        let op AstNode.kind_of(AstNode.binary_operator_token_of(n))
+        if exclude_compound
+        {
+            if op <> KindEqualsToken
+                return false
+        }
+        if exclude_compound = false
+        {
+            if Parser.is_assignment_operator(op) = false
+                return false
+        }
+        Parser.is_left_hand_side_expression_kind(AstNode.kind_of(AstNode.binary_left_of(n)))
+    }
+
+    ; ContainsObjectRestOrSpread
+    function contains_object_rest_or_spread(n: ref[AstNode]) returns bool
+    {
+        if (Emitter.subtree_facts(n) & SubtreeContainsObjectRestOrSpread) <> 0
+            return true
+        if (Emitter.subtree_facts(n) & SubtreeContainsESObjectRestOrSpread) <> 0
+        {
+            ; check for nested spread assignments, otherwise '{ x: { a, ...b } = foo } = c'
+            ; will not be correctly interpreted by the rest/spread transformer
+            let elements Emitter.elements_of_binding_or_assignment_pattern(n)
+            if elements = null
+                return false
+            let l elements as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (l.get_length() as int)
+            {
+                let target Emitter.target_of_binding_or_assignment_element(l[i as size_t])
+                set i: i + 1
+                if target = null
+                    continue
+                let t target as ref[AstNode]
+                if Emitter.is_assignment_pattern(t) = false
+                    continue
+                if (Emitter.subtree_facts(t) & SubtreeContainsObjectRestOrSpread) <> 0
+                    return true
+                if (Emitter.subtree_facts(t) & SubtreeContainsESObjectRestOrSpread) <> 0
+                {
+                    if Emitter.contains_object_rest_or_spread(t)
+                        return true
+                }
+            }
+        }
+        false
+    }
+
     ; internal/vfs/internal/internal.go decodeBytes + decodeUtf16: the compiler
     ; host reads a source file THROUGH this — a UTF-16 file (either byte order
     ; mark) is transcoded to UTF-8 and a UTF-8 mark is dropped — while the
@@ -1090,6 +1992,13 @@ define Emitter
             set facts.has_import_or_export: true
         if k = KindEnumDeclaration
             set facts.has_runtime_syntax: true
+        ; an INTERNAL `import x = N.M` (an entity-name reference) is rewritten to
+        ; `var x = N.M` by runtimesyntax.go's visitImportEqualsDeclaration
+        if k = KindImportEqualsDeclaration
+        {
+            if AstNode.kind_of(AstNode.module_reference_of(node)) <> KindExternalModuleReference
+                set facts.has_runtime_syntax: true
+        }
         if k = KindModuleDeclaration
         {
             ; the eraser drops a non-instantiated one itself; an instantiated one
@@ -1157,8 +2066,6 @@ define Emitter
         this.scan(file, checker, &facts)
         ; getScriptTransformers, each gate a transformer not yet ported
         let import_elision_enabled (options.verbatim_module_syntax <> TristateTrue) and ((file.flags & NodeFlagsJavaScriptFile) = 0)
-        if import_elision_enabled and facts.has_import_or_export
-            this.record_unported("transform-import-elision", 0)
         if facts.has_runtime_syntax
             this.record_unported("transform-runtime-syntax", 0)
         if options.experimental_decorators = TristateTrue
@@ -1201,12 +2108,17 @@ define Emitter
         var current file
         let eraser Transformer.create(host, TransformerTagTypeEraser, opts)
         set current: eraser.transform_source_file(current)
+        let elision Transformer.create(host, TransformerTagImportElision, opts)
+        if import_elision_enabled
+            set current: elision.transform_source_file(current)
         let use_strict Transformer.create(host, TransformerTagUseStrict, opts)
         set current: use_strict.transform_source_file(current)
         let es_module Transformer.create(host, TransformerTagESModule, opts)
         set current: es_module.transform_source_file(current)
         if eraser.unported_count > 0
             this.record_unported(eraser.unported_tag, eraser.unported_detail)
+        if elision.unported_count > 0
+            this.record_unported(elision.unported_tag, elision.unported_detail)
         if use_strict.unported_count > 0
             this.record_unported(use_strict.unported_tag, use_strict.unported_detail)
         if es_module.unported_count > 0
