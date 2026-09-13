@@ -346,6 +346,7 @@ def main():
     ap.add_argument("--store", default=os.path.join(PKG, "tests", "out", "run.db"))
     ap.add_argument("--binary", default=os.path.join(PKG, "tests", "out", "tscaly_dump"))
     ap.add_argument("--filter", default="")
+    ap.add_argument("--only", default="", help="a file naming one case per line: run those cases alone (a probe run, seconds instead of minutes)")
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--verdicts", default="")
@@ -366,8 +367,13 @@ def main():
     plans = []            # dicts
     skips = collections.Counter()
     groups = collections.defaultdict(list)   # options string → [(vpath, content)]
+    only = None
+    if args.only:
+        only = set(l.strip() for l in open(args.only) if l.strip())
     for ci, name, case_file in cases:
         if args.filter and args.filter not in name:
+            continue
+        if only is not None and name not in only:
             continue
         base = os.path.basename(case_file)
         stem = os.path.splitext(base)[0]

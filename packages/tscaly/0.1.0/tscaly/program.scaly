@@ -148,6 +148,20 @@ function mangle_scoped_package_name(host: ref[Page], name: Slice[char]) returns 
     Slice[char](s.get_length(), s.get_buffer() as pointer[char])
 }
 
+; strings.Contains(path, "/node_modules/")
+function slice_contains_node_modules(path: Slice[char]) returns bool
+{
+    var i 0
+    while (i + 14) <= (path.length as int)
+    {
+        let piece path.subslice(i as size_t, (i + 14) as size_t)
+        if piece.equals("/node_modules/")
+            return true
+        set i: i + 1
+    }
+    false
+}
+
 ; ── the program's file table ───────────────────────────────────────────────────
 
 define ProgramFiles
@@ -298,6 +312,442 @@ define ProgramFiles
     }
 }
 
+; ── a JSON value tree (internal/packagejson/jsonvalue.go) ─────────────────────
+
+define JsonKindAbsent: int 0
+define JsonKindNull: int 1
+define JsonKindBoolean: int 2
+define JsonKindNumber: int 3
+define JsonKindString: int 4
+define JsonKindArray: int 5
+define JsonKindObject: int 6
+
+; the exports/imports object kinds (packagejson.ExportsOrImports.initObjectKind)
+define JsonObjectKindConditions: int 0
+define JsonObjectKindSubpaths: int 1
+define JsonObjectKindImports: int 2
+define JsonObjectKindInvalid: int 3
+
+define JsonValue
+(
+    kind: int
+    text: Slice[char]
+    truth: bool
+    keys: ref[Array[Slice[char]]]?
+    values: ref[Array[ref[JsonValue]?]]?
+)
+{
+    ; JSONValue.IsFalsy
+    function is_falsy(this) returns bool
+    {
+        if (kind = JsonKindAbsent) or (kind = JsonKindNull)
+            return true
+        if kind = JsonKindString
+            return (text.length as int) = 0
+        if kind = JsonKindNumber
+            return text.equals("0")
+        if kind = JsonKindBoolean
+            return truth = false
+        false
+    }
+
+    function size(this) returns int
+    {
+        if values = null
+            return 0
+        (values as ref[Array[ref[JsonValue]?]]).get_length() as int
+    }
+
+    function key_at(this, i: int) returns Slice[char]
+        (keys as ref[Array[Slice[char]]])[i as size_t]
+
+    function value_at(this, i: int) returns ref[JsonValue]?
+        (values as ref[Array[ref[JsonValue]?]])[i as size_t]
+
+    ; an object member by key (null when absent or not an object)
+    function get(this, key: Slice[char]) returns ref[JsonValue]?
+    {
+        if kind <> JsonKindObject
+            return null
+        let n this.size()
+        var i 0
+        while i < n
+        {
+            let k this.key_at(i)
+            if k.equals(key)
+                return this.value_at(i)
+            set i: i + 1
+        }
+        null
+    }
+
+    ; the string of a member, empty when absent or not a string
+    function string_of(this, key: Slice[char]) returns Slice[char]
+    {
+        let v this.get(key)
+        if v = null
+            return Slice[char]()
+        let jv v as ref[JsonValue]
+        if jv.kind <> JsonKindString
+            return Slice[char]()
+        jv.text
+    }
+
+    ; ExportsOrImports.initObjectKind: every key `.`-led → subpaths, `#`-led →
+    ; imports, neither → conditions, a mix → invalid
+    function object_kind(this) returns int
+    {
+        if kind <> JsonKindObject
+            return JsonObjectKindConditions
+        let n this.size()
+        if n = 0
+            return JsonObjectKindConditions
+        var seen_dot false
+        var seen_hash false
+        var seen_other false
+        var i 0
+        while i < n
+        {
+            let k this.key_at(i)
+            set i: i + 1
+            if (k.length as int) = 0
+                continue
+            let c k[0] as int
+            if c = ("." as char) as int
+                set seen_dot: true
+            if c = ("#" as char) as int
+                set seen_hash: true
+            if (c <> ("." as char) as int) and (c <> ("#" as char) as int)
+                set seen_other: true
+            if seen_other and (seen_dot or seen_hash)
+                return JsonObjectKindInvalid
+        }
+        if seen_dot
+            return JsonObjectKindSubpaths
+        if seen_hash
+            return JsonObjectKindImports
+        JsonObjectKindConditions
+    }
+}
+
+; a recursive-descent reader over the text (encoding/json's grammar); `ok`
+; false after the first error, the value then null
+define JsonParser
+(
+    host: ref[Page]
+    text: Slice[char]
+    pos: int
+    ok: bool
+)
+{
+    function parse(host: ref[Page], text: Slice[char]) returns ref[JsonValue]?
+    {
+        let jp &JsonParser^host(host, text, 0, true)
+        jp.skip_ws()
+        let v jp.parse_value()
+        if jp.ok = false
+            return null
+        v
+    }
+
+    function peek(this) returns int
+    {
+        if pos >= (text.length as int)
+            return 0 - 1
+        text[pos as size_t] as int
+    }
+
+    procedure skip_ws(this)
+    {
+        while pos < (text.length as int)
+        {
+            let c text[pos as size_t] as int
+            if (c = 32) or (c = 10) or (c = 13) or (c = 9)
+                set pos: pos + 1
+            else
+                return
+        }
+    }
+
+    procedure fail(this)
+        set ok: false
+
+    procedure parse_value(this) returns ref[JsonValue]?
+    {
+        if ok = false
+            return null
+        let c this.peek()
+        if c = ("{" as char) as int
+            return this.parse_object()
+        if c = ("[" as char) as int
+            return this.parse_array()
+        if c = ("\"" as char) as int
+        {
+            let str this.parse_string()
+            if ok = false
+                return null
+            return &JsonValue^host(JsonKindString, str, false, null, null)
+        }
+        if this.text_at_is("true")
+        {
+            set pos: pos + 4
+            return &JsonValue^host(JsonKindBoolean, null, true, null, null)
+        }
+        if this.text_at_is("false")
+        {
+            set pos: pos + 5
+            return &JsonValue^host(JsonKindBoolean, null, false, null, null)
+        }
+        if this.text_at_is("null")
+        {
+            set pos: pos + 4
+            return &JsonValue^host(JsonKindNull, null, false, null, null)
+        }
+        ; a number: the run of number characters, kept as text
+        let start pos
+        while pos < (text.length as int)
+        {
+            let d text[pos as size_t] as int
+            var number_char false
+            if (d >= ("0" as char) as int) and (d <= ("9" as char) as int)
+                set number_char: true
+            if (d = ("-" as char) as int) or (d = ("+" as char) as int) or (d = ("." as char) as int) or (d = ("e" as char) as int) or (d = ("E" as char) as int)
+                set number_char: true
+            if number_char = false
+                break
+            set pos: pos + 1
+        }
+        if pos = start
+        {
+            this.fail()
+            return null
+        }
+        &JsonValue^host(JsonKindNumber, text.subslice(start as size_t, pos as size_t), false, null, null)
+    }
+
+    function text_at_is(this, word: Slice[char]) returns bool
+    {
+        if (pos + (word.length as int)) > (text.length as int)
+            return false
+        let piece text.subslice(pos as size_t, (pos + (word.length as int)) as size_t)
+        piece.equals(word)
+    }
+
+    procedure parse_object(this) returns ref[JsonValue]?
+    {
+        set pos: pos + 1
+        let keys &Array[Slice[char]]^host()
+        let values &Array[ref[JsonValue]?]^host()
+        this.skip_ws()
+        if this.peek() = ("}" as char) as int
+        {
+            set pos: pos + 1
+            return &JsonValue^host(JsonKindObject, null, false, keys, values)
+        }
+        repeat
+        {
+            this.skip_ws()
+            if this.peek() <> ("\"" as char) as int
+            {
+                this.fail()
+                return null
+            }
+            let key this.parse_string()
+            if ok = false
+                return null
+            this.skip_ws()
+            if this.peek() <> (":" as char) as int
+            {
+                this.fail()
+                return null
+            }
+            set pos: pos + 1
+            this.skip_ws()
+            let v this.parse_value()
+            if ok = false
+                return null
+            keys.add(key)
+            values.add(v)
+            this.skip_ws()
+            let c this.peek()
+            if c = ("," as char) as int
+            {
+                set pos: pos + 1
+                continue
+            }
+            if c = ("}" as char) as int
+            {
+                set pos: pos + 1
+                return &JsonValue^host(JsonKindObject, null, false, keys, values)
+            }
+            this.fail()
+            return null
+        }
+    }
+
+    procedure parse_array(this) returns ref[JsonValue]?
+    {
+        set pos: pos + 1
+        let values &Array[ref[JsonValue]?]^host()
+        this.skip_ws()
+        if this.peek() = ("]" as char) as int
+        {
+            set pos: pos + 1
+            return &JsonValue^host(JsonKindArray, null, false, null, values)
+        }
+        repeat
+        {
+            this.skip_ws()
+            let v this.parse_value()
+            if ok = false
+                return null
+            values.add(v)
+            this.skip_ws()
+            let c this.peek()
+            if c = ("," as char) as int
+            {
+                set pos: pos + 1
+                continue
+            }
+            if c = ("]" as char) as int
+            {
+                set pos: pos + 1
+                return &JsonValue^host(JsonKindArray, null, false, null, values)
+            }
+            this.fail()
+            return null
+        }
+    }
+
+    ; a string with its escapes decoded (\uXXXX as UTF-8, surrogate pairs joined)
+    procedure parse_string(this) returns Slice[char]
+    {
+        set pos: pos + 1
+        let sb StringBuilder^host()
+        while pos < (text.length as int)
+        {
+            let c text[pos as size_t] as int
+            if c = ("\"" as char) as int
+            {
+                set pos: pos + 1
+                let s String^host(sb.to_string())
+                return Slice[char](s.get_length(), s.get_buffer() as pointer[char])
+            }
+            if c = ("\\" as char) as int
+            {
+                set pos: pos + 1
+                if pos >= (text.length as int)
+                    break
+                let e text[pos as size_t] as int
+                set pos: pos + 1
+                if e = ("n" as char) as int
+                    sb.append("\n" as char)
+                else
+                {
+                    if e = ("t" as char) as int
+                        sb.append("\t" as char)
+                    else
+                    {
+                        if e = ("r" as char) as int
+                            sb.append("\r" as char)
+                        else
+                        {
+                            if e = ("b" as char) as int
+                                sb.append(8 as char)
+                            else
+                            {
+                                if e = ("f" as char) as int
+                                    sb.append(12 as char)
+                                else
+                                {
+                                    if e = ("u" as char) as int
+                                    {
+                                        var code this.hex4()
+                                        if code < 0
+                                            break
+                                        if (code >= 0xD800) and (code <= 0xDBFF)
+                                        {
+                                            ; a surrogate pair
+                                            if this.text_at_is("\\u")
+                                            {
+                                                set pos: pos + 2
+                                                let low this.hex4()
+                                                if low < 0
+                                                    break
+                                                set code: 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                                            }
+                                        }
+                                        JsonParser.append_utf8(sb, code)
+                                    }
+                                    else
+                                        sb.append(e as char)
+                                }
+                            }
+                        }
+                    }
+                }
+                continue
+            }
+            sb.append(c as char)
+            set pos: pos + 1
+        }
+        this.fail()
+        Slice[char]()
+    }
+
+    ; four hex digits at pos, advancing; -1 when malformed
+    procedure hex4(this) returns int
+    {
+        if (pos + 4) > (text.length as int)
+            return 0 - 1
+        var v 0
+        var i 0
+        while i < 4
+        {
+            let h text[(pos + i) as size_t] as int
+            var d 0 - 1
+            if (h >= ("0" as char) as int) and (h <= ("9" as char) as int)
+                set d: h - (("0" as char) as int)
+            if (h >= ("a" as char) as int) and (h <= ("f" as char) as int)
+                set d: 10 + h - (("a" as char) as int)
+            if (h >= ("A" as char) as int) and (h <= ("F" as char) as int)
+                set d: 10 + h - (("A" as char) as int)
+            if d < 0
+                return 0 - 1
+            set v: v * 16 + d
+            set i: i + 1
+        }
+        set pos: pos + 4
+        v
+    }
+
+    procedure append_utf8(sb: ref[StringBuilder], code: int)
+    {
+        if code < 0x80
+        {
+            sb.append(code as char)
+            return
+        }
+        if code < 0x800
+        {
+            sb.append((0xC0 | (code >> 6)) as char)
+            sb.append((0x80 | (code & 0x3F)) as char)
+            return
+        }
+        if code < 0x10000
+        {
+            sb.append((0xE0 | (code >> 12)) as char)
+            sb.append((0x80 | ((code >> 6) & 0x3F)) as char)
+            sb.append((0x80 | (code & 0x3F)) as char)
+            return
+        }
+        sb.append((0xF0 | (code >> 18)) as char)
+        sb.append((0x80 | ((code >> 12) & 0x3F)) as char)
+        sb.append((0x80 | ((code >> 6) & 0x3F)) as char)
+        sb.append((0x80 | (code & 0x3F)) as char)
+    }
+}
+
 ; ── package.json, the fields the resolver reads ────────────────────────────────
 
 define PackageJsonInfo
@@ -309,16 +759,19 @@ define PackageJsonInfo
     typings: Slice[char]
     main: Slice[char]
     type_field: Slice[char]
+    exports: ref[JsonValue]?
+    imports: ref[JsonValue]?
     has_exports: bool
     has_imports: bool
     has_types_versions: bool
 )
 {
     function none() returns PackageJsonInfo
-        PackageJsonInfo(false, null, null, null, null, null, null, false, false, false)
+        PackageJsonInfo(false, null, null, null, null, null, null, null, null, false, false, false)
 
     ; the package.json of a directory, read off the table; `exists` false when
-    ; the directory carries none
+    ; the directory carries none. An unreadable document is a package.json whose
+    ; fields are all absent (packagejson.Parse ignores its error).
     function at(host: ref[Page], files: ref[ProgramFiles], directory: Slice[char]) returns PackageJsonInfo
     {
         let path combine_paths(host, directory, "package.json")
@@ -327,110 +780,26 @@ define PackageJsonInfo
         var info PackageJsonInfo.none()
         set info.exists: true
         set info.directory: directory
-        PackageJsonInfo.scan(files.text_of_path(path), &info)
+        let root JsonParser.parse(host, files.text_of_path(path))
+        if root = null
+            return info
+        let obj root as ref[JsonValue]
+        if obj.kind <> JsonKindObject
+            return info
+        set info.name: obj.string_of("name")
+        set info.types: obj.string_of("types")
+        set info.typings: obj.string_of("typings")
+        set info.main: obj.string_of("main")
+        set info.type_field: obj.string_of("type")
+        set info.exports: obj.get("exports")
+        set info.imports: obj.get("imports")
+        if info.exports <> null
+            set info.has_exports: true
+        if info.imports <> null
+            set info.has_imports: true
+        if obj.get("typesVersions") <> null
+            set info.has_types_versions: true
         info
-    }
-
-    ; the TOP-LEVEL string fields of a JSON object and the presence of the
-    ; structured ones — enough for the reference's packagejson.Fields reader here
-    procedure scan(text: Slice[char], out: ref[PackageJsonInfo])
-    {
-        let n text.length as int
-        var depth 0
-        var i 0
-        var expect_value false
-        var key Slice[char]()
-        while i < n
-        {
-            let c text[i as size_t] as int
-            if c = ("\"" as char) as int
-            {
-                ; a string: from i + 1 to the closing quote, escapes skipped
-                var j i + 1
-                while j < n
-                {
-                    let cj text[j as size_t] as int
-                    if cj = ("\\" as char) as int
-                    {
-                        set j: j + 2
-                        continue
-                    }
-                    if cj = ("\"" as char) as int
-                        break
-                    set j: j + 1
-                }
-                let s text.subslice((i + 1) as size_t, j as size_t)
-                set i: j + 1
-                if depth = 1
-                {
-                    if expect_value
-                    {
-                        PackageJsonInfo.apply(out, key, s)
-                        set expect_value: false
-                    }
-                    else
-                    {
-                        set key: s
-                        ; the colon that makes it a key
-                        var k i
-                        while (k < n) and (((text[k as size_t] as int) = 32) or ((text[k as size_t] as int) = 10) or ((text[k as size_t] as int) = 13) or ((text[k as size_t] as int) = 9))
-                            set k: k + 1
-                        if (k < n) and ((text[k as size_t] as int) = (":" as char) as int)
-                        {
-                            set expect_value: true
-                            set i: k + 1
-                            ; a structured value is noted by its key and skipped by the depth walk
-                            var m i
-                            while (m < n) and (((text[m as size_t] as int) = 32) or ((text[m as size_t] as int) = 10) or ((text[m as size_t] as int) = 13) or ((text[m as size_t] as int) = 9))
-                                set m: m + 1
-                            if m < n
-                            {
-                                let vc text[m as size_t] as int
-                                if vc <> ("\"" as char) as int
-                                {
-                                    PackageJsonInfo.note_structured(out, key)
-                                    set expect_value: false
-                                }
-                            }
-                        }
-                    }
-                }
-                continue
-            }
-            if (c = ("{" as char) as int) or (c = ("[" as char) as int)
-                set depth: depth + 1
-            if (c = ("}" as char) as int) or (c = ("]" as char) as int)
-                set depth: depth - 1
-            set i: i + 1
-        }
-    }
-
-    procedure apply(out: ref[PackageJsonInfo], key: Slice[char], value: Slice[char])
-    {
-        if key.equals("name")
-            set out.name: value
-        if key.equals("types")
-            set out.types: value
-        if key.equals("typings")
-            set out.typings: value
-        if key.equals("main")
-            set out.main: value
-        if key.equals("type")
-            set out.type_field: value
-        if key.equals("exports")
-            set out.has_exports: true
-        if key.equals("imports")
-            set out.has_imports: true
-    }
-
-    procedure note_structured(out: ref[PackageJsonInfo], key: Slice[char])
-    {
-        if key.equals("exports")
-            set out.has_exports: true
-        if key.equals("imports")
-            set out.has_imports: true
-        if key.equals("typesVersions")
-            set out.has_types_versions: true
     }
 }
 
@@ -439,6 +808,13 @@ define PackageJsonInfo
 ; module/resolver.go's resolutionState over the program's table. `resolve`
 ; answers the INDEX of the file in the table, -1 for none; a shape this port has
 ; not written sets `stop_tag` (the checker records it) and answers -1.
+; module/types.go's NodeResolutionFeatures
+define ResolutionFeatureImports: int 1
+define ResolutionFeatureSelfName: int 2
+define ResolutionFeatureExports: int 4
+define ResolutionFeatureExportsPatternTrailers: int 8
+define ResolutionFeatureImportsPatternRoot: int 16
+
 define ModuleResolver
 (
     host: ref[Page]
@@ -449,10 +825,50 @@ define ModuleResolver
     stop_tag: Slice[char]
     name: Slice[char]
     containing_directory: Slice[char]
+    conditions: ref[Array[Slice[char]]]?
+    features: int
+    allow_js: bool
+    out_dir: Slice[char]
+    root_dir: Slice[char]
 )
 {
-    function create(host: ref[Page], files: ref[ProgramFiles], module_resolution: int, resolve_json: bool, esm_mode: bool) returns ref[ModuleResolver]
-        &ModuleResolver^host(host, files, module_resolution, resolve_json, esm_mode, null, null, null)
+    ; `usage_mode` is the usage location's mode (ModuleKindNone/CommonJS/ESNext,
+    ; the checker's GetEmitSyntaxForUsageLocation); `exports_option`/`imports_option`
+    ; the two tristate options (2 = unset)
+    function create(host: ref[Page], files: ref[ProgramFiles], module_resolution: int, resolve_json: bool, usage_mode: int, allow_js: bool, exports_option: int, imports_option: int, out_dir: Slice[char], root_dir: Slice[char]) returns ref[ModuleResolver]
+    {
+        var esm false
+        if (module_resolution = ModuleResolutionKindNode16) or (module_resolution = ModuleResolutionKindNodeNext)
+        {
+            if usage_mode = 99
+                set esm: true
+        }
+        ; GetConditions
+        let conds &Array[Slice[char]]^host()
+        var mode usage_mode
+        if (mode = 0) and (module_resolution = ModuleResolutionKindBundler)
+            set mode: 99
+        if mode = 99
+            conds.add("import")
+        else
+            conds.add("require")
+        conds.add("types")
+        if module_resolution <> ModuleResolutionKindBundler
+            conds.add("node")
+        ; getNodeResolutionFeatures
+        var features ResolutionFeatureImports | ResolutionFeatureSelfName | ResolutionFeatureExports | ResolutionFeatureExportsPatternTrailers
+        if module_resolution <> ModuleResolutionKindNode16
+            set features: features | ResolutionFeatureImportsPatternRoot
+        if exports_option = 1
+            set features: features | ResolutionFeatureExports
+        if exports_option = 0
+            set features: features & (0 - 1 - ResolutionFeatureExports)
+        if imports_option = 1
+            set features: features | ResolutionFeatureImports
+        if imports_option = 0
+            set features: features & (0 - 1 - ResolutionFeatureImports)
+        &ModuleResolver^host(host, files, module_resolution, resolve_json, esm, null, null, null, conds, features, allow_js, out_dir, root_dir)
+    }
 
     function extensions(this) returns int
     {
@@ -473,19 +889,35 @@ define ModuleResolver
     {
         set name: module_name
         set containing_directory: get_directory_path(host, containing_file)
+        this.resolve_node_like_worker()
+    }
+
+    ; resolveNodeLikeWorker over `name` and `containing_directory` (re-entered by
+    ; an imports map target that names another package)
+    procedure resolve_node_like_worker(this) returns int
+    {
+        let module_name name
         let ext this.extensions()
         if is_external_module_name_relative(module_name) = false
         {
-            ; `#` imports and a package self-name need the package.json maps
-            if ((module_name.length as int) > 0) and ((module_name[0] as int) = ("#" as char) as int)
+            if (features & ResolutionFeatureImports) <> 0
             {
-                this.stop("module-package-imports")
-                return 0 - 1
+                if ((module_name.length as int) > 0) and ((module_name[0] as int) = ("#" as char) as int)
+                {
+                    let r this.load_module_from_imports()
+                    if r >= 0
+                        return r
+                    if (stop_tag.length as int) > 0
+                        return 0 - 1
+                }
             }
-            if this.is_self_name_reference()
+            if (features & ResolutionFeatureSelfName) <> 0
             {
-                this.stop("module-self-name")
-                return 0 - 1
+                let r this.load_module_from_self_name_reference()
+                if r >= 0
+                    return r
+                if (stop_tag.length as int) > 0
+                    return 0 - 1
             }
             if slice_contains_byte(module_name, (":" as char) as int)
                 return 0 - 1
@@ -498,34 +930,548 @@ define ModuleResolver
         this.node_load_module_by_relative_name(ext, candidate, true)
     }
 
-    ; loadModuleFromSelfNameReference's gate: the nearest package.json with an
-    ; `exports` map whose name the specifier starts with
-    function is_self_name_reference(this) returns bool
+    ; getPackageScopeForPath: the nearest package.json at or above a directory
+    function package_scope_for_path(this, directory: Slice[char]) returns PackageJsonInfo
     {
-        var dir containing_directory
+        var dir directory
         repeat
         {
             let info PackageJsonInfo.at(host, files, dir)
             if info.exists
-            {
-                if info.has_exports = false
-                    return false
-                if (info.name.length as int) = 0
-                    return false
-                if name.starts_with(info.name)
-                {
-                    if (name.length as int) = (info.name.length as int)
-                        return true
-                    if (name[info.name.length] as int) = ("/" as char) as int
-                        return true
-                }
-                return false
-            }
+                return info
             let parent get_directory_path(host, dir)
             if parent.equals(dir)
-                return false
+                return PackageJsonInfo.none()
             set dir: parent
         }
+    }
+
+    ; loadModuleFromSelfNameReference
+    procedure load_module_from_self_name_reference(this) returns int
+    {
+        let scope this.package_scope_for_path(containing_directory)
+        if scope.exists = false
+            return 0 - 1
+        if scope.exports = null
+            return 0 - 1
+        if (scope.exports as ref[JsonValue]).is_falsy()
+            return 0 - 1
+        if (scope.name.length as int) = 0
+            return 0 - 1
+        ; the specifier's components must start with the package name's
+        let pkg scope.name
+        if name.starts_with(pkg) = false
+            return 0 - 1
+        var subpath: Slice[char] "."
+        if (name.length as int) > (pkg.length as int)
+        {
+            if (name[pkg.length] as int) <> ("/" as char) as int
+                return 0 - 1
+            set subpath: join_slices(host, ".", name.slice_from(pkg.length))
+        }
+        let ext this.extensions()
+        if allow_js and (slice_contains_node_modules(containing_directory) = false)
+            return this.load_module_from_exports(scope, ext, subpath)
+        let priority ext & (ExtTypeScript | ExtDeclaration)
+        let r this.load_module_from_exports(scope, priority, subpath)
+        if r >= 0
+            return r
+        if (stop_tag.length as int) > 0
+            return 0 - 1
+        this.load_module_from_exports(scope, ext & (ExtJavaScript | ExtJson), subpath)
+    }
+
+    ; loadModuleFromImports: the `#` map of the nearest package.json
+    procedure load_module_from_imports(this) returns int
+    {
+        if name.equals("#")
+            return 0 - 1
+        if name.starts_with("#/") and ((features & ResolutionFeatureImportsPatternRoot) = 0)
+            return 0 - 1
+        let scope this.package_scope_for_path(containing_directory)
+        if scope.exists = false
+            return 0 - 1
+        if scope.imports = null
+            return 0 - 1
+        let imports scope.imports as ref[JsonValue]
+        if imports.kind <> JsonKindObject
+            return 0 - 1
+        this.load_module_from_exports_or_imports(this.extensions(), name, imports, scope, true)
+    }
+
+    ; loadModuleFromExports
+    procedure load_module_from_exports(this, scope: PackageJsonInfo, ext: int, subpath: Slice[char]) returns int
+    {
+        if scope.exists = false
+            return 0 - 1
+        if scope.exports = null
+            return 0 - 1
+        let exports scope.exports as ref[JsonValue]
+        if exports.is_falsy()
+            return 0 - 1
+        if subpath.equals(".")
+        {
+            var main_export: ref[JsonValue]? null
+            if (exports.kind = JsonKindString) or (exports.kind = JsonKindArray)
+                set main_export: exports
+            if exports.kind = JsonKindObject
+            {
+                if exports.object_kind() = JsonObjectKindConditions
+                    set main_export: exports
+                else
+                    set main_export: exports.get(".")
+            }
+            if main_export <> null
+                return this.load_module_from_target_export_or_import(ext, subpath, scope, false, main_export as ref[JsonValue], Slice[char](), false, subpath)
+            return 0 - 1
+        }
+        if exports.kind = JsonKindObject
+        {
+            if exports.object_kind() = JsonObjectKindSubpaths
+                return this.load_module_from_exports_or_imports(ext, subpath, exports, scope, false)
+        }
+        0 - 1
+    }
+
+    ; loadModuleFromExportsOrImports: an exact key, else the pattern keys in
+    ; ComparePatternKeys order
+    procedure load_module_from_exports_or_imports(this, ext: int, module_name: Slice[char], lookup: ref[JsonValue], scope: PackageJsonInfo, is_imports: bool) returns int
+    {
+        if (module_name.ends_with("/") = false) and (slice_contains_byte(module_name, ("*" as char) as int) = false)
+        {
+            let target lookup.get(module_name)
+            if target <> null
+                return this.load_module_from_target_export_or_import(ext, module_name, scope, is_imports, target as ref[JsonValue], Slice[char](), false, module_name)
+        }
+        ; the expanding keys: exactly one `*`, or a trailing `/`
+        let expanding &Array[int]^host()
+        let n lookup.size()
+        var i 0
+        while i < n
+        {
+            let key lookup.key_at(i)
+            var stars 0
+            var ki 0
+            while ki < (key.length as int)
+            {
+                if (key[ki as size_t] as int) = ("*" as char) as int
+                    set stars: stars + 1
+                set ki: ki + 1
+            }
+            if (stars = 1) or key.ends_with("/")
+                expanding.add(i)
+            set i: i + 1
+        }
+        ; insertion sort by ComparePatternKeys
+        var a 1
+        while a < (expanding.get_length() as int)
+        {
+            let moving expanding[a as size_t]
+            var b a - 1
+            while b >= 0
+            {
+                let there expanding[b as size_t]
+                if ModuleResolver.compare_pattern_keys(lookup.key_at(moving), lookup.key_at(there)) < 0
+                {
+                    expanding.put((b + 1) as size_t, there)
+                    set b: b - 1
+                }
+                else
+                    break
+            }
+            expanding.put((b + 1) as size_t, moving)
+            set a: a + 1
+        }
+        var e 0
+        while e < (expanding.get_length() as int)
+        {
+            let ki2 expanding[e as size_t]
+            set e: e + 1
+            let potential lookup.key_at(ki2)
+            let target lookup.value_at(ki2)
+            if target = null
+                continue
+            let tv target as ref[JsonValue]
+            let star slice_index_of_byte(potential, ("*" as char) as int)
+            if ((features & ResolutionFeatureExportsPatternTrailers) <> 0) and ModuleResolver.matches_pattern_with_trailer(potential, module_name)
+            {
+                let sub_end (module_name.length as int) - ((potential.length as int) - 1 - star)
+                let subpath module_name.subslice(star as size_t, sub_end as size_t)
+                return this.load_module_from_target_export_or_import(ext, module_name, scope, is_imports, tv, subpath, true, potential)
+            }
+            if potential.ends_with("*")
+            {
+                let head potential.subslice(0, ((potential.length as int) - 1) as size_t)
+                if module_name.starts_with(head)
+                {
+                    let subpath module_name.slice_from(((potential.length as int) - 1) as size_t)
+                    return this.load_module_from_target_export_or_import(ext, module_name, scope, is_imports, tv, subpath, true, potential)
+                }
+                continue
+            }
+            if module_name.starts_with(potential)
+            {
+                let subpath module_name.slice_from(potential.length)
+                return this.load_module_from_target_export_or_import(ext, module_name, scope, is_imports, tv, subpath, false, potential)
+            }
+        }
+        0 - 1
+    }
+
+    ; loadModuleFromTargetExportOrImport
+    procedure load_module_from_target_export_or_import(this, ext: int, module_name: Slice[char], scope: PackageJsonInfo, is_imports: bool, target: ref[JsonValue], subpath: Slice[char], is_pattern: bool, key: Slice[char]) returns int
+    {
+        if target.kind = JsonKindString
+        {
+            let target_string target.text
+            if (is_pattern = false) and ((subpath.length as int) > 0) and (target_string.ends_with("/") = false)
+                return 0 - 1
+            if target_string.starts_with("./") = false
+            {
+                if is_imports and (target_string.starts_with("../") = false) and (target_string.starts_with("/") = false) and (is_rooted_disk_path(target_string) = false)
+                {
+                    ; an imports target that names another package resolves as that package
+                    let saved_name name
+                    let saved_directory containing_directory
+                    set name: ModuleResolver.combined_import_target(host, target_string, subpath, is_pattern)
+                    set containing_directory: ensure_trailing_directory_separator(host, scope.directory)
+                    let r this.resolve_node_like_worker()
+                    set name: saved_name
+                    set containing_directory: saved_directory
+                    return r
+                }
+                return 0 - 1
+            }
+            ; no `..`, `.` or `node_modules` after the first component, in the
+            ; target nor in the subpath
+            if ModuleResolver.path_has_forbidden_part(target_string, true)
+                return 0 - 1
+            if ModuleResolver.path_has_forbidden_part(subpath, false)
+                return 0 - 1
+            let resolved_target combine_paths(host, scope.directory, target_string)
+            var final_path Slice[char]()
+            if is_pattern
+                set final_path: get_normalized_absolute_path(host, ModuleResolver.replace_star(host, resolved_target, subpath), Slice[char]())
+            else
+                set final_path: get_normalized_absolute_path(host, join_slices(host, resolved_target, subpath), Slice[char]())
+            ; tryLoadInputFileForPath: with an outDir an output path is mapped back to
+            ; its input under rootDir; without a rootDir (or a config) the project root
+            ; is ambiguous and the target stays unresolved
+            if ((out_dir.length as int) > 0) and (slice_contains_node_modules(final_path) = false)
+            {
+                if (root_dir.length as int) = 0
+                    return 0 - 1
+                let mapped this.load_input_file_for_output_path(ext, final_path)
+                if mapped >= 0
+                    return mapped
+            }
+            return this.load_file_name_from_package_json_field(ext, final_path)
+        }
+        if target.kind = JsonKindObject
+        {
+            let n target.size()
+            var i 0
+            while i < n
+            {
+                let condition target.key_at(i)
+                let sub target.value_at(i)
+                set i: i + 1
+                if sub = null
+                    continue
+                if this.condition_matches(condition)
+                {
+                    let r this.load_module_from_target_export_or_import(ext, module_name, scope, is_imports, sub as ref[JsonValue], subpath, is_pattern, key)
+                    if r >= 0
+                        return r
+                    if (stop_tag.length as int) > 0
+                        return 0 - 1
+                }
+            }
+            return 0 - 1
+        }
+        if target.kind = JsonKindArray
+        {
+            let n target.size()
+            var i 0
+            while i < n
+            {
+                let elem target.value_at(i)
+                set i: i + 1
+                if elem = null
+                    continue
+                let r this.load_module_from_target_export_or_import(ext, module_name, scope, is_imports, elem as ref[JsonValue], subpath, is_pattern, key)
+                if r >= 0
+                    return r
+                if (stop_tag.length as int) > 0
+                    return 0 - 1
+            }
+            return 0 - 1
+        }
+        0 - 1
+    }
+
+    ; tryLoadInputFileForPath's mapping: `<outDir>/<fragment>` → `<rootDir>/<fragment>`
+    ; with the output extension swapped for each possible input extension
+    procedure load_input_file_for_output_path(this, ext: int, final_path: Slice[char]) returns int
+    {
+        let out_prefix ensure_trailing_directory_separator(host, out_dir)
+        if final_path.starts_with(out_prefix) = false
+            return 0 - 1
+        let fragment final_path.slice_from(out_prefix.length)
+        let base combine_paths(host, root_dir, fragment)
+        var known false
+        if base.ends_with(".mjs") or base.ends_with(".cjs") or base.ends_with(".js") or base.ends_with(".json") or base.ends_with(".d.mts") or base.ends_with(".d.cts") or base.ends_with(".d.ts")
+            set known: true
+        if known = false
+            return 0 - 1
+        ; GetPossibleOriginalInputExtensionForExtension
+        let candidates &Array[Slice[char]]^host()
+        if base.ends_with(".d.mts") or base.ends_with(".mjs") or base.ends_with(".mts")
+        {
+            candidates.add(".mts")
+            candidates.add(".mjs")
+        }
+        else
+        {
+            if base.ends_with(".d.cts") or base.ends_with(".cjs") or base.ends_with(".cts")
+            {
+                candidates.add(".cts")
+                candidates.add(".cjs")
+            }
+            else
+            {
+                candidates.add(".tsx")
+                candidates.add(".ts")
+                candidates.add(".jsx")
+                candidates.add(".js")
+            }
+        }
+        let stem base.subslice(0, remove_file_extension(base) as size_t)
+        var i 0
+        while i < (candidates.get_length() as int)
+        {
+            let e candidates[i as size_t]
+            set i: i + 1
+            if ModuleResolver.extension_is_ok(ext, e) = false
+                continue
+            let input join_slices(host, stem, e)
+            if files.file_exists(input)
+            {
+                let r this.load_file_name_from_package_json_field(ext, input)
+                if r >= 0
+                    return r
+            }
+        }
+        0 - 1
+    }
+
+    ; extensionIsOk
+    function extension_is_ok(ext: int, e: Slice[char]) returns bool
+    {
+        if e.equals(".ts") or e.equals(".tsx") or e.equals(".mts") or e.equals(".cts")
+            return (ext & ExtTypeScript) <> 0
+        if e.equals(".js") or e.equals(".jsx") or e.equals(".mjs") or e.equals(".cjs")
+            return (ext & ExtJavaScript) <> 0
+        if e.equals(".json")
+            return (ext & ExtJson) <> 0
+        (ext & ExtDeclaration) <> 0
+    }
+
+    ; conditionMatches: `default`, one of the conditions, or a `types@<range>` key
+    ; the compiler's version satisfies (types 7.0.2)
+    function condition_matches(this, condition: Slice[char]) returns bool
+    {
+        if condition.equals("default")
+            return true
+        let cl conditions as ref[Array[Slice[char]]]
+        var i 0
+        var has_types false
+        while i < (cl.get_length() as int)
+        {
+            let c cl[i as size_t]
+            if c.equals(condition)
+                return true
+            if c.equals("types")
+                set has_types: true
+            set i: i + 1
+        }
+        if has_types = false
+            return false
+        if condition.starts_with("types@") = false
+            return false
+        ModuleResolver.versioned_types_key_applies(condition.slice_from(6))
+    }
+
+    ; IsApplicableVersionedTypesKey over the one range shape the corpus writes
+    ; (`>=X.Y`, `>X.Y`, `<=X.Y`, `<X.Y`, `X.Y`), against version 7.0
+    function versioned_types_key_applies(range: Slice[char]) returns bool
+    {
+        var op 0
+        var at 0
+        if range.starts_with(">=")
+        {
+            set op: 1
+            set at: 2
+        }
+        else
+        {
+            if range.starts_with("<=")
+            {
+                set op: 2
+                set at: 2
+            }
+            else
+            {
+                if range.starts_with(">")
+                {
+                    set op: 3
+                    set at: 1
+                }
+                else
+                {
+                    if range.starts_with("<")
+                    {
+                        set op: 4
+                        set at: 1
+                    }
+                }
+            }
+        }
+        var major 0
+        var minor 0
+        var in_minor false
+        var seen_digit false
+        var i at
+        while i < (range.length as int)
+        {
+            let c range[i as size_t] as int
+            set i: i + 1
+            if (c >= ("0" as char) as int) and (c <= ("9" as char) as int)
+            {
+                set seen_digit: true
+                if in_minor
+                    set minor: minor * 10 + (c - (("0" as char) as int))
+                else
+                    set major: major * 10 + (c - (("0" as char) as int))
+                continue
+            }
+            if (c = ("." as char) as int) and (in_minor = false)
+            {
+                set in_minor: true
+                continue
+            }
+            break
+        }
+        if seen_digit = false
+            return false
+        let ours 7 * 1000 + 0
+        let theirs major * 1000 + minor
+        if op = 1
+            return ours >= theirs
+        if op = 2
+            return ours <= theirs
+        if op = 3
+            return ours > theirs
+        if op = 4
+            return ours < theirs
+        (major = 7) and ((in_minor = false) or (minor = 0))
+    }
+
+    ; ComparePatternKeys
+    function compare_pattern_keys(a: Slice[char], b: Slice[char]) returns int
+    {
+        let a_star slice_index_of_byte(a, ("*" as char) as int)
+        let b_star slice_index_of_byte(b, ("*" as char) as int)
+        var base_a a.length as int
+        if a_star >= 0
+            set base_a: a_star + 1
+        var base_b b.length as int
+        if b_star >= 0
+            set base_b: b_star + 1
+        if base_a > base_b
+            return 0 - 1
+        if base_b > base_a
+            return 1
+        if a_star < 0
+            return 1
+        if b_star < 0
+            return 0 - 1
+        if (a.length as int) > (b.length as int)
+            return 0 - 1
+        if (b.length as int) > (a.length as int)
+            return 1
+        0
+    }
+
+    ; matchesPatternWithTrailer: `before*after` with a non-empty trailer
+    function matches_pattern_with_trailer(target: Slice[char], candidate: Slice[char]) returns bool
+    {
+        if target.ends_with("*")
+            return false
+        let star slice_index_of_byte(target, ("*" as char) as int)
+        if star < 0
+            return false
+        let before target.subslice(0, star as size_t)
+        let after target.slice_from((star + 1) as size_t)
+        candidate.starts_with(before) and candidate.ends_with(after)
+    }
+
+    ; the imports target with its subpath: the `*` replaced for a pattern, appended
+    ; otherwise (page-hosted, so the resolver may hold it as its name)
+    function combined_import_target(host: ref[Page], target_string: Slice[char], subpath: Slice[char], is_pattern: bool) returns Slice[char]
+    {
+        if is_pattern
+            return ModuleResolver.replace_star(host, target_string, subpath)
+        join_slices(host, target_string, subpath)
+    }
+
+    ; strings.ReplaceAll(s, "*", subpath)
+    function replace_star(host: ref[Page], s: Slice[char], subpath: Slice[char]) returns Slice[char]
+    {
+        let sb StringBuilder^host()
+        var i 0
+        while i < (s.length as int)
+        {
+            let c s[i as size_t] as int
+            if c = ("*" as char) as int
+                sb.append(subpath.data, subpath.length)
+            else
+                sb.append(c as char)
+            set i: i + 1
+        }
+        let out String^host(sb.to_string())
+        Slice[char](out.get_length(), out.get_buffer() as pointer[char])
+    }
+
+    ; a `..`, `.` or `node_modules` component (after the first, when `skip_first`)
+    function path_has_forbidden_part(path: Slice[char], skip_first: bool) returns bool
+    {
+        var start 0
+        var index 0
+        var i 0
+        let n path.length as int
+        while i <= n
+        {
+            var at_sep i = n
+            if i < n
+            {
+                if (path[i as size_t] as int) = ("/" as char) as int
+                    set at_sep: true
+            }
+            if at_sep
+            {
+                let part path.subslice(start as size_t, i as size_t)
+                if (skip_first = false) or (index > 0)
+                {
+                    if part.equals("..") or part.equals(".") or part.equals("node_modules")
+                        return true
+                }
+                set index: index + 1
+                set start: i + 1
+            }
+            set i: i + 1
+        }
+        false
     }
 
     ; nodeLoadModuleByRelativeName
@@ -916,11 +1862,17 @@ define ModuleResolver
         }
         if info.exists
         {
-            ; package exports are higher priority than file/directory lookups
-            if info.has_exports
+            ; package exports are higher priority than file/directory lookups (a
+            ; top-level `"exports": null` does not block them)
+            if ((features & ResolutionFeatureExports) <> 0) and (info.exports <> null)
             {
-                this.stop("module-package-exports")
-                return 0 - 1
+                if (info.exports as ref[JsonValue]).is_falsy() = false
+                {
+                    var subpath: Slice[char] "."
+                    if (rest.length as int) > 0
+                        set subpath: join_slices(host, "./", rest)
+                    return this.load_module_from_exports(info, ext, subpath)
+                }
             }
             if ((rest.length as int) > 0) and info.has_types_versions
             {

@@ -5482,6 +5482,28 @@ define ReferenceHintExportImportEquals: int 5
 define ReferenceHintExportSpecifier: int 6
 define ReferenceHintDecorator: int 7
 
+; checker/types.go ExternalEmitHelpers (slice 249)
+define ExternalEmitHelpersRest: int 1
+define ExternalEmitHelpersDecorate: int 2
+define ExternalEmitHelpersMetadata: int 4
+define ExternalEmitHelpersParam: int 8
+define ExternalEmitHelpersAwaiter: int 16
+define ExternalEmitHelpersAwait: int 32
+define ExternalEmitHelpersAsyncGenerator: int 64
+define ExternalEmitHelpersAsyncDelegator: int 128
+define ExternalEmitHelpersAsyncValues: int 256
+define ExternalEmitHelpersExportStar: int 512
+define ExternalEmitHelpersImportStar: int 1024
+define ExternalEmitHelpersImportDefault: int 2048
+define ExternalEmitHelpersMakeTemplateObject: int 4096
+define ExternalEmitHelpersClassPrivateFieldGet: int 8192
+define ExternalEmitHelpersClassPrivateFieldSet: int 16384
+define ExternalEmitHelpersClassPrivateFieldIn: int 32768
+define ExternalEmitHelpersSetFunctionName: int 65536
+define ExternalEmitHelpersPropKey: int 131072
+define ExternalEmitHelpersAddDisposableResourceAndDisposeResources: int 262144
+define ExternalEmitHelpersRewriteRelativeImportExtension: int 524288
+
 define ModuleKindNone: int 0
 define ModuleKindCommonJS: int 1
 ; ModuleKindSystem (slice 133) — checkImportMetaProperty's one exemption from the
@@ -5868,6 +5890,17 @@ define Checker
     ; `importHelpers`: checkExternalEmitHelpers returns at once without it, and
     ; the tslib lookup it does with it is a said stop (slice 248)
     import_helpers: bool
+    ; sourceFileLinks.requestedExternalEmitHelpers / externalHelpersModule of the
+    ; file being checked (reset per unit by select_program_file)
+    requested_external_emit_helpers: int
+    external_helpers_module: ref[Symbol]?
+    ; the resolver's further options (slice 249): allowJs, the two package.json
+    ; map tristates, whether outDir/rootDir are set
+    allow_js: bool
+    resolve_package_json_exports: int
+    resolve_package_json_imports: int
+    out_dir: Slice[char]
+    root_dir: Slice[char]
 
     ; ★ THE RE-SCANNING SCANNER IS THE BINDER'S, AND THAT IS AN ARGUMENT RATHER
     ; THAN A SAVING. grammarErrorOnFirstToken reports at
@@ -7841,6 +7874,15 @@ define Checker
         set c.module_resolution_kind: ModuleResolutionKindUnknown
         set c.resolve_json_module: false
         set c.import_helpers: false
+        set c.requested_external_emit_helpers: 0
+        set c.external_helpers_module: null
+        set c.allow_js: false
+        set c.resolve_package_json_exports: 2
+        set c.resolve_package_json_imports: 2
+        set c.out_dir.data: null
+        set c.out_dir.length: 0
+        set c.root_dir.data: null
+        set c.root_dir.length: 0
         set c.is_declaration_file: is_declaration_file_name(file_name)
         ; The one question the arrow-function grammar check asks of the FILE NAME
         ; (slice 100). Derived at construction, on is_declaration_file's own
@@ -23423,8 +23465,8 @@ define Checker
             if ci >= 0
             {
                 let containing_path pf.path_at(ci)
-                let esm this.usage_is_esm(location, pf.format_at(ci))
-                let resolver ModuleResolver.create(host, pf, module_resolution_kind, resolve_json_module, esm)
+                let usage_mode this.usage_mode_of(location, pf.format_at(ci))
+                let resolver ModuleResolver.create(host, pf, module_resolution_kind, resolve_json_module, usage_mode, allow_js, resolve_package_json_exports, resolve_package_json_imports, out_dir, root_dir)
                 let idx resolver.resolve(d, containing_path)
                 if (resolver.stop_tag.length as int) > 0
                 {
@@ -26121,9 +26163,15 @@ define Checker
     ; getResolvedSymbolOrNil first, then resolveName without a message)
     procedure rr_referenced_value_symbol(this, reference: ref[AstNode], start_in_declaration_container: bool) returns ref[Symbol]?
     {
+        ; the cached resolution stands unless it is the UNKNOWN symbol (an
+        ; identifier the check could not resolve is resolved again here, as the
+        ; reference's getReferencedValueOrAliasSymbol does; slice 249)
         let resolved this.get_resolved_symbol_or_nil(reference)
         if resolved <> null
-            return resolved
+        {
+            if (resolved as ref[Symbol]) <> unknown_symbol
+                return resolved
+        }
         var location: ref[AstNode]? reference
         if start_in_declaration_container
         {
@@ -27009,17 +27057,60 @@ define Checker
             ; option is unset, so the report has no host.
             if AstNode.kind_of(node) <> KindExportSpecifier
             {
+                ; an import that LOOKS like a value to a transpiler (isolatedModules,
+                ; not type-only) conflicting with a local value (slice 249)
                 if isolated_modules
                 {
-                    this.record_unported("check-alias-isolated-modules-value", AstNode.kind_of(node))
-                    return
+                    if Checker.find_ancestor_type_only_import_or_export(node) = null
+                    {
+                        if (sf & (SymbolFlagsValue | SymbolFlagsExportValue)) <> 0
+                            this.error_on_node(node, DiagImport_0_conflicts_with_local_value_so_must_be_declared_with_a_type_only_import_when_isolatedModules_is_enabled)
+                    }
                 }
             }
         }
-        if this.get_isolated_modules()
+        ; the isolatedModules/verbatimModuleSyntax type-only arms (slice 249)
+        if this.get_isolated_modules() and (Checker.is_type_only_import_or_export_declaration(node) = false) and ((AstNode.flags_of(node) & NodeFlagsAmbient) = 0)
         {
-            this.record_unported("check-alias-isolated-modules", AstNode.kind_of(node))
-            return
+            let type_only_alias this.get_type_only_alias_declaration(symbol)
+            let is_type (target_flags & SymbolFlagsValue) = 0
+            if is_type or (type_only_alias <> null)
+            {
+                let nk AstNode.kind_of(node)
+                if (nk = KindImportClause) or (nk = KindImportSpecifier) or (nk = KindImportEqualsDeclaration)
+                {
+                    if verbatim_module_syntax
+                    {
+                        if Checker.is_internal_module_import_equals_declaration(node)
+                            this.error_on_node(node, DiagAn_import_alias_cannot_resolve_to_a_type_or_type_only_declaration_when_verbatimModuleSyntax_is_enabled)
+                        else
+                        {
+                            if is_type
+                                this.error_on_node(node, DiagX_0_is_a_type_and_must_be_imported_using_a_type_only_import_when_verbatimModuleSyntax_is_enabled)
+                            else
+                                this.error_on_node(node, DiagX_0_resolves_to_a_type_only_declaration_and_must_be_imported_using_a_type_only_import_when_verbatimModuleSyntax_is_enabled)
+                        }
+                    }
+                    if is_type and (nk = KindImportEqualsDeclaration) and b.has_syntactic_modifier(node, ModifierFlagsExport)
+                        this.error_on_node(node, DiagCannot_use_export_import_on_a_type_or_type_only_namespace_when_0_is_enabled)
+                }
+                if nk = KindExportSpecifier
+                {
+                    var report verbatim_module_syntax
+                    if report = false
+                    {
+                        if Checker.source_file_of_node(type_only_alias) <> Checker.source_file_of_node(node)
+                            set report: true
+                    }
+                    if report
+                    {
+                        if is_type
+                            this.error_on_node(node, DiagRe_exporting_a_type_when_0_is_enabled_requires_using_export_type)
+                        else
+                            this.error_on_node(node, DiagX_0_resolves_to_a_type_only_declaration_and_must_be_re_exported_using_a_type_only_re_export_when_1_is_enabled)
+                    }
+                }
+            }
         }
         if AstNode.kind_of(node) = KindImportSpecifier
         {
@@ -27114,11 +27205,7 @@ define Checker
         ; The emit-helper branch needs the file's emit format to be CommonJS, and
         ; the stub program answers ModuleKindNone.
         if emit_module_format = ModuleKindCommonJS
-            {
-                ; checkExternalEmitHelpers: nothing without importHelpers
-                if import_helpers
-                    this.record_unported("external-emit-helpers", KindExportSpecifier)
-            }
+            this.check_external_emit_helpers(node, ExternalEmitHelpersImportDefault)
     }
 
     ; checkModuleExportName. ★The second arm needs module_kind to be ES2015 or
@@ -87660,12 +87747,39 @@ define Checker
         ; says why it is not GetIsolatedModules), and that option is unset. The
         ; test is written so the day it moves this is the line that reports; what
         ; stands behind it is `c.getSymbol(c.globals, …)`, i.e. §3.11 again.
-        if isolated_modules
+        ; an import that shadows a GLOBAL value used in the file (isolatedModules,
+        ; slice 249): the file's non-value symbol of that name names the import
+        if isolated_modules and is_in_external_module and value_meaning
         {
-            if is_in_external_module
+            let name Symbol.name_of(result)
+            let global this.get_symbol_in_table(globals, name, meaning)
+            var is_global false
+            if global <> null
             {
-                if value_meaning
-                    this.record_unported("isolated-modules-global-conflict", meaning)
+                if (global as ref[Symbol]) = result
+                    set is_global: true
+            }
+            if is_global and (Checker.kind_or_unknown(last_location) = KindSourceFile)
+            {
+                let non_value this.get_symbol_in_table(AstNode.locals_of(last_location), name, 0 - 1 - SymbolFlagsValue)
+                if non_value <> null
+                {
+                    let nv non_value as ref[Symbol]
+                    let dn Symbol.declaration_count(nv)
+                    var di 0
+                    while di < dn
+                    {
+                        let d Symbol.declaration_at(nv, di)
+                        set di: di + 1
+                        let dk Checker.kind_or_unknown(d)
+                        if (dk = KindImportSpecifier) or (dk = KindImportClause) or (dk = KindNamespaceImport) or (dk = KindImportEqualsDeclaration)
+                        {
+                            if Checker.is_type_only_import_declaration(d as ref[AstNode]) = false
+                                this.error_on_node(d, DiagImport_0_conflicts_with_global_value_used_in_this_file_so_must_be_declared_with_a_type_only_import_when_isolatedModules_is_enabled)
+                            break
+                        }
+                    }
+                }
             }
         }
     }
@@ -89910,8 +90024,21 @@ define Checker
 
             ; The verbatim-module-syntax report, behind the same option every other
             ; site of it is behind (see check_export_assignment's own note).
+            ; a top-level `export` on a value declaration of a CommonJS-format file
+            ; under verbatimModuleSyntax (slice 249)
             if verbatim_module_syntax
-                this.record_unported("grammar-verbatim-module-syntax", KindModuleDeclaration)
+            {
+                let holder AstNode.parent_node_of(node)
+                if Checker.kind_or_unknown(holder) = KindSourceFile
+                {
+                    if b.has_syntactic_modifier(node, ModifierFlagsExport) and (this.file_emit_format_of(holder) = ModuleKindCommonJS)
+                    {
+                        let export_modifier Checker.modifier_of_kind(node, KindExportKeyword)
+                        if export_modifier <> null
+                            this.error_on_node(export_modifier, DiagA_top_level_export_modifier_cannot_be_used_on_value_declarations_in_a_CommonJS_module_when_verbatimModuleSyntax_is_enabled)
+                    }
+                }
+            }
         }
 
         if Binder.is_ambient_module(node) = false
@@ -90137,6 +90264,38 @@ define Checker
         file_format = ModuleKindESNext
     }
 
+    ; the usage location's mode for the resolver's conditions (GetModeForUsageLocation
+    ; reduced to the emit syntax): a string literal answers as itself, a declaration
+    ; through its specifier; None where nothing decides
+    function usage_mode_of(this, location: ref[AstNode]?, file_format: int) returns int
+    {
+        if location = null
+            return ModuleKindNone
+        let lk Checker.kind_or_unknown(location)
+        if (lk = KindStringLiteral) or (lk = KindNoSubstitutionTemplateLiteral)
+            return this.get_emit_syntax_for_module_specifier_expression(location)
+        if Checker.find_ancestor_kind(location, KindImportEqualsDeclaration) <> null
+            return ModuleKindCommonJS
+        let call Checker.find_ancestor_kind(location, KindCallExpression)
+        if call <> null
+        {
+            let cn call as ref[AstNode]
+            if Parser.is_require_call(cn, false)
+                return ModuleKindCommonJS
+            if AstNode.is_import_call(cn)
+            {
+                if file_format = ModuleKindCommonJS
+                    return ModuleKindCommonJS
+                return ModuleKindESNext
+            }
+        }
+        if file_format = ModuleKindCommonJS
+            return ModuleKindCommonJS
+        if ((file_format >= ModuleKindES2015) and (file_format <= ModuleKindESNext)) or (file_format = ModuleKindPreserve)
+            return ModuleKindESNext
+        ModuleKindNone
+    }
+
     ; isSideEffectImport: an import declaration without a clause
     function is_side_effect_import(node: ref[AstNode]?) returns bool
     {
@@ -90144,6 +90303,17 @@ define Checker
         if decl = null
             return false
         AstNode.import_clause_of(decl) = null
+    }
+
+    ; outDir/rootDir as absolute paths under the harness root, normalized on the
+    ; checker's own page (a driver without a page cannot hand a view in)
+    procedure set_program_directories(this, out_dir_option: Slice[char], root_dir_option: Slice[char])
+    {
+        var root: Slice[char] "/.src"
+        if (out_dir_option.length as int) > 0
+            set out_dir: get_normalized_absolute_path(host, out_dir_option, root)
+        if (root_dir_option.length as int) > 0
+            set root_dir: get_normalized_absolute_path(host, root_dir_option, root)
     }
 
     ; the driver's switch between units: the checker's per-file state (the
@@ -90163,6 +90333,121 @@ define Checker
         ; the per-file constructor's note said would need clearing the day a
         ; checker saw a second file
         set renamed_binding_elements_in_types: &Array[ref[AstNode]?]^host()
+        set requested_external_emit_helpers: 0
+        set external_helpers_module: null
+    }
+
+    ; checkExternalEmitHelpers (slice 249): under importHelpers the `tslib` module
+    ; is resolved once per file and each requested helper must be exported by it
+    procedure check_external_emit_helpers(this, location: ref[AstNode], helpers: int)
+    {
+        if import_helpers = false
+            return
+        if this.is_effective_external_module() = false
+            return
+        if (AstNode.flags_of(location) & NodeFlagsAmbient) <> 0
+            return
+        let helpers_module this.resolve_helpers_module(location)
+        if helpers_module = null
+            return
+        let hm helpers_module as ref[Symbol]
+        if hm = unknown_symbol
+            return
+        if (requested_external_emit_helpers & helpers) = helpers
+            return
+        let unchecked helpers & (0 - 1 - requested_external_emit_helpers)
+        var helper 1
+        while helper <= ExternalEmitHelpersRewriteRelativeImportExtension
+        {
+            if (unchecked & helper) <> 0
+            {
+                let names this.get_helper_names(helper)
+                var i 0
+                while i < (names.get_length() as int)
+                {
+                    let name names[i as size_t]
+                    set i: i + 1
+                    let exports this.get_exports_of_module(hm)
+                    let symbol this.resolve_symbol(SymbolTable.get(exports, name))
+                    if symbol = null
+                        this.error_on_node(location, DiagThis_syntax_requires_an_imported_helper_named_1_which_does_not_exist_in_0_Consider_upgrading_your_version_of_0)
+                    ; the two private-field arity checks are not ported: no site here asks them
+                }
+            }
+            set helper: helper * 2
+        }
+        set requested_external_emit_helpers: requested_external_emit_helpers | helpers
+    }
+
+    ; resolveHelpersModule: `tslib` resolved from the file (the location stands in
+    ; for the program's synthesized import specifier)
+    function resolve_helpers_module(this, error_node: ref[AstNode]) returns ref[Symbol]?
+    {
+        if external_helpers_module <> null
+            return external_helpers_module
+        var found this.resolve_external_module(error_node, "tslib", DiagThis_syntax_requires_an_imported_helper_but_module_0_cannot_be_found, error_node, false)
+        if found = null
+            set found: unknown_symbol
+        set external_helpers_module: found
+        found
+    }
+
+    ; getHelperNames
+    function get_helper_names(this, helper: int) returns ref[Array[Slice[char]]]
+    {
+        let names &Array[Slice[char]]^host()
+        if helper = ExternalEmitHelpersRest
+            names.add("__rest")
+        if helper = ExternalEmitHelpersDecorate
+        {
+            if legacy_decorators
+                names.add("__decorate")
+            else
+            {
+                names.add("__esDecorate")
+                names.add("__runInitializers")
+            }
+        }
+        if helper = ExternalEmitHelpersMetadata
+            names.add("__metadata")
+        if helper = ExternalEmitHelpersParam
+            names.add("__param")
+        if helper = ExternalEmitHelpersAwaiter
+            names.add("__awaiter")
+        if helper = ExternalEmitHelpersAwait
+            names.add("__await")
+        if helper = ExternalEmitHelpersAsyncGenerator
+            names.add("__asyncGenerator")
+        if helper = ExternalEmitHelpersAsyncDelegator
+            names.add("__asyncDelegator")
+        if helper = ExternalEmitHelpersAsyncValues
+            names.add("__asyncValues")
+        if helper = ExternalEmitHelpersExportStar
+            names.add("__exportStar")
+        if helper = ExternalEmitHelpersImportStar
+            names.add("__importStar")
+        if helper = ExternalEmitHelpersImportDefault
+            names.add("__importDefault")
+        if helper = ExternalEmitHelpersMakeTemplateObject
+            names.add("__makeTemplateObject")
+        if helper = ExternalEmitHelpersClassPrivateFieldGet
+            names.add("__classPrivateFieldGet")
+        if helper = ExternalEmitHelpersClassPrivateFieldSet
+            names.add("__classPrivateFieldSet")
+        if helper = ExternalEmitHelpersClassPrivateFieldIn
+            names.add("__classPrivateFieldIn")
+        if helper = ExternalEmitHelpersSetFunctionName
+            names.add("__setFunctionName")
+        if helper = ExternalEmitHelpersPropKey
+            names.add("__propKey")
+        if helper = ExternalEmitHelpersAddDisposableResourceAndDisposeResources
+        {
+            names.add("__addDisposableResource")
+            names.add("__disposeResources")
+        }
+        if helper = ExternalEmitHelpersRewriteRelativeImportExtension
+            names.add("__rewriteRelativeImportExtension")
+        names
     }
 
 
@@ -90495,11 +90780,7 @@ define Checker
                 }
             }
             if emit_module_format = ModuleKindCommonJS
-                {
-                    ; checkExternalEmitHelpers: nothing without importHelpers
-                    if import_helpers
-                        this.record_unported("external-emit-helpers", KindExportDeclaration)
-                }
+                this.check_external_emit_helpers(node, ExternalEmitHelpersExportStar)
             this.check_import_attributes(node)
             return
         }
@@ -90609,11 +90890,6 @@ define Checker
         ; program.GetEmitModuleFormatOfFile, which the stub program does not have*;
         ; slice 54 measured that and it is false — the oracle's program HAS the
         ; method and answers ModuleKindNone. The option is the whole of the hole.
-        if verbatim_module_syntax
-        {
-            this.record_unported("grammar-verbatim-module-syntax", KindExportAssignment)
-            return
-        }
 
         ; ★★★ BOTH TAGS ARE ANSWERED SINCE SLICE 110, AND THE FUNCTION NOW RUNS TO
         ; ITS END. `isIllegalExportDefaultInCJS` is false — verbatimModuleSyntax is
@@ -90633,8 +90909,35 @@ define Checker
                 this.mark_linked_references(node, ReferenceHintExportAssignment, null, null)
                 if this.unported_mark() <> unported_before
                     return
+                ; the verbatimModuleSyntax arms (slice 249): an `export =`/`export default`
+                ; of a type or a type-only alias is reported, unless it is the illegal
+                ; default in a CommonJS-format file (reported elsewhere)
+                let ambient (AstNode.flags_of(node) & NodeFlagsAmbient) <> 0
+                var illegal_default_in_cjs false
+                if (is_export_equals = false) and (ambient = false) and verbatim_module_syntax and (this.current_file_emit_format() = ModuleKindCommonJS)
+                    set illegal_default_in_cjs: true
+                let type_only_declaration this.get_type_only_alias_declaration_ex(sym as ref[Symbol], SymbolFlagsValue)
                 if (this.get_symbol_flags(sym as ref[Symbol]) & SymbolFlagsValue) <> 0
+                {
                     this.check_expression_cached(id)
+                    if (illegal_default_in_cjs = false) and (ambient = false) and verbatim_module_syntax and (type_only_declaration <> null)
+                    {
+                        if is_export_equals
+                            this.error_on_node(id, DiagAn_export_declaration_must_reference_a_real_value_when_verbatimModuleSyntax_is_enabled_but_0_resolves_to_a_type_only_declaration)
+                        else
+                            this.error_on_node(id, DiagAn_export_default_must_reference_a_real_value_when_verbatimModuleSyntax_is_enabled_but_0_resolves_to_a_type_only_declaration)
+                    }
+                }
+                else
+                {
+                    if (illegal_default_in_cjs = false) and (ambient = false) and verbatim_module_syntax
+                    {
+                        if is_export_equals
+                            this.error_on_node(id, DiagAn_export_declaration_must_reference_a_value_when_verbatimModuleSyntax_is_enabled_but_0_only_refers_to_a_type)
+                        else
+                            this.error_on_node(id, DiagAn_export_default_must_reference_a_value_when_verbatimModuleSyntax_is_enabled_but_0_only_refers_to_a_type)
+                    }
+                }
                 if this.unported_mark() <> unported_before
                     return
             }
@@ -92499,6 +92802,7 @@ define Checker
         }
         if first_decorator = null
             return
+        this.check_external_emit_helpers(first_decorator as ref[AstNode], ExternalEmitHelpersMetadata)
         let k AstNode.kind_of(node)
         if k = KindClassDeclaration
         {
@@ -92564,6 +92868,24 @@ define Checker
             if prm <> null
                 this.mark_decorator_metadata_type_node_as_referenced(this.get_parameter_type_node_for_decorator_check(prm as ref[AstNode]))
         }
+    }
+
+    ; `core.Find(node.ModifierNodes(), m => m.Kind == kind)`
+    function modifier_of_kind(node: ref[AstNode], kind: int) returns ref[AstNode]?
+    {
+        let mods AstNode.modifiers_of(node)
+        if mods = null
+            return null
+        let ml mods as ref[Array[ref[AstNode]?]]
+        var mi 0
+        while mi < (ml.get_length() as int)
+        {
+            let m ml[mi as size_t]
+            set mi: mi + 1
+            if Checker.kind_or_unknown(m) = kind
+                return m
+        }
+        null
     }
 
     ; `core.Find(node.ModifierNodes(), ast.IsDecorator)`
@@ -92778,6 +93100,20 @@ define Checker
                 if for_decorator_metadata and this.get_isolated_modules() and (module_kind >= ModuleKindES2015) and (this.symbol_is_value(rs) = false) and (Checker.some_declaration_is_type_only_import_or_export(rs) = false)
                     this.error_on_node(type_name, DiagA_type_referenced_in_a_decorated_signature_must_be_imported_with_import_type_or_a_namespace_import_when_isolatedModules_and_emitDecoratorMetadata_are_enabled)
             }
+    }
+
+    ; ast.FindAncestor(node, ast.IsTypeOnlyImportOrExportDeclaration)
+    function find_ancestor_type_only_import_or_export(node: ref[AstNode]?) returns ref[AstNode]?
+    {
+        var n node
+        while n <> null
+        {
+            let nn n as ref[AstNode]
+            if Checker.is_type_only_import_or_export_declaration(nn)
+                return nn
+            set n: AstNode.parent_node_of(nn)
+        }
+        null
     }
 
     ; core.Some(symbol.Declarations, ast.IsTypeOnlyImportOrExportDeclaration)
@@ -96575,7 +96911,19 @@ define Checker
             return
         if Checker.need_collision_check_for_identifier(node, name, "Promise") = false
             return
-        this.record_unported("check-collision-with-global-promise", AstNode.kind_of(node))
+        if AstNode.kind_of(node) = KindModuleDeclaration
+        {
+            if b.get_module_instance_state(node) <> ModuleInstanceStateInstantiated
+                return
+        }
+        let parent Checker.get_declaration_container(node)
+        if Checker.kind_or_unknown(parent) <> KindSourceFile
+            return
+        let pb this.binder_of_node(parent)
+        if pb.is_external_or_common_js_module() = false
+            return
+        if (AstNode.flags_of(parent as ref[AstNode]) & NodeFlagsHasAsyncFunctions) <> 0
+            this.error_on_node(name, DiagDuplicate_identifier_0_Compiler_reserves_name_1_in_top_level_scope_of_a_module_containing_async_functions)
     }
 
     ; recordPotentialCollisionWithWeakMapSetInGeneratedCode's GUARD. Behind it:
@@ -96707,11 +97055,7 @@ define Checker
             if Checker.module_export_name_is_default(Checker.property_name_or_name_of(node))
             {
                 if emit_module_format = ModuleKindCommonJS
-                    {
-                        ; checkExternalEmitHelpers: nothing without importHelpers
-                        if import_helpers
-                            this.record_unported("external-emit-helpers", AstNode.kind_of(node))
-                    }
+                    this.check_external_emit_helpers(node, ExternalEmitHelpersImportDefault)
             }
         }
     }
@@ -117350,8 +117694,25 @@ define Checker
                     ; it into a port instead of into a silent wrong answer.
                     if Checker.is_accessor_kind(AstNode.kind_of(node))
                     {
-                        this.record_unported("grammar-legacy-accessor-decorators", AstNode.kind_of(node))
-                        return false
+                        ; slice 249: the pair's SECOND accessor (by position) reports
+                        ; when the first carries a decorator
+                        var other_kind KindSetAccessor
+                        if AstNode.kind_of(node) = KindSetAccessor
+                            set other_kind: KindGetAccessor
+                        let sym this.get_symbol_of_declaration(node)
+                        if sym <> null
+                        {
+                            let other Checker.get_declaration_of_kind(sym as ref[Symbol], other_kind)
+                            if other <> null
+                            {
+                                let on other as ref[AstNode]
+                                if AstNode.pos_of(on) < AstNode.pos_of(node as ref[AstNode])
+                                {
+                                    if Checker.first_decorator_of(on) <> null
+                                        return this.grammar_error_on_first_token(node, DiagDecorators_cannot_be_applied_to_multiple_get_Slashset_accessors_of_the_same_name)
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -117619,10 +117980,16 @@ define Checker
                     ; the header), which is the whole of the hole — the claim that
                     ; program.GetEmitModuleFormatOfFile is a second one was
                     ; measured false in slice 54 (§3.5cy).
-                    if verbatim_module_syntax
+                    ; a top-level `export` on a value declaration of a CommonJS-format
+                    ; file under verbatimModuleSyntax (slice 249)
+                    if verbatim_module_syntax and ((AstNode.flags_of(node as ref[AstNode]) & NodeFlagsAmbient) = 0) and (nk <> KindTypeAliasDeclaration) and (nk <> KindInterfaceDeclaration) and (nk <> KindModuleDeclaration)
                     {
-                        this.record_unported("grammar-verbatim-module-syntax", nk)
-                        return false
+                        let holder AstNode.parent_node_of(node)
+                        if Checker.kind_or_unknown(holder) = KindSourceFile
+                        {
+                            if this.file_emit_format_of(holder) = ModuleKindCommonJS
+                                return this.grammar_error_on_node(modifier, DiagA_top_level_export_modifier_cannot_be_used_on_value_declarations_in_a_CommonJS_module_when_verbatimModuleSyntax_is_enabled)
+                        }
                     }
                     if (flags & ModifierFlagsExport) <> 0
                         return this.grammar_error_on_node(modifier, DiagX_0_modifier_already_seen)
