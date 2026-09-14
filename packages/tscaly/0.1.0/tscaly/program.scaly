@@ -17,6 +17,7 @@
 ; case-sensitive), so `FileExists` is a lookup by exact path and
 ; `DirectoryExists` is "some path lies below it".
 
+use tscaly.semver.*
 use scaly.memory.Page
 use scaly.containers.Array
 use scaly.containers.String
@@ -773,10 +774,12 @@ define PackageJsonInfo
     has_exports: bool
     has_imports: bool
     has_types_versions: bool
+    ; the `typesVersions` value itself (slice 259)
+    types_versions: ref[JsonValue]?
 )
 {
     function none() returns PackageJsonInfo
-        PackageJsonInfo(false, null, null, null, null, null, null, null, null, false, false, false)
+        PackageJsonInfo(false, null, null, null, null, null, null, null, null, false, false, false, null)
 
     ; the package.json of a directory, read off the table; `exists` false when
     ; the directory carries none. An unreadable document is a package.json whose
@@ -807,7 +810,10 @@ define PackageJsonInfo
         if info.imports <> null
             set info.has_imports: true
         if obj.get("typesVersions") <> null
+        {
             set info.has_types_versions: true
+            set info.types_versions: obj.get("typesVersions")
+        }
         info
     }
 }
@@ -819,6 +825,9 @@ define PackageJsonInfo
 ; not written sets `stop_tag` (the checker records it) and answers -1.
 ; module/types.go's NodeResolutionFeatures
 define ResolutionFeatureImports: int 1
+; tryLoadModuleUsingPaths' two loaders (slice 259)
+define ResolverLoaderNodeModules: int 1
+define ResolverLoaderDirectory: int 2
 define ResolutionFeatureSelfName: int 2
 define ResolutionFeatureExports: int 4
 define ResolutionFeatureExportsPatternTrailers: int 8
@@ -1308,82 +1317,18 @@ define ModuleResolver
             return false
         if condition.starts_with("types@") = false
             return false
-        ModuleResolver.versioned_types_key_applies(condition.slice_from(6))
+        ModuleResolver.versioned_types_key_applies(host, condition.slice_from(6))
     }
 
-    ; IsApplicableVersionedTypesKey over the one range shape the corpus writes
-    ; (`>=X.Y`, `>X.Y`, `<=X.Y`, `<X.Y`, `X.Y`), against version 7.0
-    function versioned_types_key_applies(range: Slice[char]) returns bool
+    ; IsApplicableVersionedTypesKey's range half: TryParseVersionRange and Test
+    ; against the compiler's version (slice 259: internal/semver whole)
+    function versioned_types_key_applies(host: ref[Page], range: Slice[char]) returns bool
     {
-        var op 0
-        var at 0
-        if range.starts_with(">=")
-        {
-            set op: 1
-            set at: 2
-        }
-        else
-        {
-            if range.starts_with("<=")
-            {
-                set op: 2
-                set at: 2
-            }
-            else
-            {
-                if range.starts_with(">")
-                {
-                    set op: 3
-                    set at: 1
-                }
-                else
-                {
-                    if range.starts_with("<")
-                    {
-                        set op: 4
-                        set at: 1
-                    }
-                }
-            }
-        }
-        var major 0
-        var minor 0
-        var in_minor false
-        var seen_digit false
-        var i at
-        while i < (range.length as int)
-        {
-            let c range[i as size_t] as int
-            set i: i + 1
-            if (c >= ("0" as char) as int) and (c <= ("9" as char) as int)
-            {
-                set seen_digit: true
-                if in_minor
-                    set minor: minor * 10 + (c - (("0" as char) as int))
-                else
-                    set major: major * 10 + (c - (("0" as char) as int))
-                continue
-            }
-            if (c = ("." as char) as int) and (in_minor = false)
-            {
-                set in_minor: true
-                continue
-            }
-            break
-        }
-        if seen_digit = false
+        var ok false
+        let r Semver.try_parse_version_range(host, range, &ok)
+        if ok = false
             return false
-        let ours 7 * 1000 + 0
-        let theirs major * 1000 + minor
-        if op = 1
-            return ours >= theirs
-        if op = 2
-            return ours <= theirs
-        if op = 3
-            return ours > theirs
-        if op = 4
-            return ours < theirs
-        (major = 7) and ((in_minor = false) or (minor = 0))
+        r.test(Semver.typescript_version())
     }
 
     ; ComparePatternKeys
@@ -1688,14 +1633,32 @@ define ModuleResolver
     procedure load_node_module_from_directory_worker(this, ext: int, candidate: Slice[char], info: PackageJsonInfo) returns int
     {
         var package_file Slice[char]()
+        var version_paths: ref[JsonValue]? null
         if info.exists
         {
-            if info.has_types_versions
+            set version_paths: this.version_paths_of(info)
+            ; the package file only for the package's own directory (slice 259)
+            if ModuleResolver.same_directory(candidate, info.directory)
+                set package_file: this.package_file_of(ext, info)
+        }
+        if version_paths <> null
+        {
+            var in_candidate true
+            if (package_file.length as int) > 0
+                set in_candidate: ModuleResolver.directory_contains(candidate, package_file)
+            if in_candidate
             {
-                this.stop("module-types-versions")
-                return 0 - 1
+                var module_name Slice[char]()
+                if (package_file.length as int) > 0
+                    set module_name: ModuleResolver.relative_below(candidate, package_file)
+                else
+                    set module_name: ModuleResolver.relative_below(candidate, combine_paths(host, candidate, "index"))
+                let from_paths this.try_load_module_using_paths(ext, module_name, candidate, version_paths as ref[JsonValue], ResolverLoaderDirectory, info, Slice[char]())
+                if from_paths >= 0
+                    return from_paths
+                if (stop_tag.length as int) > 0
+                    return 0 - 1
             }
-            set package_file: this.package_file_of(ext, info)
         }
         if (package_file.length as int) > 0
         {
@@ -1883,13 +1846,25 @@ define ModuleResolver
                     return this.load_module_from_exports(info, ext, subpath)
                 }
             }
-            if ((rest.length as int) > 0) and info.has_types_versions
+            if (rest.length as int) > 0
             {
-                this.stop("module-types-versions")
-                return 0 - 1
+                let version_paths this.version_paths_of(info)
+                if version_paths <> null
+                {
+                    let from_paths this.try_load_module_using_paths(ext, rest, package_directory, version_paths as ref[JsonValue], ResolverLoaderNodeModules, info, rest)
+                    if from_paths >= 0
+                        return from_paths
+                    if (stop_tag.length as int) > 0
+                        return 0 - 1
+                }
             }
         }
-        ; the `loader`
+        this.node_modules_loader(ext, candidate, rest, info)
+    }
+
+    ; loadModuleFromSpecificNodeModulesDirectory's `loader`
+    procedure node_modules_loader(this, ext: int, candidate: Slice[char], rest: Slice[char], info: PackageJsonInfo) returns int
+    {
         if ((rest.length as int) > 0) or (esm_mode = false)
         {
             let from_file this.load_module_from_file(ext, candidate)
@@ -1907,5 +1882,199 @@ define ModuleResolver
             return this.load_module_from_file(ext, combine_paths(host, candidate, "index.js"))
         }
         0 - 1
+    }
+
+    ; PackageJson.GetVersionPaths: the `typesVersions` entry whose key is a range
+    ; this compiler's version satisfies, null for none (or for a matching entry that
+    ; is not an object, which ends the search)
+    function version_paths_of(this, info: PackageJsonInfo) returns ref[JsonValue]?
+        ModuleResolver.version_paths_for(host, info)
+
+    function version_paths_for(host: ref[Page], info: PackageJsonInfo) returns ref[JsonValue]?
+    {
+        if info.types_versions = null
+            return null
+        let tv info.types_versions as ref[JsonValue]
+        if tv.kind <> JsonKindObject
+            return null
+        let version Semver.typescript_version()
+        let n tv.size()
+        var i 0
+        while i < n
+        {
+            let key tv.key_at(i)
+            let value tv.value_at(i)
+            set i: i + 1
+            var ok false
+            let key_range Semver.try_parse_version_range(host, key, &ok)
+            if ok = false
+                continue
+            if key_range.test(version)
+            {
+                if value = null
+                    return null
+                if (value as ref[JsonValue]).kind <> JsonKindObject
+                    return null
+                return value
+            }
+        }
+        null
+    }
+
+    ; tryLoadModuleUsingPaths over MatchPatternOrExact(TryParsePatterns(paths)).
+    ; `loader` names the caller's closure: the node_modules directory's or the
+    ; directory worker's; `rest` is the former's module subpath
+    procedure try_load_module_using_paths(this, ext: int, module_name: Slice[char], containing_directory: Slice[char], paths: ref[JsonValue], loader: int, info: PackageJsonInfo, rest: Slice[char]) returns int
+    {
+        var found false
+        let key ModuleResolver.match_pattern_or_exact(paths, module_name, &found)
+        if found = false
+            return 0 - 1
+        let star slice_index_of_byte(key, ("*" as char) as int)
+        var matched_star Slice[char]()
+        if star >= 0
+            set matched_star: module_name.subslice(star as size_t, ((module_name.length as int) - (key.length as int) + star + 1) as size_t)
+        let substitutions paths.get(key)
+        if substitutions = null
+            return 0 - 1
+        let subs substitutions as ref[JsonValue]
+        if subs.kind <> JsonKindArray
+            return 0 - 1
+        var i 0
+        while i < subs.size()
+        {
+            let sv subs.value_at(i)
+            set i: i + 1
+            var subst Slice[char]()
+            if sv <> null
+            {
+                if (sv as ref[JsonValue]).kind = JsonKindString
+                    set subst: (sv as ref[JsonValue]).text
+            }
+            ; strings.Replace(subst, "*", matchedStar, 1)
+            var path subst
+            let subst_star slice_index_of_byte(subst, ("*" as char) as int)
+            if subst_star >= 0
+                set path: join_slices(host, join_slices(host, subst.subslice(0, subst_star as size_t), matched_star), subst.slice_from((subst_star + 1) as size_t))
+            let candidate get_normalized_absolute_path(host, combine_paths(host, containing_directory, path), Slice[char]())
+            ; a path mapping may have an extension
+            if ModuleResolver.has_known_extension(subst)
+            {
+                let direct files.index_of_path(candidate)
+                if direct >= 0
+                    return direct
+            }
+            var r 0 - 1
+            if loader = ResolverLoaderNodeModules
+                set r: this.node_modules_loader(ext, candidate, rest, info)
+            else
+                set r: this.load_package_file(ext, candidate, info)
+            if r >= 0
+                return r
+            if (stop_tag.length as int) > 0
+                return 0 - 1
+        }
+        0 - 1
+    }
+
+    ; MatchPatternOrExact: an exact key first, then the pattern with the longest
+    ; prefix (FindBestPatternMatch); TryParsePattern refuses a key with two stars
+    function match_pattern_or_exact(paths: ref[JsonValue], candidate: Slice[char], found: ref[bool]) returns Slice[char]
+    {
+        set found: false
+        let n paths.size()
+        var i 0
+        while i < n
+        {
+            let key paths.key_at(i)
+            set i: i + 1
+            if slice_index_of_byte(key, ("*" as char) as int) < 0
+            {
+                if key.equals(candidate)
+                {
+                    set found: true
+                    return key
+                }
+            }
+        }
+        var best Slice[char]()
+        var longest 0 - 1
+        set i: 0
+        while i < n
+        {
+            let key paths.key_at(i)
+            set i: i + 1
+            let star slice_index_of_byte(key, ("*" as char) as int)
+            if star < 0
+                continue
+            if slice_index_of_byte(key.slice_from((star + 1) as size_t), ("*" as char) as int) >= 0
+                continue
+            if star <= longest
+                continue
+            if (candidate.length as int) < ((key.length as int) - 1)
+                continue
+            if candidate.starts_with(key.subslice(0, star as size_t)) = false
+                continue
+            if candidate.ends_with(key.slice_from((star + 1) as size_t)) = false
+                continue
+            set best: key
+            set longest: star
+            set found: true
+        }
+        best
+    }
+
+    ; tspath.TryGetExtensionFromPath answering non-empty
+    function has_known_extension(path: Slice[char]) returns bool
+    {
+        if path.ends_with(".d.ts") or path.ends_with(".d.mts") or path.ends_with(".d.cts")
+            return true
+        if path.ends_with(".ts") or path.ends_with(".tsx") or path.ends_with(".mts") or path.ends_with(".cts")
+            return true
+        if path.ends_with(".js") or path.ends_with(".jsx") or path.ends_with(".mjs") or path.ends_with(".cjs")
+            return true
+        path.ends_with(".json")
+    }
+
+    ; tspath.ComparePaths(a, b) == 0 over two normalized directories
+    function same_directory(a: Slice[char], b: Slice[char]) returns bool
+    {
+        var an a.length as int
+        var bn b.length as int
+        if (an > 1) and ((a[(an - 1) as size_t] as int) = 47)
+            set an: an - 1
+        if (bn > 1) and ((b[(bn - 1) as size_t] as int) = 47)
+            set bn: bn - 1
+        if an <> bn
+            return false
+        let sa a.subslice(0, an as size_t)
+        let sb b.subslice(0, bn as size_t)
+        sa.equals(sb)
+    }
+
+    ; tspath.ContainsPath(directory, path)
+    function directory_contains(directory: Slice[char], path: Slice[char]) returns bool
+    {
+        var dn directory.length as int
+        if (dn > 1) and ((directory[(dn - 1) as size_t] as int) = 47)
+            set dn: dn - 1
+        if (path.length as int) <= dn
+            return ModuleResolver.same_directory(directory, path)
+        let head path.subslice(0, dn as size_t)
+        let dir directory.subslice(0, dn as size_t)
+        if head.equals(dir) = false
+            return false
+        (path[dn as size_t] as int) = 47
+    }
+
+    ; GetRelativePathFromDirectory(directory, path) for a path below the directory
+    function relative_below(directory: Slice[char], path: Slice[char]) returns Slice[char]
+    {
+        var dn directory.length as int
+        if (dn > 1) and ((directory[(dn - 1) as size_t] as int) = 47)
+            set dn: dn - 1
+        if (path.length as int) <= (dn + 1)
+            return Slice[char]()
+        path.slice_from((dn + 1) as size_t)
     }
 }
