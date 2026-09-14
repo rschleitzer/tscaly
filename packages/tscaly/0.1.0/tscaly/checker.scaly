@@ -5911,6 +5911,9 @@ mutable checker_rewrite_relative_import_extensions: bool false
 mutable checker_no_implicit_any_explicit: bool false
 mutable checker_no_implicit_returns: bool false
 mutable checker_no_unchecked_indexed_access: bool false
+; noUnusedLocals / noUnusedParameters (slice 265): checkUnusedIdentifiers' gate
+mutable checker_no_unused_locals: bool false
+mutable checker_no_unused_parameters: bool false
 
 define Checker
 (
@@ -6940,6 +6943,10 @@ define Checker
     ; reach, and this one is reached the moment a `.ts` file carries a renamed
     ; binding element in a body-less signature.
     renamed_binding_elements_in_types: ref[Array[ref[AstNode]?]]
+
+    ; sourceFileLinks.identifierCheckNodes (slice 265), one list over every file;
+    ; the drain picks a file's nodes by their source file
+    identifier_check_nodes: ref[Array[ref[AstNode]?]]
 
     ; c.sourceFileLinks[file].deferredNodes — the nodes checkNodeDeferred parks so
     ; that a check needing a type runs after every declaration is bound into the
@@ -7998,6 +8005,8 @@ define Checker
         set c.reported_ambient: ra
         let rb &Array[ref[AstNode]?]^host()
         set c.renamed_binding_elements_in_types: rb
+        let icn &Array[ref[AstNode]?]^host()
+        set c.identifier_check_nodes: icn
         let dn &Array[ref[AstNode]?]^host()
         set c.deferred_nodes: dn
         let dt &Array[ref[DeclaredTypeLink]?]^host()
@@ -12509,7 +12518,7 @@ define Checker
         {
             var sym: ref[Symbol]? null
             if Binder.node_is_missing(node) = false
-                set sym: this.resolve_name(node, AstNode.identifier_text_of(node), SymbolFlagsValue | SymbolFlagsExportValue, this.get_cannot_find_name_diagnostic_for_name(node), true, false)
+                set sym: this.resolve_name(node, AstNode.identifier_text_of(node), SymbolFlagsValue | SymbolFlagsExportValue, this.get_cannot_find_name_diagnostic_for_name(node), Checker.is_write_only_access(node) = false, false)
             if sym = null
                 set sym: unknown_symbol
             set links.resolved_symbol: sym
@@ -16548,15 +16557,11 @@ define Checker
                 if access_expression <> null
                 {
                     let ae access_expression as ref[AstNode]
-                    ; markPropertyAsReferenced. ★★★ IT IS INERT HERE AND SAYING SO
-                    ; IS THE HONEST ANSWER, not a stop: its whole product is a
-                    ; `referenceKinds` bit, and every reader of that bit upstream
-                    ; is inside checkUnusedIdentifiers, a chapter this port does
-                    ; not have. Its argument `isSelfTypeAccess` resolves a name
-                    ; that checkExpression has already resolved, so it cannot
-                    ; report either. The line that WOULD matter the day the unused
-                    ; identifiers arrive is one link write; the table comes with
-                    ; them.
+                    let ae_expr AstNode.expression_of(ae)
+                    var self_access false
+                    if ae_expr <> null
+                        set self_access: this.is_self_type_access(ae_expr as ref[AstNode], object_type.symbol)
+                    this.mark_property_as_referenced(p, ae, self_access)
                     let atk Checker.get_assignment_target_kind(ae)
                     if this.is_assignment_to_readonly_entity(ae, p, atk)
                     {
@@ -52655,7 +52660,10 @@ define Checker
             let um24 this.unported_mark()
             let f file
             if f <> null
+            {
                 this.check_external_module_exports(f as ref[AstNode])
+                this.register_for_unused_identifiers_check(f as ref[AstNode])
+            }
             if this.unported_mark() <> um24
                 return
         }
@@ -52664,6 +52672,14 @@ define Checker
             this.check_unused_renamed_binding_elements()
 
         this.produce_deferred_diagnostics()
+
+        ; `checkUnused := NoUnusedLocals.IsTrue() || NoUnusedParameters.IsTrue()`
+        ; (the suggestion collection's third disjunct prints nothing)
+        if Checker.check_unused_enabled()
+        {
+            if is_declaration_file = false
+                this.check_unused_identifiers()
+        }
     }
 
     procedure check_source_elements(this, nodes: ref[Array[ref[AstNode]?]]?)
@@ -66753,8 +66769,7 @@ define Checker
                     return null
                 if prop <> null
                 {
-                    ; markPropertyAsReferenced — see the chapter header for why it
-                    ; is not ported and cannot change an answer here.
+                    this.mark_property_as_referenced(prop as ref[Symbol], property, right_is_this)
                     this.check_property_accessibility(property, false, true, object_literal_type, prop as ref[Symbol])
                     if this.unported_mark() <> mark
                         return null
@@ -74483,6 +74498,7 @@ define Checker
         let p prop as ref[Symbol]
         this.check_deprecated_property(p, node, r)
         this.check_property_not_used_before_declaration(p, node, r)
+        this.mark_property_as_referenced(p, node, this.is_self_type_access(left, this.get_resolved_symbol_or_nil(left)))
         let links this.symbol_node_link_of(node)
         set links.resolved_symbol: p
         var is_super false
@@ -76728,9 +76744,11 @@ define Checker
         this.check_grammar_private_identifier_expression(node)
         if this.unported_mark() <> mark
             return null
-        this.get_symbol_for_private_identifier_expression(node)
+        let pie_symbol this.get_symbol_for_private_identifier_expression(node)
         if this.unported_mark() <> mark
             return null
+        if pie_symbol <> null
+            this.mark_property_as_referenced(pie_symbol as ref[Symbol], null, false)
         any_type
     }
 
@@ -84451,9 +84469,8 @@ define Checker
         if incrementor <> null
             this.check_expression(incrementor as ref[AstNode])
         this.check_source_element(AstNode.statement_of(node))
-        ; `if node.Locals() != nil { c.registerForUnusedIdentifiersCheck(node) }` —
-        ; observable only through checkUnusedIdentifiers, which checkUnused gates
-        ; off under this harness (see the file header).
+        if SymbolTable.length(AstNode.locals_of(node)) > 0
+            this.register_for_unused_identifiers_check(node)
     }
 
     ; checkForInStatement, a PREFIX in three places and whole in its walk.
@@ -84600,6 +84617,8 @@ define Checker
             }
         }
         this.check_source_element(AstNode.statement_of(node))
+        if SymbolTable.length(AstNode.locals_of(node)) > 0
+            this.register_for_unused_identifiers_check(node)
     }
 
     ; checkForOfStatement, a prefix in its right half.
@@ -84712,6 +84731,8 @@ define Checker
             }
         }
         this.check_source_element(AstNode.statement_of(node))
+        if SymbolTable.length(AstNode.locals_of(node)) > 0
+            this.register_for_unused_identifiers_check(node)
     }
 
     ; checkReturnStatement, WHOLE as of slice 84 — the two grammar reports slice 63
@@ -84975,8 +84996,9 @@ define Checker
             ; NoFallthroughCasesInSwitch — see the header.
             set i: i + 1
         }
-        ; `if caseBlock.Locals() != nil { c.registerForUnusedIdentifiersCheck(…) }`
-        ; — gated off, as in check_for_statement above.
+        let case_block AstNode.case_block_of(node)
+        if SymbolTable.length(AstNode.locals_of(case_block)) > 0
+            this.register_for_unused_identifiers_check(case_block as ref[AstNode])
     }
 
     ; ── slice 49: the four arms whose first grammar check is the modifier one ──
@@ -85290,6 +85312,7 @@ define Checker
                                         let property this.get_property_of_type(parent_type as ref[Type], nd)
                                         if property <> null
                                         {
+                                            this.mark_property_as_referenced(property as ref[Symbol], null, false)
                                             ; "A destructuring is never a write-only
                                             ; reference."
                                             var is_super false
@@ -90510,10 +90533,7 @@ define Checker
         }
         this.check_source_elements(AstNode.member_list_of(node))
         this.check_class_or_interface_for_duplicate_index_signatures(node)
-        ; registerForUnusedIdentifiersCheck closes both arms in the reference and is
-        ; not ported anywhere in this file — the unused-identifier pass is a
-        ; dimension of its own, and every other caller of it (checkBlock,
-        ; checkSourceFile) omits it silently. Named here rather than left out.
+        this.register_for_unused_identifiers_check(node)
     }
 
     ; checkInterfaceDeclaration's `if !links.interfaceChecked` block, lifted whole.
@@ -90842,6 +90862,7 @@ define Checker
             return
         }
         this.check_source_element(type_node)
+        this.register_for_unused_identifiers_check(node)
     }
 
     ; The negated condition of checkTypeAliasDeclaration's `intrinsic` report, as
@@ -91984,6 +92005,8 @@ define Checker
         if AstNode.kind_of(node) = KindBlock
             this.check_grammar_statement_in_ambient_context(node)
         this.check_source_elements(AstNode.statements_of(node))
+        if SymbolTable.length(AstNode.locals_of(node)) > 0
+            this.register_for_unused_identifiers_check(node)
     }
 
     ; checkModuleDeclaration's prefix.
@@ -92091,7 +92114,11 @@ define Checker
     {
         let body AstNode.body_of(node)
         if body <> null
+        {
             this.check_source_element(body)
+            if Binder.is_global_scope_augmentation(node) = false
+                this.register_for_unused_identifiers_check(node)
+        }
 
         let is_global_augmentation Binder.is_global_scope_augmentation(node)
         var in_ambient_context false
@@ -97987,8 +98014,7 @@ define Checker
     procedure check_class_expression_deferred(this, node: ref[AstNode])
     {
         this.check_source_elements(AstNode.member_list_of(node))
-        ; `registerForUnusedIdentifiersCheck(node)` — observable only through
-        ; checkUnusedIdentifiers, which this harness gates off.
+        this.register_for_unused_identifiers_check(node)
     }
 
     procedure check_class_like_declaration(this, node: ref[AstNode])
@@ -98836,9 +98862,7 @@ define Checker
         ; declaration's initializer) at 60 units and `check 177` (the CONSTRUCTOR,
         ; which has no arm in check_source_element_worker at all) at 53.
         this.check_source_elements(AstNode.member_list_of(node))
-        ; `c.registerForUnusedIdentifiersCheck(node)` is omitted for the reason
-        ; every other caller of it omits it: the unused-identifier pass is a
-        ; dimension of its own and checkUnused is gated off under this harness.
+        this.register_for_unused_identifiers_check(node)
     }
 
     ; ── slice 59: the collision checks, and one head for four arms ───────────
@@ -100780,6 +100804,12 @@ define Checker
     ; getSymbolOfDeclaration all the same, and that is the tag.
     procedure check_infer_type(this, node: ref[AstNode])
     {
+        this.check_infer_type_worker(node)
+        this.register_for_unused_identifiers_check(node)
+    }
+
+    procedure check_infer_type_worker(this, node: ref[AstNode])
+    {
         var n: ref[AstNode]? node
         var found false
         while n <> null
@@ -101458,6 +101488,13 @@ define Checker
 
     procedure check_signature_declaration(this, node: ref[AstNode])
     {
+        this.check_signature_declaration_worker(node)
+        if AstNode.kind_of(node) <> KindIndexSignature
+            this.register_for_unused_identifiers_check(node)
+    }
+
+    procedure check_signature_declaration_worker(this, node: ref[AstNode])
+    {
         let k AstNode.kind_of(node)
         if k = KindIndexSignature
         {
@@ -101574,10 +101611,6 @@ define Checker
             }
         }
 
-        ; `if !ast.IsIndexSignatureDeclaration(node) { c.registerForUnusedIdentifiersCheck(node) }`
-        ; — observable only through checkUnusedIdentifiers, which checkUnused gates
-        ; off under this harness. checkBlock carries the same line for the same
-        ; reason.
     }
 
     ; checkFunctionOrMethodDeclaration's prefix — two calls, and the third thing it
@@ -117712,6 +117745,708 @@ define Checker
     ; checked here* — is an assertion about the WRITER (the list is filled from a
     ; parameter's binding element) and not a branch; a walk that answers null is
     ; skipped rather than reported, which is what an assertion means here.
+    ; ── checkUnusedIdentifiers (slice 265) ──────────────────────────────────
+    ;
+    ; registerForUnusedIdentifiersCheck appends to sourceFileLinks.identifierCheckNodes;
+    ; here one list for the checker, each node tagged by its file through the parent
+    ; walk at drain time. The reports go through reportUnused, which sends a
+    ; non-error to the suggestion list: under noUnusedLocals / noUnusedParameters the
+    ; report is a diagnostic, otherwise it is dropped (a suggestion is not printed).
+    procedure register_for_unused_identifiers_check(this, node: ref[AstNode])
+        identifier_check_nodes.add(node)
+
+    procedure set_unused_options(no_unused_locals: bool, no_unused_parameters: bool)
+    {
+        set checker_no_unused_locals: no_unused_locals
+        set checker_no_unused_parameters: no_unused_parameters
+    }
+
+    function check_unused_enabled() returns bool
+    {
+        if checker_no_unused_locals
+            return true
+        checker_no_unused_parameters
+    }
+
+    procedure check_unused_identifiers(this)
+    {
+        let n identifier_check_nodes.get_length() as int
+        var i 0
+        while i < n
+        {
+            let entry identifier_check_nodes[i as size_t]
+            set i: i + 1
+            if entry = null
+                continue
+            let node entry as ref[AstNode]
+            if Checker.source_file_of_node(node) <> file
+                continue
+            let k AstNode.kind_of(node)
+            if (k = KindClassDeclaration) or (k = KindClassExpression)
+            {
+                this.check_unused_class_members(node)
+                this.check_unused_type_parameters(node)
+                continue
+            }
+            if (k = KindSourceFile) or (k = KindModuleDeclaration) or (k = KindBlock) or (k = KindCaseBlock) or (k = KindForStatement) or (k = KindForInStatement) or (k = KindForOfStatement)
+            {
+                this.check_unused_locals_and_parameters(node)
+                continue
+            }
+            if (k = KindConstructor) or (k = KindFunctionExpression) or (k = KindFunctionDeclaration) or (k = KindArrowFunction) or (k = KindMethodDeclaration) or (k = KindGetAccessor) or (k = KindSetAccessor)
+            {
+                ; only the implementation reports its parameters, not an overload
+                if AstNode.body_of(node) <> null
+                    this.check_unused_locals_and_parameters(node)
+                this.check_unused_type_parameters(node)
+                continue
+            }
+            if (k = KindMethodSignature) or (k = KindCallSignature) or (k = KindConstructSignature) or (k = KindFunctionType) or (k = KindConstructorType) or (k = KindTypeAliasDeclaration) or (k = KindJSTypeAliasDeclaration) or (k = KindInterfaceDeclaration)
+            {
+                this.check_unused_type_parameters(node)
+                continue
+            }
+            if k = KindInferType
+            {
+                this.check_unused_infer_type_parameter(node)
+                continue
+            }
+            ; the reference panics ("Unhandled case in checkUnusedIdentifiers")
+            this.record_unported("check-unused-identifiers", k)
+        }
+    }
+
+    ; reportUnused's condition: the location is neither ambient nor under a parse
+    ; error, and unusedIsError(kind) — a suggestion otherwise, which is not printed
+    function unused_is_reported(location: ref[AstNode], is_parameter: bool) returns bool
+    {
+        if (AstNode.flags_of(location) & (NodeFlagsAmbient | NodeFlagsThisNodeOrAnySubNodesHasError)) <> 0
+            return false
+        if is_parameter
+            return checker_no_unused_parameters
+        checker_no_unused_locals
+    }
+
+    ; reportUnusedVariable: the kind is read off the location above the binding
+    ; elements and patterns
+    procedure report_unused_variable(this, location: ref[AstNode], diagnostic_node: ref[AstNode], code: int)
+    {
+        var loc: ref[AstNode] location
+        repeat
+        {
+            let lk AstNode.kind_of(loc)
+            if (lk <> KindBindingElement) and (AstNode.is_binding_pattern(loc) = false)
+                break
+            let lp AstNode.parent_node_of(loc)
+            if lp = null
+                break
+            set loc: lp as ref[AstNode]
+        }
+        if Checker.unused_is_reported(loc, AstNode.kind_of(loc) = KindParameter)
+            this.error_on_node(diagnostic_node, code)
+    }
+
+    function is_referenced(symbol: ref[Symbol]?) returns bool
+    {
+        if symbol = null
+            return false
+        Symbol.reference_kinds_of(symbol as ref[Symbol]) <> 0
+    }
+
+    procedure check_unused_class_members(this, node: ref[AstNode])
+    {
+        let members AstNode.member_list_of(node)
+        if members = null
+            return
+        let ms members as ref[Array[ref[AstNode]?]]
+        let n ms.get_length() as int
+        var i 0
+        while i < n
+        {
+            let mo ms[i as size_t]
+            set i: i + 1
+            if mo = null
+                continue
+            let member mo as ref[AstNode]
+            let mk AstNode.kind_of(member)
+            if (mk = KindMethodDeclaration) or (mk = KindPropertyDeclaration) or (mk = KindGetAccessor) or (mk = KindSetAccessor)
+            {
+                if mk = KindSetAccessor
+                {
+                    let own AstNode.symbol_of(member)
+                    if own <> null
+                    {
+                        ; already reported on the getter
+                        if (Symbol.flags_of(own as ref[Symbol]) & SymbolFlagsGetAccessor) <> 0
+                            continue
+                    }
+                }
+                let symbol this.get_symbol_of_declaration(member)
+                if Checker.is_referenced(symbol)
+                    continue
+                var is_private false
+                if b.has_syntactic_modifier(member, ModifierFlagsPrivate)
+                    set is_private: true
+                let mn AstNode.name_of(member)
+                if mn <> null
+                {
+                    if AstNode.is_private_identifier(mn)
+                        set is_private: true
+                }
+                if is_private = false
+                    continue
+                if (AstNode.flags_of(member) & NodeFlagsAmbient) <> 0
+                    continue
+                if Checker.unused_is_reported(member, false)
+                    this.error_on_node(mn, DiagX_0_is_declared_but_its_value_is_never_read)
+                continue
+            }
+            if mk = KindConstructor
+            {
+                let params AstNode.parameters_of(member)
+                if params = null
+                    continue
+                let ps params as ref[Array[ref[AstNode]?]]
+                let pn ps.get_length() as int
+                var pi 0
+                while pi < pn
+                {
+                    let po ps[pi as size_t]
+                    set pi: pi + 1
+                    if po = null
+                        continue
+                    let parameter po as ref[AstNode]
+                    if Checker.is_referenced(AstNode.symbol_of(parameter))
+                        continue
+                    if b.has_syntactic_modifier(parameter, ModifierFlagsPrivate) = false
+                        continue
+                    if Checker.unused_is_reported(parameter, false)
+                        this.error_on_node(AstNode.name_of(parameter), DiagProperty_0_is_declared_but_its_value_is_never_read)
+                }
+            }
+            ; an index signature, a semicolon, a static block, a JS type alias: never
+            ; private
+        }
+    }
+
+    ; isIdentifierThatStartsWithUnderscore
+    function is_identifier_that_starts_with_underscore(node: ref[AstNode]?) returns bool
+    {
+        if AstNode.kind_of(node) <> KindIdentifier
+            return false
+        let text AstNode.identifier_text_of(node)
+        if (text.length as int) = 0
+            return false
+        text[0] = ("_" as char)
+    }
+
+    ; importClauseFromImported
+    function import_clause_from_imported(node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let k AstNode.kind_of(node)
+        if k = KindImportClause
+            return node
+        if k = KindNamespaceImport
+            return AstNode.parent_node_of(node)
+        AstNode.parent_node_of(AstNode.parent_node_of(node))
+    }
+
+    procedure check_unused_locals_and_parameters(this, node: ref[AstNode])
+    {
+        let locals AstNode.locals_of(node)
+        let variable_parents &Array[ref[AstNode]?]^host()
+        let import_clauses &Array[ref[AstNode]?]^host()
+        let imported &Array[ref[AstNode]?]^host()
+        let imported_clause &Array[ref[AstNode]?]^host()
+        let ln SymbolTable.length(locals)
+        var li 0
+        while li < ln
+        {
+            let lo SymbolTable.entry_symbol_at(locals, li)
+            set li: li + 1
+            if lo = null
+                continue
+            let local lo as ref[Symbol]
+            let reference_kinds Symbol.reference_kinds_of(local)
+            let flags Symbol.flags_of(local)
+            if (flags & SymbolFlagsTypeParameter) <> 0
+            {
+                if (flags & SymbolFlagsVariable) = 0
+                    continue
+                if (reference_kinds & SymbolFlagsVariable) <> 0
+                    continue
+            }
+            else
+            {
+                if reference_kinds <> 0
+                    continue
+                if Symbol.export_symbol_of(local) <> null
+                    continue
+                if (flags & SymbolFlagsModuleExports) <> 0
+                    continue
+            }
+            let dn Symbol.declaration_count(local)
+            var di 0
+            while di < dn
+            {
+                let dof Symbol.declaration_at(local, di)
+                set di: di + 1
+                if dof = null
+                    continue
+                let declaration dof as ref[AstNode]
+                let dk AstNode.kind_of(declaration)
+                if (dk = KindVariableDeclaration) or (dk = KindParameter) or (dk = KindBindingElement)
+                {
+                    let root Binder.get_root_declaration(declaration)
+                    let rp AstNode.parent_node_of(root)
+                    if rp <> null
+                    {
+                        if Checker.node_list_contains(variable_parents, rp as ref[AstNode]) = false
+                            variable_parents.add(rp)
+                    }
+                    continue
+                }
+                if (dk = KindImportClause) or (dk = KindImportSpecifier) or (dk = KindNamespaceImport)
+                {
+                    if Checker.is_identifier_that_starts_with_underscore(AstNode.name_of(declaration)) = false
+                    {
+                        let clause Checker.import_clause_from_imported(declaration)
+                        if clause <> null
+                        {
+                            if Checker.node_list_contains(import_clauses, clause as ref[AstNode]) = false
+                                import_clauses.add(clause)
+                            imported.add(declaration)
+                            imported_clause.add(clause)
+                        }
+                    }
+                    continue
+                }
+                if (dk <> KindTypeParameter) and (Binder.is_ambient_module(declaration) = false)
+                    this.report_unused_local(declaration)
+            }
+        }
+        let vn variable_parents.get_length() as int
+        var vi 0
+        while vi < vn
+        {
+            let vp variable_parents[vi as size_t]
+            set vi: vi + 1
+            if vp = null
+                continue
+            let declaration vp as ref[AstNode]
+            if AstNode.kind_of(declaration) = KindVariableDeclarationList
+                this.report_unused_variables(declaration)
+            else
+                this.report_unused_variable_declarations(AstNode.parameters_of(declaration))
+        }
+        let cn import_clauses.get_length() as int
+        var ci 0
+        while ci < cn
+        {
+            let co import_clauses[ci as size_t]
+            set ci: ci + 1
+            if co = null
+                continue
+            let clause co as ref[AstNode]
+            let unuseds &Array[ref[AstNode]?]^host()
+            let iln imported.get_length() as int
+            var ii 0
+            while ii < iln
+            {
+                let ic imported_clause[ii as size_t]
+                if ic <> null
+                {
+                    if (ic as ref[AstNode]) = clause
+                        unuseds.add(imported[ii as size_t])
+                }
+                set ii: ii + 1
+            }
+            this.report_unused_imports(clause, unuseds)
+        }
+    }
+
+    function node_list_contains(list: ref[Array[ref[AstNode]?]], node: ref[AstNode]) returns bool
+    {
+        let n list.get_length() as int
+        var i 0
+        while i < n
+        {
+            let e list[i as size_t]
+            if e <> null
+            {
+                if (e as ref[AstNode]) = node
+                    return true
+            }
+            set i: i + 1
+        }
+        false
+    }
+
+    ; reportUnusedLocal
+    procedure report_unused_local(this, node: ref[AstNode])
+    {
+        var code DiagX_0_is_declared_but_its_value_is_never_read
+        if Checker.is_type_declaration(node)
+            set code: DiagX_0_is_declared_but_never_used
+        if Checker.unused_is_reported(node, false) = false
+            return
+        let name AstNode.name_of(node)
+        if name <> null
+            this.error_on_node(name, code)
+        else
+            this.error_on_node(node, code)
+    }
+
+    ; reportUnusedVariables
+    procedure report_unused_variables(this, node: ref[AstNode])
+    {
+        let declarations AstNode.variable_declarations_of(node)
+        if AstNode.list_count(declarations) > 1
+        {
+            if this.every_unreferenced_variable_declaration(declarations)
+            {
+                this.report_unused_variable(node, node, DiagAll_variables_are_unused)
+                return
+            }
+        }
+        this.report_unused_variable_declarations(declarations)
+    }
+
+    ; reportUnusedBindingElements
+    procedure report_unused_binding_elements(this, node: ref[AstNode])
+    {
+        let declarations AstNode.elements_of(node)
+        if AstNode.list_count(declarations) > 1
+        {
+            if this.every_unreferenced_variable_declaration(declarations)
+            {
+                this.report_unused_variable(node, node, DiagAll_destructured_elements_are_unused)
+                return
+            }
+        }
+        this.report_unused_variable_declarations(declarations)
+    }
+
+    function every_unreferenced_variable_declaration(this, declarations: ref[Array[ref[AstNode]?]]?) returns bool
+    {
+        let n AstNode.list_count(declarations)
+        var i 0
+        while i < n
+        {
+            let d AstNode.child_in_list(declarations, i)
+            set i: i + 1
+            if d = null
+                continue
+            if this.is_unreferenced_variable_declaration(d as ref[AstNode]) = false
+                return false
+        }
+        true
+    }
+
+    ; reportUnusedVariableDeclarations
+    procedure report_unused_variable_declarations(this, declarations: ref[Array[ref[AstNode]?]]?)
+    {
+        let n AstNode.list_count(declarations)
+        var i 0
+        while i < n
+        {
+            let d AstNode.child_in_list(declarations, i)
+            set i: i + 1
+            if d = null
+                continue
+            let declaration d as ref[AstNode]
+            let name AstNode.name_of(declaration)
+            if name = null
+                continue
+            if b.is_parameter_property_declaration(declaration)
+                continue
+            if AstNode.is_this_parameter(declaration)
+                continue
+            let nm name as ref[AstNode]
+            if AstNode.is_binding_pattern(nm)
+                this.report_unused_binding_elements(nm)
+            else
+            {
+                if this.is_unreferenced_variable_declaration(declaration)
+                    this.report_unused_variable(declaration, nm, DiagX_0_is_declared_but_its_value_is_never_read)
+            }
+        }
+    }
+
+    ; isUnreferencedVariableDeclaration
+    function is_unreferenced_variable_declaration(this, node: ref[AstNode]) returns bool
+    {
+        let name AstNode.name_of(node)
+        if name = null
+            return true
+        let nm name as ref[AstNode]
+        if AstNode.is_binding_pattern(nm)
+            return this.every_unreferenced_variable_declaration(AstNode.elements_of(nm))
+        let symbol this.get_symbol_of_declaration(node)
+        if symbol <> null
+        {
+            if (Symbol.reference_kinds_of(symbol as ref[Symbol]) & SymbolFlagsVariable) <> 0
+                return false
+        }
+        let k AstNode.kind_of(node)
+        let parent AstNode.parent_node_of(node)
+        if k = KindBindingElement
+        {
+            if AstNode.kind_of(parent) = KindObjectBindingPattern
+            {
+                ; in `{ a, ...b }` `a` is used: it removes a property from `b`
+                let elements AstNode.elements_of(parent)
+                let en AstNode.list_count(elements)
+                if en > 0
+                {
+                    let last AstNode.child_in_list(elements, en - 1)
+                    if last <> null
+                    {
+                        if (last as ref[AstNode]) <> node
+                        {
+                            if AstNode.dot_dot_dot_token_of(last) <> null
+                                return false
+                        }
+                    }
+                }
+            }
+        }
+        var underscore_exempt false
+        if k = KindParameter
+            set underscore_exempt: true
+        if k = KindVariableDeclaration
+        {
+            let gk AstNode.kind_of(AstNode.parent_node_of(parent))
+            if (gk = KindForInStatement) or (gk = KindForOfStatement)
+                set underscore_exempt: true
+            if (Binder.combined_node_flags(node) & NodeFlagsUsing) <> 0
+                set underscore_exempt: true
+        }
+        if k = KindBindingElement
+        {
+            var shorthand false
+            if AstNode.kind_of(parent) = KindObjectBindingPattern
+            {
+                if AstNode.property_name_of(node) = null
+                    set shorthand: true
+            }
+            if shorthand = false
+                set underscore_exempt: true
+        }
+        if underscore_exempt
+        {
+            if Checker.is_identifier_that_starts_with_underscore(nm)
+                return false
+        }
+        true
+    }
+
+    ; reportUnusedImports
+    procedure report_unused_imports(this, node: ref[AstNode], unuseds: ref[Array[ref[AstNode]?]])
+    {
+        var declaration_count 0
+        if AstNode.name_of(node) <> null
+            set declaration_count: 1
+        let named_bindings AstNode.named_bindings_of(node)
+        if named_bindings <> null
+        {
+            if AstNode.kind_of(named_bindings) = KindNamespaceImport
+                set declaration_count: declaration_count + 1
+            else
+                set declaration_count: declaration_count + AstNode.list_count(AstNode.elements_of(named_bindings))
+        }
+        let un unuseds.get_length() as int
+        if declaration_count > 1
+        {
+            if declaration_count = un
+            {
+                if Checker.unused_is_reported(node, false)
+                    this.error_on_node(AstNode.parent_node_of(node), DiagAll_imports_in_import_declaration_are_unused)
+                return
+            }
+        }
+        var i 0
+        while i < un
+        {
+            let u unuseds[i as size_t]
+            set i: i + 1
+            if u <> null
+                this.report_unused_local(u as ref[AstNode])
+        }
+    }
+
+    ; checkUnusedInferTypeParameter
+    procedure check_unused_infer_type_parameter(this, node: ref[AstNode])
+    {
+        let type_parameter AstNode.infer_type_parameter_of(node)
+        if type_parameter = null
+            return
+        let tp type_parameter as ref[AstNode]
+        if this.is_unreferenced_type_parameter(tp)
+        {
+            if Checker.unused_is_reported(node, true)
+                this.error_on_node(AstNode.name_of(tp), DiagX_0_is_declared_but_never_used)
+        }
+    }
+
+    ; checkUnusedTypeParameters
+    procedure check_unused_type_parameters(this, node: ref[AstNode])
+    {
+        let symbol this.get_symbol_of_declaration(node)
+        if symbol <> null
+        {
+            if Checker.all_declarations_in_same_source_file(symbol as ref[Symbol]) = false
+                return
+        }
+        let list AstNode.type_parameters_of(node)
+        if list = null
+            return
+        let n AstNode.list_count(list)
+        var all_unreferenced: bool n > 1
+        var i 0
+        while all_unreferenced and (i < n)
+        {
+            let tp AstNode.child_in_list(list, i)
+            set i: i + 1
+            if tp <> null
+            {
+                if this.is_unreferenced_type_parameter(tp as ref[AstNode]) = false
+                    set all_unreferenced: false
+            }
+        }
+        if all_unreferenced
+        {
+            ; rangeOfTypeParameters: from the `<` to past the `>`
+            var lpos 0
+            var lend 0
+            if AstNode.list_range_of(node, list, &lpos, &lend) = false
+            {
+                this.record_unported("range-of-type-parameters", AstNode.kind_of(node))
+                return
+            }
+            var stop b.skip_trivia_at(lend) + 1
+            let text_length b.trivia.buffer.length as int
+            if stop > text_length
+                set stop: text_length
+            if Checker.unused_is_reported(node, true)
+                this.add_diagnostic_direct(lpos - 1, stop, DiagAll_type_parameters_are_unused)
+            return
+        }
+        set i: 0
+        while i < n
+        {
+            let tp AstNode.child_in_list(list, i)
+            set i: i + 1
+            if tp = null
+                continue
+            if this.is_unreferenced_type_parameter(tp as ref[AstNode])
+            {
+                if Checker.unused_is_reported(node, true)
+                    this.error_on_node(tp, DiagX_0_is_declared_but_never_used)
+            }
+        }
+    }
+
+    ; allDeclarationsInSameSourceFile
+    function all_declarations_in_same_source_file(symbol: ref[Symbol]) returns bool
+    {
+        let n Symbol.declaration_count(symbol)
+        if n <= 1
+            return true
+        let first Checker.source_file_of_node(Symbol.declaration_at(symbol, 0))
+        var i 1
+        while i < n
+        {
+            if Checker.source_file_of_node(Symbol.declaration_at(symbol, i)) <> first
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    ; isUnreferencedTypeParameter
+    function is_unreferenced_type_parameter(this, type_parameter: ref[AstNode]) returns bool
+    {
+        let symbol this.get_merged_symbol(AstNode.symbol_of(type_parameter))
+        if symbol <> null
+        {
+            if (Symbol.reference_kinds_of(symbol as ref[Symbol]) & SymbolFlagsTypeParameter) <> 0
+                return false
+        }
+        Checker.is_identifier_that_starts_with_underscore(AstNode.name_of(type_parameter)) = false
+    }
+
+    ; markPropertyAsReferenced — a private member read or called marks its symbol
+    procedure mark_property_as_referenced(this, prop: ref[Symbol], node_for_check_write_only: ref[AstNode]?, is_self_type_access: bool)
+    {
+        if (Symbol.flags_of(prop) & SymbolFlagsClassMember) = 0
+            return
+        let vd Symbol.value_declaration_of(prop)
+        if vd = null
+            return
+        let decl vd as ref[AstNode]
+        var is_private b.has_syntactic_modifier(decl, ModifierFlagsPrivate)
+        let dn AstNode.name_of(decl)
+        if dn <> null
+        {
+            if AstNode.is_private_identifier(dn)
+                set is_private: true
+        }
+        if is_private = false
+            return
+        if node_for_check_write_only <> null
+        {
+            if Checker.is_write_only_access(node_for_check_write_only as ref[AstNode])
+            {
+                if (Symbol.flags_of(prop) & SymbolFlagsSetAccessor) = 0
+                    return
+            }
+        }
+        if is_self_type_access
+        {
+            var a node_for_check_write_only
+            while a <> null
+            {
+                if AstNode.is_function_like_declaration(a)
+                    break
+                set a: AstNode.parent_node_of(a)
+            }
+            if a <> null
+            {
+                let asym AstNode.symbol_of(a)
+                if asym <> null
+                {
+                    if (asym as ref[Symbol]) = prop
+                        return
+                }
+            }
+        }
+        var target: ref[Symbol] prop
+        if (Symbol.check_flags_of(prop) & CheckFlagsInstantiated) <> 0
+        {
+            let t this.value_symbol_link_of(prop).target
+            if t <> null
+                set target: t as ref[Symbol]
+        }
+        Symbol.add_reference_kinds(target, SymbolFlagsAll)
+    }
+
+    ; isSelfTypeAccess
+    function is_self_type_access(this, name: ref[AstNode], parent: ref[Symbol]?) returns bool
+    {
+        if AstNode.kind_of(name) = KindThisKeyword
+            return true
+        if parent = null
+            return false
+        if Checker.is_entity_name_expression(name) = false
+            return false
+        let first Checker.get_first_identifier(name)
+        if first = null
+            return false
+        let resolved this.get_resolved_symbol(first as ref[AstNode])
+        (parent as ref[Symbol]) = resolved
+    }
+
     procedure check_unused_renamed_binding_elements(this)
     {
         let n renamed_binding_elements_in_types.get_length() as int
