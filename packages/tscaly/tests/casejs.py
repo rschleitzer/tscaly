@@ -515,7 +515,25 @@ def main():
             # the JS outputs, unless emitDeclarationOnly; the declaration outputs under
             # declaration/composite (slice 250) — each entry carries its KIND
             if cfg.get("emitdeclarationonly", "").lower() != "true":
+                input_paths = set(program_path(n) for n, _ in units)
+
+                def js_full_path(un):
+                    oname = output_name(un, cfg)
+                    if oname is None:
+                        return None
+                    js_out_dir = (cfg.get("outdir") or "").replace("\\", "/")
+                    if js_out_dir:
+                        rel = posixpath.relpath(posixpath.dirname(program_path(un)), common) if common else "."
+                        return posixpath.normpath(posixpath.join("/.src", js_out_dir, rel, os.path.basename(oname)))
+                    return posixpath.normpath(posixpath.join(posixpath.dirname(program_path(un)), os.path.basename(oname)))
+                js_targets = collections.Counter(js_full_path(un) for un, _ in to_emit)
                 for un, content in to_emit:
+                    js_full = js_full_path(un)
+                    # a JS output that would overwrite an input (TS5055: a `.js` unit
+                    # without outDir) or that several inputs would write (TS5056) is
+                    # not written (slice 257)
+                    if js_full is not None and (js_full in input_paths or js_targets[js_full] > 1):
+                        continue
                     plan["units"].append((program_path(un), un, output_path(un, cfg, common), "js"))
             if declaration_on(cfg):
                 unit_paths = set(program_path(n) for n, _ in units)
