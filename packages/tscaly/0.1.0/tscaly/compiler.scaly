@@ -1,0 +1,1301 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; compiler — internal/compiler's construction of a program for a case (slice 268):
+; fileloader.go and filesparser.go's file set — the root tasks, triple-slash path
+; references, the imports and module augmentations through the module resolver,
+; maxNodeModuleJsDepth — with processingDiagnostic.go's explaining diagnostics, and
+; program.go's verifyCompilerOptions.
+;
+; ★ The loader is sequential where the reference queues parse tasks on a work group:
+; a task's data (lowest depth, loaded, its subtasks) is per PATH, the reference's own
+; key, and collectFiles' depth-first order — a file after its subtasks — decides the
+; program's file order either way.
+;
+; ★ Not ported, and said by a stop: a lib reference directive naming no known lib
+; (the spelling suggestion). A KNOWN lib
+; reference adds nothing here: the lib chain is the checker's own. Package
+; deduplication (redirects by PackageId) and project references are not ported.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use tscaly.ast.*
+use tscaly.binder.Binder
+use tscaly.parser.Parser
+use tscaly.scanner.Scanner
+use tscaly.checker.Checker
+use tscaly.program.*
+use tscaly.emitter.EmitOptions
+use tscaly.emitter.Emitter
+use tscaly.emitter.Transformer
+use tscaly.modulespecifiers.SpecifierHost
+use tscaly.printer.SourceFileInfo
+use tscaly.TsOptionDecls.TsOptionDecls
+use tscaly.tsoptions.TsConfigParser
+
+; fileIncludeKind
+define FileIncludeKindImport: int 0
+define FileIncludeKindReferenceFile: int 1
+define FileIncludeKindTypeReferenceDirective: int 2
+define FileIncludeKindLibReferenceDirective: int 3
+define FileIncludeKindRootFile: int 4
+
+; where a program diagnostic lies: a program file's index, or one of these
+define ProgramDiagnosticGlobal: int -1
+define ProgramDiagnosticConfig: int -2
+
+define ProgramDiagnostic (file_index: int  pos: int  end: int  code: int)
+
+; a FileIncludeReason: a root, or a reference in a program file — an import
+; specifier (synthetic for tslib and the JSX runtime) or a triple-slash reference's
+; range
+define IncludeReason (kind: int  file_index: int  pos: int  end: int  synthetic: bool)
+
+; a parse task as its parent created it
+define LoaderEdge (path: Slice[char]  increase_depth: bool  elide_on_depth: bool  reason: ref[IncludeReason])
+
+; a parse task's data, per path
+define LoaderNode
+(
+    path: Slice[char]
+    lowest_depth: int
+    loaded: bool
+    subtasks_started: bool
+    edges: ref[Array[ref[LoaderEdge]]]
+    diagnostics: ref[Array[ProgramDiagnostic]]
+    file_index: int
+)
+
+define ProgramLoader
+(
+    host: ref[Page]
+    files: ref[ProgramFiles]
+    options: EmitOptions
+    checker: ref[Checker]
+    specifiers: ref[SpecifierHost]
+    nodes: ref[Array[ref[LoaderNode]]]
+    root_edges: ref[Array[ref[LoaderEdge]]]
+    max_depth: int
+    ; the program's files in the reference's order, and per table index whether
+    ; the program holds it and whether it was found searching node_modules
+    program_files: ref[Array[int]]
+    program_paths: ref[Array[Slice[char]]]
+    members: ref[Array[bool]]
+    from_node_modules_search: ref[Array[bool]]
+    diagnostics: ref[Array[ProgramDiagnostic]]
+    stop_tag: Slice[char]
+)
+{
+    function create(host: ref[Page], files: ref[ProgramFiles], options: EmitOptions, checker: ref[Checker]) returns ref[ProgramLoader]
+    {
+        let members &Array[bool]^host()
+        let searched &Array[bool]^host()
+        var i 0
+        while i < files.count()
+        {
+            members.add(false)
+            searched.add(false)
+            set i: i + 1
+        }
+        var depth 0
+        if options.max_node_module_js_depth > 0
+            set depth: options.max_node_module_js_depth
+        let sh SpecifierHost.create(host, checker, files, options)
+        &ProgramLoader^host(host, files, options, checker, sh, &Array[ref[LoaderNode]]^host(), &Array[ref[LoaderEdge]]^host(), depth, &Array[int]^host(), &Array[Slice[char]]^host(), members, searched, &Array[ProgramDiagnostic]^host(), Slice[char]())
+    }
+
+    procedure stop(this, tag: Slice[char])
+    {
+        if (stop_tag.length as int) = 0
+            set this.stop_tag: tag
+    }
+
+    ; processAllProgramFiles over the harness's root file names (lib files are the
+    ; checker's lib chain)
+    procedure load(this, roots: ref[Array[Slice[char]]])
+    {
+        var r 0
+        while r < (roots.get_length() as int)
+        {
+            this.add_root_file_task(roots[r as size_t])
+            set r: r + 1
+        }
+        if roots.get_length() > 0
+            this.add_automatic_type_directive_tasks()
+        this.start(root_edges, 0)
+        let seen &Array[ref[LoaderNode]]^host()
+        this.collect_files(root_edges, seen)
+        var k 0
+        while k < (program_files.get_length() as int)
+        {
+            members.put(program_files[k as size_t] as size_t, true)
+            set k: k + 1
+        }
+    }
+
+    function node_for(this, path: Slice[char]) returns ref[LoaderNode]
+    {
+        var i 0
+        while i < (nodes.get_length() as int)
+        {
+            let n nodes[i as size_t]
+            if n.path.equals(path)
+                return n
+            set i: i + 1
+        }
+        let made &LoaderNode^host(slice_copy_on(host, path), 1000000000, false, false, &Array[ref[LoaderEdge]]^host(), &Array[ProgramDiagnostic]^host(), 0 - 1)
+        nodes.add(made)
+        made
+    }
+
+    ; addRootFileTask
+    procedure add_root_file_task(this, file_name: Slice[char])
+    {
+        let cwd options.get_current_directory()
+        let abs_path get_normalized_absolute_path(host, file_name, cwd)
+        var containing cwd
+        if (options.config_file_path.length as int) > 0
+            set containing: get_normalized_absolute_path(host, options.config_file_path, cwd)
+        let reason &IncludeReason^host(FileIncludeKindRootFile, 0 - 1, 0, 0, false)
+        var resolved Slice[char]()
+        let code this.source_file_from_reference(abs_path, containing, false, &resolved)
+        var path resolved
+        if code <> 0
+            set path: abs_path
+        let edge &LoaderEdge^host(path, false, false, reason)
+        root_edges.add(edge)
+        if code <> 0
+        {
+            let node this.node_for(path)
+            this.add_explaining_diagnostic(node.diagnostics, reason, code)
+        }
+    }
+
+    ; getSourceFileFromReference: the file a reference names, or a code
+    procedure source_file_from_reference(this, file_name: Slice[char], containing_file: Slice[char], is_referenced: bool, out_path: ref[Slice[char]]) returns int
+    {
+        if ProgramLoader.has_extension(host, file_name)
+        {
+            if this.is_supported_extension(file_name) = false
+            {
+                if ProgramLoader.has_js_file_extension(file_name)
+                    return DiagFile_0_is_a_JavaScript_file_Did_you_mean_to_enable_the_allowJs_option
+                return DiagFile_0_has_an_unsupported_extension_The_only_supported_extensions_are_1
+            }
+            if files.file_exists(file_name) = false
+                return DiagFile_0_not_found
+            if is_referenced and containing_file.equals(file_name)
+                return DiagA_file_cannot_have_a_reference_to_itself
+            set out_path.data: file_name.data
+            set out_path.length: file_name.length
+            return 0
+        }
+        let candidates &Array[Slice[char]]^host()
+        candidates.add(".ts")
+        candidates.add(".tsx")
+        candidates.add(".d.ts")
+        var i 0
+        while i < (candidates.get_length() as int)
+        {
+            let candidate join_slices(host, file_name, candidates[i as size_t])
+            if files.file_exists(candidate)
+            {
+                set out_path.data: candidate.data
+                set out_path.length: candidate.length
+                return 0
+            }
+            set i: i + 1
+        }
+        DiagCould_not_resolve_the_path_0_with_the_extensions_Colon_1
+    }
+
+    ; tspath.HasExtension: a dot in the base file name
+    function has_extension(host: ref[Page], path: Slice[char]) returns bool
+        slice_contains_byte(get_base_file_name(host, path), ("." as char) as int)
+
+    function has_js_file_extension(path: Slice[char]) returns bool
+        path.ends_with(".js") or path.ends_with(".jsx") or path.ends_with(".mjs") or path.ends_with(".cjs")
+
+    ; isSupportedExtension over GetSupportedExtensionsWithJsonIfResolveJsonModule
+    function is_supported_extension(this, path: Slice[char]) returns bool
+    {
+        if path.ends_with(".ts") or path.ends_with(".tsx") or path.ends_with(".cts") or path.ends_with(".mts")
+            return true
+        if EmitOptions.on(options.allow_js)
+        {
+            if ProgramLoader.has_js_file_extension(path)
+                return true
+        }
+        if options.get_resolve_json_module()
+        {
+            if path.ends_with(".json")
+                return true
+        }
+        false
+    }
+
+    ; createDiagnosticExplainingFile: at the reference when the reason is a
+    ; non-synthetic reference in a file, else a compiler diagnostic
+    procedure add_explaining_diagnostic(this, out: ref[Array[ProgramDiagnostic]], reason: ref[IncludeReason], code: int)
+    {
+        if (reason.kind <= FileIncludeKindLibReferenceDirective) and (reason.synthetic = false)
+            out.add(ProgramDiagnostic(reason.file_index, reason.pos, reason.end, code))
+        else
+            out.add(ProgramDiagnostic(ProgramDiagnosticGlobal, 0, 0, code))
+    }
+
+    ; filesParser.start
+    procedure start(this, edges: ref[Array[ref[LoaderEdge]]], depth: int)
+    {
+        var i 0
+        while i < (edges.get_length() as int)
+        {
+            let edge edges[i as size_t]
+            set i: i + 1
+            let node this.node_for(edge.path)
+            var start_subtasks false
+            var current_depth depth
+            if edge.increase_depth
+                set current_depth: depth + 1
+            if current_depth < node.lowest_depth
+            {
+                set node.lowest_depth: current_depth
+                set start_subtasks: true
+            }
+            if edge.elide_on_depth and (current_depth > max_depth)
+                continue
+            if node.loaded = false
+                this.load_node(node, edge.reason)
+            if (node.subtasks_started = false) and start_subtasks
+            {
+                set node.subtasks_started: true
+                this.start(node.edges, node.lowest_depth)
+            }
+        }
+    }
+
+    ; parseTask.load
+    procedure load_node(this, node: ref[LoaderNode], reason: ref[IncludeReason])
+    {
+        set node.loaded: true
+        let path node.path
+        if ProgramLoader.has_extension(host, path)
+        {
+            if this.is_supported_extension(path) = false
+            {
+                if ProgramLoader.has_js_file_extension(path)
+                    this.add_explaining_diagnostic(node.diagnostics, reason, DiagFile_0_is_a_JavaScript_file_Did_you_mean_to_enable_the_allowJs_option)
+                else
+                    this.add_explaining_diagnostic(node.diagnostics, reason, DiagFile_0_has_an_unsupported_extension_The_only_supported_extensions_are_1)
+                return
+            }
+        }
+        let index files.index_of_path(path)
+        if index < 0
+            return
+        if files.file_at(index) = null
+            return
+        set node.file_index: index
+        let parser files.parser_at(index)
+        if (EmitOptions.on(options.no_resolve) = false) and (parser <> null)
+        {
+            let pp parser as ref[Parser]
+            var ri 0
+            while ri < Parser.reference_directive_count(pp)
+            {
+                var kind 0
+                var rs 0
+                var re 0
+                Parser.reference_directive_at(pp, ri, &kind, &rs, &re)
+                set ri: ri + 1
+                if kind = 0
+                    this.resolve_tripleslash_path_reference(node, index, rs, re)
+                if kind = 1
+                    this.resolve_type_reference_directive(node, index, rs, re)
+            }
+        }
+        if (options.no_lib <> TristateTrue) and (parser <> null)
+        {
+            let pp parser as ref[Parser]
+            var li 0
+            while li < Parser.reference_directive_count(pp)
+            {
+                var kind 0
+                var rs 0
+                var re 0
+                Parser.reference_directive_at(pp, li, &kind, &rs, &re)
+                set li: li + 1
+                if kind = 2
+                {
+                    let text files.text_at(index)
+                    let name text.subslice(rs as size_t, re as size_t)
+                    if ProgramLoader.is_known_lib(host, name) = false
+                        this.stop("unknown-lib-reference")
+                }
+            }
+        }
+        this.resolve_imports_and_module_augmentations(node, index)
+    }
+
+    function lower_ascii(host: ref[Page], s: Slice[char]) returns Slice[char]
+    {
+        let sb StringBuilder^host()
+        var i 0
+        while i < (s.length as int)
+        {
+            var c s[i as size_t] as int
+            if (c >= 65) and (c <= 90)
+                set c: c + 32
+            sb.append(c as char)
+            set i: i + 1
+        }
+        let text sb.to_string()
+        Slice[char](text.get_length() as int, text.get_buffer() as pointer[char])
+    }
+
+    ; tsoptions.GetLibFileName: a lib name or a lib file name
+    function is_known_lib(host: ref[Page], name: Slice[char]) returns bool
+    {
+        let lower ProgramLoader.lower_ascii(host, name)
+        let lib_index TsOptionDecls.index_of("lib")
+        if lib_index < 0
+            return false
+        if (TsOptionDecls.enum_value(lib_index, lower).length as int) > 0
+            return true
+        if lower.starts_with("lib.") and lower.ends_with(".d.ts")
+        {
+            let inner lower.subslice(4, (lower.length as int - 5) as size_t)
+            return (TsOptionDecls.enum_value(lib_index, inner).length as int) > 0
+        }
+        false
+    }
+
+    ; compilerOptions.GetEffectiveTypeRoots: the option, else node_modules/@types in
+    ; every ancestor of the config's (or the current) directory
+    procedure effective_type_roots(this, out_from_config: ref[bool]) returns ref[Array[Slice[char]]]
+    {
+        let roots &Array[Slice[char]]^host()
+        let cwd options.get_current_directory()
+        if (options.type_roots.length as int) > 0
+        {
+            set out_from_config: true
+            var start 0
+            var i 0
+            let text options.type_roots
+            while i <= (text.length as int)
+            {
+                var at_end i = (text.length as int)
+                var is_comma false
+                if at_end = false
+                    set is_comma: (text[i as size_t] as int) = ("," as char) as int
+                if at_end or is_comma
+                {
+                    if i > start
+                        roots.add(get_normalized_absolute_path(host, text.subslice(start as size_t, i as size_t), cwd))
+                    set start: i + 1
+                }
+                set i: i + 1
+            }
+            return roots
+        }
+        set out_from_config: false
+        var base cwd
+        if (options.config_file_path.length as int) > 0
+            set base: get_directory_path(host, get_normalized_absolute_path(host, options.config_file_path, cwd))
+        var dir base
+        repeat
+        {
+            roots.add(combine_paths(host, combine_paths(host, dir, "node_modules"), "@types"))
+            let parent get_directory_path(host, dir)
+            if parent.equals(dir)
+                break
+            set dir: parent
+        }
+        roots
+    }
+
+    ; resolveTypeReferenceDirectives, one directive
+    procedure resolve_type_reference_directive(this, node: ref[LoaderNode], index: int, start: int, stop: int)
+    {
+        let text files.text_at(index)
+        let type_name text.subslice(start as size_t, stop as size_t)
+        var from_config false
+        let type_roots this.effective_type_roots(&from_config)
+        let resolver ModuleResolver.create(host, files, options.get_module_resolution_kind(), false, checker.usage_mode_of(null, files.format_at(index)), EmitOptions.on(options.allow_js), options.resolve_package_json_exports, options.resolve_package_json_imports, options.out_dir, options.project_root_directory(host))
+        let r resolver.resolve_type_reference_directive(type_name, files.path_at(index), type_roots, from_config, false)
+        if (resolver.stop_tag.length as int) > 0
+        {
+            this.stop(resolver.stop_tag)
+            return
+        }
+        let reason &IncludeReason^host(FileIncludeKindTypeReferenceDirective, index, start, stop, false)
+        if r < 0
+        {
+            node.diagnostics.add(ProgramDiagnostic(index, start, stop, DiagCannot_find_type_definition_file_for_0))
+            return
+        }
+        let resolved files.path_at(r)
+        node.edges.add(&LoaderEdge^host(slice_copy_on(host, resolved), slice_contains_node_modules(resolved), false, reason))
+    }
+
+    ; addAutomaticTypeDirectiveTasks with loadAutomaticTypeDirectives: the `types`
+    ; option's names, resolved from `__inferred type names__.ts`
+    procedure add_automatic_type_directive_tasks(this)
+    {
+        let text options.types
+        if (text.length as int) = 0
+            return
+        let cwd options.get_current_directory()
+        var directory cwd
+        if (options.config_file_path.length as int) > 0
+            set directory: get_directory_path(host, get_normalized_absolute_path(host, options.config_file_path, cwd))
+        let containing combine_paths(host, directory, "__inferred type names__.ts")
+        var from_config false
+        let type_roots this.effective_type_roots(&from_config)
+        let node this.node_for(containing)
+        set node.loaded: true
+        let reason &IncludeReason^host(FileIncludeKindRootFile, 0 - 1, 0, 0, false)
+        root_edges.add(&LoaderEdge^host(containing, false, false, reason))
+        var start 0
+        var i 0
+        while i <= (text.length as int)
+        {
+            var at_end i = (text.length as int)
+            var is_comma false
+            if at_end = false
+                set is_comma: (text[i as size_t] as int) = ("," as char) as int
+            if at_end or is_comma
+            {
+                var s start
+                var e i
+                while (s < e) and ((text[s as size_t] as int) = (" " as char) as int)
+                    set s: s + 1
+                while (e > s) and ((text[(e - 1) as size_t] as int) = (" " as char) as int)
+                    set e: e - 1
+                if e > s
+                {
+                    let type_name text.subslice(s as size_t, e as size_t)
+                    if type_name.equals("*")
+                    {
+                        let matches this.wildcard_type_directive_names(type_roots)
+                        var m 0
+                        while m < (matches.get_length() as int)
+                        {
+                            this.add_automatic_type_directive(node, matches[m as size_t], containing, type_roots, from_config, reason)
+                            set m: m + 1
+                        }
+                    }
+                    else
+                        this.add_automatic_type_directive(node, type_name, containing, type_roots, from_config, reason)
+                }
+                set start: i + 1
+            }
+            set i: i + 1
+        }
+    }
+
+    ; GetAutomaticTypeDirectiveNames' walk of the type roots: each root's
+    ; directories, unless their package.json says `"typings": null` or the name
+    ; starts with a dot
+    procedure wildcard_type_directive_names(this, type_roots: ref[Array[Slice[char]]]) returns ref[Array[Slice[char]]]
+    {
+        let result &Array[Slice[char]]^host()
+        var r 0
+        while r < (type_roots.get_length() as int)
+        {
+            let root ensure_trailing_directory_separator(host, type_roots[r as size_t])
+            set r: r + 1
+            let names &Array[Slice[char]]^host()
+            var f 0
+            while f < files.count()
+            {
+                let path files.path_at(f)
+                set f: f + 1
+                if (path.length <= root.length) or (path.starts_with(root) = false)
+                    continue
+                let rest path.slice_from(root.length)
+                var slash 0 - 1
+                var k 0
+                while k < (rest.length as int)
+                {
+                    if (rest[k as size_t] as int) = ("/" as char) as int
+                    {
+                        set slash: k
+                        break
+                    }
+                    set k: k + 1
+                }
+                if slash <= 0
+                    continue
+                let dir_name rest.subslice(0, slash as size_t)
+                var known false
+                var n 0
+                while n < (names.get_length() as int)
+                {
+                    let existing names[n as size_t]
+                    if existing.equals(dir_name)
+                    {
+                        set known: true
+                        break
+                    }
+                    set n: n + 1
+                }
+                if known = false
+                    names.add(dir_name)
+            }
+            ; the directory listing's order
+            var a 0
+            while a < (names.get_length() as int)
+            {
+                var b a + 1
+                while b < (names.get_length() as int)
+                {
+                    let x names[a as size_t]
+                    let y names[b as size_t]
+                    if TsConfigParser.compare_bytes(y, x) < 0
+                    {
+                        names.put(a as size_t, y)
+                        names.put(b as size_t, x)
+                    }
+                    set b: b + 1
+                }
+                set a: a + 1
+            }
+            var q 0
+            while q < (names.get_length() as int)
+            {
+                let dir_name names[q as size_t]
+                set q: q + 1
+                if (dir_name[0] as int) = ("." as char) as int
+                    continue
+                let package_json combine_paths(host, combine_paths(host, root, dir_name), "package.json")
+                let pj_index files.index_of_path(package_json)
+                if pj_index >= 0
+                {
+                    let json JsonParser.parse(host, files.text_at(pj_index))
+                    if json <> null
+                    {
+                        let typings (json as ref[JsonValue]).get("typings")
+                        if typings <> null
+                        {
+                            if (typings as ref[JsonValue]).kind = JsonKindNull
+                                continue
+                        }
+                    }
+                }
+                result.add(dir_name)
+            }
+        }
+        result
+    }
+
+    procedure add_automatic_type_directive(this, node: ref[LoaderNode], type_name: Slice[char], containing: Slice[char], type_roots: ref[Array[Slice[char]]], from_config: bool, reason: ref[IncludeReason])
+    {
+        let resolver ModuleResolver.create(host, files, options.get_module_resolution_kind(), false, ModuleKindNone, EmitOptions.on(options.allow_js), options.resolve_package_json_exports, options.resolve_package_json_imports, options.out_dir, options.project_root_directory(host))
+        let r resolver.resolve_type_reference_directive(type_name, containing, type_roots, from_config, true)
+        if (resolver.stop_tag.length as int) > 0
+        {
+            this.stop(resolver.stop_tag)
+            return
+        }
+        if r < 0
+            node.diagnostics.add(ProgramDiagnostic(ProgramDiagnosticGlobal, 0, 0, DiagCannot_find_type_definition_file_for_0))
+        else
+        {
+            let resolved files.path_at(r)
+            node.edges.add(&LoaderEdge^host(slice_copy_on(host, resolved), slice_contains_node_modules(resolved), false, reason))
+        }
+    }
+
+    ; resolveTripleslashPathReference
+    procedure resolve_tripleslash_path_reference(this, node: ref[LoaderNode], index: int, start: int, stop: int)
+    {
+        let containing files.path_at(index)
+        let text files.text_at(index)
+        let module_name text.subslice(start as size_t, stop as size_t)
+        var referenced module_name
+        if is_rooted_disk_path(module_name) = false
+            set referenced: combine_paths(host, get_directory_path(host, containing), module_name)
+        let normalized get_normalized_absolute_path(host, referenced, Slice[char]())
+        let reason &IncludeReason^host(FileIncludeKindReferenceFile, index, start, stop, false)
+        var resolved Slice[char]()
+        let code this.source_file_from_reference(normalized, containing, true, &resolved)
+        if code <> 0
+        {
+            this.add_explaining_diagnostic(node.diagnostics, reason, code)
+            return
+        }
+        node.edges.add(&LoaderEdge^host(resolved, false, false, reason))
+    }
+
+    ; resolveImportsAndModuleAugmentations
+    procedure resolve_imports_and_module_augmentations(this, node: ref[LoaderNode], index: int)
+    {
+        let file files.file_at(index) as ref[AstNode]
+        let path files.path_at(index)
+        let binder files.binder_at(index)
+        var is_external_module false
+        var is_declaration_file false
+        if binder <> null
+        {
+            set is_external_module: (binder as ref[Binder]).is_external_module_of()
+            set is_declaration_file: (binder as ref[Binder]).is_declaration_file_of()
+        }
+        let is_js ProgramLoader.has_js_file_extension(path)
+        checker.select_program_file(index, files.format_at(index))
+        let names &Array[ref[AstNode]?]^host()
+        let synthetic_names &Array[Slice[char]]^host()
+        ; the synthetic tslib import
+        if is_js or ((is_declaration_file = false) and (EmitOptions.on(options.isolated_modules) or EmitOptions.on(options.verbatim_module_syntax) or is_external_module))
+        {
+            if EmitOptions.on(options.import_helpers)
+                synthetic_names.add("tslib")
+        }
+        if path.ends_with(".jsx") or path.ends_with(".tsx")
+        {
+            let jsx_import checker.get_jsx_runtime_import_specifier(file)
+            if (jsx_import.length as int) > 0
+                synthetic_names.add(jsx_import)
+        }
+        var si 0
+        while si < (synthetic_names.get_length() as int)
+        {
+            this.resolve_one(node, index, synthetic_names[si as size_t], null, 0 - 1, 0)
+            set si: si + 1
+        }
+        let imports specifiers.imports_of(file)
+        let import_count imports.get_length() as int
+        var ii 0
+        while ii < import_count
+        {
+            let entry imports[ii as size_t]
+            if entry <> null
+                names.add(entry)
+            else
+                names.add(null)
+            set ii: ii + 1
+        }
+        this.collect_module_augmentations(file, is_external_module, is_declaration_file, names)
+        var n 0
+        while n < (names.get_length() as int)
+        {
+            let entry names[n as size_t]
+            if entry <> null
+            {
+                let en entry as ref[AstNode]
+                this.resolve_one(node, index, AstNode.literal_text_of(en), en, n, import_count)
+            }
+            set n: n + 1
+        }
+    }
+
+    ; the module augmentations of collectModuleReferences (string-literal names only)
+    procedure collect_module_augmentations(this, file: ref[AstNode], is_external_module: bool, is_declaration_file: bool, out: ref[Array[ref[AstNode]?]])
+    {
+        let statements AstNode.statements_of(file)
+        var i 0
+        while i < AstNode.list_count(statements)
+        {
+            let st AstNode.child_in_list(statements, i)
+            set i: i + 1
+            if st <> null
+                this.collect_augmentations_of(st as ref[AstNode], false, is_external_module, is_declaration_file, out)
+        }
+    }
+
+    procedure collect_augmentations_of(this, node: ref[AstNode], in_ambient_module: bool, is_external_module: bool, is_declaration_file: bool, out: ref[Array[ref[AstNode]?]])
+    {
+        if AstNode.kind_of(node) <> KindModuleDeclaration
+            return
+        if Binder.is_ambient_module(node) = false
+            return
+        var eligible in_ambient_module or is_declaration_file
+        if Transformer.has_syntactic_modifier(node, ModifierFlagsAmbient)
+            set eligible: true
+        if eligible = false
+            return
+        let name AstNode.name_of(node)
+        let name_text AstNode.literal_text_of(name)
+        if is_external_module or (in_ambient_module and (is_external_module_name_relative(name_text) = false))
+        {
+            if AstNode.kind_of(name) = KindStringLiteral
+                out.add(name)
+            return
+        }
+        if in_ambient_module
+            return
+        let body AstNode.body_of(node)
+        if body = null
+            return
+        let statements AstNode.statements_of(body)
+        var i 0
+        while i < AstNode.list_count(statements)
+        {
+            let st AstNode.child_in_list(statements, i)
+            set i: i + 1
+            if st <> null
+                this.collect_augmentations_of(st as ref[AstNode], true, is_external_module, is_declaration_file, out)
+        }
+    }
+
+    ; one module name of resolveImportsAndModuleAugmentations; `entry` null for a
+    ; synthetic import, `import_count` the length of file.Imports()
+    procedure resolve_one(this, node: ref[LoaderNode], index: int, module_name: Slice[char], entry: ref[AstNode]?, import_index: int, import_count: int)
+    {
+        if (module_name.length as int) = 0
+            return
+        let path files.path_at(index)
+        var mode ModuleKindNone
+        if entry <> null
+            set mode: checker.usage_mode_of(entry, files.format_at(index))
+        else
+            set mode: checker.usage_mode_of(null, files.format_at(index))
+        let resolver ModuleResolver.create(host, files, options.get_module_resolution_kind(), options.get_resolve_json_module(), mode, EmitOptions.on(options.allow_js), options.resolve_package_json_exports, options.resolve_package_json_imports, options.out_dir, options.project_root_directory(host))
+        let r resolver.resolve(module_name, path)
+        if (resolver.stop_tag.length as int) > 0
+        {
+            this.stop(resolver.stop_tag)
+            return
+        }
+        if r < 0
+            return
+        var resolved_path files.path_at(r)
+        var found resolver.found_path
+        if (found.length as int) = 0
+            set found: resolved_path
+        let is_external_library_import slice_contains_node_modules(found)
+        ; createResolvedModuleHandlingSymlink: the realpath only inside node_modules
+        if is_external_library_import = false
+            set resolved_path: found
+        var is_js true
+        if resolved_path.ends_with(".ts") or resolved_path.ends_with(".tsx") or resolved_path.ends_with(".cts") or resolved_path.ends_with(".mts") or resolved_path.ends_with(".json")
+            set is_js: false
+        let is_js_from_node_modules is_external_library_import and is_js and slice_contains_node_modules(resolved_path)
+        if ProgramLoader.resolution_diagnostic(options, Checker.resolution_extension_of(resolved_path), path) <> 0
+            return
+        if EmitOptions.on(options.no_resolve)
+            return
+        if is_js and (EmitOptions.on(options.allow_js) = false)
+            return
+        if entry <> null
+        {
+            let en entry as ref[AstNode]
+            if import_index < import_count
+            {
+                if (Parser.is_in_js_file(en) = false) and ((AstNode.flags_of(en) & NodeFlagsJSDoc) <> 0)
+                    return
+            }
+        }
+        var reason &IncludeReason^host(FileIncludeKindImport, index, 0, 0, true)
+        if entry <> null
+        {
+            let en entry as ref[AstNode]
+            let b files.binder_at(index)
+            var s 0
+            var e 0
+            if b <> null
+            {
+                if (b as ref[Binder]).error_range_for_node(files.parser_at(index), en, &s, &e) = false
+                {
+                    set s: AstNode.pos_of(en)
+                    set e: AstNode.end_of(en)
+                }
+            }
+            set reason: &IncludeReason^host(FileIncludeKindImport, index, s, e, false)
+        }
+        node.edges.add(&LoaderEdge^host(slice_copy_on(host, resolved_path), is_external_library_import, is_js_from_node_modules, reason))
+    }
+
+    ; module.GetResolutionDiagnostic over the options
+    function resolution_diagnostic(options: EmitOptions, ext: Slice[char], importing_path: Slice[char]) returns int
+    {
+        if ext.equals(".tsx") or ext.equals(".jsx")
+        {
+            if options.jsx = JsxEmitNone
+                return DiagModule_0_was_resolved_to_1_but_jsx_is_not_set
+        }
+        if ext.equals(".ts") or ext.equals(".tsx") or ext.equals(".d.ts") or ext.equals(".mts") or ext.equals(".d.mts") or ext.equals(".cts") or ext.equals(".d.cts")
+            return 0
+        if ext.equals(".js") or ext.equals(".jsx") or ext.equals(".mjs") or ext.equals(".cjs")
+        {
+            if EmitOptions.on(options.allow_js) or (options.no_implicit_any_explicit() = false)
+                return 0
+            return DiagCould_not_find_a_declaration_file_for_module_0_1_implicitly_has_an_any_type
+        }
+        if ext.equals(".json")
+        {
+            if options.get_resolve_json_module()
+                return 0
+            return DiagModule_0_was_resolved_to_1_but_resolveJsonModule_is_not_used
+        }
+        if is_declaration_file_name_of(importing_path) or EmitOptions.on(options.allow_arbitrary_extensions)
+            return 0
+        DiagModule_0_was_resolved_to_1_but_allowArbitraryExtensions_is_not_set
+    }
+
+    ; filesParser.getProcessedFiles' collectFiles
+    procedure collect_files(this, edges: ref[Array[ref[LoaderEdge]]], seen: ref[Array[ref[LoaderNode]]])
+    {
+        var i 0
+        while i < (edges.get_length() as int)
+        {
+            let edge edges[i as size_t]
+            set i: i + 1
+            let node this.node_for(edge.path)
+            if node.loaded = false
+                continue
+            var was_seen false
+            var s 0
+            while s < (seen.get_length() as int)
+            {
+                if (seen[s as size_t] as ref[LoaderNode]) = node
+                {
+                    set was_seen: true
+                    break
+                }
+                set s: s + 1
+            }
+            if was_seen
+                continue
+            seen.add(node)
+            this.collect_files(node.edges, seen)
+            var d 0
+            while d < (node.diagnostics.get_length() as int)
+            {
+                diagnostics.add(node.diagnostics[d as size_t])
+                set d: d + 1
+            }
+            if node.file_index < 0
+                continue
+            program_files.add(node.file_index)
+            program_paths.add(node.path)
+            if node.lowest_depth > 0
+                from_node_modules_search.put(node.file_index as size_t, true)
+        }
+    }
+
+    function holds(this, index: int) returns bool
+        members[index as size_t]
+
+    ; sourceFileMayBeEmitted (forceDtsEmit false, no project references)
+    function source_file_may_be_emitted(this, index: int) returns bool
+    {
+        let path files.path_at(index)
+        if is_declaration_file_name_of(path)
+            return false
+        if from_node_modules_search[index as size_t]
+            return false
+        if path.ends_with(".json") = false
+            return true
+        if (options.out_dir.length as int) = 0
+            return false
+        if ((options.root_dir.length as int) > 0) or ((options.config_file_path.length as int) > 0)
+        {
+            let cwd options.get_current_directory()
+            let common get_normalized_absolute_path(host, options.project_root_directory(host), cwd)
+            let out_dir get_normalized_absolute_path(host, options.out_dir, cwd)
+            let output Emitter.source_file_path_in_new_dir(host, path, out_dir, cwd, common)
+            if output.equals(path)
+                return false
+        }
+        true
+    }
+
+    ; ── program.go verifyCompilerOptions ─────────────────────────────────────
+
+    procedure verify_compiler_options(this)
+    {
+        let o options
+        let config_path files.config_path
+        let config_text files.config_text
+        var config_file: ref[AstNode]? null
+        if (config_path.length as int) > 0
+        {
+            let name String^host(config_path.data as pointer[const_char], config_path.length)
+            let source String^host(config_text.data as pointer[const_char], config_text.length)
+            var unported 0 - 1
+            var tag: Slice[char] ""
+            var detail 0
+            let p Parser.parse_ex(host, name, source, ScriptKindJSON, &unported, &tag, &detail)
+            if unported >= 0
+            {
+                this.stop("tsconfig-json-parse")
+                return
+            }
+            set config_file: Parser.source_file_of(p)
+        }
+        let verifier &OptionVerifier^host(host, this, config_file, config_text)
+
+        ; removed in TS7 (the harness skips a configuration carrying the others)
+        if o.downlevel_iteration <> TristateUnknown
+            verifier.for_option(true, "downlevelIteration", "", DiagOption_0_has_been_removed_Please_remove_it_from_your_configuration)
+
+        if (o.strict_property_initialization = TristateTrue) and (o.strict_option_on(o.strict_null_checks) = false)
+            verifier.for_option(true, "strictPropertyInitialization", "strictNullChecks", DiagOption_0_cannot_be_specified_without_specifying_option_1)
+        if (o.exact_optional_property_types = TristateTrue) and (o.strict_option_on(o.strict_null_checks) = false)
+            verifier.for_option(true, "exactOptionalPropertyTypes", "strictNullChecks", DiagOption_0_cannot_be_specified_without_specifying_option_1)
+
+        let emit_declarations EmitOptions.on(o.declaration) or EmitOptions.on(o.composite)
+        if EmitOptions.on(o.isolated_declarations)
+        {
+            if EmitOptions.on(o.allow_js)
+                verifier.for_option(true, "allowJs", "isolatedDeclarations", DiagOption_0_cannot_be_specified_with_option_1)
+            if emit_declarations = false
+                verifier.for_option(true, "isolatedDeclarations", "declaration", DiagOption_0_cannot_be_specified_without_specifying_option_1_or_option_2)
+        }
+        if EmitOptions.on(o.inline_source_map)
+        {
+            if EmitOptions.on(o.source_map)
+                verifier.for_option(true, "sourceMap", "inlineSourceMap", DiagOption_0_cannot_be_specified_with_option_1)
+            if (o.map_root.length as int) > 0
+                verifier.for_option(true, "mapRoot", "inlineSourceMap", DiagOption_0_cannot_be_specified_with_option_1)
+        }
+        if EmitOptions.on(o.composite)
+        {
+            if o.declaration = TristateFalse
+                verifier.for_option(true, "declaration", "", DiagComposite_projects_may_not_disable_declaration_emit)
+            if o.incremental = TristateFalse
+                verifier.for_option(true, "declaration", "", DiagComposite_projects_may_not_disable_incremental_compilation)
+        }
+        if ((o.ts_build_info_file.length as int) = 0) and EmitOptions.on(o.incremental) and ((o.config_file_path.length as int) = 0)
+            verifier.compiler_options_diagnostic(DiagOption_incremental_is_only_valid_with_a_known_configuration_file_like_tsconfig_json_or_when_tsBuildInfoFile_is_explicitly_provided)
+
+        if (EmitOptions.on(o.source_map) = false) and (EmitOptions.on(o.inline_source_map) = false)
+        {
+            if EmitOptions.on(o.inline_sources)
+                verifier.for_option(true, "inlineSources", "", DiagOption_0_can_only_be_used_when_either_option_inlineSourceMap_or_option_sourceMap_is_provided)
+            if (o.source_root.length as int) > 0
+                verifier.for_option(true, "sourceRoot", "", DiagOption_0_can_only_be_used_when_either_option_inlineSourceMap_or_option_sourceMap_is_provided)
+        }
+        if ((o.map_root.length as int) > 0) and ((EmitOptions.on(o.source_map) or EmitOptions.on(o.declaration_map)) = false)
+            verifier.for_option(true, "mapRoot", "sourceMap", DiagOption_0_cannot_be_specified_without_specifying_option_1_or_option_2)
+        if (o.declaration_dir.length as int) > 0
+        {
+            if emit_declarations = false
+                verifier.for_option(true, "declarationDir", "declaration", DiagOption_0_cannot_be_specified_without_specifying_option_1_or_option_2)
+        }
+        if EmitOptions.on(o.declaration_map) and (emit_declarations = false)
+            verifier.for_option(true, "declarationMap", "declaration", DiagOption_0_cannot_be_specified_without_specifying_option_1_or_option_2)
+        if ((o.lib.length as int) > 0) and EmitOptions.on(o.no_lib)
+            verifier.for_option(true, "lib", "noLib", DiagOption_0_cannot_be_specified_with_option_1)
+        if EmitOptions.on(o.isolated_modules) or EmitOptions.on(o.verbatim_module_syntax)
+        {
+            if o.preserve_const_enums = TristateFalse
+            {
+                if EmitOptions.on(o.verbatim_module_syntax)
+                    verifier.for_option(true, "verbatimModuleSyntax", "preserveConstEnums", DiagOption_preserveConstEnums_cannot_be_disabled_when_0_is_enabled)
+                else
+                    verifier.for_option(true, "isolatedModules", "preserveConstEnums", DiagOption_preserveConstEnums_cannot_be_disabled_when_0_is_enabled)
+            }
+        }
+        this.verify_root_dir_layout(verifier)
+        if EmitOptions.on(o.check_js) and (EmitOptions.on(o.allow_js) = false)
+            verifier.for_option(true, "checkJs", "allowJs", DiagOption_0_cannot_be_specified_without_specifying_option_1)
+        if EmitOptions.on(o.emit_declaration_only)
+        {
+            if emit_declarations = false
+                verifier.for_option(true, "emitDeclarationOnly", "declaration", DiagOption_0_cannot_be_specified_without_specifying_option_1_or_option_2)
+        }
+        if EmitOptions.on(o.emit_decorator_metadata) and (EmitOptions.on(o.experimental_decorators) = false)
+            verifier.for_option(true, "emitDecoratorMetadata", "experimentalDecorators", DiagOption_0_cannot_be_specified_without_specifying_option_1)
+        let jsx_automatic (o.jsx = JsxEmitReactJSX) or (o.jsx = JsxEmitReactJSXDev)
+        if (o.jsx_factory.length as int) > 0
+        {
+            if (o.react_namespace.length as int) > 0
+                verifier.for_option(true, "reactNamespace", "jsxFactory", DiagOption_0_cannot_be_specified_with_option_1)
+            if jsx_automatic
+                verifier.for_option(true, "jsxFactory", "", DiagOption_0_cannot_be_specified_when_option_jsx_is_1)
+            if Parser.parse_isolated_entity_name(host, o.jsx_factory) = null
+                verifier.for_option(false, "jsxFactory", "", DiagInvalid_value_for_jsxFactory_0_is_not_a_valid_identifier_or_qualified_name)
+        }
+        else
+        {
+            if (o.react_namespace.length as int) > 0
+            {
+                if Checker.is_identifier_text(o.react_namespace) = false
+                    verifier.for_option(false, "reactNamespace", "", DiagInvalid_value_for_reactNamespace_0_is_not_a_valid_identifier)
+            }
+        }
+        if (o.jsx_fragment_factory.length as int) > 0
+        {
+            if (o.jsx_factory.length as int) = 0
+                verifier.for_option(true, "jsxFragmentFactory", "jsxFactory", DiagOption_0_cannot_be_specified_without_specifying_option_1)
+            if jsx_automatic
+                verifier.for_option(true, "jsxFragmentFactory", "", DiagOption_0_cannot_be_specified_when_option_jsx_is_1)
+            if Parser.parse_isolated_entity_name(host, o.jsx_fragment_factory) = null
+                verifier.for_option(false, "jsxFragmentFactory", "", DiagInvalid_value_for_jsxFragmentFactory_0_is_not_a_valid_identifier_or_qualified_name)
+        }
+        if (o.react_namespace.length as int) > 0
+        {
+            if jsx_automatic
+                verifier.for_option(true, "reactNamespace", "", DiagOption_0_cannot_be_specified_when_option_jsx_is_1)
+        }
+        if (o.jsx_import_source.length as int) > 0
+        {
+            if o.jsx = JsxEmitReact
+                verifier.for_option(true, "jsxImportSource", "", DiagOption_0_cannot_be_specified_when_option_jsx_is_1)
+        }
+        let module_kind o.get_emit_module_kind()
+        if EmitOptions.on(o.allow_importing_ts_extensions) and ((EmitOptions.on(o.no_emit) or EmitOptions.on(o.emit_declaration_only) or EmitOptions.on(o.rewrite_relative_import_extensions)) = false)
+            verifier.for_option(false, "allowImportingTsExtensions", "", DiagOption_allowImportingTsExtensions_can_only_be_used_when_one_of_noEmit_emitDeclarationOnly_or_rewriteRelativeImportExtensions_is_set)
+        let module_resolution o.get_module_resolution_kind()
+        let supports_exports (module_resolution = ModuleResolutionKindNode16) or (module_resolution = ModuleResolutionKindNodeNext) or (module_resolution = ModuleResolutionKindBundler)
+        if (o.resolve_package_json_exports = TristateTrue) and (supports_exports = false)
+            verifier.for_option(true, "resolvePackageJsonExports", "", DiagOption_0_can_only_be_used_when_moduleResolution_is_set_to_node16_nodenext_or_bundler)
+        if (o.resolve_package_json_imports = TristateTrue) and (supports_exports = false)
+            verifier.for_option(true, "resolvePackageJsonImports", "", DiagOption_0_can_only_be_used_when_moduleResolution_is_set_to_node16_nodenext_or_bundler)
+        if ((o.custom_conditions.length as int) > 0) and (supports_exports = false)
+            verifier.for_option(true, "customConditions", "", DiagOption_0_can_only_be_used_when_moduleResolution_is_set_to_node16_nodenext_or_bundler)
+        let non_node_esm (module_kind >= ModuleKindES2015) and (module_kind <= ModuleKindESNext)
+        if (module_resolution = ModuleResolutionKindBundler) and (non_node_esm = false) and (module_kind <> ModuleKindPreserve) and (module_kind <> ModuleKindCommonJS)
+            verifier.for_option(false, "moduleResolution", "", DiagOption_0_can_only_be_used_when_module_is_set_to_preserve_commonjs_or_es2015_or_later)
+        let node_module (module_kind >= ModuleKindNode16) and (module_kind <= ModuleKindNodeNext)
+        let node_resolution (module_resolution >= ModuleResolutionKindNode16) and (module_resolution <= ModuleResolutionKindNodeNext)
+        if node_module and (node_resolution = false)
+            verifier.for_option(false, "moduleResolution", "", DiagOption_moduleResolution_must_be_set_to_0_or_left_unspecified_when_option_module_is_set_to_1)
+        else
+        {
+            if node_resolution and (node_module = false)
+                verifier.for_option(false, "module", "", DiagOption_module_must_be_set_to_0_when_option_moduleResolution_is_set_to_1)
+        }
+        if (EmitOptions.on(o.no_emit) = false) and (EmitOptions.on(o.suppress_output_path_check) = false)
+            this.verify_emit_file_paths()
+    }
+
+    ; the rootDir layout check (TS5011): a config file, an outDir or declarationDir,
+    ; no rootDir, and a computed common directory unlike the config's
+    procedure verify_root_dir_layout(this, verifier: ref[OptionVerifier])
+    {
+        let o options
+        if EmitOptions.on(o.no_emit) or EmitOptions.on(o.composite)
+            return
+        if ((o.root_dir.length as int) > 0) or ((o.config_file_path.length as int) = 0)
+            return
+        let emit_declarations EmitOptions.on(o.declaration) or EmitOptions.on(o.composite)
+        if ((o.out_dir.length as int) = 0) and ((emit_declarations and ((o.declaration_dir.length as int) > 0)) = false)
+            return
+        let cwd o.get_current_directory()
+        let dir ensure_trailing_directory_separator(host, get_normalized_absolute_path(host, o.project_root_directory(host), cwd))
+        let computed this.computed_common_source_directory()
+        if (computed.length as int) = 0
+            return
+        if dir.equals(computed)
+            return
+        if (o.out_dir.length as int) > 0
+            verifier.for_option(true, "outDir", "declarationDir", DiagThe_common_source_directory_of_0_is_1_The_rootDir_setting_must_be_explicitly_set_to_this_or_another_path_to_adjust_your_output_s_file_layout)
+        else
+            verifier.for_option(true, "declarationDir", "", DiagThe_common_source_directory_of_0_is_1_The_rootDir_setting_must_be_explicitly_set_to_this_or_another_path_to_adjust_your_output_s_file_layout)
+    }
+
+    ; outputpaths.GetComputedCommonSourceDirectory over the emitted non-declaration
+    ; files, with its trailing separator
+    procedure computed_common_source_directory(this) returns Slice[char]
+    {
+        let cwd options.get_current_directory()
+        var common: ref[Array[Slice[char]]]? null
+        var k 0
+        while k < (program_files.get_length() as int)
+        {
+            let index program_files[k as size_t]
+            let path program_paths[k as size_t]
+            set k: k + 1
+            if is_declaration_file_name_of(path)
+                continue
+            if this.source_file_may_be_emitted(index) = false
+                continue
+            let all reduce_path_components(host, get_path_components(host, path, cwd))
+            let components &Array[Slice[char]]^host()
+            var j 0
+            while j < ((all.get_length() as int) - 1)
+            {
+                components.add(all[j as size_t])
+                set j: j + 1
+            }
+            if common = null
+                set common: components
+            else
+            {
+                let cc common as ref[Array[Slice[char]]]
+                var limit cc.get_length() as int
+                if (components.get_length() as int) < limit
+                    set limit: components.get_length() as int
+                let kept &Array[Slice[char]]^host()
+                var m 0
+                while m < limit
+                {
+                    let a cc[m as size_t]
+                    if a.equals(components[m as size_t]) = false
+                        break
+                    kept.add(a)
+                    set m: m + 1
+                }
+                if kept.get_length() = 0
+                    return Slice[char]()
+                set common: kept
+            }
+        }
+        if common = null
+            return Slice[char]()
+        ensure_trailing_directory_separator(host, get_path_from_path_components(host, common as ref[Array[Slice[char]]]))
+    }
+
+    ; the emit files: unique, and none over an input file (TS5055, TS5056)
+    procedure verify_emit_file_paths(this)
+    {
+        let o options
+        let seen &Array[Slice[char]]^host()
+        let cwd o.get_current_directory()
+        let emitter Emitter.create(host)
+        var k 0
+        while k < (program_files.get_length() as int)
+        {
+            let index program_files[k as size_t]
+            let path program_paths[k as size_t]
+            set k: k + 1
+            if this.source_file_may_be_emitted(index) = false
+                continue
+            let file files.file_at(index) as ref[AstNode]
+            let info &SourceFileInfo^host(file, path, files.text_at(index), &Array[int]^host(), false, Parser.supported_script_kind(String^host(path.data as pointer[const_char], path.length)), false, null)
+            let is_json path.ends_with(".json")
+            if EmitOptions.on(o.emit_declaration_only) = false
+            {
+                let js emitter.js_output_path(info, o, cwd, checker)
+                if (is_json and js.equals(path)) = false
+                {
+                    this.verify_emit_file_path(js, seen)
+                    if (is_json = false) and EmitOptions.on(o.source_map) and (EmitOptions.on(o.inline_source_map) = false)
+                        this.verify_emit_file_path(join_slices(host, js, ".map"), seen)
+                }
+            }
+            if (EmitOptions.on(o.declaration) or EmitOptions.on(o.composite)) and (is_json = false)
+            {
+                let dts emitter.dts_output_path(info, o, cwd, checker)
+                this.verify_emit_file_path(dts, seen)
+                if EmitOptions.on(o.declaration_map)
+                    this.verify_emit_file_path(join_slices(host, dts, ".map"), seen)
+            }
+        }
+    }
+
+    procedure verify_emit_file_path(this, emit_file_name: Slice[char], seen: ref[Array[Slice[char]]])
+    {
+        if (emit_file_name.length as int) = 0
+            return
+        let index files.index_of_exact_path(emit_file_name)
+        if index >= 0
+        {
+            if members[index as size_t]
+                diagnostics.add(ProgramDiagnostic(ProgramDiagnosticGlobal, 0, 0, DiagCannot_write_file_0_because_it_would_overwrite_input_file))
+        }
+        var i 0
+        while i < (seen.get_length() as int)
+        {
+            let seen_name seen[i as size_t]
+            if seen_name.equals(emit_file_name)
+            {
+                diagnostics.add(ProgramDiagnostic(ProgramDiagnosticGlobal, 0, 0, DiagCannot_write_file_0_because_it_would_be_overwritten_by_multiple_input_files))
+                return
+            }
+            set i: i + 1
+        }
+        seen.add(emit_file_name)
+    }
+}
+
+; verifyCompilerOptions' closures over the config file's syntax
+define OptionVerifier
+(
+    host: ref[Page]
+    loader: ref[ProgramLoader]
+    config_file: ref[AstNode]?
+    config_text: Slice[char]
+)
+{
+    ; getTsConfigObjectLiteralExpression
+    function root_object(this) returns ref[AstNode]?
+    {
+        if config_file = null
+            return null
+        let statements AstNode.statements_of(config_file)
+        if AstNode.list_count(statements) = 0
+            return null
+        let first AstNode.child_in_list(statements, 0)
+        let expression AstNode.expression_of(first)
+        if AstNode.kind_of(expression) <> KindObjectLiteralExpression
+            return null
+        expression
+    }
+
+    ; ForEachPropertyAssignment's first match of key1 or key2
+    function property_named(this, object_literal: ref[AstNode]?, key1: Slice[char], key2: Slice[char]) returns ref[AstNode]?
+    {
+        if object_literal = null
+            return null
+        let properties AstNode.properties_of(object_literal)
+        var i 0
+        while i < AstNode.list_count(properties)
+        {
+            let property AstNode.child_in_list(properties, i)
+            set i: i + 1
+            if AstNode.kind_of(property) <> KindPropertyAssignment
+                continue
+            let name AstNode.name_of(property)
+            let k AstNode.kind_of(name)
+            if (k <> KindStringLiteral) and (k <> KindIdentifier) and (k <> KindNoSubstitutionTemplateLiteral)
+                continue
+            var text AstNode.literal_text_of(name)
+            if k = KindIdentifier
+                set text: AstNode.identifier_text_of(name)
+            if text.equals(key1)
+                return property
+            if ((key2.length as int) > 0) and text.equals(key2)
+                return property
+        }
+        null
+    }
+
+    ; CreateDiagnosticForNodeInSourceFile over the config's text
+    procedure add_at_node(this, node: ref[AstNode]?, code: int)
+    {
+        if node = null
+            return
+        let n node as ref[AstNode]
+        let start Scanner.skip_trivia(config_text, AstNode.pos_of(n))
+        loader.diagnostics.add(ProgramDiagnostic(ProgramDiagnosticConfig, start, AstNode.end_of(n), code))
+    }
+
+    ; createCompilerOptionsDiagnostic
+    procedure compiler_options_diagnostic(this, code: int)
+    {
+        let compiler_options this.property_named(this.root_object(), "compilerOptions", "")
+        if compiler_options <> null
+            this.add_at_node(AstNode.name_of(compiler_options), code)
+        else
+            loader.diagnostics.add(ProgramDiagnostic(ProgramDiagnosticGlobal, 0, 0, code))
+    }
+
+    ; createDiagnosticForOption: the option's key (or value) inside compilerOptions,
+    ; else the compilerOptions key, else a compiler diagnostic
+    procedure for_option(this, on_key: bool, option1: Slice[char], option2: Slice[char], code: int)
+    {
+        let compiler_options this.property_named(this.root_object(), "compilerOptions", "")
+        if compiler_options <> null
+        {
+            let initializer AstNode.initializer_of(compiler_options)
+            if AstNode.kind_of(initializer) = KindObjectLiteralExpression
+            {
+                let property this.property_named(initializer, option1, option2)
+                if property <> null
+                {
+                    if on_key
+                        this.add_at_node(AstNode.name_of(property), code)
+                    else
+                        this.add_at_node(AstNode.initializer_of(property), code)
+                    return
+                }
+            }
+        }
+        this.compiler_options_diagnostic(code)
+    }
+}

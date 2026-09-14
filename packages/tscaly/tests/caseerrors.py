@@ -85,7 +85,7 @@ def parse_answer(body):
     cur = None
     for line in body.decode("utf-8", "replace").split("\n"):
         if line.startswith("==== TSCALY-FILE "):
-            cur = {"K": 0, "D": [], "J": [], "B": [], "C": [], "R": [], "S": []}
+            cur = {"K": 0, "D": [], "J": [], "B": [], "C": [], "R": [], "S": [], "P": [], "G": []}
             files[line[len("==== TSCALY-FILE "):]] = cur
             continue
         if cur is None or len(line) < 2:
@@ -93,7 +93,7 @@ def parse_answer(body):
         tag, rest = line[0], line[2:].split()
         if tag == "K":
             cur["K"] = int(rest[0])
-        elif tag in "DJBCRS" and len(rest) == 3:
+        elif tag in "DJBCRSPG" and len(rest) == 3:
             cur[tag].append(tuple(int(x) for x in rest))
     return files
 
@@ -122,7 +122,7 @@ def is_comment_or_blank_line(text, pos):
     return pos == len(text) or text[pos] in (13, 10) or (pos + 1 < len(text) and text[pos] == 47 and text[pos + 1] == 47)
 
 
-def with_preceding_directives(text, directives, diags):
+def with_preceding_directives(text, directives, diags, report_unused=True):
     """program.go getDiagnosticsWithPrecedingDirectives, then the unused @ts-expect-error reports (TS2578)"""
     if not directives:
         return diags
@@ -145,7 +145,7 @@ def with_preceding_directives(text, directives, diags):
         if not ignore:
             out.append(d)
     for start, end, kind in by_line.values():
-        if kind == 1:
+        if kind == 1 and report_unused:
             out.append((start, end, 2578))
     return out
 
@@ -177,6 +177,8 @@ def compose(path, entry, cfg, text=b""):
                 semantic += list(entry["S"])
             semantic = with_preceding_directives(text, entry["R"], semantic)
         diags += semantic
+        # GetIncludeProcessorDiagnostics: the loader's diagnostics located in the file
+        diags += with_preceding_directives(text, entry["R"], list(entry["P"]), report_unused=False)
     return diags
 
 
@@ -186,7 +188,7 @@ def main():
     ap.add_argument("--binary", default=os.path.join(PKG, "tests", "out", "tscaly_dump"))
     ap.add_argument("--filter", default="")
     ap.add_argument("--only", default="")
-    ap.add_argument("--jobs", type=int, default=4)
+    ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--verdicts", default="")
     ap.add_argument("--show", default="")
@@ -261,12 +263,33 @@ def main():
             vpath = "/errors/%s/%s" % (name, cname or "default")
             parts = []
             texts = {}
-            for un, content in program_units:
+            # compiler_runner.go's root files: the config's file names, else every unit
+            # unless the last one requires or references the rest (programFileNames
+            # drops JSON)
+            last_content = units[-1][1] if units else b""
+            last_text = last_content.decode("utf-8", "replace") if isinstance(last_content, bytes) else last_content
+            last_only = bool(re.search(r"require\(", last_text) or re.search(r"reference\s+path", last_text) or cfg.get("noimplicitreferences"))
+            config_roots = set(config[1]) if config is not None else None
+            for ui, (un, content) in enumerate(program_units):
                 body = content if isinstance(content, bytes) else content.encode("utf-8", "surrogateescape")
-                parts.append(b"==== TSCALY-FILE %d 1 %s\n" % (len(body), un.encode("utf-8", "surrogateescape")))
+                ppath = casejs.program_path(un)
+                if config_roots is not None:
+                    root = ppath in config_roots
+                else:
+                    root = (not last_only) or ui == len(program_units) - 1
+                if ppath.lower().endswith(".json"):
+                    root = False
+                parts.append(b"==== TSCALY-FILE %d %s %s\n" % (len(body), b"3" if root else b"1", un.encode("utf-8", "surrogateescape")))
                 parts.append(body)
                 parts.append(b"\n")
-                texts[casejs.program_path(un)] = body
+                texts[ppath] = body
+            if config is not None:
+                cun, ccontent = units[config_index]
+                cbody = ccontent if isinstance(ccontent, bytes) else ccontent.encode("utf-8", "surrogateescape")
+                parts.append(b"==== TSCALY-FILE %d c %s\n" % (len(cbody), cun.encode("utf-8", "surrogateescape")))
+                parts.append(cbody)
+                parts.append(b"\n")
+                texts[casejs.program_path(cun)] = cbody
             for symlink, target in links:
                 parts.append(b"==== TSCALY-LINK %s\t%s\n" % (casejs.program_path(symlink).encode("utf-8", "surrogateescape"), casejs.program_path(target).encode("utf-8", "surrogateescape")))
             groups[opts].append((vpath, b"".join(parts)))
@@ -291,10 +314,19 @@ def main():
             verdict, detail = "UNPORTED", body.decode("utf-8", "replace").split("\n")[0]
         else:
             for path, entry in parse_answer(body).items():
+                if path == "TSCALY-GLOBAL":
+                    for _, _, code in entry["G"]:
+                        ours[("", 0, 0, code)] += 1
+                    continue
                 text = plan["texts"].get(path)
                 if text is None:
                     continue
                 shown = casejs.remove_test_path_prefixes(path)
+                if casejs.is_config_unit(path):
+                    for pos, end, code in entry["P"]:
+                        line, col = line_col(text, pos)
+                        ours[(shown, line, col, code)] += 1
+                    continue
                 for pos, end, code in compose(path, entry, plan["cfg"], text):
                     line, col = line_col(text, pos)
                     ours[(shown, line, col, code)] += 1

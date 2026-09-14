@@ -108,6 +108,11 @@ SOURCES = [
     # program's option and file diagnostics (program.go, the case yardstick's TS5xxx)
     os.path.join(SUB, "internal/module/util.go"),
     os.path.join(SUB, "internal/compiler/program.go"),
+    # Slice 268. The program's file loader reports its explaining diagnostics
+    # (File_0_not_found, the allowJs hint, the reference to itself) from these.
+    os.path.join(SUB, "internal/compiler/fileloader.go"),
+    os.path.join(SUB, "internal/compiler/filesparser.go"),
+    os.path.join(SUB, "internal/compiler/processingDiagnostic.go"),
     # Slice 119. jsx.go joins under the same per-FILE rule: the JSX element chapter
     # reports, and four of its messages appear in NO other source of this list —
     # TS17004 (the --jsx flag), TS7026 (no interface JSX.IntrinsicElements),
