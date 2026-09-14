@@ -16,8 +16,8 @@
 ; so IsExcludedByRegex never sees a pattern).
 ;
 ; ★★ THE HOST'S EMPTY ANSWERS ARE THE PROGRAM'S, NOT A SIMPLIFICATION. The symlink
-; cache holds directories only where the program followed a symlink, and the case
-; runner refuses `@link` (tests/casejs.py); redirect targets exist only where the
+; cache holds directories only where the program followed a symlink (since slice 260
+; the program has symlinks: `ensure_symlink_cache`); redirect targets exist only where the
 ; file loader deduplicated two copies of one package, which the port's program
 ; does not; project references need a tsconfig, which the runner refuses too; the
 ; global typings cache location is tsc's empty default. `paths`, `rootDirs` and
@@ -128,14 +128,19 @@ define SpecifierHost
     import_lists: ref[Array[ref[Array[ref[AstNode]?]]?]]
     common_source_directory_cache: Slice[char]
     common_source_directory_known: bool
+    ; the program's KnownSymlinks (slice 260): directories by realpath — each
+    ; `symlink_reals[i]` has the symlinked directory `symlink_links[i]` (both with a
+    ; trailing separator); computed once
+    symlink_links: ref[Array[Slice[char]]]?
+    symlink_reals: ref[Array[Slice[char]]]?
 )
 {
     function create(host: ref[Page], checker: ref[Checker], files: ref[ProgramFiles], options: EmitOptions) returns ref[SpecifierHost]
     {
-        let cwd: Slice[char] "/.src"
+        let cwd options.get_current_directory()
         let keys &Array[ref[AstNode]?]^host()
         let lists &Array[ref[Array[ref[AstNode]?]]?]^host()
-        let h &SpecifierHost^host(host, checker, files, options, cwd, keys, lists, Slice[char](), false)
+        let h &SpecifierHost^host(host, checker, files, options, cwd, keys, lists, Slice[char](), false, null, null)
         h
     }
 
@@ -1513,14 +1518,61 @@ define SpecifierHost
         }
     }
 
-    ; GetEachFileNameOfModule (preferSymlinks: true). With no symlink cache
-    ; entries and no redirects or project references (the file header), the
-    ; candidates are the imported file's normalized name, filtered when ignored.
+    ; GetEachFileNameOfModule (preferSymlinks: true). No redirects or project
+    ; references (the file header): the candidates are the paths the symlink cache
+    ; knows for an ancestor directory of the imported file (slice 260), then the
+    ; imported file's normalized name, filtered when ignored.
     procedure get_each_file_name_of_module(this, importing_file_name: Slice[char], imported_file_name: Slice[char]) returns ref[Array[ModulePath]]
     {
         let target get_normalized_absolute_path(host, imported_file_name, current_directory)
-        let should_filter_ignored_paths (SpecifierHost.contains_ignored_path(target) = false)
+        var should_filter_ignored_paths (SpecifierHost.contains_ignored_path(target) = false)
         let results &Array[ModulePath]^host()
+        this.ensure_symlink_cache()
+        let links symlink_links as ref[Array[Slice[char]]]
+        let reals symlink_reals as ref[Array[Slice[char]]]
+        if links.get_length() > 0
+        {
+            ; ForEachAncestorDirectoryStoppingAtGlobalCache (no global cache)
+            var real_path_directory get_directory_path(host, target)
+            repeat
+            {
+                let dir_key ensure_trailing_directory_separator(host, real_path_directory)
+                var found false
+                var stop false
+                var i 0
+                while i < (reals.get_length() as int)
+                {
+                    let real reals[i as size_t]
+                    let link links[i as size_t]
+                    set i: i + 1
+                    if real.equals(dir_key) = false
+                        continue
+                    if found = false
+                    {
+                        ; a package does not globally import from itself
+                        if SpecifierHost.starts_with_directory(importing_file_name, real_path_directory)
+                        {
+                            set stop: true
+                            break
+                        }
+                    }
+                    set found: true
+                    if SpecifierHost.starts_with_directory(target, real_path_directory)
+                    {
+                        let relative target.slice_from(((remove_trailing_directory_separator(dir_key).length as int) + 1) as size_t)
+                        let option get_normalized_absolute_path(host, combine_paths(host, link, relative), Slice[char]())
+                        results.add(ModulePath(option, slice_contains_node_modules(option), false))
+                        set should_filter_ignored_paths: true
+                    }
+                }
+                if stop
+                    break
+                let parent get_directory_path(host, real_path_directory)
+                if parent.equals(real_path_directory)
+                    break
+                set real_path_directory: parent
+            }
+        }
         var keep true
         if should_filter_ignored_paths
         {
@@ -1530,6 +1582,214 @@ define SpecifierHost
         if keep
             results.add(ModulePath(target, slice_contains_node_modules(target), false))
         results
+    }
+
+    ; tspath.StartsWithDirectory
+    function starts_with_directory(file_name: Slice[char], directory: Slice[char]) returns bool
+    {
+        var d directory
+        if (d.length as int) > 1
+        {
+            if (d[((d.length as int) - 1) as size_t] as int) = ("/" as char) as int
+                set d: d.subslice(0, ((d.length as int) - 1) as size_t)
+        }
+        if (file_name.length as int) <= (d.length as int)
+            return false
+        if file_name.starts_with(d) = false
+            return false
+        (file_name[d.length] as int) = ("/" as char) as int
+    }
+
+    ; Program.GetSymlinkCache: the resolutions that went through a symlink, then
+    ; each emitted file's nearest package.json's runtime dependencies resolved as
+    ; package directories
+    procedure ensure_symlink_cache(this)
+    {
+        if symlink_links <> null
+            return
+        set this.symlink_links: &Array[Slice[char]]^host()
+        set this.symlink_reals: &Array[Slice[char]]^host()
+        var i 0
+        while i < (files.resolution_originals.get_length() as int)
+        {
+            this.process_symlink_resolution(files.resolution_originals[i as size_t], files.resolution_realpaths[i as size_t])
+            set i: i + 1
+        }
+        let seen &Array[Slice[char]]^host()
+        var fi 0
+        while fi < files.count()
+        {
+            let file_path files.path_at(fi)
+            let emitted files.emit_at(fi)
+            set fi: fi + 1
+            if emitted = false
+                continue
+            ; the nearest package.json's directory
+            var package_directory Slice[char]()
+            var dir get_directory_path(host, file_path)
+            repeat
+            {
+                if files.file_exists(combine_paths(host, dir, "package.json"))
+                {
+                    set package_directory: dir
+                    break
+                }
+                let parent get_directory_path(host, dir)
+                if parent.equals(dir)
+                    break
+                set dir: parent
+            }
+            if (package_directory.length as int) = 0
+                continue
+            if SpecifierHost.slices_contain(seen, package_directory)
+                continue
+            seen.add(package_directory)
+            let root JsonParser.parse(host, files.text_of_path(combine_paths(host, package_directory, "package.json")))
+            if root = null
+                continue
+            let obj root as ref[JsonValue]
+            if obj.kind <> JsonKindObject
+                continue
+            this.process_dependency_names(package_directory, obj.get("dependencies"))
+            this.process_dependency_names(package_directory, obj.get("peerDependencies"))
+            this.process_dependency_names(package_directory, obj.get("optionalDependencies"))
+        }
+    }
+
+    function slices_contain(list: ref[Array[Slice[char]]], s: Slice[char]) returns bool
+    {
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            let e list[i as size_t]
+            if e.equals(s)
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    ; the runtime dependency loop: skip a package whose directory (or @types one)
+    ; the cache already holds, else ResolvePackageDirectory(dep) and process it
+    procedure process_dependency_names(this, package_directory: Slice[char], deps: ref[JsonValue]?)
+    {
+        if deps = null
+            return
+        let dv deps as ref[JsonValue]
+        if dv.kind <> JsonKindObject
+            return
+        var i 0
+        while i < dv.size()
+        {
+            let dep dv.key_at(i)
+            set i: i + 1
+            let possible ensure_trailing_directory_separator(host, combine_paths(host, combine_paths(host, package_directory, "node_modules"), dep))
+            if this.has_symlink_directory(possible)
+                continue
+            if dep.starts_with("@types") = false
+            {
+                let types_possible ensure_trailing_directory_separator(host, combine_paths(host, combine_paths(host, package_directory, "node_modules"), this.get_types_package_name(dep)))
+                if this.has_symlink_directory(types_possible)
+                    continue
+            }
+            ; ResolvePackageDirectory: the nearest node_modules/<dep> directory, its
+            ; realpath when it lies inside node_modules
+            var dir package_directory
+            repeat
+            {
+                let candidate combine_paths(host, combine_paths(host, dir, "node_modules"), dep)
+                if files.directory_exists(candidate)
+                {
+                    let real files.real_path(candidate)
+                    if real.equals(candidate) = false
+                        this.process_symlink_resolution(combine_paths(host, candidate, "package.json"), combine_paths(host, real, "package.json"))
+                    break
+                }
+                let parent get_directory_path(host, dir)
+                if parent.equals(dir)
+                    break
+                set dir: parent
+            }
+        }
+    }
+
+    ; module.GetTypesPackageName: `@scope/name` → `@types/scope__name`
+    procedure get_types_package_name(this, name: Slice[char]) returns Slice[char]
+    {
+        if name.starts_with("@")
+        {
+            let slash slice_index_of_byte(name, ("/" as char) as int)
+            if slash > 0
+                return join_slices(host, join_slices(host, join_slices(host, "@types/", name.subslice(1, slash as size_t)), "__"), name.slice_from((slash + 1) as size_t))
+        }
+        join_slices(host, "@types/", name)
+    }
+
+    function has_symlink_directory(this, symlink_path: Slice[char]) returns bool
+    {
+        let links symlink_links as ref[Array[Slice[char]]]
+        SpecifierHost.slices_contain(links, symlink_path)
+    }
+
+    ; KnownSymlinks.ProcessResolution, the directory half (the files map has no
+    ; reader on the generator's route)
+    procedure process_symlink_resolution(this, original_path: Slice[char], resolved_file_name: Slice[char])
+    {
+        if ((original_path.length as int) = 0) or ((resolved_file_name.length as int) = 0)
+            return
+        let a_parts get_path_components(host, get_normalized_absolute_path(host, resolved_file_name, current_directory), Slice[char]())
+        let b_parts get_path_components(host, get_normalized_absolute_path(host, original_path, current_directory), Slice[char]())
+        var an a_parts.get_length() as int
+        var bn b_parts.get_length() as int
+        var is_directory false
+        while (an >= 2) and (bn >= 2)
+        {
+            if SpecifierHost.is_node_modules_or_scoped_package_directory(a_parts[(an - 2) as size_t])
+                break
+            if SpecifierHost.is_node_modules_or_scoped_package_directory(b_parts[(bn - 2) as size_t])
+                break
+            let al a_parts[(an - 1) as size_t]
+            let bl b_parts[(bn - 1) as size_t]
+            if al.equals(bl) = false
+                break
+            set an: an - 1
+            set bn: bn - 1
+            set is_directory: true
+        }
+        if is_directory = false
+            return
+        let common_resolved get_path_from_path_components(host, SpecifierHost.take_components(host, a_parts, an))
+        let common_original get_path_from_path_components(host, SpecifierHost.take_components(host, b_parts, bn))
+        let symlink_path ensure_trailing_directory_separator(host, common_original)
+        if SpecifierHost.contains_ignored_path(symlink_path)
+            return
+        if this.has_symlink_directory(symlink_path)
+            return
+        let links symlink_links as ref[Array[Slice[char]]]
+        let reals symlink_reals as ref[Array[Slice[char]]]
+        links.add(symlink_path)
+        reals.add(ensure_trailing_directory_separator(host, common_resolved))
+    }
+
+    function take_components(host: ref[Page], parts: ref[Array[Slice[char]]], n: int) returns ref[Array[Slice[char]]]
+    {
+        let out &Array[Slice[char]]^host()
+        var i 0
+        while i < n
+        {
+            out.add(parts[i as size_t])
+            set i: i + 1
+        }
+        out
+    }
+
+    function is_node_modules_or_scoped_package_directory(s: Slice[char]) returns bool
+    {
+        if (s.length as int) = 0
+            return false
+        if s.equals("node_modules")
+            return true
+        s.starts_with("@")
     }
 
     ; computeModuleSpecifiers (forAutoImport false)
@@ -2071,6 +2331,13 @@ define SpecifierHost
         conditions.add("types")
         if module_resolution <> ModuleResolutionKindBundler
             conditions.add("node")
+        let custom options.custom_condition_list(host)
+        var ci 0
+        while ci < (custom.get_length() as int)
+        {
+            conditions.add(custom[ci as size_t])
+            set ci: ci + 1
+        }
         conditions
     }
 

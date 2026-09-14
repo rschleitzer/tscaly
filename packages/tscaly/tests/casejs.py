@@ -166,7 +166,7 @@ def unsupported(cfg):
     if cfg.get("alwaysstrict", "").lower() == "false":
         return "alwaysStrict=false"
     # the resolver's optional settings the port does not read (slice 248)
-    for key in ("paths", "rootdirs", "modulesuffixes", "customconditions", "currentdirectory", "typeroots", "link"):
+    for key in ("paths", "rootdirs", "modulesuffixes"):
         if cfg.get(key):
             return key
     return None
@@ -306,7 +306,7 @@ def common_source_directory(units, cfg):
     """outputpaths.GetCommonSourceDirectory: rootDir, else the longest common directory of the
     non-declaration source units (a single file's directory when there is one)"""
     if cfg.get("rootdir"):
-        return posixpath.normpath(posixpath.join("/.src", cfg["rootdir"].replace("\\", "/")))
+        return posixpath.normpath(posixpath.join(ROOT, cfg["rootdir"].replace("\\", "/")))
     dirs = []
     for n, _ in units:
         low = n.lower()
@@ -314,7 +314,7 @@ def common_source_directory(units, cfg):
             continue
         dirs.append(posixpath.dirname(program_path(n)))
     if not dirs:
-        return "/.src"
+        return ROOT
     common = dirs[0]
     for d in dirs[1:]:
         while not (d == common or d.startswith(common.rstrip("/") + "/")):
@@ -361,13 +361,18 @@ def dts_output_path(unit_name, cfg, common):
     return posixpath.normpath("/".join(parts))
 
 
+# the runner's current directory (`@currentDirectory`, default /.src), set per
+# configuration before a plan is built (slice 260)
+ROOT = "/.src"
+
+
 def program_path(unit_name):
-    """the unit's path in the program: /.src/<unit>, an absolute name standing"""
+    """the unit's path in the program: ROOT/<unit>, an absolute name standing"""
     name = unit_name.replace("\\", "/")
     # a rooted name stands (tspath.GetNormalizedAbsolutePath: `/x.ts`, `A:/x.ts`)
     if name.startswith("/") or re.match(r"^[A-Za-z]:/", name):
         return posixpath.normpath(name)
-    return posixpath.normpath(posixpath.join("/.src", name))
+    return posixpath.normpath(posixpath.join(ROOT, name))
 
 
 BUNDLE_HEAD = b"==== TSCALY-FILE "
@@ -386,7 +391,34 @@ def split_bundle_answer(body):
 
 
 # option VALUES that are text, not an enum: the case decides (`jsxFactory: h`, `reactNamespace: myReactLib`)
-TEXT_OPTIONS = {"jsxfactory", "jsxfragmentfactory", "reactnamespace", "jsximportsource", "emitfilename"}
+TEXT_OPTIONS = {"jsxfactory", "jsxfragmentfactory", "reactnamespace", "jsximportsource", "emitfilename", "currentdirectory", "customconditions", "typeroots"}
+
+# test_case_parser.go's linkRegex: `// @link: <target> -> <symlink>`
+LINK_RE = re.compile(r"^/{2}\s*@link\s*:\s*([^\r\n]*?)\s*->\s*([^\r\n]*)", re.M | re.I)
+FILENAME_RE = re.compile(r"^//\s*@filename\s*:\s*([^\r\n]*)", re.I)
+SYMLINK_RE = re.compile(r"^//\s*@symlink\s*:\s*([^\r\n]*)", re.I)
+
+
+def case_links(text):
+    """[(symlink, target)] of a case: `@link: target -> symlink`, and a file's own
+    `@symlink: a, b` naming symlinks to the file declared above it"""
+    links = []
+    current = ""
+    for line in text.splitlines():
+        m = FILENAME_RE.match(line)
+        if m:
+            current = m.group(1).strip()
+            continue
+        m = LINK_RE.match(line)
+        if m:
+            links.append((m.group(2).strip(), m.group(1).strip()))
+            continue
+        m = SYMLINK_RE.match(line)
+        if m and current:
+            for link in m.group(1).split(","):
+                if link.strip():
+                    links.append((link.strip(), current))
+    return links
 
 
 def options_string(cfg):
@@ -397,6 +429,7 @@ def options_string(cfg):
 
 
 def main():
+    global ROOT
     ap = argparse.ArgumentParser()
     ap.add_argument("--store", default=os.path.join(PKG, "tests", "out", "run.db"))
     ap.add_argument("--binary", default=os.path.join(PKG, "tests", "out", "tscaly_dump"))
@@ -421,7 +454,8 @@ def main():
     # ── plan: (case, config) → the units to emit and the expected sections ──
     plans = []            # dicts
     skips = collections.Counter()
-    groups = collections.defaultdict(list)   # options string → [(vpath, content)]
+    groups = collections.defaultdict(list)
+    dts_error_pairs = [0]   # options string → [(vpath, content)]
     only = None
     if args.only:
         only = set(l.strip() for l in open(args.only) if l.strip())
@@ -446,6 +480,9 @@ def main():
         # a comment in the store's raw bytes
         text = decode_case(open(case_file, "rb").read())
         settings = {m.group(1).lower(): m.group(2).strip().rstrip(";") for m in OPTION_RE.finditer(text)}
+        settings.pop("link", None)
+        settings.pop("symlink", None)
+        links = case_links(text)
         units = db.execute("SELECT name, content FROM units WHERE ci=? ORDER BY idx", (ci,)).fetchall()
         units = [(n, strip_directives(c)) for n, c in units]
         if any(os.path.basename(n).lower() in ("tsconfig.json", "jsconfig.json") for n, c in units):
@@ -464,6 +501,9 @@ def main():
             if reason:
                 skips["unsupported: " + reason] += 1
                 continue
+            ROOT = cfg.get("currentdirectory", "").strip() or "/.src"
+            if ROOT.startswith("/"):
+                ROOT = posixpath.normpath(ROOT)
             category = "conformance" if name.startswith("submodule_conformance_") else "compiler"
             bpath = os.path.join(TSGO_BASELINES, category, bname)
             if not os.path.exists(bpath):
@@ -481,9 +521,16 @@ def main():
             outputs = sections[n_inputs:]
             if args.refute:
                 outputs = [(n, b + "x") for n, b in outputs]
-            if any(n == "DtsFileErrors" or n.startswith("!!!!") for n, _ in outputs) or "\n!!!! File " in btext:
-                skips["baseline carries declaration errors / noCheck notes"] += 1
+            if any(n.startswith("!!!!") for n, _ in outputs) or "\n!!!! File " in btext:
+                skips["baseline carries noCheck emit notes (noEmitOnError)"] += 1
                 continue
+            # the declaration files' own type check (`//// [DtsFileErrors]`, the runner
+            # re-checking the emitted .d.ts): the sections before it are compared, the
+            # errors themselves are not (slice 260)
+            dts_errors = [i for i, (n, _) in enumerate(outputs) if n == "DtsFileErrors"]
+            if dts_errors:
+                outputs = outputs[:dts_errors[0]]
+                dts_error_pairs[0] += 1
             last_content0 = units[-1][1] if units else b""
             last_text0 = last_content0.decode("utf-8", "replace") if isinstance(last_content0, bytes) else last_content0
             all_roots = not bool(re.search(r"require\(", last_text0) or re.search(r"reference\s+path", last_text0) or cfg.get("noimplicitreferences"))
@@ -512,6 +559,8 @@ def main():
                 parts.append(b"==== TSCALY-FILE %d %d %s\n" % (len(body), 1 if emitted(un, cfg, all_roots) else 0, un.encode("utf-8", "surrogateescape")))
                 parts.append(body)
                 parts.append(b"\n")
+            for symlink, target in links:
+                parts.append(b"==== TSCALY-LINK %s\t%s\n" % (program_path(symlink).encode("utf-8", "surrogateescape"), program_path(target).encode("utf-8", "surrogateescape")))
             groups[opts].append((vpath, b"".join(parts)))
             common = common_source_directory(units, cfg)
             # the JS outputs, unless emitDeclarationOnly; the declaration outputs under
@@ -526,7 +575,7 @@ def main():
                     js_out_dir = (cfg.get("outdir") or "").replace("\\", "/")
                     if js_out_dir:
                         rel = posixpath.relpath(posixpath.dirname(program_path(un)), common) if common else "."
-                        return posixpath.normpath(posixpath.join("/.src", js_out_dir, rel, os.path.basename(oname)))
+                        return posixpath.normpath(posixpath.join(ROOT, js_out_dir, rel, os.path.basename(oname)))
                     return posixpath.normpath(posixpath.join(posixpath.dirname(program_path(un)), os.path.basename(oname)))
                 js_targets = collections.Counter(js_full_path(un) for un, _ in to_emit)
                 for un, content in to_emit:
@@ -550,7 +599,7 @@ def main():
                     out_dir = (cfg.get("declarationdir") or cfg.get("outdir") or "").replace("\\", "/")
                     if out_dir:
                         rel = posixpath.relpath(posixpath.dirname(program_path(un)), common) if common else "."
-                        full = posixpath.normpath(posixpath.join("/.src", out_dir, rel, os.path.basename(dname)))
+                        full = posixpath.normpath(posixpath.join(ROOT, out_dir, rel, os.path.basename(dname)))
                     else:
                         full = dts_program_path(program_path(un))
                     if full not in unit_paths:
@@ -568,6 +617,7 @@ def main():
     os.chmod(wrapper, 0o755)
     binary = wrapper
     total_units = sum(len(v) for v in groups.values())
+    print("pairs whose DtsFileErrors section is not compared: %d" % dts_error_pairs[0])
     print("cases planned %d, configurations skipped %d, units to emit %d in %d option groups" % (
         len(plans), sum(skips.values()), total_units, len(groups)), flush=True)
     for gi, (opts, units) in enumerate(sorted(groups.items(), key=lambda kv: -len(kv[1]))):
