@@ -20,7 +20,7 @@ Usage:
   tests/caseerrors.py [--binary tests/out/tscaly_dump] [--filter S] [--only FILE]
                       [--jobs N] [--verdicts FILE] [--show CASE[:CONFIG]]
 """
-import argparse, collections, os, re, sqlite3, sys
+import argparse, bisect, collections, os, re, sqlite3, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.dirname(HERE)
@@ -85,7 +85,7 @@ def parse_answer(body):
     cur = None
     for line in body.decode("utf-8", "replace").split("\n"):
         if line.startswith("==== TSCALY-FILE "):
-            cur = {"K": 0, "D": [], "J": [], "B": [], "C": []}
+            cur = {"K": 0, "D": [], "J": [], "B": [], "C": [], "R": []}
             files[line[len("==== TSCALY-FILE "):]] = cur
             continue
         if cur is None or len(line) < 2:
@@ -93,12 +93,64 @@ def parse_answer(body):
         tag, rest = line[0], line[2:].split()
         if tag == "K":
             cur["K"] = int(rest[0])
-        elif tag in "DJBC" and len(rest) == 3:
+        elif tag in "DJBCR" and len(rest) == 3:
             cur[tag].append(tuple(int(x) for x in rest))
     return files
 
 
-def compose(path, entry, cfg):
+def ecma_line_starts(text):
+    """scanner.GetECMALineStarts over the UTF-8 bytes: CR LF, CR, LF, U+2028, U+2029"""
+    starts, i, n = [0], 0, len(text)
+    while i < n:
+        b = text[i]
+        if b == 13:
+            if i + 1 < n and text[i + 1] == 10:
+                i += 1
+            starts.append(i + 1)
+        elif b == 10:
+            starts.append(i + 1)
+        elif b == 0xE2 and text[i + 1:i + 3] in (b"\x80\xa8", b"\x80\xa9"):
+            i += 2
+            starts.append(i + 1)
+        i += 1
+    return starts
+
+
+def is_comment_or_blank_line(text, pos):
+    while pos < len(text) and text[pos] in (32, 9):
+        pos += 1
+    return pos == len(text) or text[pos] in (13, 10) or (pos + 1 < len(text) and text[pos] == 47 and text[pos + 1] == 47)
+
+
+def with_preceding_directives(text, directives, diags):
+    """program.go getDiagnosticsWithPrecedingDirectives, then the unused @ts-expect-error reports (TS2578)"""
+    if not directives:
+        return diags
+    starts = ecma_line_starts(text)
+    by_line = {}
+    for start, end, kind in directives:
+        by_line[bisect.bisect_right(starts, start) - 1] = [start, end, kind]
+    out = []
+    for d in diags:
+        ignore = False
+        line = bisect.bisect_right(starts, d[0]) - 2
+        while line >= 0:
+            if line in by_line:
+                ignore = True
+                by_line[line][2] = 0
+                break
+            if not is_comment_or_blank_line(text, starts[line]):
+                break
+            line -= 1
+        if not ignore:
+            out.append(d)
+    for start, end, kind in by_line.values():
+        if kind == 1:
+            out.append((start, end, 2578))
+    return out
+
+
+def compose(path, entry, cfg, text=b""):
     """program.go's per-file composition over the raw sections → [(pos, end, code)]"""
     low = path.lower()
     is_js = low.endswith(".js") or low.endswith(".jsx") or low.endswith(".mjs") or low.endswith(".cjs")
@@ -120,6 +172,8 @@ def compose(path, entry, cfg):
         semantic = list(entry["B"]) + list(entry["C"])
         if plain_js:
             semantic = [d for d in semantic if d[2] in PLAIN_JS_ERRORS]
+        else:
+            semantic = with_preceding_directives(text, entry["R"], semantic)
         diags += semantic
     return diags
 
@@ -239,7 +293,7 @@ def main():
                 if text is None:
                     continue
                 shown = casejs.remove_test_path_prefixes(path)
-                for pos, end, code in compose(path, entry, plan["cfg"]):
+                for pos, end, code in compose(path, entry, plan["cfg"], text):
                     line, col = line_col(text, pos)
                     ours[(shown, line, col, code)] += 1
             exp = plan["expected"]
