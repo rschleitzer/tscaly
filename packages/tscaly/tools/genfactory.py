@@ -1691,7 +1691,13 @@ for name in order:
         out('    {')
         callargs = ', '.join(['node.kind' if a == 'kind' else a for a, _ in sparams])
         out('        choose node.data')
-        for a in arm_list:
+        # an update whose reference body switches on node.Kind builds each kind with
+        # its own constructor (UpdateTypeAliasDeclaration: KindTypeAliasDeclaration →
+        # NewTypeAliasDeclaration, KindJSTypeAliasDeclaration → NewJSTypeAliasDeclaration);
+        # one `when` arm per case, so a reparsed JS node keeps its kind (slice 250)
+        kind_ctors = re.findall(r'case Kind(\w+):\s*\n\s*return updateNode\(f\.New(\w+)\(', cond)
+        update_arms = [(k, snake(c)) for k, c in kind_ctors if k in arms] if kind_ctors else [(a, fn) for a in arm_list]
+        for a, ctor_fn in update_arms:
             out('            when d: %s' % a)
             out('            {')
             out('                var changed false')
@@ -1708,7 +1714,7 @@ for name in order:
                     out('                if %s <> d.%s' % (snake(pn), f))
                 out('                    set changed: true')
             out('                if changed')
-            out('                    return this.update_node(this.new_%s(%s), node)' % (fn, callargs))
+            out('                    return this.update_node(this.new_%s(%s), node)' % (ctor_fn, callargs))
             out('                return node')
             out('            }')
         out('        node')
