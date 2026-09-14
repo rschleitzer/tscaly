@@ -103,6 +103,11 @@ SOURCES = [
     # by NAME and most of relater.go's other messages are already in the table
     # through checker.go, so the cost is small and stated with the diff.
     os.path.join(SUB, "internal/checker/relater.go"),
+    # Slice 264: the module resolver's resolution diagnostics (util.go's
+    # GetResolutionDiagnostic, which resolveExternalModule reports) and the
+    # program's option and file diagnostics (program.go, the case yardstick's TS5xxx)
+    os.path.join(SUB, "internal/module/util.go"),
+    os.path.join(SUB, "internal/compiler/program.go"),
     # Slice 119. jsx.go joins under the same per-FILE rule: the JSX element chapter
     # reports, and four of its messages appear in NO other source of this list —
     # TS17004 (the --jsx flag), TS7026 (no interface JSX.IntrinsicElements),
