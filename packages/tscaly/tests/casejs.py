@@ -255,11 +255,12 @@ def emitted(unit_name, cfg, all_roots=True):
 
 def parse_baseline(text):
     """→ (header, [(name, content)]) of a `.js` baseline, CRLF normalized."""
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\r\n", "\n")
     # js_emit_baseline.go appends the declaration files with NO separator, so a
     # `.d.ts` ending in its map comment runs into the next header (slice 254)
     text = re.sub(r"(//# sourceMappingURL=[^\n]*?)(//// \[)", r"\1\n\2", text)
-    parts = re.split(r"^//// \[([^\]\n]*)\]( ////)?\n", text, flags=re.M)
+    # a name may carry `]` (sourceMapPercentEncoded): the shortest name the line's end accepts
+    parts = re.split(r"^//// \[([^\n]*?)\]( ////)?\n", text, flags=re.M)
     # parts: [pre, name1, marker1, body1, name2, marker2, body2, ...]
     sections = []
     header = None
@@ -272,6 +273,32 @@ def parse_baseline(text):
             sections.append((name, body))
         i += 3
     return header, sections
+
+
+def input_section_count(sections, units):
+    """how many of the split sections the input files take: one each, unless a file's
+    own text carries `//// [name]` lines, which the split cut at (the section is joined
+    back until it is the file's text)"""
+    contents = []
+    for _, c in units:
+        text = c.decode("utf-8", "replace") if isinstance(c, bytes) else c
+        contents.append(text.replace("\r\n", "\n").rstrip("\n"))
+    i = 0
+    for _ in units:
+        if i >= len(sections):
+            break
+        body = sections[i][1]
+        j = i
+        while body.rstrip("\n") not in contents and j + 1 < len(sections):
+            probe = body + "//// [%s]\n" % sections[j + 1][0] + sections[j + 1][1]
+            if not any(c.startswith(probe.rstrip("\n")) for c in contents):
+                break
+            j += 1
+            body = probe
+        if body.rstrip("\n") not in contents:
+            return len(units)
+        i = j + 1
+    return i
 
 
 def decode_case(raw):
@@ -292,10 +319,12 @@ def strip_directives(content):
     if not (content.startswith(b"\xef\xbb\xbf") or content.startswith(b"\xff\xfe") or content.startswith(b"\xfe\xff")):
         return content
     text = decode_case(content)
-    while True:
+    while text:
         nl = text.find("\n")
         first = text if nl < 0 else text[:nl]
-        if OPTION_RE.match(first):
+        # a blank line before the first content line is dropped too (test_case_parser.go
+        # writes a newline only once the file has content)
+        if OPTION_RE.match(first) or first.rstrip("\r") == "":
             text = "" if nl < 0 else text[nl + 1:]
         else:
             break
@@ -398,6 +427,8 @@ def program_path(unit_name):
         return posixpath.normpath(name)
     return posixpath.normpath(posixpath.join(ROOT, name))
 
+
+NOCHECK_MISSING_RE = re.compile(r"\r?\n\r?\n!!!! File ([^\r\n]*?) missing from original emit, but present in noCheck emit\r?\n")
 
 BUNDLE_HEAD = b"==== TSCALY-FILE "
 
@@ -584,7 +615,21 @@ def main():
         last = {}
         for i, (n, c) in enumerate(units):
             last[n] = i
-        units = [(n, c) for i, (n, c) in enumerate(units) if last[n] == i]
+        # ★ harnessutil.CompileFilesEx writes toBeCompiled, then otherFiles, into the map:
+        # when the last unit is the only root (a `require(` or a reference in it) an
+        # earlier unit of its name is an OTHER file and its content is the one read
+        # (augmentExportEquals2)
+        content_of = {}
+        # the root rule reads the last unit AS WRITTEN
+        tail_units = units[-1:]
+        if units and config is None:
+            tail_text = units[-1][1].decode("utf-8", "replace") if isinstance(units[-1][1], bytes) else units[-1][1]
+            if re.search(r"require\(", tail_text) or re.search(r"reference\s+path", tail_text):
+                tail_name = units[-1][0]
+                earlier = [c for n, c in units[:-1] if n == tail_name]
+                if earlier:
+                    content_of[tail_name] = earlier[-1]
+        units = [(n, content_of.get(n, c)) for i, (n, c) in enumerate(units) if last[n] == i]
         # the config's unit is not a file of the program, nor an input section of the
         # JS baseline (compiler_runner.go: toBeCompiled + otherFiles); its first match
         # is the config
@@ -617,13 +662,18 @@ def main():
                 continue
             with open(bpath, "rb") as fh:
                 btext = fh.read().decode("utf-8", "replace")
+            # js_emit_baseline.go's noCheck comparison: a file the emit did not write
+            # (noEmitOnError) but the noCheck emit did is baselined after a note; the
+            # notes are read off and the sections compared as outputs (slice 262)
+            nocheck_missing = set(os.path.basename(m) for m in NOCHECK_MISSING_RE.findall(btext))
+            btext = NOCHECK_MISSING_RE.sub("", btext)
             header, sections = parse_baseline(btext)
             n_inputs = len(program_units)
-            outputs = sections[n_inputs:]
+            outputs = sections[input_section_count(sections, program_units):]
             if args.refute:
                 outputs = [(n, b + "x") for n, b in outputs]
             if any(n.startswith("!!!!") for n, _ in outputs) or "\n!!!! File " in btext:
-                skips["baseline carries noCheck emit notes (noEmitOnError)"] += 1
+                skips["baseline carries a noCheck emit difference"] += 1
                 continue
             # the declaration files' own type check (`//// [DtsFileErrors]`, the runner
             # re-checking the emitted .d.ts): the sections before it are compared, the
@@ -632,7 +682,7 @@ def main():
             if dts_errors:
                 outputs = outputs[:dts_errors[0]]
                 dts_error_pairs[0] += 1
-            last_content0 = units[-1][1] if units else b""
+            last_content0 = tail_units[-1][1] if tail_units else b""
             last_text0 = last_content0.decode("utf-8", "replace") if isinstance(last_content0, bytes) else last_content0
             all_roots = not bool(re.search(r"require\(", last_text0) or re.search(r"reference\s+path", last_text0) or cfg.get("noimplicitreferences"))
             config_roots = set(config[1]) if config is not None else None
@@ -648,7 +698,7 @@ def main():
             # JSON unit is never a root file (harnessutil), it is emitted only when imported.
             # Both are read off the baseline's section list (WHICH files, never their content).
             section_names = set(n for n, _ in outputs)
-            last_content = units[-1][1] if units else b""
+            last_content = tail_units[-1][1] if tail_units else b""
             last_text = last_content.decode("utf-8", "replace") if isinstance(last_content, bytes) else last_content
             last_is_root_only = bool(re.search(r"require\(", last_text) or re.search(r"reference\s+path", last_text) or cfg.get("noimplicitreferences"))
             common = common_source_directory(program_units, cfg)
@@ -666,7 +716,7 @@ def main():
             # one BUNDLE per (case, configuration): every unit, rooted at /.src as the
             # reference's runner roots them, the emitted ones flagged (slice 248)
             vpath = "/cases/%s/%s" % (name, cname or "default")
-            plan = {"case": name, "config": cname, "opts": opts, "vpath": vpath, "units": [], "outputs": outputs, "baseline": bname}
+            plan = {"case": name, "config": cname, "opts": opts, "vpath": vpath, "units": [], "outputs": outputs, "baseline": bname, "nocheck_missing": nocheck_missing}
             parts = []
             for un, content in program_units:
                 body = content if isinstance(content, bytes) else content.encode("utf-8", "surrogateescape")
@@ -754,6 +804,10 @@ def main():
                 last = err.decode("utf-8", "replace").strip().split("\n")[-1][:160] if err else ""
                 verdict, detail = "CRASH", "rc %s on %s: %s" % (rc, un, last)
                 break
+            skipped_on_error = "TSCALY-NOEMITONERROR" in sections
+            if skipped_on_error != bool(plan["nocheck_missing"]) or (skipped_on_error and os.path.basename(oname) not in plan["nocheck_missing"]):
+                verdict, detail = "FAIL", ("emit skipped on error here, not by the reference" if skipped_on_error else "the reference skipped the emit on error (noEmitOnError)")
+                break
             if body.startswith(b"UNPORTED "):
                 verdict, detail = "UNPORTED", body.decode("utf-8", "replace").split("\n")[0]
                 break
@@ -784,6 +838,21 @@ def main():
                 break
             ours_text = ours.replace("\r\n", "\n").rstrip("\n")
             hit = [i for i, b in matches if b.rstrip("\n") == ours_text]
+            if not hit:
+                # an output whose own text carries `//// [name]` lines was split there
+                # (scannerNonAsciiHorizontalWhitespace): a run of sections joined back
+                for i, _ in matches:
+                    run = plan["outputs"][i][1]
+                    for j in range(i + 1, len(plan["outputs"])):
+                        n2, b2 = plan["outputs"][j]
+                        run = run + "//// [%s]\n" % n2 + b2
+                        if run.rstrip("\n") == ours_text:
+                            hit = [i]
+                            for k in range(i + 1, j + 1):
+                                used[k] = True
+                            break
+                    if hit:
+                        break
             if not hit:
                 used[matches[0][0]] = True
                 verdict, detail = "FAIL", oname

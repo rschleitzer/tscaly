@@ -510,7 +510,7 @@ FACTORY_EXTRAS = """
                 else
                     set text: this.placeholder_text("generated", this.the_context().get_node_for_generated_name_worker(n, id) as int)
             }
-            set text: Printer.slice_of(Printer.format_generated_name(host, false, prefix, text, suffix))
+            set text: Printer.slice_on(host, Printer.format_generated_name(host, false, prefix, text, suffix))
         }
         let name this.new_identifier(text)
         let info &AutoGenerateInfo^host(kind | (flags & ~GeneratedIdentifierFlagsKindMask), id, prefix, suffix, node)
@@ -563,7 +563,7 @@ FACTORY_EXTRAS = """
                 else
                     set text: this.placeholder_text("generated", this.the_context().get_node_for_generated_name_worker(n, id) as int)
             }
-            set text: Printer.slice_of(Printer.format_generated_name(host, true, prefix, text, suffix))
+            set text: Printer.slice_on(host, Printer.format_generated_name(host, true, prefix, text, suffix))
         }
         let name this.new_private_identifier(text)
         let info &AutoGenerateInfo^host(kind | (flags & ~GeneratedIdentifierFlagsKindMask), id, prefix, suffix, node)
