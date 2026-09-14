@@ -85,7 +85,7 @@ def parse_answer(body):
     cur = None
     for line in body.decode("utf-8", "replace").split("\n"):
         if line.startswith("==== TSCALY-FILE "):
-            cur = {"K": 0, "D": [], "J": [], "B": [], "C": [], "R": []}
+            cur = {"K": 0, "D": [], "J": [], "B": [], "C": [], "R": [], "S": []}
             files[line[len("==== TSCALY-FILE "):]] = cur
             continue
         if cur is None or len(line) < 2:
@@ -93,7 +93,7 @@ def parse_answer(body):
         tag, rest = line[0], line[2:].split()
         if tag == "K":
             cur["K"] = int(rest[0])
-        elif tag in "DJBCR" and len(rest) == 3:
+        elif tag in "DJBCRS" and len(rest) == 3:
             cur[tag].append(tuple(int(x) for x in rest))
     return files
 
@@ -173,6 +173,8 @@ def compose(path, entry, cfg, text=b""):
         if plain_js:
             semantic = [d for d in semantic if d[2] in PLAIN_JS_ERRORS]
         else:
+            if check_js:
+                semantic += list(entry["S"])
             semantic = with_preceding_directives(text, entry["R"], semantic)
         diags += semantic
     return diags
@@ -306,7 +308,7 @@ def main():
                     missing_codes[k[3]] += 1
                 for k in extra:
                     extra_codes[k[3]] += 1
-                detail = "missing %s extra %s" % (miss[:3], extra[:3])
+                detail = "missing %s extra %s" % (miss, extra)
         counts[verdict] += 1
         if verdict == "UNPORTED":
             stops[" ".join(detail.split()[2:3])] += 1
