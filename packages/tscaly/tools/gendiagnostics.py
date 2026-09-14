@@ -121,6 +121,18 @@ SOURCES = [
     # reports, and its one message — TS2563, the body too large for control flow
     # analysis — appears in NO other source of this list. The cost is that entry.
     os.path.join(SUB, "internal/checker/flow.go"),
+    # Slice 250. The DECLARATION EMITTER's three files join under the same
+    # per-FILE rule: the transformer and its symbol tracker report (the TS4xxx
+    # "has or is using private name" family, the isolatedDeclarations family,
+    # the CommonJS `module.exports` serialization errors), and diagnostics.go is
+    # nothing but the selector tables that pick among them. None of those codes
+    # appears in any other source of this list. What the port does with a
+    # declaration diagnostic today is COUNT it: the reference skips the .d.ts
+    # of a file that reports one, so the presence is observable on the case
+    # yardstick even though no yardstick compares the codes yet.
+    os.path.join(SUB, "internal/transformers/declarations/transform.go"),
+    os.path.join(SUB, "internal/transformers/declarations/tracker.go"),
+    os.path.join(SUB, "internal/transformers/declarations/diagnostics.go"),
 ]
 DST = os.path.join(REPO, "packages/tscaly/0.1.0/tscaly/DiagnosticCodes.scaly")
 

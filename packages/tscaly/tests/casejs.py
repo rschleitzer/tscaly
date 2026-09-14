@@ -199,6 +199,38 @@ def allow_js(cfg):
     return cfg.get("allowjs", "").lower() == "true" or cfg.get("checkjs", "").lower() == "true"
 
 
+def declaration_on(cfg):
+    """declaration, or composite (which implies it)"""
+    return cfg.get("declaration", "").lower() == "true" or cfg.get("composite", "").lower() == "true"
+
+
+def dts_output_name(unit_name, cfg):
+    """GetDeclarationEmitOutputFilePath's name: `.mts` → `.d.mts`, `.cts` → `.d.cts`, else `.d.ts`;
+    a JSON unit has none (slice 250)"""
+    base = os.path.basename(unit_name)
+    stem, ext = os.path.splitext(base)
+    ext = ext.lower()
+    if ext in (".ts", ".tsx", ".js", ".jsx"):
+        return stem + ".d.ts"
+    if ext in (".mts", ".mjs"):
+        return stem + ".d.mts"
+    if ext in (".cts", ".cjs"):
+        return stem + ".d.cts"
+    return None
+
+
+def dts_program_path(ppath):
+    """the dump's section name for a unit's declaration file: the program path with the
+    extension replaced (Emitter.dts_name_of)"""
+    stem, ext = posixpath.splitext(ppath)
+    ext = ext.lower()
+    if ext in (".mts", ".mjs"):
+        return stem + ".d.mts"
+    if ext in (".cts", ".cjs"):
+        return stem + ".d.cts"
+    return stem + ".d.ts"
+
+
 def emitted(unit_name, cfg):
     base = os.path.basename(unit_name)
     low = base.lower()
@@ -296,6 +328,23 @@ def output_path(unit_name, cfg, common):
         return None
     outdir = cfg.get("outdir")
     # the runner names a section by its full emit path only under @fullEmitPaths
+    if not outdir or cfg.get("fullemitpaths", "").lower() != "true":
+        return oname
+    outdir = outdir.replace("\\", "/").rstrip("/")
+    if outdir.startswith("./"):
+        outdir = outdir[2:]
+    rel = posixpath.relpath(posixpath.dirname(program_path(unit_name)), common) if common else "."
+    parts = [outdir] + ([] if rel in (".", "") else [rel]) + [oname]
+    return posixpath.normpath("/".join(parts))
+
+
+def dts_output_path(unit_name, cfg, common):
+    """the baseline's section name for the declaration file: under declarationDir, else outDir,
+    with the same @fullEmitPaths rule as output_path"""
+    oname = dts_output_name(unit_name, cfg)
+    if oname is None:
+        return None
+    outdir = cfg.get("declarationdir") or cfg.get("outdir")
     if not outdir or cfg.get("fullemitpaths", "").lower() != "true":
         return oname
     outdir = outdir.replace("\\", "/").rstrip("/")
@@ -419,9 +468,6 @@ def main():
             if cfg.get("noemit", "").lower() == "true":
                 skips["noEmit"] += 1
                 continue
-            if cfg.get("emitdeclarationonly", "").lower() == "true":
-                skips["emitDeclarationOnly (the declaration chapter)"] += 1
-                continue
             with open(bpath, "rb") as fh:
                 btext = fh.read().decode("utf-8", "replace")
             header, sections = parse_baseline(btext)
@@ -457,8 +503,19 @@ def main():
                 parts.append(b"\n")
             groups[opts].append((vpath, b"".join(parts)))
             common = common_source_directory(units, cfg)
-            for un, content in to_emit:
-                plan["units"].append((program_path(un), un, output_path(un, cfg, common)))
+            # the JS outputs, unless emitDeclarationOnly; the declaration outputs under
+            # declaration/composite (slice 250) — each entry carries its KIND
+            if cfg.get("emitdeclarationonly", "").lower() != "true":
+                for un, content in to_emit:
+                    plan["units"].append((program_path(un), un, output_path(un, cfg, common), "js"))
+            if declaration_on(cfg):
+                unit_names = set(os.path.basename(n) for n, _ in units)
+                for un, content in to_emit:
+                    dname = dts_output_path(un, cfg, common)
+                    # a declaration output that would overwrite an input is not written
+                    # (the driver's overwrite error)
+                    if dname is not None and os.path.basename(dname) not in unit_names:
+                        plan["units"].append((dts_program_path(program_path(un)), un, dname, "dts"))
             plans.append(plan)
 
     # ── run: one batch per configuration string ──
@@ -487,12 +544,14 @@ def main():
         used = {}
         rc, body, err = answers.get(plan["vpath"], (None, b"", b""))
         sections = split_bundle_answer(body)
-        for ppath, un, oname in plan["units"]:
+        for ppath, un, oname, okind in plan["units"]:
             if rc is None:
                 verdict, detail = "CRASH", "no answer for %s" % un
                 break
             if rc != 0:
-                verdict, detail = "CRASH", "rc %s on %s" % (rc, un)
+                # the last line of stderr names the trap (an exit 21 names its symbol)
+                last = err.decode("utf-8", "replace").strip().split("\n")[-1][:160] if err else ""
+                verdict, detail = "CRASH", "rc %s on %s: %s" % (rc, un, last)
                 break
             if body.startswith(b"UNPORTED "):
                 verdict, detail = "UNPORTED", body.decode("utf-8", "replace").split("\n")[0]
@@ -504,6 +563,13 @@ def main():
             if ours.startswith("UNPORTED "):
                 verdict, detail = "UNPORTED", ours.split("\n")[0]
                 break
+            if okind == "dts" and ours.startswith("TSCALY-DECLARATION-BLOCKED"):
+                # the file's declaration emit reported: the reference writes no .d.ts
+                # for it, so the baseline must carry no section of that name
+                if any(n == oname for n, _ in plan["outputs"]):
+                    verdict, detail = "FAIL", "%s: declaration emit blocked here, emitted by the reference" % oname
+                    break
+                continue
             # the output sections of that name: the reference writes them in ITS program
             # order (an imported file before its importer), so a same-named section is
             # matched by content — any not-yet-taken section that equals ours (slice 248)
@@ -518,9 +584,13 @@ def main():
                 verdict, detail = "FAIL", oname
                 break
             used[hit[0]] = True
-        if verdict == "MATCH" and any(n.endswith(".d.ts") or n.endswith(".d.mts") or n.endswith(".d.cts") for n, _ in plan["outputs"]):
-            # the JavaScript matched; the declaration files beside it are a chapter of their own
-            verdict, detail = "UNPORTED", "UNPORTED 1 emit-declaration 0"
+        if verdict == "MATCH":
+            # a declaration section the plan did not cover (a case whose baseline carries
+            # one under a directive the planner does not read) is not a match
+            planned = set(oname for _, _, oname, okind in plan["units"] if okind == "dts")
+            stray = [n for n, _ in plan["outputs"] if (n.endswith(".d.ts") or n.endswith(".d.mts") or n.endswith(".d.cts")) and n not in planned]
+            if stray:
+                verdict, detail = "UNPORTED", "UNPORTED 1 emit-declaration-unplanned 0"
         counts[verdict] += 1
         if verdict == "UNPORTED":
             stops[" ".join(detail.split()[2:3])] += 1
@@ -554,7 +624,7 @@ def main():
                 rc, body, err = answers.get(plan["vpath"], (None, b"", b""))
                 sections = split_bundle_answer(body)
                 shown = {}
-                for ppath, un, oname in plan["units"]:
+                for ppath, un, oname, okind in plan["units"]:
                     ours = sections.get(ppath, body).decode("utf-8", "replace").replace("\r\n", "\n")
                     matches = [(i, b) for i, (n, b) in enumerate(plan["outputs"]) if n == oname and i not in shown]
                     hit = [(i, b) for i, b in matches if b.rstrip("\n") == ours.rstrip("\n")]

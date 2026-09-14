@@ -5836,6 +5836,25 @@ define ErrorChain
     depth: int
 )
 
+; printer.SymbolAccessibilityResult (slice 250, the declaration emitter): how a
+; symbol may be named from an enclosing declaration, and which unexported
+; aliases the emitter must paint visible to name it (`AliasesToMakeVisible`).
+; ErrorSymbolName/ErrorModuleName are message arguments no yardstick observes
+; (a diagnostic here is (pos, end, code)); they carry the symbols' bare names.
+define SymbolAccessibilityAccessible: int 0
+define SymbolAccessibilityNotAccessible: int 1
+define SymbolAccessibilityCannotBeNamed: int 2
+define SymbolAccessibilityNotResolved: int 3
+
+define SymbolAccessibilityResult
+(
+    accessibility: int
+    aliases_to_make_visible: ref[Array[ref[AstNode]?]]?
+    error_symbol_name: Slice[char]
+    error_module_name: Slice[char]
+    error_node: ref[AstNode]?
+)
+
 ; a generated identifier and the import specifier it stands for (SetReferencedImportDeclaration)
 define NodeDeclPair
 (
@@ -6558,6 +6577,9 @@ define Checker
     chain_visited_symbols: ref[Array[ref[Symbol]?]]?
     chain_visited_tables: ref[Array[ref[SymbolTable]?]]?
     chain_visited_count: int
+    ; emitresolver.go's declarationFileLinks.aliasesMarked (slice 250): the
+    ; files PrecalculateDeclarationEmitVisibility has walked
+    decl_visibility_marked_files: ref[Array[ref[AstNode]?]]?
 
     ; ── `isIdentifierTypeReference(typeNode)`, slice 183 ─────────────────────
     ;
@@ -7985,6 +8007,7 @@ define Checker
         set c.jsx_namespace_name: Slice[char]()
         set c.jsx_factory_entity: null
         set c.jsx_import_refs: null
+        set c.decl_visibility_marked_files: null
         set c.flow_analysis_disabled: false
         let fnr &Array[ref[FlowReachableLink]?]^host()
         set c.flow_node_reachable: fnr
@@ -26259,6 +26282,1302 @@ define Checker
         declarations
     }
 
+    ; ═══ emitresolver.go — the DECLARATION EMITTER's half (slice 250) ═══════════
+    ;
+    ; The reference's EmitResolver wraps the checker behind a mutex; here the
+    ; checker IS the resolver (§3.41). `IsParseTreeNode` is the NodeFlagsSynthesized
+    ; test the four answers above spell. Its per-node `declarationLinks.isVisible`
+    ; tristate is a SLOT on the node (`AstNode.decl_visible`), its per-file
+    ; `aliasesMarked` a list of the files walked. The node-builder entry points
+    ; (CreateTypeOfDeclaration and its kin) are NOT here: they need the factory,
+    ; a later module, and live with the transformer until the builder lands.
+
+    ; IsDeclarationVisible
+    function is_declaration_visible(this, node: ref[AstNode]?) returns bool
+    {
+        if node = null
+            return false
+        let n node as ref[AstNode]
+        if (n.flags & NodeFlagsSynthesized) <> 0
+            return false
+        if n.decl_visible = 0
+        {
+            if this.determine_if_declaration_is_visible(n)
+                set n.decl_visible: 1
+            else
+                set n.decl_visible: 2
+        }
+        n.decl_visible = 1
+    }
+
+    function determine_if_declaration_is_visible(this, n: ref[AstNode]) returns bool
+    {
+        let k n.kind
+        if (k = KindJSDocCallbackTag) or (k = KindJSDocTypedefTag)
+        {
+            ; a top-level jsdoc type alias: comment → hosting declaration → file
+            let p1 AstNode.parent_node_of(n)
+            if p1 = null
+                return false
+            let p2 AstNode.parent_node_of(p1)
+            if p2 = null
+                return false
+            let p3 AstNode.parent_node_of(p2)
+            if p3 = null
+                return false
+            return AstNode.kind_of(p3) = KindSourceFile
+        }
+        if k = KindBindingElement
+        {
+            let p1 AstNode.parent_node_of(n)
+            if p1 = null
+                return false
+            return this.is_declaration_visible(AstNode.parent_node_of(p1))
+        }
+        var declaration_like false
+        if k = KindVariableDeclaration
+            set declaration_like: true
+        if k = KindModuleDeclaration
+            set declaration_like: true
+        if k = KindClassDeclaration
+            set declaration_like: true
+        if k = KindInterfaceDeclaration
+            set declaration_like: true
+        if k = KindTypeAliasDeclaration
+            set declaration_like: true
+        if k = KindJSTypeAliasDeclaration
+            set declaration_like: true
+        if k = KindFunctionDeclaration
+            set declaration_like: true
+        if k = KindEnumDeclaration
+            set declaration_like: true
+        if k = KindImportEqualsDeclaration
+            set declaration_like: true
+        if declaration_like
+        {
+            if k = KindVariableDeclaration
+            {
+                let name AstNode.name_of(n)
+                if AstNode.is_binding_pattern(name)
+                {
+                    let els AstNode.elements_of(name)
+                    var empty true
+                    if els <> null
+                    {
+                        if ((els as ref[Array[ref[AstNode]?]]).get_length() as int) > 0
+                            set empty: false
+                    }
+                    ; an empty binding pattern declares nothing visible
+                    if empty
+                        return false
+                }
+            }
+            ; an external module augmentation is always visible, and so is a
+            ; @typedef at the top level of an external module
+            if Checker.is_external_module_augmentation(this, n)
+                return true
+            if this.binder_of_node(n).is_implicitly_exported_jsdoc_declaration(n)
+                return true
+            let parent_opt Checker.get_declaration_container(n)
+            if parent_opt = null
+                return false
+            let parent parent_opt as ref[AstNode]
+            var ambient_module_element false
+            if k <> KindImportEqualsDeclaration
+            {
+                if parent.kind <> KindSourceFile
+                {
+                    if (parent.flags & NodeFlagsAmbient) <> 0
+                        set ambient_module_element: true
+                }
+            }
+            ; not exported, and not an ambient module element (except an import
+            ; declaration): visible only at the top of a global script
+            if ((b.combined_modifier_flags(n) & ModifierFlagsExport) = 0) and (ambient_module_element = false)
+                return Checker.is_global_source_file(this.binder_of_node(parent), parent)
+            ; exported members / ambient module elements are visible if the parent is
+            return this.is_declaration_visible(parent)
+        }
+        var member false
+        if k = KindPropertyDeclaration
+            set member: true
+        if k = KindPropertySignature
+            set member: true
+        if k = KindGetAccessor
+            set member: true
+        if k = KindSetAccessor
+            set member: true
+        if k = KindMethodDeclaration
+            set member: true
+        if k = KindMethodSignature
+            set member: true
+        if member
+        {
+            ; private/protected members are not visible; public ones follow the parent
+            if this.get_effective_declaration_flags(n, ModifierFlagsPrivate | ModifierFlagsProtected) <> 0
+                return false
+            return this.is_declaration_visible(AstNode.parent_node_of(n))
+        }
+        var follows_parent false
+        if k = KindConstructor
+            set follows_parent: true
+        if k = KindConstructSignature
+            set follows_parent: true
+        if k = KindCallSignature
+            set follows_parent: true
+        if k = KindIndexSignature
+            set follows_parent: true
+        if k = KindParameter
+            set follows_parent: true
+        if k = KindModuleBlock
+            set follows_parent: true
+        if k = KindFunctionType
+            set follows_parent: true
+        if k = KindConstructorType
+            set follows_parent: true
+        if k = KindTypeLiteral
+            set follows_parent: true
+        if k = KindTypeReference
+            set follows_parent: true
+        if k = KindArrayType
+            set follows_parent: true
+        if k = KindTupleType
+            set follows_parent: true
+        if k = KindUnionType
+            set follows_parent: true
+        if k = KindIntersectionType
+            set follows_parent: true
+        if k = KindParenthesizedType
+            set follows_parent: true
+        if k = KindNamedTupleMember
+            set follows_parent: true
+        if follows_parent
+            return this.is_declaration_visible(AstNode.parent_node_of(n))
+        ; a default binding, import specifier or namespace import is visible only
+        ; on demand — by default it is not
+        if (k = KindImportClause) or (k = KindNamespaceImport) or (k = KindImportSpecifier)
+            return false
+        ; type parameters, the file and a namespace export are always visible
+        if k = KindTypeParameter
+            return true
+        if (k = KindSourceFile) or (k = KindNamespaceExportDeclaration)
+            return true
+        ; an export assignment creates no name binding outside the module
+        if k = KindExportAssignment
+            return false
+        ; `export {X}` without a module specifier is itself a visible re-export
+        if k = KindExportSpecifier
+        {
+            let p1 AstNode.parent_node_of(n)
+            if p1 = null
+                return false
+            let export_decl AstNode.parent_node_of(p1)
+            if AstNode.kind_of(export_decl) = KindExportDeclaration
+            {
+                if AstNode.module_specifier_of(export_decl) = null
+                    return this.is_declaration_visible(AstNode.parent_node_of(export_decl))
+            }
+            return false
+        }
+        false
+    }
+
+    ; the checker's getEffectiveDeclarationFlags: the combined modifier flags, with
+    ; `declare` (and `export` inside an exporting ambient container) implied for a
+    ; node in an ambient context that is not a class or interface member
+    function get_effective_declaration_flags(this, n: ref[AstNode], flags_to_check: int) returns int
+    {
+        var flags b.combined_modifier_flags(n)
+        let parent AstNode.parent_node_of(n)
+        var parent_is_class_like false
+        if parent <> null
+        {
+            let pk AstNode.kind_of(parent)
+            if (pk = KindInterfaceDeclaration) or (pk = KindClassDeclaration) or (pk = KindClassExpression)
+                set parent_is_class_like: true
+        }
+        if (parent_is_class_like = false) and ((n.flags & NodeFlagsAmbient) <> 0)
+        {
+            let container Checker.get_enclosing_container(n)
+            if container <> null
+            {
+                let c container as ref[AstNode]
+                if ((c.flags & NodeFlagsExportContext) <> 0) and ((flags & ModifierFlagsAmbient) = 0)
+                {
+                    var global_augmentation false
+                    if parent <> null
+                    {
+                        if AstNode.kind_of(parent) = KindModuleBlock
+                        {
+                            if Binder.is_global_scope_augmentation(AstNode.parent_node_of(parent))
+                                set global_augmentation: true
+                        }
+                    }
+                    ; nested in an ambient export context: automatically exported
+                    if global_augmentation = false
+                        set flags: flags | ModifierFlagsExport
+                }
+            }
+            set flags: flags | ModifierFlagsAmbient
+        }
+        flags & flags_to_check
+    }
+
+    ; getEnclosingContainer: the nearest ancestor the binder treats as a container
+    function get_enclosing_container(n: ref[AstNode]) returns ref[AstNode]?
+    {
+        var p AstNode.parent_node_of(n)
+        while p <> null
+        {
+            let node p as ref[AstNode]
+            if (Binder.get_container_flags(node) & ContainerFlagsIsContainer) <> 0
+                return node
+            set p: AstNode.parent_node_of(node)
+        }
+        null
+    }
+
+    ; PrecalculateDeclarationEmitVisibility: the aliases an `export =`, an export
+    ; assignment or an export specifier links to are painted visible up front,
+    ; once per file
+    procedure precalculate_declaration_emit_visibility(this, file: ref[AstNode])
+    {
+        if decl_visibility_marked_files = null
+            set this.decl_visibility_marked_files: &Array[ref[AstNode]?]^host()
+        let marked decl_visibility_marked_files as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (marked.get_length() as int)
+        {
+            let m marked[i]
+            if m <> null
+            {
+                if (m as ref[AstNode]) = file
+                    return
+            }
+            set i: i + 1
+        }
+        marked.add(file)
+        this.alias_marking_visit_children(file)
+    }
+
+    procedure alias_marking_visit_children(this, node: ref[AstNode])
+    {
+        var i 0
+        while true
+        {
+            let child AstNode.child_at(node, i)
+            if child = null
+                break
+            this.alias_marking_visit(child as ref[AstNode])
+            set i: i + 1
+        }
+    }
+
+    ; aliasMarkingVisitorWorker, over the whole tree
+    procedure alias_marking_visit(this, node: ref[AstNode])
+    {
+        let k node.kind
+        if k = KindBinaryExpression
+        {
+            if this.is_common_js_module_exports(node)
+            {
+                let right AstNode.binary_right_of(node)
+                if AstNode.kind_of(right) = KindIdentifier
+                    this.mark_linked_aliases(right as ref[AstNode])
+            }
+        }
+        if k = KindExportAssignment
+        {
+            let e AstNode.expression_of(node)
+            if AstNode.kind_of(e) = KindIdentifier
+                this.mark_linked_aliases(e as ref[AstNode])
+        }
+        if k = KindExportSpecifier
+        {
+            let pn Checker.property_name_or_name_of(node)
+            if pn <> null
+                this.mark_linked_aliases(pn as ref[AstNode])
+        }
+        this.alias_marking_visit_children(node)
+    }
+
+    ; markLinkedAliases: sets the isVisible link on the statements the identifier
+    ; or export name points at, following chains of `import d = a.b.c`
+    procedure mark_linked_aliases(this, node: ref[AstNode])
+    {
+        var export_symbol: ref[Symbol]? null
+        let parent AstNode.parent_node_of(node)
+        var handled false
+        if (node.kind <> KindStringLiteral) and (parent <> null)
+        {
+            let p parent as ref[AstNode]
+            var parent_exports false
+            if p.kind = KindExportAssignment
+                set parent_exports: true
+            if this.is_common_js_module_exports(p)
+                set parent_exports: true
+            if parent_exports
+            {
+                set export_symbol: this.resolve_name(node, AstNode.identifier_text_of(node), SymbolFlagsValue | SymbolFlagsType | SymbolFlagsNamespace | SymbolFlagsAlias, 0, false, false)
+                set handled: true
+            }
+        }
+        if handled = false
+        {
+            if AstNode.kind_of(parent) = KindExportSpecifier
+                set export_symbol: this.get_target_of_export_specifier(parent as ref[AstNode], SymbolFlagsValue | SymbolFlagsType | SymbolFlagsNamespace | SymbolFlagsAlias, false)
+        }
+        ; guard against circular imports
+        let visited &Array[ref[Symbol]?]^host()
+        while export_symbol <> null
+        {
+            let es export_symbol as ref[Symbol]
+            if Checker.symbol_list_contains(visited, es)
+                break
+            visited.add(es)
+            var next_symbol: ref[Symbol]? null
+            let n Symbol.declaration_count(es)
+            var i 0
+            while i < n
+            {
+                let dd Symbol.declaration_at(es, i)
+                if dd <> null
+                {
+                    let d dd as ref[AstNode]
+                    set d.decl_visible: 1
+                    if Checker.is_internal_module_import_equals_declaration(d)
+                    {
+                        ; add the referenced top container visible
+                        let first Checker.get_first_identifier(AstNode.module_reference_of(d))
+                        if first <> null
+                            set next_symbol: this.resolve_name(d, AstNode.identifier_text_of(first), SymbolFlagsValue | SymbolFlagsType | SymbolFlagsNamespace | SymbolFlagsAlias, 0, false, false)
+                    }
+                }
+                set i: i + 1
+            }
+            set export_symbol: next_symbol
+        }
+    }
+
+    ; getMeaningOfEntityNameReference: which meaning the first identifier of an
+    ; entity name is resolved under
+    function get_meaning_of_entity_name_reference(entity_name: ref[AstNode]) returns int
+    {
+        let parent AstNode.parent_node_of(entity_name)
+        let pk AstNode.kind_of(parent)
+        var value false
+        if pk = KindTypeQuery
+            set value: true
+        if pk = KindExpressionWithTypeArguments
+        {
+            if AstNode.is_part_of_type_node(parent) = false
+                set value: true
+        }
+        if pk = KindComputedPropertyName
+            set value: true
+        if pk = KindTypePredicate
+        {
+            if AstNode.type_predicate_parameter_name_of(parent) = entity_name
+                set value: true
+        }
+        if pk = KindBinaryExpression
+            set value: true
+        ; typeof value
+        if value
+            return SymbolFlagsValue | SymbolFlagsExportValue
+        var namespace false
+        let k entity_name.kind
+        if k = KindQualifiedName
+            set namespace: true
+        if k = KindPropertyAccessExpression
+            set namespace: true
+        if pk = KindImportEqualsDeclaration
+            set namespace: true
+        if pk = KindQualifiedName
+        {
+            if AstNode.qualified_left_of(parent) = entity_name
+                set namespace: true
+        }
+        if (pk = KindPropertyAccessExpression) or (pk = KindElementAccessExpression)
+        {
+            if AstNode.expression_of(parent) = entity_name
+                set namespace: true
+        }
+        ; the left identifier of a type reference, or an import's entity name
+        if namespace
+            return SymbolFlagsNamespace
+        ; a type reference or type alias entity that is one identifier
+        SymbolFlagsType
+    }
+
+    ; IsEntityNameVisible
+    function is_entity_name_visible(this, entity_name: ref[AstNode], enclosing: ref[AstNode]?, should_compute_alias: bool) returns SymbolAccessibilityResult
+    {
+        if (entity_name.flags & NodeFlagsSynthesized) <> 0
+            return SymbolAccessibilityResult(SymbolAccessibilityNotAccessible, null, null, null, null)
+        let meaning Checker.get_meaning_of_entity_name_reference(entity_name)
+        let first_opt Checker.get_first_identifier(entity_name)
+        if first_opt = null
+            return SymbolAccessibilityResult(SymbolAccessibilityNotResolved, null, null, null, null)
+        let first first_opt as ref[AstNode]
+        let first_text AstNode.identifier_text_of(first)
+        let symbol this.resolve_name(enclosing, first_text, meaning, 0, false, false)
+        if symbol <> null
+        {
+            let s symbol as ref[Symbol]
+            if ((Symbol.flags_of(s) & SymbolFlagsTypeParameter) <> 0) and ((meaning & SymbolFlagsType) <> 0)
+                return SymbolAccessibilityResult(SymbolAccessibilityAccessible, null, null, null, null)
+        }
+        if symbol = null
+        {
+            if AstNode.is_this_identifier(first)
+            {
+                let container Binder.get_this_container(first, false, false)
+                let sym this.get_symbol_of_declaration(container)
+                let r this.is_symbol_accessible(sym, enclosing, meaning, false)
+                if r.accessibility = SymbolAccessibilityAccessible
+                    return SymbolAccessibilityResult(SymbolAccessibilityAccessible, null, null, null, null)
+            }
+            var unresolved SymbolAccessibilityResult(SymbolAccessibilityNotResolved, null, null, null, first)
+            set unresolved.error_symbol_name: first_text
+            return unresolved
+        }
+        let visible this.has_visible_declarations(symbol as ref[Symbol], should_compute_alias)
+        if visible <> null
+        {
+            let copy: SymbolAccessibilityResult (visible as ref[SymbolAccessibilityResult])
+            return copy
+        }
+        var r SymbolAccessibilityResult(SymbolAccessibilityNotAccessible, null, null, null, first)
+        set r.error_symbol_name: first_text
+        r
+    }
+
+    ; hasVisibleDeclarations: null when some declaration of the symbol cannot be
+    ; made visible; else Accessible with the aliasing statements to paint
+    ; (`AliasesToMakeVisible`), each recorded once per declaration
+    function has_visible_declarations(this, symbol: ref[Symbol], should_compute_alias: bool) returns ref[SymbolAccessibilityResult]?
+    {
+        var alias_keys: ref[Array[ref[AstNode]?]]? null
+        var alias_values: ref[Array[ref[AstNode]?]]? null
+        let n Symbol.declaration_count(symbol)
+        var i 0
+        while i < n
+        {
+            let dd Symbol.declaration_at(symbol, i)
+            set i: i + 1
+            if dd <> null
+            {
+                let d dd as ref[AstNode]
+                if d.kind <> KindIdentifier
+                {
+                    if this.is_declaration_visible(d) = false
+                    {
+                        var aliasing: ref[AstNode]? null
+                        var refused false
+                        ; an unexported alias whose parent is visible can name a type
+                        let any_import Checker.get_any_import_syntax(d)
+                        if any_import <> null
+                        {
+                            let ai any_import as ref[AstNode]
+                            if b.has_syntactic_modifier(ai, ModifierFlagsExport) = false
+                            {
+                                if this.is_declaration_visible(AstNode.parent_node_of(ai))
+                                    set aliasing: ai
+                            }
+                        }
+                        if aliasing = null
+                        {
+                            if d.kind = KindVariableDeclaration
+                            {
+                                let p1 AstNode.parent_node_of(d)
+                                let stmt AstNode.parent_node_of(p1)
+                                if AstNode.kind_of(stmt) = KindVariableStatement
+                                {
+                                    ; an unexported variable statement in a visible container
+                                    if b.has_syntactic_modifier(stmt, ModifierFlagsExport) = false
+                                    {
+                                        if this.is_declaration_visible(AstNode.parent_node_of(stmt))
+                                            set aliasing: stmt
+                                    }
+                                }
+                            }
+                        }
+                        if aliasing = null
+                        {
+                            ; an unexported top-level statement
+                            if Checker.is_late_visibility_painted_statement(d)
+                            {
+                                if b.has_syntactic_modifier(d, ModifierFlagsExport) = false
+                                {
+                                    if this.is_declaration_visible(AstNode.parent_node_of(d))
+                                        set aliasing: d
+                                }
+                            }
+                        }
+                        if aliasing = null
+                        {
+                            if d.kind = KindBindingElement
+                            {
+                                var js_require false
+                                if ((Symbol.flags_of(symbol) & SymbolFlagsAlias) <> 0) and Parser.is_in_js_file(d)
+                                {
+                                    ; an exported import-like top-level JS require statement
+                                    let p1 AstNode.parent_node_of(d)
+                                    let p2 AstNode.parent_node_of(p1)
+                                    if AstNode.kind_of(p2) = KindVariableDeclaration
+                                    {
+                                        let p3 AstNode.parent_node_of(p2)
+                                        let p4 AstNode.parent_node_of(p3)
+                                        if AstNode.kind_of(p4) = KindVariableStatement
+                                        {
+                                            if b.has_syntactic_modifier(p4, ModifierFlagsExport) = false
+                                            {
+                                                let p5 AstNode.parent_node_of(p4)
+                                                if p5 <> null
+                                                {
+                                                    if this.is_declaration_visible(p5)
+                                                    {
+                                                        set aliasing: p4
+                                                        set js_require: true
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if js_require = false
+                                {
+                                    if (Symbol.flags_of(symbol) & SymbolFlagsBlockScopedVariable) <> 0
+                                    {
+                                        let root Checker.walk_up_binding_elements_and_patterns(d)
+                                        if root = null
+                                            return null
+                                        if AstNode.kind_of(root) = KindParameter
+                                            return null
+                                        let vs AstNode.parent_node_of(AstNode.parent_node_of(root))
+                                        if AstNode.kind_of(vs) <> KindVariableStatement
+                                            return null
+                                        if b.has_syntactic_modifier(vs, ModifierFlagsExport)
+                                            set refused: false
+                                        else
+                                        {
+                                            if this.is_declaration_visible(AstNode.parent_node_of(vs)) = false
+                                                return null
+                                            set aliasing: vs
+                                        }
+                                        ; already exported: no alias to add, and the
+                                        ; declaration is not refused
+                                        if aliasing = null
+                                            set js_require: true
+                                    }
+                                }
+                                if (aliasing = null) and (js_require = false)
+                                    set refused: true
+                            }
+                            else
+                                set refused: true
+                        }
+                        if refused
+                            return null
+                        if (aliasing <> null) and should_compute_alias
+                        {
+                            set d.decl_visible: 1
+                            if alias_keys = null
+                            {
+                                set alias_keys: &Array[ref[AstNode]?]^host()
+                                set alias_values: &Array[ref[AstNode]?]^host()
+                            }
+                            let keys alias_keys as ref[Array[ref[AstNode]?]]
+                            var seen false
+                            var ki 0
+                            while ki < (keys.get_length() as int)
+                            {
+                                let kd keys[ki]
+                                if kd <> null
+                                {
+                                    if (kd as ref[AstNode]) = d
+                                        set seen: true
+                                }
+                                set ki: ki + 1
+                            }
+                            if seen = false
+                            {
+                                keys.add(d)
+                                (alias_values as ref[Array[ref[AstNode]?]]).add(aliasing)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        &SymbolAccessibilityResult^host(SymbolAccessibilityAccessible, alias_values, null, null, null)
+    }
+
+    ; getAnyImportSyntax: the import statement an import binding belongs to
+    function get_any_import_syntax(node: ref[AstNode]) returns ref[AstNode]?
+    {
+        let k node.kind
+        if k = KindImportEqualsDeclaration
+            return node
+        if k = KindImportClause
+            return AstNode.parent_node_of(node)
+        if k = KindNamespaceImport
+            return AstNode.parent_node_of(AstNode.parent_node_of(node))
+        if k = KindImportSpecifier
+            return AstNode.parent_node_of(AstNode.parent_node_of(AstNode.parent_node_of(node)))
+        null
+    }
+
+    ; ast.IsLateVisibilityPaintedStatement
+    function is_late_visibility_painted_statement(node: ref[AstNode]) returns bool
+    {
+        let k node.kind
+        if k = KindImportDeclaration
+            return true
+        if k = KindJSImportDeclaration
+            return true
+        if k = KindImportEqualsDeclaration
+            return true
+        if k = KindVariableStatement
+            return true
+        if k = KindClassDeclaration
+            return true
+        if k = KindFunctionDeclaration
+            return true
+        if k = KindModuleDeclaration
+            return true
+        if k = KindTypeAliasDeclaration
+            return true
+        if k = KindJSTypeAliasDeclaration
+            return true
+        if k = KindInterfaceDeclaration
+            return true
+        k = KindEnumDeclaration
+    }
+
+    ; IsImplementationOfOverload: a function body that belongs to a symbol with
+    ; several signatures, or with one signature that is not this node's
+    function is_implementation_of_overload(this, node: ref[AstNode]) returns bool
+    {
+        if (node.flags & NodeFlagsSynthesized) <> 0
+            return false
+        if Binder.node_is_present(AstNode.body_of(node))
+        {
+            ; get or set accessors can never be overload implementations
+            if (node.kind = KindGetAccessor) or (node.kind = KindSetAccessor)
+                return false
+            let symbol this.get_symbol_of_declaration(node)
+            let sigs this.get_signatures_of_symbol(symbol)
+            if sigs <> null
+            {
+                let s sigs as ref[Array[ref[Signature]?]]
+                let n s.get_length() as int
+                if n > 1
+                    return true
+                if n = 1
+                {
+                    let sig s[0]
+                    if sig <> null
+                    {
+                        let decl (sig as ref[Signature]).declaration
+                        if decl <> null
+                        {
+                            let d decl as ref[AstNode]
+                            if (d <> node) and ((d.flags & NodeFlagsJSDoc) = 0)
+                                return true
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    ; IsImportRequiredByAugmentation: an import whose target file declares an
+    ; augmentation of something this file exports
+    function is_import_required_by_augmentation(this, decl: ref[AstNode]) returns bool
+    {
+        if (decl.flags & NodeFlagsSynthesized) <> 0
+            return false
+        let file Checker.source_file_of_node(decl)
+        if file = null
+            return false
+        let file_symbol AstNode.symbol_of(file)
+        if file_symbol = null
+            return false
+        let import_target this.get_external_module_file_from_declaration(decl)
+        if import_target = null
+            return false
+        if import_target = file
+            return false
+        let exports this.get_exports_of_module(file_symbol as ref[Symbol])
+        if exports = null
+            return false
+        let t exports as ref[SymbolTable]
+        let n SymbolTable.length(t)
+        var i 0
+        while i < n
+        {
+            let so SymbolTable.entry_symbol_at(t, i)
+            set i: i + 1
+            if so <> null
+            {
+                let s so as ref[Symbol]
+                let merged this.get_merged_symbol(s)
+                if merged <> null
+                {
+                    let m merged as ref[Symbol]
+                    if m <> s
+                    {
+                        let dn Symbol.declaration_count(m)
+                        var di 0
+                        while di < dn
+                        {
+                            let d Symbol.declaration_at(m, di)
+                            if d <> null
+                            {
+                                if Checker.source_file_of_node(d) = import_target
+                                    return true
+                            }
+                            set di: di + 1
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    ; getExternalModuleFileFromDeclaration: the source file an import, export or
+    ; string-named module declaration resolves to
+    function get_external_module_file_from_declaration(this, declaration: ref[AstNode]) returns ref[AstNode]?
+    {
+        var specifier: ref[AstNode]? null
+        if declaration.kind = KindModuleDeclaration
+        {
+            let name AstNode.name_of(declaration)
+            if AstNode.kind_of(name) = KindStringLiteral
+                set specifier: name
+        }
+        else
+            set specifier: AstNode.get_external_module_name(declaration)
+        if specifier = null
+            return null
+        let module_symbol this.resolve_external_module_name(specifier, specifier, true)
+        if module_symbol = null
+            return null
+        Checker.get_declaration_of_kind(module_symbol as ref[Symbol], KindSourceFile)
+    }
+
+    ; IsDefinitelyReferenceToGlobalSymbolObject: exactly `Symbol.x` or
+    ; `globalThis.Symbol.x` resolving to the global Symbol
+    function is_definitely_reference_to_global_symbol_object(this, node: ref[AstNode]) returns bool
+    {
+        if node.kind <> KindPropertyAccessExpression
+            return false
+        let name AstNode.name_of(node)
+        if AstNode.kind_of(name) <> KindIdentifier
+            return false
+        let expr_opt AstNode.expression_of(node)
+        if expr_opt = null
+            return false
+        let expr expr_opt as ref[AstNode]
+        if expr.kind = KindIdentifier
+        {
+            if AstNode.identifier_text_of(expr).equals("Symbol") = false
+                return false
+            let resolved this.get_resolved_symbol(expr)
+            ; getGlobalSymbol: resolveName with no location
+            let global this.resolve_name(null, "Symbol", SymbolFlagsValue | SymbolFlagsExportValue, 0, false, false)
+            if global = null
+                return false
+            return resolved = (global as ref[Symbol])
+        }
+        if expr.kind <> KindPropertyAccessExpression
+            return false
+        let inner_opt AstNode.expression_of(expr)
+        if inner_opt = null
+            return false
+        let inner inner_opt as ref[AstNode]
+        if inner.kind <> KindIdentifier
+            return false
+        if AstNode.identifier_text_of(inner).equals("globalThis") = false
+            return false
+        if AstNode.identifier_text_of(AstNode.name_of(expr)).equals("Symbol") = false
+            return false
+        this.get_resolved_symbol(inner) = global_this_symbol
+    }
+
+    ; RequiresAddingImplicitUndefined with the declaration emitter's ENCLOSING
+    ; declaration (the printer's entry above passes none); the parameter arms
+    function requires_adding_implicit_undefined_ex(this, declaration: ref[AstNode], enclosing: ref[AstNode]?) returns bool
+    {
+        if (declaration.flags & NodeFlagsSynthesized) <> 0
+            return false
+        if (declaration.kind <> KindParameter) and (declaration.kind <> KindJSDocParameterTag)
+            return false
+        var wants false
+        if this.is_required_initialized_parameter_ex(declaration, enclosing)
+            set wants: true
+        if this.is_optional_uninitialized_parameter_property(declaration)
+            set wants: true
+        if wants = false
+            return false
+        this.declared_parameter_type_contains_undefined(declaration) = false
+    }
+
+    function is_required_initialized_parameter_ex(this, parameter: ref[AstNode], enclosing: ref[AstNode]?) returns bool
+    {
+        if Checker.strict_null_checks() = false
+            return false
+        let mark this.unported_mark()
+        let opt this.is_optional_parameter(parameter)
+        if this.unported_mark() <> mark
+            return false
+        if opt
+            return false
+        if AstNode.initializer_of(parameter) = null
+            return false
+        if b.has_syntactic_modifier(parameter, ModifierFlagsParameterPropertyModifier)
+        {
+            if enclosing = null
+                return false
+            return AstNode.is_function_like_declaration(enclosing)
+        }
+        true
+    }
+
+    ; IsLiteralConstDeclaration: a readonly or const declaration whose type is a
+    ; fresh literal type — printed with its initializer rather than a type
+    function is_literal_const_declaration(this, node: ref[AstNode]) returns bool
+    {
+        if (node.flags & NodeFlagsSynthesized) <> 0
+            return false
+        var const_like this.is_declaration_readonly(node)
+        if node.kind = KindVariableDeclaration
+        {
+            if (Binder.combined_node_flags(node) & NodeFlagsBlockScoped) = NodeFlagsConst
+                set const_like: true
+        }
+        if const_like = false
+            return false
+        let symbol this.get_symbol_of_declaration(node)
+        if symbol = null
+            return false
+        let t this.get_type_of_symbol(symbol as ref[Symbol])
+        if t = null
+            return false
+        Checker.is_fresh_literal_type(t as ref[Type])
+    }
+
+    ; GetPropertiesOfContainerFunction
+    function get_properties_of_container_function(this, node: ref[AstNode]) returns ref[Array[ref[Symbol]?]]?
+    {
+        let s this.get_symbol_of_declaration(node)
+        if s = null
+            return null
+        let t this.get_type_of_symbol(s as ref[Symbol])
+        if t = null
+            return null
+        this.get_properties_of_type(t as ref[Type])
+    }
+
+    ; IsExpandoFunctionDeclaration: a function some property assignment declares on
+    function is_expando_function_declaration(this, node: ref[AstNode]) returns bool
+    {
+        if (node.flags & NodeFlagsSynthesized) <> 0
+            return false
+        let props this.get_properties_of_container_function(node)
+        if props = null
+            return false
+        let list props as ref[Array[ref[Symbol]?]]
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            let p list[i]
+            if p <> null
+            {
+                let vd Symbol.value_declaration_of(p as ref[Symbol])
+                if vd <> null
+                {
+                    if AstNode.kind_of(vd) = KindBinaryExpression
+                        return true
+                }
+            }
+            set i: i + 1
+        }
+        false
+    }
+
+    ; IsSymbolAccessible: whether the symbol can be named from the enclosing
+    ; declaration under the meaning, marking the aliases that make it so when asked
+    function is_symbol_accessible(this, symbol: ref[Symbol]?, enclosing: ref[AstNode]?, meaning: int, should_compute_aliases: bool) returns SymbolAccessibilityResult
+        this.is_symbol_accessible_worker(symbol, enclosing, meaning, should_compute_aliases, true)
+
+    function is_symbol_accessible_worker(this, symbol: ref[Symbol]?, enclosing: ref[AstNode]?, meaning: int, should_compute_aliases: bool, allow_modules: bool) returns SymbolAccessibilityResult
+    {
+        if (symbol <> null) and (enclosing <> null)
+        {
+            let s symbol as ref[Symbol]
+            ; the accessible-chain walk reads its enclosing declaration off the
+            ; printer's cell (§3.20's shape): set it for the duration
+            let saved printer_enclosing_declaration
+            set this.printer_enclosing_declaration: enclosing
+            let one &Array[ref[Symbol]?]^host()
+            one.add(s)
+            let result this.is_any_symbol_accessible(one, s, meaning, should_compute_aliases, allow_modules)
+            set this.printer_enclosing_declaration: saved
+            if result <> null
+            {
+                let copy: SymbolAccessibilityResult (result as ref[SymbolAccessibilityResult])
+                return copy
+            }
+            ; not exported from its external module, or from a different external
+            ; module with no alias — hence cannot be named
+            var symbol_external_module: ref[Symbol]? null
+            let n Symbol.declaration_count(s)
+            var i 0
+            while i < n
+            {
+                if symbol_external_module = null
+                {
+                    let d Symbol.declaration_at(s, i)
+                    if d <> null
+                        set symbol_external_module: this.get_external_module_container(d as ref[AstNode])
+                }
+                set i: i + 1
+            }
+            if symbol_external_module <> null
+            {
+                let enclosing_external_module this.get_external_module_container(enclosing as ref[AstNode])
+                var same false
+                if enclosing_external_module <> null
+                {
+                    if (enclosing_external_module as ref[Symbol]) = (symbol_external_module as ref[Symbol])
+                        set same: true
+                }
+                if same = false
+                {
+                    var cannot SymbolAccessibilityResult(SymbolAccessibilityCannotBeNamed, null, null, null, null)
+                    set cannot.error_symbol_name: Symbol.name_of(s)
+                    set cannot.error_module_name: Symbol.name_of(symbol_external_module as ref[Symbol])
+                    if Parser.is_in_js_file(enclosing)
+                        set cannot.error_node: enclosing
+                    return cannot
+                }
+            }
+            ; just a local name that is not accessible
+            var local SymbolAccessibilityResult(SymbolAccessibilityNotAccessible, null, null, null, null)
+            set local.error_symbol_name: Symbol.name_of(s)
+            return local
+        }
+        SymbolAccessibilityResult(SymbolAccessibilityAccessible, null, null, null, null)
+    }
+
+    ; IsAnySymbolAccessible, over the printer's enclosing-declaration cell: null
+    ; when no verdict — the caller's fallbacks decide
+    function is_any_symbol_accessible(this, symbols: ref[Array[ref[Symbol]?]], initial_symbol: ref[Symbol], meaning: int, should_compute_aliases: bool, allow_modules: bool) returns ref[SymbolAccessibilityResult]?
+    {
+        let count symbols.get_length() as int
+        if count = 0
+            return null
+        var had_accessible_chain: ref[Symbol]? null
+        var early_module_bail false
+        var i 0
+        while i < count
+        {
+            let so symbols[i]
+            set i: i + 1
+            if so <> null
+            {
+                let symbol so as ref[Symbol]
+                ; the symbol is accessible if it by itself is accessible
+                let chain &Array[ref[Symbol]?]^host()
+                let mark this.unported_mark()
+                this.get_accessible_symbol_chain(symbol, meaning, chain)
+                if this.unported_mark() <> mark
+                    return null
+                if (chain.get_length() as int) > 0
+                {
+                    set had_accessible_chain: symbol
+                    let head chain[0]
+                    if head <> null
+                    {
+                        let visible this.has_visible_declarations(head as ref[Symbol], should_compute_aliases)
+                        if visible <> null
+                            return visible
+                    }
+                }
+                var skip false
+                if allow_modules
+                {
+                    if this.symbol_has_non_global_augmentation_external_module_declaration(symbol)
+                    {
+                        ; a module's aliases must be found first in declaration emit,
+                        ; so the module fast path waits until every other route failed
+                        if should_compute_aliases
+                        {
+                            set early_module_bail: true
+                            set skip: true
+                        }
+                        else
+                            return &SymbolAccessibilityResult^host(SymbolAccessibilityAccessible, null, null, null, null)
+                    }
+                }
+                if skip = false
+                {
+                    ; a qualified symbol is accessible if its parent is (`m.c`)
+                    let containers &Array[ref[Symbol]?]^host()
+                    this.containers_of_symbol(symbol, meaning, containers)
+                    var next_meaning meaning
+                    if initial_symbol = symbol
+                        set next_meaning: Checker.qualified_left_meaning(meaning)
+                    let parent_result this.is_any_symbol_accessible(containers, initial_symbol, next_meaning, should_compute_aliases, allow_modules)
+                    if parent_result <> null
+                        return parent_result
+                }
+            }
+        }
+        if early_module_bail
+            return &SymbolAccessibilityResult^host(SymbolAccessibilityAccessible, null, null, null, null)
+        if had_accessible_chain <> null
+        {
+            let r &SymbolAccessibilityResult^host(SymbolAccessibilityNotAccessible, null, null, null, null)
+            set r.error_symbol_name: Symbol.name_of(initial_symbol)
+            if (had_accessible_chain as ref[Symbol]) <> initial_symbol
+                set r.error_module_name: Symbol.name_of(had_accessible_chain as ref[Symbol])
+            return r
+        }
+        null
+    }
+
+    ; IsNameResolvable: the name resolves to any symbol at the location
+    function is_name_resolvable(this, location: ref[AstNode]?, name: Slice[char]) returns bool
+        this.resolve_name(location, name, SymbolFlagsValue | SymbolFlagsType | SymbolFlagsNamespace, 0, false, false) <> null
+
+    ; GetElementAccessExpressionName: the property name of `o["x"]` / `o[K.a]`,
+    ; empty when it has none
+    function get_element_access_expression_name(this, expression: ref[AstNode]) returns Slice[char]
+    {
+        if (expression.flags & NodeFlagsSynthesized) <> 0
+            return Slice[char]()
+        let arg AstNode.element_access_argument_of(expression)
+        if arg = null
+            return Slice[char]()
+        let a arg as ref[AstNode]
+        if Binder.is_string_or_numeric_literal_like(a)
+            return AstNode.literal_text_of(a)
+        if Parser.is_entity_name_expression(a)
+        {
+            var out_name Slice[char]()
+            if this.try_get_name_from_entity_name_expression(a, &out_name)
+                return out_name
+        }
+        Slice[char]()
+    }
+
+    ; GetReferencedMemberValueDeclaration: `this.x` / `this[x]` references have a
+    ; resolved symbol; a declaration instead of a reference has its own
+    function get_referenced_member_value_declaration(this, node: ref[AstNode]) returns ref[AstNode]?
+    {
+        if (node.flags & NodeFlagsSynthesized) <> 0
+            return null
+        var s this.get_resolved_symbol_or_nil(node)
+        if s = null
+        {
+            let own AstNode.symbol_of(node)
+            if own <> null
+                set s: this.get_merged_symbol(own)
+        }
+        if s = null
+            return null
+        let ex this.get_export_symbol_of_value_symbol_if_exported(s)
+        if ex = null
+            return null
+        Symbol.value_declaration_of(ex as ref[Symbol])
+    }
+
+    ; CreateLiteralConstValue, minus the node: the transformer builds it (the
+    ; factory is a later module) from the KIND this answers and the text —
+    ; 0 none · 1 string · 2 number · 3 negative number (text is the magnitude) ·
+    ; 4 Infinity · 5 -Infinity · 6 NaN · 7 bigint (text carries its `n`) ·
+    ; 8 true · 9 false · 10 an enum member (its expression needs the node builder)
+    procedure literal_const_value(this, node: ref[AstNode], out_text: ref[Slice[char]]) returns int
+    {
+        set out_text.data: null
+        set out_text.length: 0
+        let symbol this.get_symbol_of_declaration(node)
+        if symbol = null
+            return 0
+        let to this.get_type_of_symbol(symbol as ref[Symbol])
+        if to = null
+            return 0
+        let t to as ref[Type]
+        if (t.flags & TypeFlagsEnumLike) <> 0
+            return 10
+        if t = true_type
+            return 8
+        if t = false_type
+            return 9
+        if (t.flags & TypeFlagsLiteral) = 0
+            return 0
+        if (t.flags & TypeFlagsStringLiteral) <> 0
+        {
+            let text Checker.literal_text_of(t)
+            set out_text.data: text.data
+            set out_text.length: text.length
+            return 1
+        }
+        if (t.flags & TypeFlagsNumberLiteral) <> 0
+        {
+            let bits Checker.literal_bits_of(t)
+            if jsnum_is_inf(bits)
+            {
+                if jsnum_abs(bits) = bits
+                    return 4
+                return 5
+            }
+            if jsnum_is_nan(bits)
+                return 6
+            var kind 2
+            var magnitude bits
+            if jsnum_abs(bits) <> bits
+            {
+                set kind: 3
+                set magnitude: jsnum_abs(bits)
+            }
+            let raw host.allocate(40 as size_t, 1) as pointer[char]
+            let buf Slice[char](40 as size_t, raw)
+            let n jsnum_to_string(magnitude, buf)
+            set out_text.data: raw
+            set out_text.length: n
+            return kind
+        }
+        if (t.flags & TypeFlagsBigIntLiteral) <> 0
+        {
+            let sb StringBuilder^host()
+            Checker.write_pseudo_big_int(sb, t)
+            sb.append("n")
+            let s Printer.slice_on(host, sb.to_string())
+            set out_text.data: s.data
+            set out_text.length: s.length
+            return 7
+        }
+        if (t.flags & TypeFlagsBooleanLiteral) <> 0
+        {
+            ; the regular true/false types
+            if Checker.literal_bool_of(t)
+                return 8
+            return 9
+        }
+        0
+    }
+
+    ; IsThisPropertyAssignmentDeclarationRedundant: a JS `this.x = …` whose member
+    ; an `extends` base already provides — an inherited accessor or method (always
+    ; redundant), or an identical inherited property (same readonly-ness,
+    ; optionality and type); `implements` members are not inherited
+    function is_this_property_assignment_declaration_redundant(this, node: ref[AstNode]) returns bool
+    {
+        let so this.get_symbol_of_declaration(node)
+        if so = null
+            return false
+        let s so as ref[Symbol]
+        let parent Symbol.parent_of(s)
+        if parent = null
+            return false
+        let pt this.get_declared_type_of_symbol(parent as ref[Symbol])
+        if pt = null
+            return false
+        let bases this.get_base_types(pt as ref[Type])
+        if bases = null
+            return false
+        let bl bases as ref[Array[ref[Type]?]]
+        var i 0
+        while i < (bl.get_length() as int)
+        {
+            let bo bl[i as size_t]
+            set i: i + 1
+            if bo <> null
+            {
+                let base_prop this.get_property_of_type(bo as ref[Type], Symbol.name_of(s))
+                if base_prop <> null
+                {
+                    let bp base_prop as ref[Symbol]
+                    if (Symbol.flags_of(bp) & (SymbolFlagsAccessor | SymbolFlagsMethod | SymbolFlagsFunction)) <> 0
+                        return true
+                    if this.is_readonly_symbol(bp) = this.is_readonly_symbol(s)
+                    {
+                        if (Symbol.flags_of(s) & SymbolFlagsOptional) = (Symbol.flags_of(bp) & SymbolFlagsOptional)
+                        {
+                            let ts this.get_type_of_symbol(s)
+                            let tb this.get_type_of_symbol(bp)
+                            if (ts <> null) and (tb <> null)
+                            {
+                                if this.is_type_identical_to(ts as ref[Type], tb as ref[Type])
+                                    return true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    ; the count of a class's index signatures that only the node builder can
+    ; write: an index info without a declaration (a late-bound one), static or
+    ; instance, that is not the inherited any-base placeholder
+    function late_bound_index_signature_count(this, container: ref[AstNode]) returns int
+    {
+        let sym_opt AstNode.symbol_of(container)
+        if sym_opt = null
+            return 0
+        let sym sym_opt as ref[Symbol]
+        var count 0
+        let t this.get_type_of_symbol(sym)
+        if t <> null
+            set count: count + this.count_undeclared_index_infos(this.get_index_infos_of_type(t as ref[Type]))
+        let index_symbol this.get_index_symbol(sym)
+        if index_symbol <> null
+        {
+            let members this.get_members_of_symbol(sym)
+            set count: count + this.count_undeclared_index_infos(this.get_index_infos_of_index_symbol(index_symbol as ref[Symbol], members))
+        }
+        count
+    }
+
+    function count_undeclared_index_infos(this, infos: ref[Array[ref[IndexInfo]?]]?) returns int
+    {
+        if infos = null
+            return 0
+        let list infos as ref[Array[ref[IndexInfo]?]]
+        var count 0
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            let io list[i]
+            if io <> null
+            {
+                let info io as ref[IndexInfo]
+                if info.declaration = null
+                {
+                    var inherited false
+                    if any_base_type_index_info <> null
+                    {
+                        if (any_base_type_index_info as ref[IndexInfo]) = info
+                            set inherited: true
+                    }
+                    if inherited = false
+                        set count: count + 1
+                }
+            }
+            set i: i + 1
+        }
+        count
+    }
+
     ; GetReferencedExportContainer: the SourceFile, ModuleDeclaration or
     ; EnumDeclaration whose export `node` refers to, else null
     ; ═══ checker/emitresolver.go GetTypeReferenceSerializationKind (slice 245) ═══
@@ -32404,6 +33723,7 @@ define Checker
         set n.emit_index: 0
         set n.emit_context_id: 0
         set n.subtree_facts: 0
+        set n.decl_visible: 0
         set n.flow_node: null
         set n.end_flow_node: null
         set n.return_flow_node: null
