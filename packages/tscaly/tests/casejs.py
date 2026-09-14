@@ -256,6 +256,9 @@ def emitted(unit_name, cfg, all_roots=True):
 def parse_baseline(text):
     """→ (header, [(name, content)]) of a `.js` baseline, CRLF normalized."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # js_emit_baseline.go appends the declaration files with NO separator, so a
+    # `.d.ts` ending in its map comment runs into the next header (slice 254)
+    text = re.sub(r"(//# sourceMappingURL=[^\n]*?)(//// \[)", r"\1\n\2", text)
     parts = re.split(r"^//// \[([^\]\n]*)\]( ////)?\n", text, flags=re.M)
     # parts: [pre, name1, marker1, body1, name2, marker2, body2, ...]
     sections = []

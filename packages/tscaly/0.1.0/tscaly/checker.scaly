@@ -6130,6 +6130,8 @@ define Checker
     ; serializationLevel guard DOES fire — see type_to_string_serialized (slice 213);
     ; the note that stood here said the opposite.
     diagnostics: ref[DiagnosticList]?
+    ; the diagnostics with no location, counted (slice 254)
+    global_diagnostic_count: int
 
     ; nextTypeId, in creation order.
     type_count: int
@@ -7937,6 +7939,7 @@ define Checker
         set c.no_implicit_override: false
         let dl &DiagnosticList^host(host)
         set c.diagnostics: dl
+        set c.global_diagnostic_count: 0
         set c.type_count: 0
         let ra &Array[ref[AstNode]?]^host()
         set c.reported_ambient: ra
@@ -28568,10 +28571,13 @@ define Checker
             this.grammar_error_on_node(name, DiagIdentifier_expected)
             return
         }
-        if module_kind = ModuleKindES2015
-            this.record_unported("module-export-name-es2015", module_kind)
-        if module_kind = ModuleKindES2020
-            this.record_unported("module-export-name-es2015", module_kind)
+        ; slice 254: the emit programs read the module option
+        if (module_kind = ModuleKindES2015) or (module_kind = ModuleKindES2020)
+        {
+            let nb this.binder_of_node(name)
+            if nb.is_declaration_file_of() = false
+                this.grammar_error_on_node(name, DiagString_literal_import_and_export_names_are_not_supported_when_the_module_flag_is_set_to_es2015_or_es2020)
+        }
     }
 
     ; checkExternalModuleExports — the file's export table walked for a name
@@ -36148,15 +36154,17 @@ define Checker
                 return error_type
             return any_type
         }
-        ; `!c.strictNullChecks && includes&Nullable != 0` — the option is TRUE under
-        ; this harness, so the whole fork is dead. A gate with a report, on this
-        ; file's standing rule for an inert arm.
+        ; `!c.strictNullChecks && includes&Nullable != 0` (slice 254: the emit
+        ; programs read the case's strictNullChecks)
         if Checker.strict_null_checks() = false
         {
             if (includes & TypeFlagsNullable) <> 0
             {
-                this.record_unported("intersection-non-strict-nullable", includes)
-                return null
+                if (includes & TypeFlagsIncludesEmptyObject) <> 0
+                    return never_type
+                if (includes & TypeFlagsUndefined) <> 0
+                    return undefined_type
+                return null_type
             }
         }
         var reduce_supertypes false
@@ -49054,15 +49062,40 @@ define Checker
                     }
                     if handled = false
                     {
-                        if AstNode.kind_of(d) = KindClassExpression
+                        ; a class expression assigned to an access expression (JS):
+                        ; `module.exports`/`exports.x` answer the file, anything
+                        ; else the resolved left operand (slice 254)
+                        if (AstNode.kind_of(d) = KindClassExpression) and (AstNode.kind_of(p) = KindBinaryExpression)
                         {
-                            if AstNode.kind_of(p) = KindBinaryExpression
+                            if AstNode.binary_operator_kind(p) = KindEqualsToken
                             {
-                                ; a class expression assigned to `module.exports` /
-                                ; `exports.x` (JS): the container is the file or the
-                                ; resolved left operand — not ported
-                                this.record_unported("containers-of-symbol-class-expression-assignment", 0)
-                                return
+                                let left AstNode.binary_left_of(p)
+                                if Parser.is_access_expression(left)
+                                {
+                                    let left_expr AstNode.expression_of(left)
+                                    if Parser.is_entity_name_expression(left_expr)
+                                    {
+                                        var exports_like Parser.is_module_exports_access_expression(left)
+                                        if Parser.is_exports_identifier(left_expr)
+                                            set exports_like: true
+                                        var container_symbol: ref[Symbol]? null
+                                        if exports_like
+                                            set container_symbol: this.get_symbol_of_declaration(Checker.source_file_of_node(d))
+                                        else
+                                        {
+                                            let cmark this.unported_mark()
+                                            this.check_expression_cached(left_expr as ref[AstNode])
+                                            if this.unported_mark() <> cmark
+                                                return
+                                            set container_symbol: this.symbol_node_link_of(left_expr as ref[AstNode]).resolved_symbol
+                                        }
+                                        if container_symbol <> null
+                                        {
+                                            if Checker.symbol_list_contains(candidates, container_symbol as ref[Symbol]) = false
+                                                candidates.add(container_symbol)
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -49312,12 +49345,25 @@ define Checker
             {
                 let stmt so as ref[AstNode]
                 let k AstNode.kind_of(stmt)
+                var has_specifier false
+                ; an `import x = require("m")` is one of the file's imports (slice 254)
                 if k = KindImportEqualsDeclaration
                 {
-                    this.record_unported("alternative-containing-modules-import-equals", 0)
-                    return
+                    let module_reference AstNode.module_reference_of(stmt)
+                    if AstNode.kind_of(module_reference) = KindExternalModuleReference
+                    {
+                        let ref_expression AstNode.expression_of(module_reference)
+                        if AstNode.kind_of(ref_expression) = KindStringLiteral
+                        {
+                            let resolved_equals this.resolve_external_module_name(printer_enclosing_declaration, ref_expression, true)
+                            if resolved_equals <> null
+                            {
+                                if this.get_alias_for_symbol_in_container(resolved_equals as ref[Symbol], symbol) <> null
+                                    out.add(resolved_equals)
+                            }
+                        }
+                    }
                 }
-                var has_specifier false
                 if k = KindImportDeclaration
                     set has_specifier: true
                 if k = KindExportDeclaration
@@ -74665,6 +74711,33 @@ define Checker
     ; is unreachable and is written as the row it would be — the day a `@target: es5`
     ; case reaches the checker, that stop is the work list entry and not a silent
     ; wrong answer (§3.5p).
+    ; isPropertyDeclaredInAncestorClass
+    function is_property_declared_in_ancestor_class(this, prop: ref[Symbol]) returns bool
+    {
+        let parent Symbol.parent_of(prop)
+        if parent = null
+            return false
+        let ps parent as ref[Symbol]
+        if (Symbol.flags_of(ps) & SymbolFlagsClass) = 0
+            return false
+        let declared this.get_declared_type_of_symbol(ps)
+        if declared = null
+            return false
+        let base_types this.get_base_types(declared as ref[Type])
+        if base_types = null
+            return false
+        let bl base_types as ref[Array[ref[Type]?]]
+        if (bl.get_length() as int) = 0
+            return false
+        let first bl[0]
+        if first = null
+            return false
+        let super_property this.get_property_of_type(first as ref[Type], Symbol.name_of(prop))
+        if super_property = null
+            return false
+        Symbol.value_declaration_of(super_property as ref[Symbol]) <> null
+    }
+
     procedure check_property_not_used_before_declaration(this, prop: ref[Symbol], node: ref[AstNode], right: ref[AstNode])
     {
         let vd Symbol.value_declaration_of(prop)
@@ -74700,13 +74773,21 @@ define Checker
                         }
                         if static_method = false
                         {
+                            ; `GetUseDefineForClassFields() || !isPropertyDeclaredInAncestorClass(prop)`
+                            var report_it true
                             if use_define_for_class_fields = false
                             {
-                                this.record_unported("is-property-declared-in-ancestor-class", AstNode.kind_of(value_declaration))
-                                return
+                                let ancestor_mark this.unported_mark()
+                                if this.is_property_declared_in_ancestor_class(prop)
+                                    set report_it: false
+                                if this.unported_mark() <> ancestor_mark
+                                    return
                             }
-                            this.error_on_node(right, DiagProperty_0_is_used_before_its_initialization)
-                            set reported: true
+                            if report_it
+                            {
+                                this.error_on_node(right, DiagProperty_0_is_used_before_its_initialization)
+                                set reported: true
+                            }
                         }
                     }
                 }
@@ -86126,12 +86207,78 @@ define Checker
             return false
         if AstNode.end_of(v) > AstNode.end_of(b)
             return false
-        ; The two assertions that carry the reduction above.
-        if this.use_define_for_class_fields = false
-            this.record_unported("requires-scope-change", 0)
-        if this.language_version < ScriptTargetES2020
-            this.record_unported("requires-scope-change", 1)
+        ; declarationRequiresScopeChange over the function's parameters (slice 254;
+        ; the reference memoizes it on the function's node links)
+        let params AstNode.parameters_of(location)
+        let pn AstNode.list_count(params)
+        var i 0
+        while i < pn
+        {
+            let p AstNode.child_in_list(params, i)
+            set i: i + 1
+            if p <> null
+            {
+                if this.requires_scope_change(p as ref[AstNode])
+                    return false
+            }
+        }
         true
+    }
+
+    ; requiresScopeChange: a parameter whose name or initializer needs temporaries
+    ; that move it into the body
+    function requires_scope_change(this, node: ref[AstNode]) returns bool
+    {
+        if this.requires_scope_change_worker(AstNode.name_of(node))
+            return true
+        let initializer AstNode.initializer_of(node)
+        if initializer = null
+            return false
+        this.requires_scope_change_worker(initializer)
+    }
+
+    function requires_scope_change_worker(this, node_in: ref[AstNode]?) returns bool
+    {
+        if node_in = null
+            return false
+        let node node_in as ref[AstNode]
+        let k AstNode.kind_of(node)
+        if (k = KindArrowFunction) or (k = KindFunctionExpression) or (k = KindFunctionDeclaration) or (k = KindConstructor)
+            return false
+        if (k = KindMethodDeclaration) or (k = KindGetAccessor) or (k = KindSetAccessor) or (k = KindPropertyAssignment)
+            return this.requires_scope_change_worker(AstNode.name_of(node))
+        if k = KindPropertyDeclaration
+        {
+            let nb this.binder_of_node(node)
+            if nb.has_syntactic_modifier(node, ModifierFlagsStatic)
+                return emit_standard_class_fields = false
+            return this.requires_scope_change_worker(AstNode.name_of(node))
+        }
+        if Binder.is_nullish_coalesce(node)
+            return language_version < ScriptTargetES2020
+        if Binder.is_optional_chain(node)
+            return language_version < ScriptTargetES2020
+        if k = KindBindingElement
+        {
+            if AstNode.dot_dot_dot_token_of(node) <> null
+            {
+                if AstNode.kind_of(AstNode.parent_node_of(node)) = KindObjectBindingPattern
+                    return language_version < ScriptTargetES2017
+            }
+        }
+        if AstNode.is_type_node_kind(k)
+            return false
+        var c 0
+        repeat
+        {
+            let child AstNode.child_at(node, c)
+            if child = null
+                break
+            if this.requires_scope_change_worker(child)
+                return true
+            set c: c + 1
+        }
+        false
     }
 
     ; ── binder.NameResolver.Resolve ──────────────────────────────────────────
@@ -86480,10 +86627,15 @@ define Checker
                         ; itself, i.e. false a second time. ★The `break` is NOT
                         ; behind the message: the enum member is the answer whether
                         ; or not anything is reported.
-                        if this.get_isolated_modules()
+                        if this.get_isolated_modules() and (name_not_found_message <> 0)
                         {
-                            if name_not_found_message <> 0
-                                this.record_unported("resolve-name-isolated-enum-access", k)
+                            ; slice 254: the emit programs read isolatedModules
+                            if (AstNode.flags_of(l) & NodeFlagsAmbient) = 0
+                            {
+                                let member_declaration Symbol.value_declaration_of(result as ref[Symbol])
+                                if Checker.source_file_of_node(l) <> Checker.source_file_of_node(member_declaration)
+                                    this.error_on_node(original_location, DiagCannot_access_0_from_another_file_without_qualification_when_1_is_enabled_Use_2_instead)
+                            }
                         }
                         break
                     }
@@ -97608,7 +97760,60 @@ define Checker
     {
         if use_define_for_class_fields
             return
-        this.record_unported("class-static-property-name-conflicts", AstNode.kind_of(node))
+        ; slice 254: the emit programs read useDefineForClassFields, and the body
+        ; the guard stood in front of is written
+        let members AstNode.member_list_of(node)
+        let n AstNode.list_count(members)
+        let name_word: Slice[char] "name"
+        let length_word: Slice[char] "length"
+        let caller_word: Slice[char] "caller"
+        let arguments_word: Slice[char] "arguments"
+        var i 0
+        while i < n
+        {
+            let mo AstNode.child_in_list(members, i)
+            set i: i + 1
+            if mo = null
+                continue
+            let member mo as ref[AstNode]
+            let member_name_node AstNode.name_of(member)
+            if member_name_node = null
+                continue
+            let mb this.binder_of_node(member)
+            if mb.has_syntactic_modifier(member, ModifierFlagsStatic) = false
+                continue
+            let mnn member_name_node as ref[AstNode]
+            ; getEffectivePropertyNameForPropertyNameNode
+            var member_name AstNode.property_name_text_of(mnn)
+            if (member_name.data = null) and (mnn.kind = KindComputedPropertyName)
+            {
+                let expression AstNode.expression_of(mnn)
+                if expression <> null
+                {
+                    let mark this.unported_mark()
+                    let et this.get_type_of_expression(expression as ref[AstNode])
+                    if this.unported_mark() <> mark
+                        return
+                    if et <> null
+                    {
+                        var from_type Slice[char]()
+                        if this.try_get_name_from_type(et as ref[Type], &from_type)
+                            set member_name: from_type
+                    }
+                }
+            }
+            if member_name.data = null
+                continue
+            var conflicts SymbolTable.names_equal(member_name, name_word)
+            if SymbolTable.names_equal(member_name, length_word)
+                set conflicts: true
+            if SymbolTable.names_equal(member_name, caller_word)
+                set conflicts: true
+            if SymbolTable.names_equal(member_name, arguments_word)
+                set conflicts: true
+            if conflicts
+                this.error_on_node(mnn, DiagStatic_property_0_conflicts_with_built_in_property_Function_0_of_constructor_function_1)
+        }
     }
 
     ; ── slice 74b: checkMembersForOverrideModifier ───────────────────────────
@@ -102552,13 +102757,16 @@ define Checker
         this.report_implicit_any(declaration, t, widening_kind)
     }
 
-    ; reportWideningErrorsInType. ★The array-or-tuple arm is is_array_or_tuple_type
-    ; again — false for everything this port can build — and the object-literal arm
-    ; is the one with input.
+    ; reportWideningErrorsInType (slice 254: the tuple and object-literal arms, which
+    ; the emit programs reach once strictNullChecks is the case's option). ★ Go's
+    ; `errorReported = errorReported || f(s)` stops calling after the first report;
+    ; the object-literal arm OVERWRITES per property, as the reference does.
     function report_widening_errors_in_type(this, t: ref[Type]) returns bool
     {
+        var error_reported false
         if (t.object_flags & ObjectFlagsContainsWideningType) = 0
             return false
+        let mark this.unported_mark()
         if (t.flags & TypeFlagsUnion) <> 0
         {
             let types Checker.union_types_of(t)
@@ -102577,35 +102785,94 @@ define Checker
                 }
                 set i: i + 1
             }
-            var reported false
             set i: 0
-            while i < n
+            while (i < n) and (error_reported = false)
             {
                 let c list[i]
                 if c <> null
-                {
-                    if this.report_widening_errors_in_type(c as ref[Type])
-                        set reported: true
-                }
+                    set error_reported: this.report_widening_errors_in_type(c as ref[Type])
                 set i: i + 1
             }
-            return reported
+            return error_reported
         }
         if this.is_array_or_tuple_type(t)
         {
-            ; getTypeArguments over the walk. Nothing mints a tuple here.
-            this.record_unported("report-widening-errors-in-tuple", t.flags)
-            return false
+            let args this.get_type_arguments(t)
+            if this.unported_mark() <> mark
+                return false
+            if args = null
+                return false
+            let list args as ref[Array[ref[Type]?]]
+            var i 0
+            while (i < (list.get_length() as int)) and (error_reported = false)
+            {
+                let s list[i]
+                if s <> null
+                    set error_reported: this.report_widening_errors_in_type(s as ref[Type])
+                set i: i + 1
+            }
+            return error_reported
         }
         if Checker.is_object_literal_type(t)
         {
-            ; The property walk's report needs symbolToString and TypeToString of
-            ; the WIDENED property type, and its `valueDeclaration.Parent ==
-            ; t.symbol.ValueDeclaration` term is a declaration comparison this port
-            ; can make — but the whole arm is behind ContainsWideningType on a
-            ; property, which nothing here produces.
-            this.record_unported("report-widening-errors-in-object-literal", t.flags)
-            return false
+            let props this.get_properties_of_object_type(t)
+            if this.unported_mark() <> mark
+                return false
+            if props = null
+                return false
+            let list props as ref[Array[ref[Symbol]?]]
+            var i 0
+            while i < (list.get_length() as int)
+            {
+                let po list[i]
+                set i: i + 1
+                if po = null
+                    continue
+                let p po as ref[Symbol]
+                let st this.get_type_of_symbol(p)
+                if this.unported_mark() <> mark
+                    return false
+                if st = null
+                    continue
+                let s st as ref[Type]
+                if (s.object_flags & ObjectFlagsContainsWideningType) = 0
+                    continue
+                set error_reported: this.report_widening_errors_in_type(s)
+                if error_reported = false
+                {
+                    ; property types from object literal normalization in unions
+                    var literal_declaration: ref[AstNode]? null
+                    if t.symbol <> null
+                        set literal_declaration: Symbol.value_declaration_of(t.symbol as ref[Symbol])
+                    var value_declaration: ref[AstNode]? null
+                    let dn Symbol.declaration_count(p)
+                    var di 0
+                    while di < dn
+                    {
+                        let d Symbol.declaration_at(p, di)
+                        set di: di + 1
+                        if d = null
+                            continue
+                        let ds AstNode.symbol_of(d)
+                        if ds = null
+                            continue
+                        let vd Symbol.value_declaration_of(ds as ref[Symbol])
+                        if vd = null
+                            continue
+                        if (literal_declaration <> null) and (AstNode.parent_node_of(vd) = literal_declaration)
+                        {
+                            set value_declaration: d
+                            break
+                        }
+                    }
+                    if value_declaration <> null
+                    {
+                        this.error_on_node(value_declaration, DiagObject_literal_s_property_0_implicitly_has_an_1_type)
+                        set error_reported: true
+                    }
+                }
+            }
+            return error_reported
         }
         false
     }
@@ -117554,7 +117821,27 @@ define Checker
     ; one is a failed parse_expected, which reported. And a missing row is then
     ; reported only where it could have changed an answer.
     function list_range_of(this, list: ref[Array[ref[AstNode]?]]?, out_pos: ref[int], out_end: ref[int]) returns bool
-        AstNode.list_range_of(file, list, out_pos, out_end)
+    {
+        if AstNode.list_range_of(file, list, out_pos, out_end)
+            return true
+        ; a list of another program file (slice 254): its own file's table
+        if program = null
+            return false
+        let pf program as ref[ProgramFiles]
+        var i 0
+        while i < pf.count()
+        {
+            let other pf.file_at(i)
+            set i: i + 1
+            if other = null
+                continue
+            if other = file
+                continue
+            if AstNode.list_range_of(other, list, out_pos, out_end)
+                return true
+        }
+        false
+    }
 
     ; checkGrammarForDisallowedTrailingComma, whole. `list.HasTrailingComma()` is
     ; DERIVED upstream too — `len(Nodes) > 0 && last.End() < list.End()` — so the
@@ -122532,33 +122819,46 @@ define Checker
                 if Checker.type_parameter_count_of(d) = 0
                     return d
                 if report_errors
-                {
-                    ; `Global_type_0_must_have_1_type_parameter_s`.
-                    this.record_unported("global-type-arity", Checker.type_parameter_count_of(d))
-                    return null
-                }
+                    this.error_on_node(Checker.get_global_type_declaration(sym), DiagGlobal_type_0_must_have_1_type_parameter_s)
             }
             else
             {
                 if report_errors
-                {
-                    ; `Global_type_0_must_be_a_class_or_interface_type`.
-                    this.record_unported("global-type-not-class-or-interface", Symbol.flags_of(sym))
-                    return null
-                }
+                    this.error_on_node(Checker.get_global_type_declaration(sym), DiagGlobal_type_0_must_be_a_class_or_interface_type)
             }
         }
         else
         {
+            ; TS2318 through resolveName(nil, …): a diagnostic with NO location, the
+            ; program's global list, which no artifact here reads (slice 254)
             if report_errors
-            {
-                ; TS2318, `Cannot_find_global_type_0` — reported by getGlobalSymbol
-                ; through resolveName's diagnostic parameter.
-                this.record_unported("cannot-find-global-type", flags)
-                return null
-            }
+                this.add_global_diagnostic(DiagCannot_find_global_type_0)
         }
         empty_object_type
+    }
+
+    ; getGlobalTypeDeclaration
+    function get_global_type_declaration(symbol: ref[Symbol]) returns ref[AstNode]?
+    {
+        let n Symbol.declaration_count(symbol)
+        var i 0
+        while i < n
+        {
+            let d Symbol.declaration_at(symbol, i)
+            set i: i + 1
+            let k Checker.kind_or_unknown(d)
+            if (k = KindClassDeclaration) or (k = KindInterfaceDeclaration) or (k = KindEnumDeclaration) or (k = KindTypeAliasDeclaration)
+                return d
+        }
+        null
+    }
+
+    ; a locationless diagnostic (slice 254): counted, never printed
+    procedure add_global_diagnostic(this, code: int)
+    {
+        if serialization_level >= 2
+            return
+        set this.global_diagnostic_count: global_diagnostic_count + 1
     }
 
     ; The `false` half of the fork, which is what four of this file's six callers
@@ -125279,33 +125579,31 @@ define Checker
                                     set rel_unknown_hits: rel_unknown_hits + 1
                                     return true
                                 }
-                                ; ★ `fillMissingTypeArguments` on both sides is the
-                                ; reference's next line and it is a stop of its own
-                                ; (the default-argument chapter). Where NEITHER side
-                                ; is short of arguments it is the identity, which is
-                                ; every alias reference this corpus writes out; the
-                                ; row stands for the other shape.
+                                ; fillMissingTypeArguments on both sides (slice 254)
                                 let params this.type_alias_link_of(src.alias_symbol as ref[Symbol]).type_parameters
-                                var np 0
+                                var source_types: ref[Array[ref[Type]?]]? null
+                                var target_types: ref[Array[ref[Type]?]]? null
                                 if params <> null
-                                    set np: (params as ref[Array[ref[Type]?]]).get_length() as int
-                                var ns 0
-                                if src.alias_type_arguments <> null
-                                    set ns: (src.alias_type_arguments as ref[Array[ref[Type]?]]).get_length() as int
-                                var nt 0
-                                if target.alias_type_arguments <> null
-                                    set nt: (target.alias_type_arguments as ref[Array[ref[Type]?]]).get_length() as int
-                                if ns <> np
                                 {
-                                    this.record_unported("fill-missing-type-arguments", src.flags)
-                                    return false
+                                    let ps params as ref[Array[ref[Type]?]]
+                                    let min_params this.get_min_type_argument_count(ps)
+                                    let alias_declaration Symbol.value_declaration_of(src.alias_symbol as ref[Symbol])
+                                    var in_js false
+                                    if alias_declaration <> null
+                                        set in_js: ((AstNode.flags_of(alias_declaration as ref[AstNode]) & NodeFlagsJavaScriptFile) <> 0)
+                                    var sargs src.alias_type_arguments
+                                    if sargs = null
+                                        set sargs: this.new_type_list(null)
+                                    var targs target.alias_type_arguments
+                                    if targs = null
+                                        set targs: this.new_type_list(null)
+                                    let fill_mark this.unported_mark()
+                                    set source_types: this.fill_missing_type_arguments(sargs as ref[Array[ref[Type]?]], ps, min_params, in_js)
+                                    set target_types: this.fill_missing_type_arguments(targs as ref[Array[ref[Type]?]], ps, min_params, in_js)
+                                    if this.unported_mark() <> fill_mark
+                                        return false
                                 }
-                                if nt <> np
-                                {
-                                    this.record_unported("fill-missing-type-arguments", target.flags)
-                                    return false
-                                }
-                                let verdict this.relate_variances(src.alias_type_arguments, target.alias_type_arguments, vs, relation, error_node, intersection_state)
+                                let verdict this.relate_variances(source_types, target_types, vs, relation, error_node, intersection_state)
                                 if verdict = RelateVariancesTrue
                                     return true
                                 if verdict = RelateVariancesFalse
