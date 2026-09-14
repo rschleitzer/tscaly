@@ -30,6 +30,9 @@ import harness  # noqa: E402
 
 HEADER_RE = re.compile(r"^(.+?)\((\d+),(\d+)\): (error|warning|message) TS(\d+): ")
 GLOBAL_RE = re.compile(r"^(error|warning|message) TS(\d+): ")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+PRETTY_RE = re.compile(r"^(\S.*?):(\d+):(\d+) - (error|warning|message) TS(\d+): ")
+PRETTY_GLOBAL_RE = re.compile(r"^(error|warning|message) TS(\d+): ")
 
 # compiler/program.go plainJSErrors
 PLAIN_JS_ERRORS = {1013, 1014, 1048, 1049, 1053, 1054, 1091, 1100, 1101, 1102, 1104, 1105, 1106, 1107, 1113, 1114,
@@ -49,6 +52,16 @@ def expected_errors(path):
     for line in text.split("\n"):
         if line.startswith("==== "):
             break
+        # `@pretty: true`: `file:line:col - error TSn:` in ANSI colours (slice 269)
+        plain = ANSI_RE.sub("", line)
+        m = PRETTY_RE.match(plain)
+        if m:
+            out[(m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(5)))] += 1
+            continue
+        m = PRETTY_GLOBAL_RE.match(plain) if plain != line else None
+        if m:
+            out[("", 0, 0, int(m.group(2)))] += 1
+            continue
         m = HEADER_RE.match(line)
         if m:
             out[(m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(5)))] += 1
@@ -240,6 +253,9 @@ def main():
                 earlier = [c for n, c in units[:-1] if n == units[-1][0]]
                 if earlier:
                     content_of[units[-1][0]] = earlier[-1]
+        # compiler_runner.go reads the LAST unit's own text for its root rule
+        orig_last = units[-1][1] if units else b""
+        orig_last_text = orig_last.decode("utf-8", "replace") if isinstance(orig_last, bytes) else orig_last
         units = [(n, content_of.get(n, c)) for i, (n, c) in enumerate(units) if last[n] == i]
         config_index = next((i for i, (n, _) in enumerate(units) if casejs.is_config_unit(n)), None) if config is not None else None
         program_units = [u for i, u in enumerate(units) if i != config_index]
@@ -266,8 +282,7 @@ def main():
             # compiler_runner.go's root files: the config's file names, else every unit
             # unless the last one requires or references the rest (programFileNames
             # drops JSON)
-            last_content = units[-1][1] if units else b""
-            last_text = last_content.decode("utf-8", "replace") if isinstance(last_content, bytes) else last_content
+            last_text = orig_last_text
             last_only = bool(re.search(r"require\(", last_text) or re.search(r"reference\s+path", last_text) or cfg.get("noimplicitreferences"))
             config_roots = set(config[1]) if config is not None else None
             for ui, (un, content) in enumerate(program_units):
