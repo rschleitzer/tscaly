@@ -2346,11 +2346,19 @@ define NodeLink
     ; file, so the table dies with it. Named rather than omitted, because the day a
     ; second file is checked through one Checker the clear becomes load-bearing.
     reported_unreachable: bool
+
+    ; NodeCheckFlagsContainsClassWithPrivateIdentifiers and
+    ; …ContainsSuperPropertyInStaticInitializer (slice 258): the markers the two
+    ; generated-code collision checks read off a block-scope container
+    contains_class_with_private_identifiers: bool
+    contains_super_property_in_static_initializer: bool
 )
 {
     init(n: ref[AstNode]?)
     {
         set node: n
+        set contains_class_with_private_identifiers: false
+        set contains_super_property_in_static_initializer: false
         set type_checked: false
         set context_checked: false
         set enum_values_computed: false
@@ -7176,6 +7184,10 @@ define Checker
     react_namespace_option: Slice[char]
     jsx_fragment_factory_option: Slice[char]
     jsx_import_source_option: Slice[char]
+    ; addDeferredDiagnostic's two collision checks (slice 258): the nodes whose
+    ; check runs in produce_deferred_diagnostics, after the markers are set
+    deferred_weak_map_set_nodes: ref[Array[ref[AstNode]?]]?
+    deferred_reflect_nodes: ref[Array[ref[AstNode]?]]?
 
     ; ── NewChecker's four singleton signatures (slices 89 and 108) ──────────
     ;
@@ -8043,6 +8055,8 @@ define Checker
         set c.react_namespace_option: Slice[char]()
         set c.jsx_fragment_factory_option: Slice[char]()
         set c.jsx_import_source_option: Slice[char]()
+        set c.deferred_weak_map_set_nodes: null
+        set c.deferred_reflect_nodes: null
         set c.decl_visibility_marked_files: null
         set c.flow_analysis_disabled: false
         let fnr &Array[ref[FlowReachableLink]?]^host()
@@ -29893,8 +29907,15 @@ define Checker
         {
             if AstNode.kind_of(node) = KindExpressionWithTypeArguments
             {
-                this.record_unported("jsdoc-augments-arity", 0)
-                return null
+                ; the third conjunct, `!IsJSDocAugmentsTag(node.Parent)` (slice 258)
+                if Checker.kind_or_unknown(AstNode.parent_node_of(node)) <> KindJSDocAugmentsTag
+                {
+                    if min_count < tp_count
+                        this.error_on_node(node, DiagExpected_0_1_type_arguments_provide_these_with_an_extends_tag)
+                    else
+                        this.error_on_node(node, DiagExpected_0_type_arguments_provide_these_with_an_extends_tag)
+                    return error_type
+                }
             }
         }
         if min_count < tp_count
@@ -76300,7 +76321,30 @@ define Checker
             }
         }
         if b.is_static(c)
+        {
+            ; `super.x` in a static initializer marks every enclosing block-scope
+            ; container for checkReflectCollision (slice 258)
+            if (is_call_expression = false) and (language_version <= ScriptTargetES2021)
+            {
+                if (AstNode.kind_of(c) = KindPropertyDeclaration) or (AstNode.kind_of(c) = KindClassStaticBlockDeclaration)
+                {
+                    var current: ref[AstNode]? null
+                    if np <> null
+                        set current: Checker.get_enclosing_block_scope_container(np as ref[AstNode])
+                    while current <> null
+                    {
+                        let cur current as ref[AstNode]
+                        var mark_it true
+                        if cur.kind = KindSourceFile
+                            set mark_it: this.binder_of_node(cur).is_external_or_common_js_module()
+                        if mark_it
+                            set this.node_link_of(cur).contains_super_property_in_static_initializer: true
+                        set current: Checker.get_enclosing_block_scope_container(cur)
+                    }
+                }
+            }
             return this.get_base_constructor_type_of_class(ct)
+        }
         if is_call_expression
             return this.get_base_constructor_type_of_class(ct)
         this.get_type_with_this_argument(base_class_type as ref[Type], Checker.this_type_of(ct), false)
@@ -98557,7 +98601,40 @@ define Checker
             set wanted: true
         if wanted = false
             return
-        this.record_unported("check-weak-map-set-collision", AstNode.kind_of(node))
+        if deferred_weak_map_set_nodes = null
+            set this.deferred_weak_map_set_nodes: &Array[ref[AstNode]?]^host()
+        (deferred_weak_map_set_nodes as ref[Array[ref[AstNode]?]]).add(node)
+    }
+
+    ; checkWeakMapSetCollision
+    procedure check_weak_map_set_collision(this, node: ref[AstNode])
+    {
+        let enclosing_block_scope Checker.get_enclosing_block_scope_container(node)
+        if enclosing_block_scope = null
+            return
+        if this.node_link_of(enclosing_block_scope as ref[AstNode]).contains_class_with_private_identifiers
+        {
+            let name AstNode.name_of(node)
+            if Checker.kind_or_unknown(name) = KindIdentifier
+                this.error_on_node(node, DiagCompiler_reserves_name_0_when_emitting_private_identifier_downlevel)
+        }
+    }
+
+    ; setNodeLinksForPrivateIdentifierScope
+    procedure set_node_links_for_private_identifier_scope(this, node: ref[AstNode])
+    {
+        if Checker.kind_or_unknown(AstNode.name_of(node)) <> KindPrivateIdentifier
+            return
+        if (language_version < ScriptTargetES2022) or (language_version < ScriptTargetLatest) or (use_define_for_class_fields = false)
+        {
+            var lexical_scope Checker.get_enclosing_block_scope_container(node)
+            while lexical_scope <> null
+            {
+                let ls lexical_scope as ref[AstNode]
+                set this.node_link_of(ls).contains_class_with_private_identifiers: true
+                set lexical_scope: Checker.get_enclosing_block_scope_container(ls)
+            }
+        }
     }
 
     ; recordPotentialCollisionWithReflectInGeneratedCode's GUARD. Behind it,
@@ -98579,7 +98656,58 @@ define Checker
             return
         if Checker.need_collision_check_for_identifier(node, name, "Reflect") = false
             return
-        this.record_unported("check-reflect-collision", AstNode.kind_of(node))
+        if deferred_reflect_nodes = null
+            set this.deferred_reflect_nodes: &Array[ref[AstNode]?]^host()
+        (deferred_reflect_nodes as ref[Array[ref[AstNode]?]]).add(node)
+    }
+
+    ; checkReflectCollision
+    procedure check_reflect_collision(this, node: ref[AstNode])
+    {
+        var has_collision false
+        if node.kind = KindClassExpression
+        {
+            let members AstNode.member_list_of(node)
+            if members <> null
+            {
+                let ml members as ref[Array[ref[AstNode]?]]
+                var i 0
+                while i < (ml.get_length() as int)
+                {
+                    let m ml[i as size_t]
+                    set i: i + 1
+                    if m = null
+                        continue
+                    if this.node_link_of(m as ref[AstNode]).contains_super_property_in_static_initializer
+                    {
+                        set has_collision: true
+                        break
+                    }
+                }
+            }
+        }
+        else
+        {
+            if node.kind = KindFunctionExpression
+            {
+                if this.node_link_of(node).contains_super_property_in_static_initializer
+                    set has_collision: true
+            }
+            else
+            {
+                let container Checker.get_enclosing_block_scope_container(node)
+                if container <> null
+                {
+                    if this.node_link_of(container as ref[AstNode]).contains_super_property_in_static_initializer
+                        set has_collision: true
+                }
+            }
+        }
+        if has_collision
+        {
+            if Checker.kind_or_unknown(AstNode.name_of(node)) = KindIdentifier
+                this.error_on_node(node, DiagDuplicate_identifier_0_Compiler_reserves_name_1_when_emitting_super_references_in_static_initializers)
+        }
     }
 
     ; checkClassNameCollisionWithObject, whole — the two-term function slice 58's
@@ -116001,7 +116129,7 @@ define Checker
         if reported = false
             this.check_grammar_computed_property_name(AstNode.name_of(node))
         this.check_variable_like_declaration(node)
-        ; setNodeLinksForPrivateIdentifierScope(node) — see the header.
+        this.set_node_links_for_private_identifier_scope(node)
         if AstNode.kind_of(node) = KindPropertyDeclaration
         {
             if b.has_syntactic_modifier(node, ModifierFlagsAbstract)
@@ -116057,8 +116185,7 @@ define Checker
             if Checker.get_containing_class(node) = null
                 this.error_on_node(node, DiagPrivate_identifiers_are_not_allowed_outside_class_bodies)
         }
-        ; setNodeLinksForPrivateIdentifierScope(node) — check_property_declaration's
-        ; header carries the argument for all three call sites.
+        this.set_node_links_for_private_identifier_scope(node)
     }
 
     ; ── slice 83: the class's LAST MEMBERS ──────────────────────────────────
@@ -116657,8 +116784,7 @@ define Checker
         ; the statements after the first report are exactly where an invented
         ; diagnostic would hide.
         this.check_source_element(AstNode.body_of(node))
-        ; setNodeLinksForPrivateIdentifierScope(node) — check_property_declaration's
-        ; header carries the argument for all three call sites.
+        this.set_node_links_for_private_identifier_scope(node)
     }
 
     ; The accessibility block of checkAccessorDeclaration, lifted to its own
@@ -116989,6 +117115,33 @@ define Checker
     ; never produced is invisible, so the drain belongs in place from the start.
     procedure produce_deferred_diagnostics(this)
     {
+        ; the two collision checks (slice 258), in the order they were deferred
+        if deferred_weak_map_set_nodes <> null
+        {
+            let wl deferred_weak_map_set_nodes as ref[Array[ref[AstNode]?]]
+            var i 0
+            while i < (wl.get_length() as int)
+            {
+                let n wl[i as size_t]
+                set i: i + 1
+                if n <> null
+                    this.check_weak_map_set_collision(n as ref[AstNode])
+            }
+            set this.deferred_weak_map_set_nodes: null
+        }
+        if deferred_reflect_nodes <> null
+        {
+            let rl deferred_reflect_nodes as ref[Array[ref[AstNode]?]]
+            var j 0
+            while j < (rl.get_length() as int)
+            {
+                let n rl[j as size_t]
+                set j: j + 1
+                if n <> null
+                    this.check_reflect_collision(n as ref[AstNode])
+            }
+            set this.deferred_reflect_nodes: null
+        }
     }
 
     ; ── slice 65: the merged declarations, and the symbol every arm asks for ──

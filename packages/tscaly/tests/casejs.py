@@ -498,7 +498,9 @@ def main():
             last_text = last_content.decode("utf-8", "replace") if isinstance(last_content, bytes) else last_content
             last_is_root_only = bool(re.search(r"require\(", last_text) or re.search(r"reference\s+path", last_text) or cfg.get("noimplicitreferences"))
             common = common_source_directory(units, cfg)
-            to_emit = [(n, c) for n, c in to_emit if (output_path(n, cfg, common) in section_names) or not (last_is_root_only or n.lower().endswith(".json"))]
+            # ★ a declaration section counts as well: under emitDeclarationOnly the baseline
+            # has no JS section at all (slice 258)
+            to_emit = [(n, c) for n, c in to_emit if (output_path(n, cfg, common) in section_names) or (declaration_on(cfg) and dts_output_path(n, cfg, common) in section_names) or not (last_is_root_only or n.lower().endswith(".json"))]
             opts = options_string(cfg)
             # one BUNDLE per (case, configuration): every unit, rooted at /.src as the
             # reference's runner roots them, the emitted ones flagged (slice 248)
