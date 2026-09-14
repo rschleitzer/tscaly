@@ -307,6 +307,9 @@ def common_source_directory(units, cfg):
     non-declaration source units (a single file's directory when there is one)"""
     if cfg.get("rootdir"):
         return posixpath.normpath(posixpath.join(ROOT, cfg["rootdir"].replace("\\", "/")))
+    # a config file's directory (slice 261)
+    if cfg.get("configfilepath"):
+        return posixpath.dirname(cfg["configfilepath"])
     dirs = []
     for n, _ in units:
         low = n.lower()
@@ -326,44 +329,65 @@ def common_source_directory(units, cfg):
     return common
 
 
+def remove_test_path_prefixes(text):
+    """tsbaseline.removeTestPathPrefixes (a strings.Replacer: the leftmost match wins)"""
+    pairs = [("/.ts/", ""), ("/.lib/", ""), ("/.src/", ""), ("bundled:///libs/", ""),
+             ("file:///./ts/", "file:///"), ("file:///./lib/", "file:///"), ("file:///./src/", "file:///")]
+    out, i = [], 0
+    while i < len(text):
+        for old, repl in pairs:
+            if text.startswith(old, i):
+                out.append(repl)
+                i += len(old)
+                break
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def section_name(unit_name, cfg, common, oname, out_dir):
+    """the baseline's section name: the bare output name, or under @fullEmitPaths the
+    emitted file's full path without the test prefixes (js_emit_baseline.go fileOutput;
+    the path by outputpaths.GetSourceFilePathInNewDir)"""
+    if cfg.get("fullemitpaths", "").lower() != "true":
+        return oname
+    out_dir = (out_dir or "").replace("\\", "/")
+    if out_dir:
+        rel = posixpath.relpath(posixpath.dirname(program_path(unit_name)), common) if common else "."
+        full = posixpath.normpath(posixpath.join(ROOT, out_dir, rel, os.path.basename(oname)))
+    else:
+        full = posixpath.normpath(posixpath.join(posixpath.dirname(program_path(unit_name)), os.path.basename(oname)))
+    return remove_test_path_prefixes(full)
+
+
 def output_path(unit_name, cfg, common):
-    """the baseline's section name: the bare output name, or `<outDir>/<relative to the common
-    source directory>` when an outDir is set (outputpaths.GetSourceFilePathInNewDir)"""
     oname = output_name(unit_name, cfg)
     if oname is None:
         return None
-    outdir = cfg.get("outdir")
-    # the runner names a section by its full emit path only under @fullEmitPaths
-    if not outdir or cfg.get("fullemitpaths", "").lower() != "true":
-        return oname
-    outdir = outdir.replace("\\", "/").rstrip("/")
-    if outdir.startswith("./"):
-        outdir = outdir[2:]
-    rel = posixpath.relpath(posixpath.dirname(program_path(unit_name)), common) if common else "."
-    parts = [outdir] + ([] if rel in (".", "") else [rel]) + [oname]
-    return posixpath.normpath("/".join(parts))
+    return section_name(unit_name, cfg, common, oname, cfg.get("outdir"))
 
 
 def dts_output_path(unit_name, cfg, common):
-    """the baseline's section name for the declaration file: under declarationDir, else outDir,
-    with the same @fullEmitPaths rule as output_path"""
+    """the declaration file's section name: under declarationDir, else outDir"""
     oname = dts_output_name(unit_name, cfg)
     if oname is None:
         return None
-    outdir = cfg.get("declarationdir") or cfg.get("outdir")
-    if not outdir or cfg.get("fullemitpaths", "").lower() != "true":
-        return oname
-    outdir = outdir.replace("\\", "/").rstrip("/")
-    if outdir.startswith("./"):
-        outdir = outdir[2:]
-    rel = posixpath.relpath(posixpath.dirname(program_path(unit_name)), common) if common else "."
-    parts = [outdir] + ([] if rel in (".", "") else [rel]) + [oname]
-    return posixpath.normpath("/".join(parts))
+    return section_name(unit_name, cfg, common, oname, cfg.get("declarationdir") or cfg.get("outdir"))
 
 
 # the runner's current directory (`@currentDirectory`, default /.src), set per
 # configuration before a plan is built (slice 260)
 ROOT = "/.src"
+
+
+def program_path_at(default_root, settings, unit_name):
+    """a unit's program path under the case's own current directory"""
+    root = posixpath.normpath(posixpath.join(default_root, settings.get("currentdirectory", "").strip()))
+    name = unit_name.replace("\\", "/")
+    if name.startswith("/") or re.match(r"^[A-Za-z]:/", name):
+        return posixpath.normpath(name)
+    return posixpath.normpath(posixpath.join(root, name))
 
 
 def program_path(unit_name):
@@ -391,7 +415,7 @@ def split_bundle_answer(body):
 
 
 # option VALUES that are text, not an enum: the case decides (`jsxFactory: h`, `reactNamespace: myReactLib`)
-TEXT_OPTIONS = {"jsxfactory", "jsxfragmentfactory", "reactnamespace", "jsximportsource", "emitfilename", "currentdirectory", "customconditions", "typeroots"}
+TEXT_OPTIONS = {"configfilepath", "maproot", "sourceroot", "jsxfactory", "jsxfragmentfactory", "reactnamespace", "jsximportsource", "emitfilename", "currentdirectory", "customconditions", "typeroots"}
 
 # test_case_parser.go's linkRegex: `// @link: <target> -> <symlink>`
 LINK_RE = re.compile(r"^/{2}\s*@link\s*:\s*([^\r\n]*?)\s*->\s*([^\r\n]*)", re.M | re.I)
@@ -428,6 +452,67 @@ def options_string(cfg):
     return ";".join("%s=%s" % (k, str(v).strip() if k in TEXT_OPTIONS else str(v).strip().lower()) for k, v in sorted(items.items()))
 
 
+def n_is_json(unit_name):
+    return unit_name.lower().endswith(".json")
+
+
+def is_config_unit(unit_name):
+    """harnessutil.GetConfigNameFromFileName"""
+    return os.path.basename(unit_name.replace("\\", "/")).lower() in ("tsconfig.json", "jsconfig.json")
+
+
+def stack_wrapper(args):
+    """the dump under the stack tests/run.sh sets (a 40 KB binary-expression chain is a
+    SIGSEGV at the default 8 MB)"""
+    os.makedirs(args.scratch, exist_ok=True)
+    wrapper = os.path.join(args.scratch, "dump-with-stack.sh")
+    with open(wrapper, "w") as fh:
+        fh.write("#!/bin/sh\nulimit -s 65520 2>/dev/null\nexec %s \"$@\"\n" % os.path.abspath(args.binary))
+    os.chmod(wrapper, 0o755)
+    return wrapper
+
+
+def read_tsconfigs(args, case_rows):
+    """test_case_parser.go's tsconfig read for every case carrying one, answered by
+    `tscaly_dump --tsconfig=` (slice 261) → {case: (options {lower name: value}, [root
+    file names])} or {case: ("STOP", detail)}"""
+    groups = collections.defaultdict(list)
+    for ci, name, case_file, stem, text, settings, links, units in case_rows:
+        if not any(is_config_unit(n) for n, _ in units):
+            continue
+        parts = []
+        for un, content in units:
+            body = content if isinstance(content, bytes) else content.encode("utf-8", "surrogateescape")
+            parts.append(b"==== TSCALY-FILE %d 0 %s\n" % (len(body), un.encode("utf-8", "surrogateescape")))
+            parts.append(body)
+            parts.append(b"\n")
+        groups[settings.get("currentdirectory", "").strip()].append(("/tsconfig/" + name, b"".join(parts)))
+    out = {}
+    binary = stack_wrapper(args)
+    for gi, (cwd, items) in enumerate(sorted(groups.items())):
+        flag = "--tsconfig=" + (("currentdirectory=" + cwd) if cwd else "")
+        res = harness.run_batch(binary, flag, items, os.path.join(args.scratch, "t%d" % gi), args.jobs, args.timeout)
+        for vpath, _ in items:
+            name = vpath[len("/tsconfig/"):]
+            rc, body, err = res.get(vpath, (None, b"", b""))
+            text = body.decode("utf-8", "replace")
+            if rc != 0:
+                out[name] = ("STOP", "tsconfig reader rc %s" % rc)
+                continue
+            if text.startswith("UNPORTED "):
+                out[name] = ("STOP", text.split("\n")[0])
+                continue
+            options, files = {}, []
+            for line in text.split("\n"):
+                if line.startswith("TSCONFIG-OPTION "):
+                    k, _, v = line[len("TSCONFIG-OPTION "):].partition("\t")
+                    options[k.lower()] = v
+                elif line.startswith("TSCONFIG-FILE "):
+                    files.append(line[len("TSCONFIG-FILE "):])
+            out[name] = (options, files)
+    return out
+
+
 def main():
     global ROOT
     ap = argparse.ArgumentParser()
@@ -459,6 +544,7 @@ def main():
     only = None
     if args.only:
         only = set(l.strip() for l in open(args.only) if l.strip())
+    case_rows = []
     for ci, name, case_file in cases:
         if args.filter and args.filter not in name:
             continue
@@ -485,25 +571,40 @@ def main():
         links = case_links(text)
         units = db.execute("SELECT name, content FROM units WHERE ci=? ORDER BY idx", (ci,)).fetchall()
         units = [(n, strip_directives(c)) for n, c in units]
-        if any(os.path.basename(n).lower() in ("tsconfig.json", "jsconfig.json") for n, c in units):
-            # the runner takes the file list and the options from the config (a chapter of its own)
-            skips["tsconfig.json in the case"] += 1
+        case_rows.append((ci, name, case_file, stem, text, settings, links, units))
+    # test_case_parser.go: a case with a tsconfig.json takes its options and its root
+    # files from the config (slice 261)
+    tsconfigs = read_tsconfigs(args, case_rows)
+    for ci, name, case_file, stem, text, settings, links, units in case_rows:
+        config = tsconfigs.get(name)
+        if config is not None and config[0] == "STOP":
+            skips["tsconfig reader: " + config[1][:60]] += 1
             continue
         # a name declared twice is ONE file to the reference (a map by path; the last content wins)
         last = {}
         for i, (n, c) in enumerate(units):
             last[n] = i
         units = [(n, c) for i, (n, c) in enumerate(units) if last[n] == i]
+        # the config's unit is not a file of the program, nor an input section of the
+        # JS baseline (compiler_runner.go: toBeCompiled + otherFiles); its first match
+        # is the config
+        config_index = next((i for i, (n, _) in enumerate(units) if is_config_unit(n)), None) if config is not None else None
+        program_units = [u for i, u in enumerate(units) if i != config_index]
         for cname, cfg in configurations(settings):
+            if config is not None:
+                # harnessutil.CompileFiles: the config's options, the case's settings over them
+                merged = dict(config[0])
+                merged["configfilepath"] = program_path_at("/.src", settings, units[config_index][0])
+                merged.update(cfg)
+                cfg = merged
             bname = stem + ("(%s)" % cname if cname else "") + ".js"
             key = (name, cname)
             reason = unsupported(cfg)
             if reason:
                 skips["unsupported: " + reason] += 1
                 continue
-            ROOT = cfg.get("currentdirectory", "").strip() or "/.src"
-            if ROOT.startswith("/"):
-                ROOT = posixpath.normpath(ROOT)
+            # GetNormalizedAbsolutePath(currentDirectory, "/.src")
+            ROOT = posixpath.normpath(posixpath.join("/.src", cfg.get("currentdirectory", "").strip()))
             category = "conformance" if name.startswith("submodule_conformance_") else "compiler"
             bpath = os.path.join(TSGO_BASELINES, category, bname)
             if not os.path.exists(bpath):
@@ -517,7 +618,7 @@ def main():
             with open(bpath, "rb") as fh:
                 btext = fh.read().decode("utf-8", "replace")
             header, sections = parse_baseline(btext)
-            n_inputs = len(units)
+            n_inputs = len(program_units)
             outputs = sections[n_inputs:]
             if args.refute:
                 outputs = [(n, b + "x") for n, b in outputs]
@@ -534,7 +635,13 @@ def main():
             last_content0 = units[-1][1] if units else b""
             last_text0 = last_content0.decode("utf-8", "replace") if isinstance(last_content0, bytes) else last_content0
             all_roots = not bool(re.search(r"require\(", last_text0) or re.search(r"reference\s+path", last_text0) or cfg.get("noimplicitreferences"))
-            to_emit = [(n, c) for n, c in units if emitted(n, cfg, all_roots)]
+            config_roots = set(config[1]) if config is not None else None
+
+            def is_root(un):
+                if config_roots is not None:
+                    return program_path(un) in config_roots
+                return all_roots
+            to_emit = [(n, c) for n, c in program_units if emitted(n, cfg, is_root(n))]
             # compiler_runner.go: when the LAST unit carries a `require(` or a triple-slash
             # reference, it is the only root file and the rest reach the program through
             # references — a unit the reference did not emit was not in the program; and a
@@ -544,29 +651,36 @@ def main():
             last_content = units[-1][1] if units else b""
             last_text = last_content.decode("utf-8", "replace") if isinstance(last_content, bytes) else last_content
             last_is_root_only = bool(re.search(r"require\(", last_text) or re.search(r"reference\s+path", last_text) or cfg.get("noimplicitreferences"))
-            common = common_source_directory(units, cfg)
+            common = common_source_directory(program_units, cfg)
+
+            def planned_without_section(un):
+                if n_is_json(un):
+                    return False
+                if config_roots is not None:
+                    return program_path(un) in config_roots
+                return not last_is_root_only
             # ★ a declaration section counts as well: under emitDeclarationOnly the baseline
             # has no JS section at all (slice 258)
-            to_emit = [(n, c) for n, c in to_emit if (output_path(n, cfg, common) in section_names) or (declaration_on(cfg) and dts_output_path(n, cfg, common) in section_names) or not (last_is_root_only or n.lower().endswith(".json"))]
+            to_emit = [(n, c) for n, c in to_emit if (output_path(n, cfg, common) in section_names) or (declaration_on(cfg) and dts_output_path(n, cfg, common) in section_names) or planned_without_section(n)]
             opts = options_string(cfg)
             # one BUNDLE per (case, configuration): every unit, rooted at /.src as the
             # reference's runner roots them, the emitted ones flagged (slice 248)
             vpath = "/cases/%s/%s" % (name, cname or "default")
             plan = {"case": name, "config": cname, "opts": opts, "vpath": vpath, "units": [], "outputs": outputs, "baseline": bname}
             parts = []
-            for un, content in units:
+            for un, content in program_units:
                 body = content if isinstance(content, bytes) else content.encode("utf-8", "surrogateescape")
-                parts.append(b"==== TSCALY-FILE %d %d %s\n" % (len(body), 1 if emitted(un, cfg, all_roots) else 0, un.encode("utf-8", "surrogateescape")))
+                parts.append(b"==== TSCALY-FILE %d %d %s\n" % (len(body), 1 if emitted(un, cfg, is_root(un)) else 0, un.encode("utf-8", "surrogateescape")))
                 parts.append(body)
                 parts.append(b"\n")
             for symlink, target in links:
                 parts.append(b"==== TSCALY-LINK %s\t%s\n" % (program_path(symlink).encode("utf-8", "surrogateescape"), program_path(target).encode("utf-8", "surrogateescape")))
             groups[opts].append((vpath, b"".join(parts)))
-            common = common_source_directory(units, cfg)
+            common = common_source_directory(program_units, cfg)
             # the JS outputs, unless emitDeclarationOnly; the declaration outputs under
             # declaration/composite (slice 250) — each entry carries its KIND
             if cfg.get("emitdeclarationonly", "").lower() != "true":
-                input_paths = set(program_path(n) for n, _ in units)
+                input_paths = set(program_path(n) for n, _ in program_units)
 
                 def js_full_path(un):
                     oname = output_name(un, cfg)
@@ -587,7 +701,12 @@ def main():
                         continue
                     plan["units"].append((program_path(un), un, output_path(un, cfg, common), "js"))
             if declaration_on(cfg):
-                unit_paths = set(program_path(n) for n, _ in units)
+                # the program's files: under a config its roots and what the plan emits
+                # (a unit outside `include` is not an input a declaration overwrites)
+                if config_roots is not None:
+                    unit_paths = set(config_roots) | set(program_path(n) for n, _ in to_emit)
+                else:
+                    unit_paths = set(program_path(n) for n, _ in program_units)
                 for un, content in to_emit:
                     dname = dts_output_path(un, cfg, common)
                     # a declaration output that would overwrite an input is not written
@@ -608,14 +727,7 @@ def main():
 
     # ── run: one batch per configuration string ──
     answers = {}
-    os.makedirs(args.scratch, exist_ok=True)
-    # the port's parser recurses: the dump runs under the stack tests/run.sh sets
-    # (a 40 KB binary-expression chain is a SIGSEGV at the default 8 MB)
-    wrapper = os.path.join(args.scratch, "dump-with-stack.sh")
-    with open(wrapper, "w") as fh:
-        fh.write("#!/bin/sh\nulimit -s 65520 2>/dev/null\nexec %s \"$@\"\n" % os.path.abspath(args.binary))
-    os.chmod(wrapper, 0o755)
-    binary = wrapper
+    binary = stack_wrapper(args)
     total_units = sum(len(v) for v in groups.values())
     print("pairs whose DtsFileErrors section is not compared: %d" % dts_error_pairs[0])
     print("cases planned %d, configurations skipped %d, units to emit %d in %d option groups" % (

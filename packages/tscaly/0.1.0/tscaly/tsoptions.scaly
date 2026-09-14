@@ -1,0 +1,2439 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; tsoptions — a tsconfig.json read the way the reference's test harness reads it
+; (slice 261): internal/tsoptions/tsconfigparsing.go's
+; ParseJsonSourceFileConfigFileContent over the case's own files — convertToJson
+; with the root and compilerOptions notifiers, parseOwnConfigOfJsonSourceFile,
+; parseConfig with `extends` (a path, or a module resolved by ResolveConfig),
+; mergeCompilerOptions, the `${configDir}` substitution and
+; getFileNamesFromConfigSpecs — and internal/vfs/vfsmatch's glob matcher, which
+; walks the case's files as the harness's map file system.
+;
+; ★ The options are the SET fields of core.CompilerOptions, kept as (declaration
+; name, converted value) pairs in assignment order: a field parseCompilerOptions
+; writes a zero value into is absent, which is what mergeCompilerOptions' IsZero
+; test reads. The declarations come from the generated TsOptionDecls.
+;
+; ★ A JSON value is program.scaly's JsonValue. Go's two empty slices differ here and
+; the reference reads the difference (getPropFromRaw, setPropertyValue): an array
+; literal whose every element converted to nil is a NIL slice, and the port marks
+; such an array with `truth` set.
+;
+; ★ No diagnostics are produced: the case yardstick compares emitted files, and a
+; config error changes neither the options nor the file list except where the
+; reference's own control flow reads it (an extended config with parse errors is
+; skipped, and that one is ported). validateJsonOptionValue's locale check is not
+; ported — no ported reader asks for the locale.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use tscaly.ast.*
+use tscaly.parser.Parser
+use tscaly.program.*
+use tscaly.Diagnostics.DiagnosticList
+use tscaly.TsOptionDecls.TsOptionDecls
+
+; which notifier an object literal's properties report to
+define TsConfigLevelNone: int 0
+define TsConfigLevelRoot: int 1
+define TsConfigLevelCompilerOptions: int 2
+
+; vfsmatch.Usage
+define TsGlobUsageFiles: int 0
+define TsGlobUsageDirectories: int 1
+define TsGlobUsageExclude: int 2
+
+; vfsmatch's componentKind and segmentKind
+define TsGlobComponentLiteral: int 0
+define TsGlobComponentWildcard: int 1
+define TsGlobComponentDoubleAsterisk: int 2
+define TsGlobSegmentLiteral: int 0
+define TsGlobSegmentStar: int 1
+define TsGlobSegmentQuestion: int 2
+
+; core.CompilerOptions as its set fields
+define TsOptions
+(
+    names: ref[Array[Slice[char]]]
+    values: ref[Array[ref[JsonValue]?]]
+)
+{
+    function create(host: ref[Page]) returns ref[TsOptions]
+        &TsOptions^host(&Array[Slice[char]]^host(), &Array[ref[JsonValue]?]^host())
+
+    function count(this) returns int
+        names.get_length() as int
+
+    function name_at(this, i: int) returns Slice[char]
+        names[i as size_t]
+
+    function value_at(this, i: int) returns ref[JsonValue]?
+        values[i as size_t]
+
+    function index_of_name(this, name: Slice[char]) returns int
+    {
+        var i 0
+        while i < (names.get_length() as int)
+        {
+            let n names[i as size_t]
+            if n.equals(name)
+                return i
+            set i: i + 1
+        }
+        0 - 1
+    }
+
+    ; the value of a set field, null when unset
+    function get(this, name: Slice[char]) returns ref[JsonValue]?
+    {
+        let i this.index_of_name(name)
+        if i < 0
+            return null
+        values[i as size_t]
+    }
+
+    ; a string field's text, empty when unset
+    function text_of(this, name: Slice[char]) returns Slice[char]
+    {
+        let v this.get(name)
+        if v = null
+            return Slice[char]()
+        let jv v as ref[JsonValue]
+        if jv.kind <> JsonKindString
+            return Slice[char]()
+        jv.text
+    }
+
+    ; a Tristate field: 1 true, 0 false, -1 unset
+    function tristate_of(this, name: Slice[char]) returns int
+    {
+        let v this.get(name)
+        if v = null
+            return 0 - 1
+        let jv v as ref[JsonValue]
+        if jv.truth
+            return 1
+        0
+    }
+
+    ; reflect's IsZero over the field kinds this table holds: an empty string and a
+    ; nil slice are zero, a Tristate false is not
+    function is_zero(v: ref[JsonValue]) returns bool
+    {
+        if (v.kind = JsonKindNull) or (v.kind = JsonKindAbsent)
+            return true
+        if v.kind = JsonKindString
+            return (v.text.length as int) = 0
+        if v.kind = JsonKindArray
+            return v.truth
+        false
+    }
+
+    ; a field written; a zero value unsets it
+    procedure put(host: ref[Page], options: ref[TsOptions], name: Slice[char], value: ref[JsonValue]?)
+    {
+        var zero value = null
+        if value <> null
+        {
+            if TsOptions.is_zero(value as ref[JsonValue])
+                set zero: true
+        }
+        let i options.index_of_name(name)
+        let vals options.values
+        if i >= 0
+        {
+            if zero
+                vals.put(i as size_t, null)
+            else
+                vals.put(i as size_t, value)
+            return
+        }
+        if zero
+            return
+        let nms options.names
+        nms.add(slice_copy_on(host, name))
+        vals.add(value)
+    }
+
+    ; mergeCompilerOptions(this, source, rawSource): a field the raw compilerOptions
+    ; spells as null is zeroed, every other field the source sets is copied
+    procedure merge(host: ref[Page], target: ref[TsOptions], source: ref[TsOptions]?, raw: ref[JsonValue]?)
+    {
+        if source = null
+            return
+        let src source as ref[TsOptions]
+        var nulls: ref[JsonValue]? null
+        if raw <> null
+        {
+            let r raw as ref[JsonValue]
+            if r.kind = JsonKindObject
+            {
+                let co r.get("compilerOptions")
+                if co <> null
+                {
+                    let cov co as ref[JsonValue]
+                    if cov.kind = JsonKindObject
+                        set nulls: cov
+                }
+            }
+        }
+        if nulls <> null
+        {
+            let nv nulls as ref[JsonValue]
+            var k 0
+            while k < nv.size()
+            {
+                let key nv.key_at(k)
+                let kv nv.value_at(k)
+                set k: k + 1
+                var is_null kv = null
+                if kv <> null
+                    set is_null: (kv as ref[JsonValue]).kind = JsonKindNull
+                if is_null
+                {
+                    if TsOptionDecls.index_of(key) >= 0
+                        TsOptions.put(host, target, key, null)
+                }
+            }
+        }
+        var i 0
+        while i < src.count()
+        {
+            let name src.name_at(i)
+            let value src.value_at(i)
+            set i: i + 1
+            if value = null
+                continue
+            var explicitly_null false
+            if nulls <> null
+            {
+                let nv2 nulls as ref[JsonValue]
+                let kv2 nv2.get(name)
+                if kv2 <> null
+                    set explicitly_null: (kv2 as ref[JsonValue]).kind = JsonKindNull
+            }
+            if explicitly_null = false
+                TsOptions.put(host, target, name, value)
+        }
+    }
+
+    ; one field's value as the case yardstick spells an option: a Tristate
+    ; `true`/`false`, a text as is, a list joined with commas, a map as its keys
+    function render(host: ref[Page], v: ref[JsonValue]) returns Slice[char]
+    {
+        if v.kind = JsonKindBoolean
+        {
+            if v.truth
+                return "true"
+            return "false"
+        }
+        if (v.kind = JsonKindString) or (v.kind = JsonKindNumber)
+            return v.text
+        var out Slice[char]()
+        if (v.kind = JsonKindArray) or (v.kind = JsonKindObject)
+        {
+            var i 0
+            while i < v.size()
+            {
+                var item Slice[char]()
+                if v.kind = JsonKindObject
+                    set item: v.key_at(i)
+                else
+                {
+                    let e v.value_at(i)
+                    if e <> null
+                        set item: TsOptions.render(host, e as ref[JsonValue])
+                }
+                if i > 0
+                    set out: join_slices(host, out, ",")
+                set out: join_slices(host, out, item)
+                set i: i + 1
+            }
+            if (v.kind = JsonKindObject) and ((out.length as int) = 0)
+                return "{}"
+        }
+        out
+    }
+}
+
+; parsedTsconfig
+define TsParsedConfig
+(
+    raw: ref[JsonValue]?
+    options: ref[TsOptions]?
+    ; extendedConfigPath: null when the config has no `extends`
+    extends_paths: ref[Array[Slice[char]]]?
+)
+
+; what parseOwnConfigOfJsonSourceFile's onPropertySet closure captured
+define TsOwnConfig
+(
+    options: ref[TsOptions]
+    extends_paths: ref[Array[Slice[char]]]?
+    base_path: Slice[char]
+    config_file_name: Slice[char]
+)
+
+; extendsResult
+define TsExtendsResult
+(
+    options: ref[TsOptions]
+    include: ref[JsonValue]?
+    exclude: ref[JsonValue]?
+    files: ref[JsonValue]?
+)
+
+; ParsedCommandLine's two halves the harness reads
+define TsParsedCommandLine
+(
+    options: ref[TsOptions]
+    file_names: ref[Array[Slice[char]]]
+)
+
+; vfsmatch.segment
+define TsGlobSegment
+(
+    kind: int
+    literal: Slice[char]
+)
+
+; vfsmatch.component
+define TsGlobComponent
+(
+    kind: int
+    literal: Slice[char]
+    segments: ref[Array[TsGlobSegment]]?
+    skip_package_folders: bool
+)
+
+; vfsmatch.globPattern (case-sensitive: the harness's file system is)
+define TsGlobPattern
+(
+    components: ref[Array[TsGlobComponent]]
+    is_exclude: bool
+    exclude_min_js: bool
+)
+{
+    ; compileGlobPattern: null when the pattern matches nothing
+    function compile(host: ref[Page], spec: Slice[char], base_path: Slice[char], usage: int) returns ref[TsGlobPattern]?
+    {
+        let parts TsGlobPattern.normalized_path_components(host, combine_paths(host, base_path, spec))
+        let n parts.get_length() as int
+        let last parts[(n - 1) as size_t]
+        if usage <> TsGlobUsageExclude
+        {
+            if last.equals("**")
+                return null
+        }
+        parts.put(0, remove_trailing_directory_separator(parts[0]))
+        if TsGlobPattern.is_implicit_glob(parts[(n - 1) as size_t])
+        {
+            parts.add("**")
+            parts.add("*")
+        }
+        let components &Array[TsGlobComponent]^host()
+        var i 0
+        while i < (parts.get_length() as int)
+        {
+            components.add(TsGlobPattern.parse_component(host, parts[i as size_t], usage <> TsGlobUsageExclude))
+            set i: i + 1
+        }
+        let is_exclude usage = TsGlobUsageExclude
+        let exclude_min_js usage = TsGlobUsageFiles
+        &TsGlobPattern^host(components, is_exclude, exclude_min_js)
+    }
+
+    ; tspath.GetNormalizedPathComponents over an already combined path
+    function normalized_path_components(host: ref[Page], path: Slice[char]) returns ref[Array[Slice[char]]]
+    {
+        let root_length get_root_length(path)
+        let out &Array[Slice[char]]^host()
+        out.add(path.subslice(0, root_length as size_t))
+        var top 1
+        let n path.length as int
+        var i root_length
+        while i < n
+        {
+            while (i < n) and ((path[i as size_t] as int) = ("/" as char) as int)
+                set i: i + 1
+            if i >= n
+                break
+            let start i
+            while (i < n) and ((path[i as size_t] as int) <> ("/" as char) as int)
+                set i: i + 1
+            let component path.subslice(start as size_t, i as size_t)
+            if (component.length as int) = 0
+                continue
+            if component.equals(".")
+                continue
+            if component.equals("..")
+            {
+                if top > 1
+                {
+                    let previous out[(top - 1) as size_t]
+                    if previous.equals("..") = false
+                    {
+                        set top: top - 1
+                        continue
+                    }
+                }
+                else
+                {
+                    let root out[0]
+                    if (root.length as int) > 0
+                        continue
+                }
+            }
+            if top < (out.get_length() as int)
+                out.put(top as size_t, component)
+            else
+                out.add(component)
+            set top: top + 1
+        }
+        if top = (out.get_length() as int)
+            return out
+        let trimmed &Array[Slice[char]]^host()
+        var j 0
+        while j < top
+        {
+            trimmed.add(out[j as size_t])
+            set j: j + 1
+        }
+        trimmed
+    }
+
+    ; IsImplicitGlob: no `.`, `*` or `?`
+    function is_implicit_glob(s: Slice[char]) returns bool
+    {
+        var i 0
+        while i < (s.length as int)
+        {
+            let c s[i as size_t] as int
+            if (c = ("." as char) as int) or (c = ("*" as char) as int) or (c = ("?" as char) as int)
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    function parse_component(host: ref[Page], s: Slice[char], is_include: bool) returns TsGlobComponent
+    {
+        if s.equals("**")
+            return TsGlobComponent(TsGlobComponentDoubleAsterisk, s, null, false)
+        var wild false
+        var i 0
+        while i < (s.length as int)
+        {
+            let c s[i as size_t] as int
+            if (c = ("*" as char) as int) or (c = ("?" as char) as int)
+                set wild: true
+            set i: i + 1
+        }
+        if wild = false
+            return TsGlobComponent(TsGlobComponentLiteral, s, null, false)
+        TsGlobComponent(TsGlobComponentWildcard, s, TsGlobPattern.parse_segments(host, s), is_include)
+    }
+
+    ; parseSegments: `*.ts` → [star, literal(".ts")]
+    function parse_segments(host: ref[Page], s: Slice[char]) returns ref[Array[TsGlobSegment]]
+    {
+        let out &Array[TsGlobSegment]^host()
+        var start 0
+        var i 0
+        let n s.length as int
+        while i < n
+        {
+            let c s[i as size_t] as int
+            if (c = ("*" as char) as int) or (c = ("?" as char) as int)
+            {
+                if i > start
+                    out.add(TsGlobSegment(TsGlobSegmentLiteral, s.subslice(start as size_t, i as size_t)))
+                if c = ("*" as char) as int
+                    out.add(TsGlobSegment(TsGlobSegmentStar, null))
+                else
+                    out.add(TsGlobSegment(TsGlobSegmentQuestion, null))
+                set start: i + 1
+            }
+            set i: i + 1
+        }
+        if start < n
+            out.add(TsGlobSegment(TsGlobSegmentLiteral, s.slice_from(start as size_t)))
+        out
+    }
+
+    function matches(this, path: Slice[char]) returns bool
+        this.match_path(path, 0, 0, false)
+
+    function matches_prefix(this, path: Slice[char]) returns bool
+        this.match_path(path, 0, 0, true)
+
+    ; nextPathPartSingle: the part at `offset` as [out_start, out_end), answering the
+    ; offset after it, -1 past the end
+    function next_path_part(s: Slice[char], offset: int, out_start: ref[int], out_end: ref[int]) returns int
+    {
+        let n s.length as int
+        var o offset
+        if o >= n
+            return 0 - 1
+        if (o = 0) and ((s[0] as int) = ("/" as char) as int)
+        {
+            set out_start: 0
+            set out_end: 0
+            return 1
+        }
+        while (o < n) and ((s[o as size_t] as int) = ("/" as char) as int)
+            set o: o + 1
+        if o >= n
+            return 0 - 1
+        var e o
+        while (e < n) and ((s[e as size_t] as int) <> ("/" as char) as int)
+            set e: e + 1
+        set out_start: o
+        set out_end: e
+        e
+    }
+
+    ; matchPathParts over one path
+    function match_path(this, s: Slice[char], offset_in: int, comp_in: int, prefix_only: bool) returns bool
+    {
+        var offset offset_in
+        var comp_idx comp_in
+        repeat
+        {
+            var ps 0
+            var pe 0
+            let next TsGlobPattern.next_path_part(s, offset, &ps, &pe)
+            if next < 0
+            {
+                if prefix_only
+                    return true
+                return this.pattern_satisfied(comp_idx)
+            }
+            if comp_idx >= (components.get_length() as int)
+                return is_exclude and (prefix_only = false)
+            let part s.subslice(ps as size_t, pe as size_t)
+            let comp components[comp_idx as size_t]
+            if comp.kind = TsGlobComponentDoubleAsterisk
+            {
+                if this.match_path(s, offset, comp_idx + 1, prefix_only)
+                    return true
+                if is_exclude = false
+                {
+                    let hidden TsGlobPattern.is_hidden_path(part)
+                    let package_folder TsGlobPattern.is_package_folder(part)
+                    if hidden or package_folder
+                        return false
+                }
+                set offset: next
+                continue
+            }
+            if comp.kind = TsGlobComponentLiteral
+            {
+                let lit comp.literal
+                if lit.equals(part) = false
+                    return false
+            }
+            if comp.kind = TsGlobComponentWildcard
+            {
+                if comp.skip_package_folders
+                {
+                    if TsGlobPattern.is_package_folder(part)
+                        return false
+                }
+                if this.match_wildcard(comp.segments as ref[Array[TsGlobSegment]], part) = false
+                    return false
+            }
+            set offset: next
+            set comp_idx: comp_idx + 1
+        }
+    }
+
+    ; patternSatisfied: only trailing `**` components may match nothing
+    function pattern_satisfied(this, comp_idx: int) returns bool
+    {
+        var i comp_idx
+        while i < (components.get_length() as int)
+        {
+            let c components[i as size_t]
+            if c.kind <> TsGlobComponentDoubleAsterisk
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    function match_wildcard(this, segs: ref[Array[TsGlobSegment]], s: Slice[char]) returns bool
+    {
+        let n segs.get_length() as int
+        ; an include's leading wildcard cannot match a hidden file
+        if (is_exclude = false) and (n > 0)
+        {
+            if TsGlobPattern.is_hidden_path(s)
+            {
+                let first segs[0]
+                if first.kind <> TsGlobSegmentLiteral
+                    return false
+            }
+        }
+        if this.match_segments(segs, s) = false
+            return false
+        this.should_include_min_js(s, segs)
+    }
+
+    ; utf8.DecodeRuneInString's size at `i`
+    function rune_size(s: Slice[char], i: int) returns int
+    {
+        let c s[i as size_t] as int
+        var size 1
+        if (c >= 192) and (c < 224)
+            set size: 2
+        if (c >= 224) and (c < 240)
+            set size: 3
+        if c >= 240
+            set size: 4
+        if i + size > (s.length as int)
+            return 1
+        size
+    }
+
+    ; matchSegments: the iterative matcher keeping only the last star
+    function match_segments(this, segs: ref[Array[TsGlobSegment]], s: Slice[char]) returns bool
+    {
+        let n s.length as int
+        let segment_count segs.get_length() as int
+        var seg_idx 0
+        var s_idx 0
+        var star_seg_idx 0 - 1
+        var star_s_idx 0
+        while s_idx < n
+        {
+            var advanced false
+            if seg_idx < segment_count
+            {
+                let seg segs[seg_idx as size_t]
+                if seg.kind = TsGlobSegmentLiteral
+                {
+                    let lit seg.literal
+                    let stop s_idx + (lit.length as int)
+                    if stop <= n
+                    {
+                        let piece s.subslice(s_idx as size_t, stop as size_t)
+                        if piece.equals(lit)
+                        {
+                            set s_idx: stop
+                            set seg_idx: seg_idx + 1
+                            set advanced: true
+                        }
+                    }
+                }
+                else
+                {
+                    if seg.kind = TsGlobSegmentQuestion
+                    {
+                        if (s[s_idx as size_t] as int) <> ("/" as char) as int
+                        {
+                            set s_idx: s_idx + TsGlobPattern.rune_size(s, s_idx)
+                            set seg_idx: seg_idx + 1
+                            set advanced: true
+                        }
+                    }
+                    else
+                    {
+                        set star_seg_idx: seg_idx
+                        set star_s_idx: s_idx
+                        set seg_idx: seg_idx + 1
+                        set advanced: true
+                    }
+                }
+            }
+            if advanced
+                continue
+            if (star_seg_idx >= 0) and (star_s_idx < n)
+            {
+                if (s[star_s_idx as size_t] as int) <> ("/" as char) as int
+                {
+                    set star_s_idx: star_s_idx + TsGlobPattern.rune_size(s, star_s_idx)
+                    set s_idx: star_s_idx
+                    set seg_idx: star_seg_idx + 1
+                    continue
+                }
+            }
+            return false
+        }
+        while seg_idx < segment_count
+        {
+            let tail segs[seg_idx as size_t]
+            if tail.kind <> TsGlobSegmentStar
+                break
+            set seg_idx: seg_idx + 1
+        }
+        seg_idx >= segment_count
+    }
+
+    ; shouldIncludeMinJs: a files pattern leaves out `.min.js` unless it names `.min.`
+    function should_include_min_js(this, filename: Slice[char], segs: ref[Array[TsGlobSegment]]) returns bool
+    {
+        if exclude_min_js = false
+            return true
+        if filename.ends_with(".min.js") = false
+            return true
+        var i 0
+        while i < (segs.get_length() as int)
+        {
+            let seg segs[i as size_t]
+            set i: i + 1
+            if seg.kind <> TsGlobSegmentLiteral
+                continue
+            if TsGlobPattern.contains_text(seg.literal, ".min.")
+                return true
+        }
+        false
+    }
+
+    function contains_text(s: Slice[char], t: Slice[char]) returns bool
+    {
+        let n s.length as int
+        let m t.length as int
+        var i 0
+        while i + m <= n
+        {
+            let piece s.subslice(i as size_t, (i + m) as size_t)
+            if piece.equals(t)
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    function is_hidden_path(name: Slice[char]) returns bool
+    {
+        if (name.length as int) = 0
+            return false
+        (name[0] as int) = ("." as char) as int
+    }
+
+    ; isPackageFolder (EqualFold)
+    function is_package_folder(name: Slice[char]) returns bool
+    {
+        if TsGlobPattern.equal_fold(name, "node_modules")
+            return true
+        if TsGlobPattern.equal_fold(name, "jspm_packages")
+            return true
+        TsGlobPattern.equal_fold(name, "bower_components")
+    }
+
+    function equal_fold(a: Slice[char], b: Slice[char]) returns bool
+    {
+        if a.length <> b.length
+            return false
+        var i 0
+        while i < (a.length as int)
+        {
+            var x a[i as size_t] as int
+            var y b[i as size_t] as int
+            if (x >= ("A" as char) as int) and (x <= ("Z" as char) as int)
+                set x: x + 32
+            if (y >= ("A" as char) as int) and (y <= ("Z" as char) as int)
+                set y: y + 32
+            if x <> y
+                return false
+            set i: i + 1
+        }
+        true
+    }
+}
+
+; vfsmatch.globMatcher
+define TsGlobMatcher
+(
+    includes: ref[Array[ref[TsGlobPattern]]]
+    excludes: ref[Array[ref[TsGlobPattern]]]
+    had_includes: bool
+)
+{
+    function create(host: ref[Page], include_specs: ref[Array[Slice[char]]], exclude_specs: ref[Array[Slice[char]]], base_path: Slice[char], usage: int) returns ref[TsGlobMatcher]
+    {
+        let includes &Array[ref[TsGlobPattern]]^host()
+        let excludes &Array[ref[TsGlobPattern]]^host()
+        var i 0
+        while i < (include_specs.get_length() as int)
+        {
+            let p TsGlobPattern.compile(host, include_specs[i as size_t], base_path, usage)
+            if p <> null
+                includes.add(p as ref[TsGlobPattern])
+            set i: i + 1
+        }
+        var j 0
+        while j < (exclude_specs.get_length() as int)
+        {
+            let q TsGlobPattern.compile(host, exclude_specs[j as size_t], base_path, TsGlobUsageExclude)
+            if q <> null
+                excludes.add(q as ref[TsGlobPattern])
+            set j: j + 1
+        }
+        &TsGlobMatcher^host(includes, excludes, include_specs.get_length() > 0)
+    }
+
+    ; matchesFileParts: the index of the matching include, -1 for none
+    function match_file(this, path: Slice[char]) returns int
+    {
+        var i 0
+        while i < (excludes.get_length() as int)
+        {
+            let e excludes[i as size_t]
+            if e.matches(path)
+                return 0 - 1
+            set i: i + 1
+        }
+        if includes.get_length() = 0
+        {
+            if had_includes
+                return 0 - 1
+            return 0
+        }
+        var j 0
+        while j < (includes.get_length() as int)
+        {
+            let p includes[j as size_t]
+            if p.matches(path)
+                return j
+            set j: j + 1
+        }
+        0 - 1
+    }
+
+    ; matchesDirectoryParts
+    function match_directory(this, path: Slice[char]) returns bool
+    {
+        var i 0
+        while i < (excludes.get_length() as int)
+        {
+            let e excludes[i as size_t]
+            if e.matches(path)
+                return false
+            set i: i + 1
+        }
+        if includes.get_length() = 0
+            return had_includes = false
+        var j 0
+        while j < (includes.get_length() as int)
+        {
+            let p includes[j as size_t]
+            if p.matches_prefix(path)
+                return true
+            set j: j + 1
+        }
+        false
+    }
+}
+
+; vfsmatch.globVisitor over the case's file table
+define TsGlobVisitor
+(
+    host: ref[Page]
+    files: ref[ProgramFiles]
+    file_matcher: ref[TsGlobMatcher]
+    directory_matcher: ref[TsGlobMatcher]
+    extensions: ref[Array[Slice[char]]]
+    visited: ref[Array[Slice[char]]]
+    results: ref[Array[ref[Array[Slice[char]]]]]
+)
+{
+    procedure visit(this, path: Slice[char], absolute_path: Slice[char], resolved_real_path: Slice[char])
+    {
+        var real_path resolved_real_path
+        if (real_path.length as int) = 0
+            set real_path: absolute_path
+        if TsConfigParser.slices_contain(visited, real_path)
+            return
+        visited.add(real_path)
+        let entry_files &Array[Slice[char]]^host()
+        let entry_directories &Array[Slice[char]]^host()
+        TsConfigParser.accessible_entries(host, files, absolute_path, entry_files, entry_directories)
+        let path_prefix TsConfigParser.ensure_trailing_slash(host, path)
+        let abs_prefix TsConfigParser.ensure_trailing_slash(host, absolute_path)
+        var i 0
+        while i < (entry_files.get_length() as int)
+        {
+            let file entry_files[i as size_t]
+            set i: i + 1
+            if extensions.get_length() > 0
+            {
+                if TsConfigParser.file_extension_is_one_of(file, extensions) = false
+                    continue
+            }
+            let idx file_matcher.match_file(join_slices(host, abs_prefix, file))
+            if idx >= 0
+            {
+                let bucket results[idx as size_t]
+                bucket.add(join_slices(host, path_prefix, file))
+            }
+        }
+        var j 0
+        while j < (entry_directories.get_length() as int)
+        {
+            let dir entry_directories[j as size_t]
+            set j: j + 1
+            if directory_matcher.match_directory(join_slices(host, abs_prefix, dir)) = false
+                continue
+            this.visit(join_slices(host, path_prefix, dir), join_slices(host, abs_prefix, dir), combine_paths(host, real_path, dir))
+        }
+    }
+}
+
+define TsConfigParser
+(
+    host: ref[Page]
+    files: ref[ProgramFiles]
+    current_directory: Slice[char]
+    ; the first shape this port has not written (the case is then UNPORTED)
+    stop_tag: Slice[char]
+)
+{
+    function create(host: ref[Page], files: ref[ProgramFiles], current_directory: Slice[char]) returns ref[TsConfigParser]
+        &TsConfigParser^host(host, files, current_directory, null)
+
+    procedure stop(this, tag: Slice[char])
+    {
+        if (stop_tag.length as int) = 0
+            set stop_tag: tag
+    }
+
+    ; ── the harness's entry (test_case_parser.go) ────────────────────────────
+
+    ; the first unit named tsconfig.json or jsconfig.json (GetConfigNameFromFileName),
+    ; -1 for none
+    function config_file_index(files: ref[ProgramFiles]) returns int
+    {
+        var i 0
+        while i < files.count()
+        {
+            let base TsConfigParser.base_name_lower(files.path_at(i))
+            if base.equals("tsconfig.json")
+                return i
+            if base.equals("jsconfig.json")
+                return i
+            set i: i + 1
+        }
+        0 - 1
+    }
+
+    function base_name_lower(path: Slice[char]) returns Slice[char]
+    {
+        let slash slice_last_index_of_byte(path, ("/" as char) as int)
+        let base path.slice_from((slash + 1) as size_t)
+        if (base.length as int) <> 13
+            return base
+        if TsGlobPattern.equal_fold(base, "tsconfig.json")
+            return "tsconfig.json"
+        if TsGlobPattern.equal_fold(base, "jsconfig.json")
+            return "jsconfig.json"
+        base
+    }
+
+    ; ParseJsonSourceFileConfigFileContent(config, host, configDir, nil, nil, configFileName)
+    ; for the unit at `index`; null after a stop
+    procedure parse_config_unit(this, index: int) returns ref[TsParsedCommandLine]?
+    {
+        let config_file_name files.path_at(index)
+        var errors false
+        let file this.parse_json(config_file_name, files.text_at(index), &errors)
+        if file = null
+            return null
+        let config_dir get_directory_path(host, config_file_name)
+        let parsed this.parse_json_config_file_content(file as ref[AstNode], config_dir, config_file_name)
+        if (stop_tag.length as int) > 0
+            return null
+        parsed
+    }
+
+    ; parser.ParseSourceFile(…, ScriptKindJSON); `out_errors` when the parse reported
+    procedure parse_json(this, file_name: Slice[char], text: Slice[char], out_errors: ref[bool]) returns ref[AstNode]?
+    {
+        let name String^host(file_name.data as pointer[const_char], file_name.length)
+        let source String^host(text.data as pointer[const_char], text.length)
+        var unported 0 - 1
+        var tag: Slice[char] ""
+        var detail 0
+        let p Parser.parse_ex(host, name, source, ScriptKindJSON, &unported, &tag, &detail)
+        if unported >= 0
+        {
+            this.stop("tsconfig-json-parse")
+            return null
+        }
+        let d p.diagnostics
+        if d <> null
+        {
+            if (d as ref[DiagnosticList]).length() > 0
+                set out_errors: true
+        }
+        let file Parser.source_file_of(p)
+        if file = null
+            this.stop("tsconfig-json-parse")
+        file
+    }
+
+    ; ── JSON values ──────────────────────────────────────────────────────────
+
+    function new_value(this, kind: int, text: Slice[char], truth: bool) returns ref[JsonValue]
+        &JsonValue^host(kind, text, truth, null, null)
+
+    function new_object(this) returns ref[JsonValue]
+        &JsonValue^host(JsonKindObject, null, false, &Array[Slice[char]]^host(), &Array[ref[JsonValue]?]^host())
+
+    function new_array(this) returns ref[JsonValue]
+        &JsonValue^host(JsonKindArray, null, false, null, &Array[ref[JsonValue]?]^host())
+
+    ; OrderedMap.Set: a key already present keeps its place and takes the value
+    procedure json_set(this, obj: ref[JsonValue], key: Slice[char], value: ref[JsonValue])
+    {
+        let keys obj.keys as ref[Array[Slice[char]]]
+        let vals obj.values as ref[Array[ref[JsonValue]?]]
+        var i 0
+        while i < (keys.get_length() as int)
+        {
+            let k keys[i as size_t]
+            if k.equals(key)
+            {
+                vals.put(i as size_t, value)
+                return
+            }
+            set i: i + 1
+        }
+        keys.add(key)
+        vals.add(value)
+    }
+
+    function object_has(obj: ref[JsonValue], key: Slice[char]) returns bool
+    {
+        if obj.kind <> JsonKindObject
+            return false
+        var i 0
+        while i < obj.size()
+        {
+            let k obj.key_at(i)
+            if k.equals(key)
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    ; convertConfigFileToObject: the root value, the first object of a root array
+    ; literal, else an empty map
+    procedure convert_config_file(this, file: ref[AstNode], own: ref[TsOwnConfig]) returns ref[JsonValue]
+    {
+        var root: ref[AstNode]? null
+        let statements AstNode.statements_of(file)
+        if statements <> null
+        {
+            let list statements as ref[Array[ref[AstNode]?]]
+            if list.get_length() > 0
+                set root: AstNode.expression_of(list[0])
+        }
+        if root = null
+            return this.new_object()
+        if AstNode.kind_of(root) <> KindObjectLiteralExpression
+        {
+            if AstNode.kind_of(root) = KindArrayLiteralExpression
+            {
+                let elements AstNode.elements_of(root)
+                if elements <> null
+                {
+                    let el elements as ref[Array[ref[AstNode]?]]
+                    var i 0
+                    while i < (el.get_length() as int)
+                    {
+                        let e el[i as size_t]
+                        set i: i + 1
+                        if AstNode.kind_of(e) = KindObjectLiteralExpression
+                            return this.convert_value(e, TsConfigLevelRoot, own)
+                    }
+                }
+            }
+            return this.new_object()
+        }
+        this.convert_value(root, TsConfigLevelRoot, own)
+    }
+
+    ; convertPropertyValueToJson; Go's nil is a JsonKindNull value
+    procedure convert_value(this, node: ref[AstNode]?, level: int, own: ref[TsOwnConfig]) returns ref[JsonValue]
+    {
+        let k AstNode.kind_of(node)
+        if k = KindTrueKeyword
+            return this.new_value(JsonKindBoolean, Slice[char](), true)
+        if k = KindFalseKeyword
+            return this.new_value(JsonKindBoolean, Slice[char](), false)
+        if k = KindStringLiteral
+            return this.new_value(JsonKindString, AstNode.literal_text_of(node), false)
+        if k = KindNumericLiteral
+            return this.new_value(JsonKindNumber, AstNode.literal_text_of(node), false)
+        if k = KindPrefixUnaryExpression
+        {
+            if AstNode.prefix_unary_operator_kind(node) = KindMinusToken
+            {
+                let operand AstNode.prefix_unary_operand_of(node)
+                if AstNode.kind_of(operand) = KindNumericLiteral
+                    return this.new_value(JsonKindNumber, join_slices(host, "-", AstNode.literal_text_of(operand)), false)
+            }
+            return this.new_value(JsonKindNull, Slice[char](), false)
+        }
+        if k = KindObjectLiteralExpression
+            return this.convert_object(node as ref[AstNode], level, own)
+        if k = KindArrayLiteralExpression
+            return this.convert_array(node as ref[AstNode], own)
+        this.new_value(JsonKindNull, Slice[char](), false)
+    }
+
+    ; convertObjectLiteralExpressionToJson with the notifier of `level`
+    procedure convert_object(this, node: ref[AstNode], level: int, own: ref[TsOwnConfig]) returns ref[JsonValue]
+    {
+        let obj this.new_object()
+        let props AstNode.properties_of(node)
+        if props = null
+            return obj
+        let list props as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            let element list[i as size_t]
+            set i: i + 1
+            if AstNode.kind_of(element) <> KindPropertyAssignment
+                continue
+            let key AstNode.property_name_text_of(AstNode.name_of(element))
+            ; the option a key names is exact (a case-insensitive hit is not it)
+            var child_level TsConfigLevelNone
+            if level = TsConfigLevelRoot
+            {
+                if key.equals("compilerOptions")
+                    set child_level: TsConfigLevelCompilerOptions
+            }
+            let value this.convert_value(AstNode.initializer_of(element), child_level, own)
+            if (key.length as int) = 0
+                continue
+            this.json_set(obj, key, value)
+            if level = TsConfigLevelRoot
+            {
+                if key.equals("extends")
+                    this.set_extends(own, value)
+            }
+            if level = TsConfigLevelCompilerOptions
+                this.on_compiler_option(own, key, value)
+        }
+        obj
+    }
+
+    ; convertArrayLiteralExpressionToJson (no notifier below an array): nil elements
+    ; dropped, an empty literal an empty slice, all dropped a nil one
+    procedure convert_array(this, node: ref[AstNode], own: ref[TsOwnConfig]) returns ref[JsonValue]
+    {
+        let out this.new_array()
+        let elements AstNode.elements_of(node)
+        if elements = null
+            return out
+        let list elements as ref[Array[ref[AstNode]?]]
+        let vals out.values as ref[Array[ref[JsonValue]?]]
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            let v this.convert_value(list[i as size_t], TsConfigLevelNone, own)
+            set i: i + 1
+            if v.kind <> JsonKindNull
+                vals.add(v)
+        }
+        if (list.get_length() > 0) and (vals.get_length() = 0)
+            set out.truth: true
+        out
+    }
+
+    ; onPropertySet's root arm for `extends`
+    procedure set_extends(this, own: ref[TsOwnConfig], value: ref[JsonValue])
+    {
+        let paths this.get_extends_config_path_or_array(value, own.base_path, own.config_file_name)
+        set own.extends_paths: paths
+    }
+
+    ; onPropertySet's compilerOptions arm: convertJsonOption, then ParseCompilerOptions
+    procedure on_compiler_option(this, own: ref[TsOwnConfig], key: Slice[char], value: ref[JsonValue])
+    {
+        let i TsOptionDecls.index_of(key)
+        if i < 0
+            return
+        let converted this.convert_json_option(i, value, own.base_path)
+        if converted.kind = JsonKindNull
+            return
+        TsConfigParser.parse_compiler_option(host, own.options, i, converted)
+    }
+
+    ; convertJsonOption for a compiler option
+    procedure convert_json_option(this, i: int, value: ref[JsonValue], base_path: Slice[char]) returns ref[JsonValue]
+    {
+        if TsOptionDecls.is_command_line_only(i)
+            return this.new_value(JsonKindNull, Slice[char](), false)
+        if value.kind = JsonKindNull
+            return value
+        let kind TsOptionDecls.kind_of(i)
+        if kind = TsOptionKindList
+        {
+            if value.kind <> JsonKindArray
+                return this.new_value(JsonKindNull, Slice[char](), false)
+            return this.convert_json_list(i, value, base_path)
+        }
+        if kind = TsOptionKindEnum
+        {
+            if value.kind <> JsonKindString
+                return this.new_value(JsonKindNull, Slice[char](), false)
+            return this.convert_enum(i, value.text)
+        }
+        var wanted JsonKindAbsent
+        if kind = TsOptionKindString
+            set wanted: JsonKindString
+        if kind = TsOptionKindBoolean
+            set wanted: JsonKindBoolean
+        if kind = TsOptionKindNumber
+            set wanted: JsonKindNumber
+        if kind = TsOptionKindObject
+            set wanted: JsonKindObject
+        if value.kind <> wanted
+            return this.new_value(JsonKindNull, Slice[char](), false)
+        if TsOptionDecls.is_file_path(i)
+            return this.normalize_file_path_value(value, base_path)
+        value
+    }
+
+    ; convertJsonOptionOfListType: each element through the element declaration, the
+    ; falsy ones dropped unless the option keeps them
+    procedure convert_json_list(this, i: int, value: ref[JsonValue], base_path: Slice[char]) returns ref[JsonValue]
+    {
+        if value.truth
+            return value
+        let out this.new_array()
+        let vals out.values as ref[Array[ref[JsonValue]?]]
+        let element_kind TsOptionDecls.element_kind_of(i)
+        let preserve TsOptionDecls.list_preserve_falsy_values(i)
+        var j 0
+        while j < value.size()
+        {
+            let e value.value_at(j)
+            set j: j + 1
+            if e = null
+                continue
+            let ev e as ref[JsonValue]
+            var c this.new_value(JsonKindNull, Slice[char](), false)
+            if (element_kind = TsOptionKindString) and (ev.kind = JsonKindString)
+            {
+                set c: ev
+                if TsOptionDecls.element_is_file_path(i)
+                    set c: this.normalize_file_path_value(ev, base_path)
+            }
+            if (element_kind = TsOptionKindEnum) and (ev.kind = JsonKindString)
+                set c: this.convert_enum(i, ev.text)
+            if (element_kind = TsOptionKindObject) and (ev.kind = JsonKindObject)
+                set c: ev
+            var falsy c.kind = JsonKindNull
+            if (c.kind = JsonKindBoolean) and (c.truth = false)
+                set falsy: true
+            if (c.kind = JsonKindString) and ((c.text.length as int) = 0)
+                set falsy: true
+            if preserve or (falsy = false)
+                vals.add(c)
+        }
+        out
+    }
+
+    ; convertJsonOptionOfEnumType: the lower-cased key's value (the key itself, or a
+    ; lib's file name), nil for an empty or unknown key
+    procedure convert_enum(this, i: int, text: Slice[char]) returns ref[JsonValue]
+    {
+        if (text.length as int) = 0
+            return this.new_value(JsonKindNull, Slice[char](), false)
+        let lower TsConfigParser.to_lower(host, text)
+        let v TsOptionDecls.enum_value(i, lower)
+        if (v.length as int) = 0
+            return this.new_value(JsonKindNull, Slice[char](), false)
+        this.new_value(JsonKindString, v, false)
+    }
+
+    ; normalizeNonListOptionValue for a file path
+    procedure normalize_file_path_value(this, value: ref[JsonValue], base_path: Slice[char]) returns ref[JsonValue]
+    {
+        var text normalize_slashes(host, value.text)
+        if TsConfigParser.starts_with_config_dir_template(text) = false
+            set text: get_normalized_absolute_path(host, text, base_path)
+        if (text.length as int) = 0
+        {
+            let dot: Slice[char] "."
+            set text: dot
+        }
+        this.new_value(JsonKindString, text, false)
+    }
+
+    function to_lower(host: ref[Page], s: Slice[char]) returns Slice[char]
+    {
+        let buf host.allocate((s.length + 1) as size_t, 1) as pointer[char]
+        var i 0
+        while i < (s.length as int)
+        {
+            var c s[i as size_t] as int
+            if (c >= ("A" as char) as int) and (c <= ("Z" as char) as int)
+                set c: c + 32
+            set *(buf + i): c as char
+            set i: i + 1
+        }
+        Slice[char](s.length, buf)
+    }
+
+    ; startsWithConfigDirTemplate (case-insensitive)
+    function starts_with_config_dir_template(s: Slice[char]) returns bool
+    {
+        if (s.length as int) < 12
+            return false
+        TsGlobPattern.equal_fold(s.subslice(0, 12), "${configDir}")
+    }
+
+    ; ParseCompilerOptions: the field's parse by its kind; a value the parse turns
+    ; into the zero value unsets the field
+    procedure parse_compiler_option(host: ref[Page], options: ref[TsOptions], i: int, converted: ref[JsonValue])
+    {
+        let name TsOptionDecls.name_of(i)
+        let fk TsOptionDecls.field_kind_of(i)
+        if fk = TsOptionFieldNone
+            return
+        if fk = TsOptionFieldTristate
+        {
+            var truth false
+            if converted.kind = JsonKindBoolean
+                set truth: converted.truth
+            TsOptions.put(host, options, name, &JsonValue^host(JsonKindBoolean, null, truth, null, null))
+            return
+        }
+        if fk = TsOptionFieldStringArray
+        {
+            if (converted.kind <> JsonKindArray) or converted.truth
+            {
+                TsOptions.put(host, options, name, null)
+                return
+            }
+            let out &JsonValue^host(JsonKindArray, null, false, null, &Array[ref[JsonValue]?]^host())
+            let vals out.values as ref[Array[ref[JsonValue]?]]
+            var j 0
+            while j < converted.size()
+            {
+                let e converted.value_at(j)
+                set j: j + 1
+                if e = null
+                    continue
+                if (e as ref[JsonValue]).kind = JsonKindString
+                    vals.add(e)
+            }
+            TsOptions.put(host, options, name, out)
+            return
+        }
+        var wanted JsonKindString
+        if fk = TsOptionFieldStringMap
+            set wanted: JsonKindObject
+        if fk = TsOptionFieldNumber
+            set wanted: JsonKindNumber
+        if converted.kind = wanted
+            TsOptions.put(host, options, name, converted)
+        else
+            TsOptions.put(host, options, name, null)
+    }
+
+    ; ── extends ──────────────────────────────────────────────────────────────
+
+    ; getExtendsConfigPathOrArray
+    procedure get_extends_config_path_or_array(this, value: ref[JsonValue], base_path: Slice[char], config_file_name: Slice[char]) returns ref[Array[Slice[char]]]
+    {
+        let out &Array[Slice[char]]^host()
+        var new_base base_path
+        if (config_file_name.length as int) > 0
+            set new_base: get_directory_path(host, get_normalized_absolute_path(host, config_file_name, base_path))
+        if value.kind = JsonKindString
+        {
+            let p this.get_extends_config_path(value.text, new_base)
+            if (p.length as int) > 0
+                out.add(p)
+            return out
+        }
+        if value.kind = JsonKindArray
+        {
+            var i 0
+            while i < value.size()
+            {
+                let e value.value_at(i)
+                set i: i + 1
+                if e = null
+                    continue
+                let ev e as ref[JsonValue]
+                if ev.kind <> JsonKindString
+                    continue
+                let p2 this.get_extends_config_path(ev.text, new_base)
+                if (p2.length as int) > 0
+                    out.add(p2)
+            }
+        }
+        out
+    }
+
+    ; getExtendsConfigPath: a rooted or relative path (with `.json` added when the
+    ; name as written is absent), else a module resolved by ResolveConfig
+    procedure get_extends_config_path(this, extended_config: Slice[char], base_path: Slice[char]) returns Slice[char]
+    {
+        let ext normalize_slashes(host, extended_config)
+        var path_like is_rooted_disk_path(ext)
+        if ext.starts_with("./")
+            set path_like: true
+        if ext.starts_with("../")
+            set path_like: true
+        if path_like
+        {
+            var path get_normalized_absolute_path(host, ext, base_path)
+            if files.file_exists(path) = false
+            {
+                if path.ends_with(".json") = false
+                {
+                    set path: join_slices(host, path, ".json")
+                    if files.file_exists(path) = false
+                        return Slice[char]()
+                }
+            }
+            return path
+        }
+        var stopped false
+        let r ModuleResolver.resolve_config(host, files, ext, combine_paths(host, base_path, "tsconfig.json"), &stopped)
+        if stopped
+        {
+            this.stop("tsconfig-extends-resolution")
+            return Slice[char]()
+        }
+        if r >= 0
+            return files.path_at(r)
+        Slice[char]()
+    }
+
+    ; ── parseConfig ──────────────────────────────────────────────────────────
+
+    ; parseOwnConfigOfJsonSourceFile
+    procedure parse_own_config(this, file: ref[AstNode], base_path: Slice[char], config_file_name: Slice[char]) returns ref[TsParsedConfig]
+    {
+        let options TsOptions.create(host)
+        ; getDefaultCompilerOptions: a jsconfig.json's defaults
+        let config_base TsConfigParser.base_name_lower(config_file_name)
+        if config_base.equals("jsconfig.json")
+        {
+            TsOptions.put(host, options, "allowJs", this.new_value(JsonKindBoolean, Slice[char](), true))
+            TsOptions.put(host, options, "maxNodeModuleJsDepth", this.new_value(JsonKindNumber, "2", false))
+            TsOptions.put(host, options, "skipLibCheck", this.new_value(JsonKindBoolean, Slice[char](), true))
+            TsOptions.put(host, options, "noEmit", this.new_value(JsonKindBoolean, Slice[char](), true))
+        }
+        let own &TsOwnConfig^host(options, null, base_path, config_file_name)
+        let raw this.convert_config_file(file, own)
+        &TsParsedConfig^host(raw, options, own.extends_paths)
+    }
+
+    ; parseConfig over a source file
+    procedure parse_config(this, file: ref[AstNode], base_path_in: Slice[char], config_file_name: Slice[char], resolution_stack: ref[Array[Slice[char]]]) returns ref[TsParsedConfig]
+    {
+        let base_path normalize_slashes(host, base_path_in)
+        let resolved_path get_normalized_absolute_path(host, config_file_name, base_path)
+        if TsConfigParser.slices_contain(resolution_stack, resolved_path)
+            return &TsParsedConfig^host(null, null, null)
+        let own this.parse_own_config(file, base_path, config_file_name)
+        if own.extends_paths = null
+            return own
+        ; the stack copied, so it is never shared between branches
+        let stack &Array[Slice[char]]^host()
+        var s 0
+        while s < (resolution_stack.get_length() as int)
+        {
+            stack.add(resolution_stack[s as size_t])
+            set s: s + 1
+        }
+        stack.add(resolved_path)
+        let result &TsExtendsResult^host(TsOptions.create(host), null, null, null)
+        let paths own.extends_paths as ref[Array[Slice[char]]]
+        var i 0
+        while i < (paths.get_length() as int)
+        {
+            this.apply_extended_config(own, result, paths[i as size_t], base_path, stack)
+            set i: i + 1
+        }
+        let raw own.raw as ref[JsonValue]
+        if raw.kind = JsonKindObject
+        {
+            if result.include <> null
+                this.json_set(raw, "include", result.include as ref[JsonValue])
+            if result.exclude <> null
+                this.json_set(raw, "exclude", result.exclude as ref[JsonValue])
+            if result.files <> null
+                this.json_set(raw, "files", result.files as ref[JsonValue])
+        }
+        let merged result.options
+        TsOptions.merge(host, merged, own.options, own.raw)
+        &TsParsedConfig^host(own.raw, merged, own.extends_paths)
+    }
+
+    ; parseConfig's applyExtendedConfig
+    procedure apply_extended_config(this, own: ref[TsParsedConfig], result: ref[TsExtendsResult], extended_config_path: Slice[char], base_path: Slice[char], stack: ref[Array[Slice[char]]])
+    {
+        let extended_opt this.parse_extended_config(extended_config_path, stack)
+        if extended_opt = null
+            return
+        let extended extended_opt as ref[TsParsedConfig]
+        if extended.options = null
+            return
+        let include this.inherited_specs(own.raw, extended.raw, "include", extended_config_path, base_path)
+        if include <> null
+            set result.include: include
+        let exclude this.inherited_specs(own.raw, extended.raw, "exclude", extended_config_path, base_path)
+        if exclude <> null
+            set result.exclude: exclude
+        let files_specs this.inherited_specs(own.raw, extended.raw, "files", extended_config_path, base_path)
+        if files_specs <> null
+            set result.files: files_specs
+        let target result.options
+        TsOptions.merge(host, target, extended.options, extended.raw)
+    }
+
+    ; setPropertyValue: an extended config's include/exclude/files the own config
+    ; does not spell, each relative spec made relative to the own config's directory
+    procedure inherited_specs(this, own_raw: ref[JsonValue]?, extends_raw: ref[JsonValue]?, name: Slice[char], extended_config_path: Slice[char], base_path: Slice[char]) returns ref[JsonValue]?
+    {
+        if own_raw <> null
+        {
+            if TsConfigParser.object_has(own_raw as ref[JsonValue], name)
+                return null
+        }
+        if extends_raw = null
+            return null
+        let er extends_raw as ref[JsonValue]
+        if TsConfigParser.object_has(er, name) = false
+            return null
+        let v er.get(name)
+        if v = null
+            return null
+        let arr v as ref[JsonValue]
+        if (arr.kind <> JsonKindArray) or arr.truth
+            return null
+        let extended_directory get_directory_path(host, extended_config_path)
+        var relative_difference extended_directory
+        if is_rooted_disk_path(extended_directory)
+            set relative_difference: get_relative_path_to_directory_or_url(host, base_path, extended_directory, false, base_path)
+        let out this.new_array()
+        let vals out.values as ref[Array[ref[JsonValue]?]]
+        var i 0
+        while i < arr.size()
+        {
+            let e arr.value_at(i)
+            set i: i + 1
+            if e = null
+                continue
+            let ev e as ref[JsonValue]
+            var mapped ev
+            if ev.kind = JsonKindString
+            {
+                var keep TsConfigParser.starts_with_config_dir_template(ev.text)
+                if is_rooted_disk_path(ev.text)
+                    set keep: true
+                if keep = false
+                    set mapped: this.new_value(JsonKindString, combine_paths(host, relative_difference, ev.text), false)
+            }
+            vals.add(mapped)
+        }
+        out
+    }
+
+    ; ParseExtendedConfig: null when the file cannot be read or does not parse cleanly
+    procedure parse_extended_config(this, file_name: Slice[char], stack: ref[Array[Slice[char]]]) returns ref[TsParsedConfig]?
+    {
+        let i files.index_of_path(file_name)
+        if i < 0
+            return null
+        var errors false
+        let file this.parse_json(file_name, files.text_at(i), &errors)
+        if file = null
+            return null
+        if errors
+            return null
+        this.parse_config(file as ref[AstNode], get_directory_path(host, file_name), get_base_file_name(host, file_name), stack)
+    }
+
+    ; ── parseJsonConfigFileContentWorker ─────────────────────────────────────
+
+    procedure parse_json_config_file_content(this, file: ref[AstNode], base_path: Slice[char], config_file_name: Slice[char]) returns ref[TsParsedCommandLine]
+    {
+        let base_for_names get_normalized_absolute_path(host, get_directory_path(host, get_normalized_absolute_path(host, config_file_name, base_path)), Slice[char]())
+        let parsed this.parse_config(file, base_path, config_file_name, &Array[Slice[char]]^host())
+        var options TsOptions.create(host)
+        if parsed.options <> null
+            set options: parsed.options as ref[TsOptions]
+        this.substitute_config_dir_options(options, base_for_names)
+        let files_prop TsConfigParser.prop_from_raw(parsed.raw, "files")
+        let include_prop TsConfigParser.prop_from_raw(parsed.raw, "include")
+        var exclude_prop TsConfigParser.prop_from_raw(parsed.raw, "exclude")
+        if exclude_prop = null
+        {
+            let out_dir options.text_of("outDir")
+            let declaration_dir options.text_of("declarationDir")
+            if ((out_dir.length as int) > 0) or ((declaration_dir.length as int) > 0)
+            {
+                let defaults this.new_array()
+                let dv defaults.values as ref[Array[ref[JsonValue]?]]
+                if (out_dir.length as int) > 0
+                    dv.add(this.new_value(JsonKindString, out_dir, false))
+                if (declaration_dir.length as int) > 0
+                    dv.add(this.new_value(JsonKindString, declaration_dir, false))
+                set exclude_prop: defaults
+            }
+        }
+        let files_slice TsConfigParser.non_nil_slice(files_prop)
+        var include_slice TsConfigParser.non_nil_slice(include_prop)
+        if (files_slice = null) and (include_slice = null)
+        {
+            let default_include this.new_array()
+            let di default_include.values as ref[Array[ref[JsonValue]?]]
+            di.add(this.new_value(JsonKindString, "**/*", false))
+            set include_slice: default_include
+        }
+        let include_specs &Array[Slice[char]]^host()
+        if include_slice <> null
+            this.validate_specs(include_slice as ref[JsonValue], true, include_specs)
+        let exclude_specs &Array[Slice[char]]^host()
+        let exclude_slice TsConfigParser.non_nil_slice(exclude_prop)
+        if exclude_slice <> null
+            this.validate_specs(exclude_slice as ref[JsonValue], false, exclude_specs)
+        let file_specs &Array[Slice[char]]^host()
+        if files_slice <> null
+        {
+            let fs files_slice as ref[JsonValue]
+            var i 0
+            while i < fs.size()
+            {
+                let e fs.value_at(i)
+                set i: i + 1
+                if e = null
+                    continue
+                if (e as ref[JsonValue]).kind = JsonKindString
+                    file_specs.add((e as ref[JsonValue]).text)
+            }
+        }
+        this.substitute_config_dir_list(include_specs, base_for_names)
+        this.substitute_config_dir_list(exclude_specs, base_for_names)
+        this.substitute_config_dir_list(file_specs, base_for_names)
+        let names this.get_file_names_from_config_specs(file_specs, include_specs, exclude_specs, base_for_names, options)
+        &TsParsedCommandLine^host(options, names)
+    }
+
+    ; getPropFromRaw for a source file: the value when it is an array, else null
+    function prop_from_raw(raw: ref[JsonValue]?, name: Slice[char]) returns ref[JsonValue]?
+    {
+        if raw = null
+            return null
+        let r raw as ref[JsonValue]
+        if r.kind <> JsonKindObject
+            return null
+        let v r.get(name)
+        if v = null
+            return null
+        if (v as ref[JsonValue]).kind <> JsonKindArray
+            return null
+        v
+    }
+
+    ; a prop's sliceValue: null for no prop and for a nil slice
+    function non_nil_slice(v: ref[JsonValue]?) returns ref[JsonValue]?
+    {
+        if v = null
+            return null
+        if (v as ref[JsonValue]).truth
+            return null
+        v
+    }
+
+    ; validateSpecs: the string specs without a diagnostic
+    procedure validate_specs(this, specs: ref[JsonValue], disallow_trailing_recursion: bool, out: ref[Array[Slice[char]]])
+    {
+        var i 0
+        while i < specs.size()
+        {
+            let e specs.value_at(i)
+            set i: i + 1
+            if e = null
+                continue
+            let ev e as ref[JsonValue]
+            if ev.kind <> JsonKindString
+                continue
+            let spec ev.text
+            if disallow_trailing_recursion
+            {
+                if TsConfigParser.invalid_trailing_recursion(spec)
+                    continue
+            }
+            if TsConfigParser.invalid_dot_dot_after_recursive_wildcard(spec)
+                continue
+            out.add(spec)
+        }
+    }
+
+    function invalid_trailing_recursion(spec: Slice[char]) returns bool
+    {
+        var s spec
+        if s.ends_with("/")
+            set s: s.subslice(0, s.length - 1)
+        if s.equals("**")
+            return true
+        s.ends_with("/**")
+    }
+
+    ; invalidDotDotAfterRecursiveWildcard: some `/..` segment after some `**/`
+    function invalid_dot_dot_after_recursive_wildcard(s: Slice[char]) returns bool
+    {
+        var wildcard_index 0 - 1
+        if s.starts_with("**/")
+            set wildcard_index: 0
+        else
+            set wildcard_index: TsConfigParser.index_of_text(s, "/**/")
+        if wildcard_index = (0 - 1)
+            return false
+        var last_dot_index 0 - 1
+        if s.ends_with("/..")
+            set last_dot_index: s.length as int
+        else
+            set last_dot_index: TsConfigParser.last_index_of_text(s, "/../")
+        last_dot_index > wildcard_index
+    }
+
+    function index_of_text(s: Slice[char], t: Slice[char]) returns int
+    {
+        let n s.length as int
+        let m t.length as int
+        var i 0
+        while i + m <= n
+        {
+            let piece s.subslice(i as size_t, (i + m) as size_t)
+            if piece.equals(t)
+                return i
+            set i: i + 1
+        }
+        0 - 1
+    }
+
+    function last_index_of_text(s: Slice[char], t: Slice[char]) returns int
+    {
+        let n s.length as int
+        let m t.length as int
+        var i n - m
+        while i >= 0
+        {
+            let piece s.subslice(i as size_t, (i + m) as size_t)
+            if piece.equals(t)
+                return i
+            set i: i - 1
+        }
+        0 - 1
+    }
+
+    ; getSubstitutedStringArrayWithConfigDirTemplate, in place
+    procedure substitute_config_dir_list(this, list: ref[Array[Slice[char]]], base_path: Slice[char])
+    {
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            let element list[i as size_t]
+            if TsConfigParser.starts_with_config_dir_template(element)
+                list.put(i as size_t, this.substituted_config_dir_path(element, base_path))
+            set i: i + 1
+        }
+    }
+
+    ; getSubstitutedPathWithConfigDirTemplate: the first exact `${configDir}` → `./`
+    procedure substituted_config_dir_path(this, value: Slice[char], base_path: Slice[char]) returns Slice[char]
+    {
+        let at TsConfigParser.index_of_text(value, "${configDir}")
+        var replaced value
+        if at >= 0
+            set replaced: join_slices(host, join_slices(host, value.subslice(0, at as size_t), "./"), value.slice_from((at + 12) as size_t))
+        get_normalized_absolute_path(host, replaced, base_path)
+    }
+
+    ; handleOptionConfigDirTemplateSubstitution
+    procedure substitute_config_dir_options(this, options: ref[TsOptions], base_path: Slice[char])
+    {
+        let paths options.get("paths")
+        if paths <> null
+        {
+            let pv paths as ref[JsonValue]
+            if pv.kind = JsonKindObject
+            {
+                let obj this.new_object()
+                var changed false
+                var i 0
+                while i < pv.size()
+                {
+                    let key pv.key_at(i)
+                    let v pv.value_at(i)
+                    set i: i + 1
+                    if v = null
+                        continue
+                    let substituted this.substituted_config_dir_value(v as ref[JsonValue], base_path)
+                    if (substituted as ref[JsonValue]) <> (v as ref[JsonValue])
+                        set changed: true
+                    this.json_set(obj, key, substituted)
+                }
+                if changed
+                    TsOptions.put(host, options, "paths", obj)
+            }
+        }
+        var k 0
+        while k < 2
+        {
+            var list_name: Slice[char] "rootDirs"
+            if k = 1
+            {
+                let tr: Slice[char] "typeRoots"
+                set list_name: tr
+            }
+            set k: k + 1
+            let lv options.get(list_name)
+            if lv <> null
+                TsOptions.put(host, options, list_name, this.substituted_config_dir_value(lv as ref[JsonValue], base_path))
+        }
+        var s 0
+        while s < 8
+        {
+            let name TsConfigParser.config_dir_string_option(s)
+            set s: s + 1
+            let text options.text_of(name)
+            if TsConfigParser.starts_with_config_dir_template(text)
+                TsOptions.put(host, options, name, this.new_value(JsonKindString, this.substituted_config_dir_path(text, base_path), false))
+        }
+    }
+
+    function config_dir_string_option(i: int) returns Slice[char]
+    {
+        if i = 0
+            return "generateCpuProfile"
+        if i = 1
+            return "generateTrace"
+        if i = 2
+            return "outFile"
+        if i = 3
+            return "outDir"
+        if i = 4
+            return "rootDir"
+        if i = 5
+            return "tsBuildInfoFile"
+        if i = 6
+            return "baseUrl"
+        "declarationDir"
+    }
+
+    ; a string list with each `${configDir}` element substituted (the same value when none is)
+    procedure substituted_config_dir_value(this, v: ref[JsonValue], base_path: Slice[char]) returns ref[JsonValue]
+    {
+        if v.kind <> JsonKindArray
+            return v
+        var any false
+        var i 0
+        while i < v.size()
+        {
+            let e v.value_at(i)
+            set i: i + 1
+            if e = null
+                continue
+            let ev e as ref[JsonValue]
+            if ev.kind = JsonKindString
+            {
+                if TsConfigParser.starts_with_config_dir_template(ev.text)
+                    set any: true
+            }
+        }
+        if any = false
+            return v
+        let out this.new_array()
+        let vals out.values as ref[Array[ref[JsonValue]?]]
+        var j 0
+        while j < v.size()
+        {
+            let e2 v.value_at(j)
+            set j: j + 1
+            if e2 = null
+                continue
+            let ev2 e2 as ref[JsonValue]
+            var mapped ev2
+            if ev2.kind = JsonKindString
+            {
+                if TsConfigParser.starts_with_config_dir_template(ev2.text)
+                    set mapped: this.new_value(JsonKindString, this.substituted_config_dir_path(ev2.text, base_path), false)
+            }
+            vals.add(mapped)
+        }
+        out
+    }
+
+    ; ── getFileNamesFromConfigSpecs ──────────────────────────────────────────
+
+    procedure get_file_names_from_config_specs(this, file_specs: ref[Array[Slice[char]]], include_specs: ref[Array[Slice[char]]], exclude_specs: ref[Array[Slice[char]]], base_path_in: Slice[char], options: ref[TsOptions]) returns ref[Array[Slice[char]]]
+    {
+        let base_path get_normalized_absolute_path(host, base_path_in, Slice[char]())
+        ; literal files: keyed by the spec as written, the value its absolute path
+        let literal_keys &Array[Slice[char]]^host()
+        let literal_values &Array[Slice[char]]^host()
+        var i 0
+        while i < (file_specs.get_length() as int)
+        {
+            let spec file_specs[i as size_t]
+            set i: i + 1
+            let file get_normalized_absolute_path(host, spec, base_path)
+            let at TsConfigParser.index_in(literal_keys, spec)
+            if at >= 0
+                literal_values.put(at as size_t, file)
+            else
+            {
+                literal_keys.add(spec)
+                literal_values.add(file)
+            }
+        }
+        let wildcard_files &Array[Slice[char]]^host()
+        let wildcard_alive &Array[bool]^host()
+        let json_files &Array[Slice[char]]^host()
+        let supported TsConfigParser.supported_extensions(host, options)
+        let with_json &Array[Slice[char]]^host()
+        var g 0
+        while g < (supported.get_length() as int)
+        {
+            let group supported[g as size_t]
+            var e 0
+            while e < (group.get_length() as int)
+            {
+                with_json.add(group[e as size_t])
+                set e: e + 1
+            }
+            set g: g + 1
+        }
+        if TsConfigParser.resolve_json_module(options)
+            with_json.add(".json")
+        if include_specs.get_length() > 0
+        {
+            let found this.read_directory(base_path, base_path, with_json, exclude_specs, include_specs)
+            var f 0
+            while f < (found.get_length() as int)
+            {
+                let file found[f as size_t]
+                set f: f + 1
+                if TsConfigParser.file_extension_is(file, ".json")
+                {
+                    let json_includes &Array[Slice[char]]^host()
+                    var ji 0
+                    while ji < (include_specs.get_length() as int)
+                    {
+                        let inc include_specs[ji as size_t]
+                        if inc.ends_with(".json")
+                            json_includes.add(inc)
+                        set ji: ji + 1
+                    }
+                    let json_matcher TsGlobMatcher.create(host, json_includes, &Array[Slice[char]]^host(), base_path, TsGlobUsageFiles)
+                    var matched false
+                    let json_patterns json_matcher.includes
+                    var pi 0
+                    while pi < (json_patterns.get_length() as int)
+                    {
+                        let pattern json_patterns[pi as size_t]
+                        if pattern.matches(file)
+                            set matched: true
+                        set pi: pi + 1
+                    }
+                    if matched
+                    {
+                        if (TsConfigParser.index_in(literal_keys, file) < 0) and (TsConfigParser.index_in(json_files, file) < 0)
+                            json_files.add(file)
+                    }
+                    continue
+                }
+                if TsConfigParser.has_file_with_higher_priority_extension(host, file, supported, literal_keys, wildcard_files, wildcard_alive)
+                    continue
+                TsConfigParser.remove_wildcard_files_with_lower_priority_extension(host, file, supported, wildcard_files, wildcard_alive)
+                if (TsConfigParser.index_in(literal_keys, file) < 0) and (TsConfigParser.alive_index_in(wildcard_files, wildcard_alive, file) < 0)
+                {
+                    wildcard_files.add(file)
+                    wildcard_alive.add(true)
+                }
+            }
+        }
+        let out &Array[Slice[char]]^host()
+        var a 0
+        while a < (literal_values.get_length() as int)
+        {
+            out.add(literal_values[a as size_t])
+            set a: a + 1
+        }
+        var b 0
+        while b < (wildcard_files.get_length() as int)
+        {
+            if wildcard_alive[b as size_t]
+                out.add(wildcard_files[b as size_t])
+            set b: b + 1
+        }
+        var c 0
+        while c < (json_files.get_length() as int)
+        {
+            out.add(json_files[c as size_t])
+            set c: c + 1
+        }
+        out
+    }
+
+    function index_in(list: ref[Array[Slice[char]]], s: Slice[char]) returns int
+    {
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            let e list[i as size_t]
+            if e.equals(s)
+                return i
+            set i: i + 1
+        }
+        0 - 1
+    }
+
+    function alive_index_in(list: ref[Array[Slice[char]]], alive: ref[Array[bool]], s: Slice[char]) returns int
+    {
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            if alive[i as size_t]
+            {
+                let e list[i as size_t]
+                if e.equals(s)
+                    return i
+            }
+            set i: i + 1
+        }
+        0 - 1
+    }
+
+    function slices_contain(list: ref[Array[Slice[char]]], s: Slice[char]) returns bool
+        TsConfigParser.index_in(list, s) >= 0
+
+    ; GetSupportedExtensions (no extra extensions)
+    function supported_extensions(host: ref[Page], options: ref[TsOptions]) returns ref[Array[ref[Array[Slice[char]]]]]
+    {
+        var allow_js false
+        let allow options.tristate_of("allowJs")
+        if allow >= 0
+            set allow_js: allow = 1
+        else
+            set allow_js: options.tristate_of("checkJs") = 1
+        let groups &Array[ref[Array[Slice[char]]]]^host()
+        let g0 &Array[Slice[char]]^host()
+        g0.add(".ts")
+        g0.add(".tsx")
+        g0.add(".d.ts")
+        if allow_js
+        {
+            g0.add(".js")
+            g0.add(".jsx")
+        }
+        groups.add(g0)
+        let g1 &Array[Slice[char]]^host()
+        g1.add(".cts")
+        g1.add(".d.cts")
+        if allow_js
+            g1.add(".cjs")
+        groups.add(g1)
+        let g2 &Array[Slice[char]]^host()
+        g2.add(".mts")
+        g2.add(".d.mts")
+        if allow_js
+            g2.add(".mjs")
+        groups.add(g2)
+        groups
+    }
+
+    ; GetResolveJsonModule over the config's own options
+    function resolve_json_module(options: ref[TsOptions]) returns bool
+    {
+        let set_value options.tristate_of("resolveJsonModule")
+        if set_value >= 0
+            return set_value = 1
+        let module_kind options.text_of("module")
+        if module_kind.equals("node20") or module_kind.equals("nodenext")
+            return true
+        let resolution options.text_of("moduleResolution")
+        var explicit (resolution.length as int) > 0
+        if resolution.equals("classic") or resolution.equals("node") or resolution.equals("node10")
+            set explicit: false
+        if explicit
+            return resolution.equals("bundler")
+        if module_kind.equals("node16") or module_kind.equals("node18") or module_kind.equals("node20") or module_kind.equals("nodenext")
+            return false
+        true
+    }
+
+    ; tspath.FileExtensionIs
+    function file_extension_is(path: Slice[char], extension: Slice[char]) returns bool
+    {
+        if (path.length as int) <= (extension.length as int)
+            return false
+        path.ends_with(extension)
+    }
+
+    function file_extension_is_one_of(path: Slice[char], extensions: ref[Array[Slice[char]]]) returns bool
+    {
+        var i 0
+        while i < (extensions.get_length() as int)
+        {
+            if TsConfigParser.file_extension_is(path, extensions[i as size_t])
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    ; tspath.ChangeExtension over extensionsToRemove
+    function change_extension(host: ref[Page], path: Slice[char], new_extension: Slice[char]) returns Slice[char]
+    {
+        var i 0
+        while i < 12
+        {
+            let e TsConfigParser.extension_to_remove(i)
+            set i: i + 1
+            let n path.length as int
+            let m e.length as int
+            if n < m
+                continue
+            if (path[(n - m) as size_t] as int) <> ("." as char) as int
+                continue
+            let tail path.slice_from((n - m) as size_t)
+            if tail.equals(e)
+                return join_slices(host, path.subslice(0, (n - m) as size_t), new_extension)
+        }
+        path
+    }
+
+    function extension_to_remove(i: int) returns Slice[char]
+    {
+        if i = 0
+            return ".d.ts"
+        if i = 1
+            return ".d.mts"
+        if i = 2
+            return ".d.cts"
+        if i = 3
+            return ".mjs"
+        if i = 4
+            return ".mts"
+        if i = 5
+            return ".cjs"
+        if i = 6
+            return ".cts"
+        if i = 7
+            return ".ts"
+        if i = 8
+            return ".js"
+        if i = 9
+            return ".tsx"
+        if i = 10
+            return ".jsx"
+        ".json"
+    }
+
+    ; the groups a file's extension belongs to, concatenated
+    function extension_group(host: ref[Page], file: Slice[char], extensions: ref[Array[ref[Array[Slice[char]]]]]) returns ref[Array[Slice[char]]]
+    {
+        let out &Array[Slice[char]]^host()
+        var g 0
+        while g < (extensions.get_length() as int)
+        {
+            let group extensions[g as size_t]
+            set g: g + 1
+            if TsConfigParser.file_extension_is_one_of(file, group)
+            {
+                var e 0
+                while e < (group.get_length() as int)
+                {
+                    out.add(group[e as size_t])
+                    set e: e + 1
+                }
+            }
+        }
+        out
+    }
+
+    ; hasFileWithHigherPriorityExtension
+    function has_file_with_higher_priority_extension(host: ref[Page], file: Slice[char], extensions: ref[Array[ref[Array[Slice[char]]]]], literal_keys: ref[Array[Slice[char]]], wildcard_files: ref[Array[Slice[char]]], wildcard_alive: ref[Array[bool]]) returns bool
+    {
+        let group TsConfigParser.extension_group(host, file, extensions)
+        var i 0
+        while i < (group.get_length() as int)
+        {
+            let ext group[i as size_t]
+            set i: i + 1
+            if TsConfigParser.file_extension_is(file, ext)
+            {
+                if ext.equals(".ts") = false
+                    return false
+                if TsConfigParser.file_extension_is(file, ".d.ts") = false
+                    return false
+            }
+            let changed TsConfigParser.change_extension(host, file, ext)
+            var has TsConfigParser.index_in(literal_keys, changed) >= 0
+            if TsConfigParser.alive_index_in(wildcard_files, wildcard_alive, changed) >= 0
+                set has: true
+            if has
+            {
+                if ext.equals(".d.ts")
+                {
+                    if TsConfigParser.file_extension_is(file, ".js") or TsConfigParser.file_extension_is(file, ".jsx")
+                        continue
+                }
+                return true
+            }
+        }
+        false
+    }
+
+    ; removeWildcardFilesWithLowerPriorityExtension
+    procedure remove_wildcard_files_with_lower_priority_extension(host: ref[Page], file: Slice[char], extensions: ref[Array[ref[Array[Slice[char]]]]], wildcard_files: ref[Array[Slice[char]]], wildcard_alive: ref[Array[bool]])
+    {
+        let group TsConfigParser.extension_group(host, file, extensions)
+        var i (group.get_length() as int) - 1
+        while i >= 0
+        {
+            let ext group[i as size_t]
+            set i: i - 1
+            if TsConfigParser.file_extension_is(file, ext)
+                return
+            let lower TsConfigParser.change_extension(host, file, ext)
+            let at TsConfigParser.alive_index_in(wildcard_files, wildcard_alive, lower)
+            if at >= 0
+                wildcard_alive.put(at as size_t, false)
+        }
+    }
+
+    ; ── vfsmatch.ReadDirectory ───────────────────────────────────────────────
+
+    procedure read_directory(this, path_in: Slice[char], current_directory_in: Slice[char], extensions: ref[Array[Slice[char]]], excludes: ref[Array[Slice[char]]], includes: ref[Array[Slice[char]]]) returns ref[Array[Slice[char]]]
+    {
+        let path get_normalized_absolute_path(host, path_in, Slice[char]())
+        let cwd get_normalized_absolute_path(host, current_directory_in, Slice[char]())
+        let absolute_path combine_paths(host, cwd, path)
+        let file_matcher TsGlobMatcher.create(host, includes, excludes, absolute_path, TsGlobUsageFiles)
+        let directory_matcher TsGlobMatcher.create(host, includes, excludes, absolute_path, TsGlobUsageDirectories)
+        let results &Array[ref[Array[Slice[char]]]]^host()
+        let file_includes file_matcher.includes
+        var buckets file_includes.get_length() as int
+        if buckets < 1
+            set buckets: 1
+        var b 0
+        while b < buckets
+        {
+            results.add(&Array[Slice[char]]^host())
+            set b: b + 1
+        }
+        let visitor &TsGlobVisitor^host(host, files, file_matcher, directory_matcher, extensions, &Array[Slice[char]]^host(), results)
+        let base_paths this.get_base_paths(path, includes)
+        var i 0
+        while i < (base_paths.get_length() as int)
+        {
+            let base base_paths[i as size_t]
+            visitor.visit(base, combine_paths(host, cwd, base), Slice[char]())
+            set i: i + 1
+        }
+        let out &Array[Slice[char]]^host()
+        var r 0
+        while r < (results.get_length() as int)
+        {
+            let bucket results[r as size_t]
+            var k 0
+            while k < (bucket.get_length() as int)
+            {
+                out.add(bucket[k as size_t])
+                set k: k + 1
+            }
+            set r: r + 1
+        }
+        out
+    }
+
+    ; getBasePaths: the path, then each include's literal base not below one already kept
+    procedure get_base_paths(this, path: Slice[char], includes: ref[Array[Slice[char]]]) returns ref[Array[Slice[char]]]
+    {
+        let base_paths &Array[Slice[char]]^host()
+        base_paths.add(path)
+        if includes.get_length() = 0
+            return base_paths
+        let include_bases &Array[Slice[char]]^host()
+        var i 0
+        while i < (includes.get_length() as int)
+        {
+            let inc includes[i as size_t]
+            set i: i + 1
+            var absolute inc
+            if is_rooted_disk_path(inc) = false
+                set absolute: get_normalized_absolute_path(host, combine_paths(host, path, inc), Slice[char]())
+            include_bases.add(TsConfigParser.include_base_path(host, absolute))
+        }
+        TsConfigParser.sort_slices(include_bases)
+        var j 0
+        while j < (include_bases.get_length() as int)
+        {
+            let ib include_bases[j as size_t]
+            set j: j + 1
+            var contained false
+            var k 0
+            while k < (base_paths.get_length() as int)
+            {
+                if TsConfigParser.contains_path(host, base_paths[k as size_t], ib, path)
+                    set contained: true
+                set k: k + 1
+            }
+            if contained = false
+                base_paths.add(ib)
+        }
+        base_paths
+    }
+
+    ; getIncludeBasePath
+    function include_base_path(host: ref[Page], absolute: Slice[char]) returns Slice[char]
+    {
+        var wildcard_offset 0 - 1
+        var i 0
+        while i < (absolute.length as int)
+        {
+            let c absolute[i as size_t] as int
+            if (c = ("*" as char) as int) or (c = ("?" as char) as int)
+            {
+                set wildcard_offset: i
+                break
+            }
+            set i: i + 1
+        }
+        if wildcard_offset < 0
+        {
+            let base get_base_file_name(host, absolute)
+            if slice_contains_byte(base, ("." as char) as int) = false
+                return absolute
+            return remove_trailing_directory_separator(get_directory_path(host, absolute))
+        }
+        let head absolute.subslice(0, wildcard_offset as size_t)
+        var last slice_last_index_of_byte(head, ("/" as char) as int)
+        if last < 0
+            set last: 0
+        absolute.subslice(0, last as size_t)
+    }
+
+    ; tspath.ContainsPath (the root component compared case-insensitively)
+    function contains_path(host: ref[Page], parent_in: Slice[char], child_in: Slice[char], cwd: Slice[char]) returns bool
+    {
+        let parent combine_paths(host, cwd, parent_in)
+        let child combine_paths(host, cwd, child_in)
+        if ((parent.length as int) = 0) or ((child.length as int) = 0)
+            return false
+        if parent.equals(child)
+            return true
+        let pc reduce_path_components(host, get_path_components(host, parent, Slice[char]()))
+        let cc reduce_path_components(host, get_path_components(host, child, Slice[char]()))
+        if cc.get_length() < pc.get_length()
+            return false
+        var i 0
+        while i < (pc.get_length() as int)
+        {
+            let a pc[i as size_t]
+            let b cc[i as size_t]
+            var same a.equals(b)
+            if i = 0
+                set same: TsGlobPattern.equal_fold(a, b)
+            if same = false
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    ; a stable sort by bytes
+    procedure sort_slices(list: ref[Array[Slice[char]]])
+    {
+        var i 1
+        while i < (list.get_length() as int)
+        {
+            let item list[i as size_t]
+            var j i - 1
+            while j >= 0
+            {
+                let prev list[j as size_t]
+                if TsConfigParser.compare_bytes(prev, item) <= 0
+                    break
+                list.put((j + 1) as size_t, prev)
+                set j: j - 1
+            }
+            list.put((j + 1) as size_t, item)
+            set i: i + 1
+        }
+    }
+
+    function compare_bytes(a: Slice[char], b: Slice[char]) returns int
+    {
+        let n a.length as int
+        let m b.length as int
+        var i 0
+        while (i < n) and (i < m)
+        {
+            let x a[i as size_t] as int
+            let y b[i as size_t] as int
+            if x < y
+                return 0 - 1
+            if x > y
+                return 1
+            set i: i + 1
+        }
+        if n < m
+            return 0 - 1
+        if n > m
+            return 1
+        0
+    }
+
+    function ensure_trailing_slash(host: ref[Page], s: Slice[char]) returns Slice[char]
+    {
+        if (s.length as int) = 0
+            return s
+        if (s[(s.length as int - 1) as size_t] as int) = ("/" as char) as int
+            return s
+        join_slices(host, s, "/")
+    }
+
+    ; GetAccessibleEntries over the table: the files and directories directly
+    ; below `dir`, each sorted by name (fs.ReadDir's order)
+    procedure accessible_entries(host: ref[Page], files: ref[ProgramFiles], dir: Slice[char], out_files: ref[Array[Slice[char]]], out_directories: ref[Array[Slice[char]]])
+    {
+        let prefix TsConfigParser.ensure_trailing_slash(host, dir)
+        var i 0
+        while i < files.count()
+        {
+            let p files.path_at(i)
+            set i: i + 1
+            if (p.length as int) <= (prefix.length as int)
+                continue
+            if p.starts_with(prefix) = false
+                continue
+            let rest p.slice_from(prefix.length)
+            let slash slice_index_of_byte(rest, ("/" as char) as int)
+            if slash < 0
+            {
+                if TsConfigParser.index_in(out_files, rest) < 0
+                    out_files.add(rest)
+            }
+            else
+            {
+                let name rest.subslice(0, slash as size_t)
+                if TsConfigParser.index_in(out_directories, name) < 0
+                    out_directories.add(name)
+            }
+        }
+        TsConfigParser.sort_slices(out_files)
+        TsConfigParser.sort_slices(out_directories)
+    }
+}
