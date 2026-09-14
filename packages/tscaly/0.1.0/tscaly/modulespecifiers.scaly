@@ -1,0 +1,2299 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; internal/modulespecifiers (compare.go, types.go, preferences.go, util.go,
+; specifiers.go) and the ModuleSpecifierGenerationHost the program answers
+; through (compiler/program.go's host methods, compiler/fileloader.go's
+; getDefaultResolutionModeForFile and getModeForUsageLocation, parser/references.go's
+; collectExternalModuleReferences for SourceFile.Imports(),
+; outputpaths/commonsourcedirectory.go). Ported in slice 253.
+;
+; ★ The generator's one non-editor caller is the node builder's
+; getSpecifierForModuleSymbol (the `import("./x")` of a declaration file), and
+; this file carries what that caller reaches. Not written, each because nothing
+; on that route calls it: GetNodeModulesPackageName, ProcessEntrypointEnding,
+; GetModuleSpecifier / UpdateModuleSpecifier (the language service's), and the
+; auto-import exclusion regexes (`forAutoImports` is false on the builder's route,
+; so IsExcludedByRegex never sees a pattern).
+;
+; ★★ THE HOST'S EMPTY ANSWERS ARE THE PROGRAM'S, NOT A SIMPLIFICATION. The symlink
+; cache holds directories only where the program followed a symlink, and the case
+; runner refuses `@link` (tests/casejs.py); redirect targets exist only where the
+; file loader deduplicated two copies of one package, which the port's program
+; does not; project references need a tsconfig, which the runner refuses too; the
+; global typings cache location is tsc's empty default. `paths`, `rootDirs` and
+; `baseUrl` never reach the program (the runner's unsupported list), so
+; compilerOptions.Paths is nil and RootDirs empty, and the typesVersions path
+; mapping — tryGetModuleNameFromPaths' one caller left — is the resolver's said
+; stop `module-types-versions` here as well.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use tscaly.ast.*
+use tscaly.binder.Binder
+use tscaly.parser.Parser
+use tscaly.checker.Checker
+use tscaly.program.*
+use tscaly.emitter.EmitOptions
+use tscaly.emitter.Transformer
+
+; types.go
+define SpecifierResultKindNone: int 0
+define SpecifierResultKindNodeModules: int 1
+define SpecifierResultKindPaths: int 2
+define SpecifierResultKindRedirect: int 3
+define SpecifierResultKindRelative: int 4
+define SpecifierResultKindAmbient: int 5
+
+define ImportSpecifierPreferenceNone: int 0
+define ImportSpecifierPreferenceShortest: int 1
+define ImportSpecifierPreferenceProjectRelative: int 2
+define ImportSpecifierPreferenceRelative: int 3
+define ImportSpecifierPreferenceNonRelative: int 4
+
+define ImportSpecifierEndingPreferenceNone: int 0
+define ImportSpecifierEndingPreferenceAuto: int 1
+define ImportSpecifierEndingPreferenceMinimal: int 2
+define ImportSpecifierEndingPreferenceIndex: int 3
+define ImportSpecifierEndingPreferenceJs: int 4
+
+define RelativePreferenceRelative: int 0
+define RelativePreferenceNonRelative: int 1
+define RelativePreferenceShortest: int 2
+define RelativePreferenceExternalNonRelative: int 3
+
+define SpecifierEndingMinimal: int 0
+define SpecifierEndingIndex: int 1
+define SpecifierEndingJsExtension: int 2
+define SpecifierEndingTsExtension: int 3
+
+define MatchingModeExact: int 0
+define MatchingModeDirectory: int 1
+define MatchingModePattern: int 2
+
+define ModulePath
+(
+    file_name: Slice[char]
+    is_in_node_modules: bool
+    is_redirect: bool
+)
+
+; specifiers.go's Info
+define SpecifierInfo
+(
+    use_case_sensitive_file_names: bool
+    importing_source_file_name: Slice[char]
+    source_directory: Slice[char]
+)
+
+; preferences.go's ModuleSpecifierPreferences; the reference's closure
+; getAllowedEndingsInPreferredOrder captured the user preferences, the importing
+; file and the old specifier, which ride here and are asked through
+; `allowed_endings_in_preferred_order`
+define SpecifierPreferences
+(
+    relative_preference: int
+    ending_preference: int
+    importing_file: ref[AstNode]
+    old_import_specifier: Slice[char]
+)
+
+define NodeModulePathParts
+(
+    ; false where the reference answers nil
+    found: bool
+    top_level_node_modules_index: int
+    top_level_package_name_index: int
+    package_root_index: int
+    file_name_index: int
+)
+
+define PackageJsonDirAttempt
+(
+    module_file_to_try: Slice[char]
+    package_root_path: Slice[char]
+    blocked_by_exports: bool
+    verbatim_from_exports: bool
+)
+
+define SpecifierHost
+(
+    host: ref[Page]
+    checker: ref[Checker]
+    files: ref[ProgramFiles]
+    options: EmitOptions
+    current_directory: Slice[char]
+    import_files: ref[Array[ref[AstNode]?]]
+    import_lists: ref[Array[ref[Array[ref[AstNode]?]]?]]
+    common_source_directory_cache: Slice[char]
+    common_source_directory_known: bool
+)
+{
+    function create(host: ref[Page], checker: ref[Checker], files: ref[ProgramFiles], options: EmitOptions) returns ref[SpecifierHost]
+    {
+        let cwd: Slice[char] "/.src"
+        let keys &Array[ref[AstNode]?]^host()
+        let lists &Array[ref[Array[ref[AstNode]?]]?]^host()
+        let h &SpecifierHost^host(host, checker, files, options, cwd, keys, lists, Slice[char](), false)
+        h
+    }
+
+    ; ── the host (compiler/program.go) ─────────────────────────────────────
+
+    ; the runner's virtual file system is case-sensitive (harnessutil)
+    function use_case_sensitive_file_names(this) returns bool
+        true
+
+    function file_exists(this, path: Slice[char]) returns bool
+        files.file_exists(path)
+
+    ; the importing file's name: its path in the program, else its binder's
+    function file_name_of(this, file: ref[AstNode]) returns Slice[char]
+    {
+        let i files.index_of_file(file)
+        if i >= 0
+            return files.path_at(i)
+        let b checker.binder_of_node(file)
+        b.file_name
+    }
+
+    ; GetNearestAncestorDirectoryWithPackageJson: the package scope's directory
+    procedure get_nearest_ancestor_directory_with_package_json(this, dirname: Slice[char]) returns Slice[char]
+    {
+        var dir dirname
+        repeat
+        {
+            let info PackageJsonInfo.at(host, files, dir)
+            if info.exists
+                return info.directory
+            let parent get_directory_path(host, dir)
+            if parent.equals(dir)
+                return Slice[char]()
+            set dir: parent
+        }
+    }
+
+    ; GetPackageJsonInfo: the scope of the package.json's directory, when the
+    ; scope IS that directory
+    procedure get_package_json_info(this, pkg_json_path: Slice[char]) returns PackageJsonInfo
+    {
+        let directory get_directory_path(host, pkg_json_path)
+        let info PackageJsonInfo.at(host, files, directory)
+        info
+    }
+
+    ; importSyntaxAffectsModuleResolution
+    function import_syntax_affects_module_resolution(this) returns bool
+    {
+        let mr options.get_module_resolution_kind()
+        if (mr >= ModuleResolutionKindNode16) and (mr <= ModuleResolutionKindNodeNext)
+            return true
+        if this.get_resolve_package_json_exports()
+            return true
+        this.get_resolve_package_json_imports()
+    }
+
+    ; CompilerOptions.GetResolvePackageJsonExports / Imports: IsTrueOrUnknown
+    function get_resolve_package_json_exports(this) returns bool
+        options.resolve_package_json_exports <> TristateFalse
+
+    function get_resolve_package_json_imports(this) returns bool
+        options.resolve_package_json_imports <> TristateFalse
+
+    ; CompilerOptions.GetAllowImportingTsExtensions
+    function get_allow_importing_ts_extensions(this) returns bool
+    {
+        if options.allow_importing_ts_extensions = TristateTrue
+            return true
+        options.rewrite_relative_import_extensions = TristateTrue
+    }
+
+    ; the emit format of a program file (formats[] is GetEmitModuleFormatOfFile)
+    function emit_module_format_of(this, file: ref[AstNode]) returns int
+    {
+        let i files.index_of_file(file)
+        if i >= 0
+            return files.format_at(i)
+        options.get_emit_module_kind()
+    }
+
+    ; GetDefaultResolutionModeForFile: GetImpliedNodeFormatForEmitWorker when the
+    ; import syntax affects resolution
+    function get_default_resolution_mode_for_file(this, file: ref[AstNode]) returns int
+    {
+        if this.import_syntax_affects_module_resolution() = false
+            return ModuleKindNone
+        let i files.index_of_file(file)
+        var uo options
+        if i >= 0
+            set uo.package_json_type: files.package_json_type_at(i)
+        let name this.file_name_of(file)
+        uo.implied_node_format_for_emit_of_file(name)
+    }
+
+    ; getModeForUsageLocation
+    procedure get_mode_for_usage_location(this, file: ref[AstNode], usage: ref[AstNode]) returns int
+    {
+        let parent_node AstNode.parent_node_of(usage)
+        if parent_node <> null
+        {
+            let parent parent_node as ref[AstNode]
+            let pk parent.kind
+            if (pk = KindImportDeclaration) or (pk = KindJSImportDeclaration) or (pk = KindExportDeclaration) or (pk = KindJSDocImportTag)
+            {
+                if Checker.is_exclusively_type_only_import_or_export(parent)
+                {
+                    let attributes AstNode.import_attributes_of(parent)
+                    if attributes <> null
+                    {
+                        let o checker.get_resolution_mode_override(attributes as ref[AstNode], false)
+                        if o <> ModuleKindNone
+                            return o
+                    }
+                }
+            }
+            if pk = KindLiteralType
+            {
+                let grand AstNode.parent_node_of(parent)
+                if AstNode.kind_of(grand) = KindImportType
+                {
+                    let attributes AstNode.import_type_attributes_of(grand)
+                    if attributes <> null
+                    {
+                        let o checker.get_resolution_mode_override(attributes as ref[AstNode], false)
+                        if o <> ModuleKindNone
+                            return o
+                    }
+                }
+            }
+        }
+        if this.import_syntax_affects_module_resolution()
+            return this.get_emit_syntax_for_usage_location(file, usage)
+        ModuleKindNone
+    }
+
+    ; getEmitSyntaxForUsageLocationWorker
+    function get_emit_syntax_for_usage_location(this, file: ref[AstNode], usage: ref[AstNode]) returns int
+    {
+        let parent AstNode.parent_node_of(usage)
+        if Parser.is_require_call(parent, false)
+            return ModuleKindCommonJS
+        if AstNode.kind_of(parent) = KindExternalModuleReference
+        {
+            if AstNode.kind_of(AstNode.parent_node_of(parent)) = KindImportEqualsDeclaration
+                return ModuleKindCommonJS
+        }
+        let file_emit_mode this.emit_module_format_of(file)
+        let walked Checker.walk_up_parenthesized_expressions(parent)
+        if AstNode.is_import_call(walked)
+        {
+            if this.should_transform_import_call(file_emit_mode)
+                return ModuleKindCommonJS
+            return ModuleKindESNext
+        }
+        if file_emit_mode = ModuleKindCommonJS
+            return ModuleKindCommonJS
+        ; ModuleKind.IsNonNodeESM: ES2015..ESNext
+        if (file_emit_mode >= ModuleKindES2015) and (file_emit_mode <= ModuleKindESNext)
+            return ModuleKindESNext
+        if file_emit_mode = ModuleKindPreserve
+            return ModuleKindESNext
+        ModuleKindNone
+    }
+
+    ; ast.ShouldTransformImportCall
+    function should_transform_import_call(this, implied_node_format_for_emit: int) returns bool
+    {
+        let module_kind options.get_emit_module_kind()
+        if (module_kind >= ModuleKindNode16) and (module_kind <= ModuleKindNodeNext)
+            return false
+        if module_kind = ModuleKindPreserve
+            return false
+        implied_node_format_for_emit < ModuleKindES2015
+    }
+
+    ; GetResolvedModuleFromModuleSpecifier: the resolved file's name, empty when
+    ; unresolved (the port's resolver answers a table index)
+    procedure get_resolved_module_from_module_specifier(this, file: ref[AstNode], module_specifier: ref[AstNode]) returns Slice[char]
+    {
+        let mode this.get_mode_for_usage_location(file, module_specifier)
+        let containing this.file_name_of(file)
+        let resolver ModuleResolver.create(host, files, options.get_module_resolution_kind(), options.get_resolve_json_module(), mode, EmitOptions.on(options.allow_js), options.resolve_package_json_exports, options.resolve_package_json_imports, options.out_dir, options.root_dir)
+        let idx resolver.resolve(AstNode.literal_text_of(module_specifier), containing)
+        if idx < 0
+            return Slice[char]()
+        files.path_at(idx)
+    }
+
+    ; SourceFile.Imports() (parser/references.go collectExternalModuleReferences),
+    ; collected once per file
+    procedure imports_of(this, file: ref[AstNode]) returns ref[Array[ref[AstNode]?]]
+    {
+        var i 0
+        while i < (import_files.get_length() as int)
+        {
+            if import_files[i as size_t] = file
+            {
+                let cached import_lists[i as size_t]
+                if cached <> null
+                    return cached as ref[Array[ref[AstNode]?]]
+            }
+            set i: i + 1
+        }
+        let result &Array[ref[AstNode]?]^host()
+        let statements AstNode.statements_of(file)
+        let n AstNode.list_count(statements)
+        var s 0
+        while s < n
+        {
+            let st AstNode.child_in_list(statements, s)
+            if st <> null
+                this.collect_module_references(file, st as ref[AstNode], false, result)
+            set s: s + 1
+        }
+        var dynamic ((AstNode.flags_of(file) & NodeFlagsPossiblyContainsDynamicImport) <> 0)
+        let in_js ((AstNode.flags_of(file) & NodeFlagsJavaScriptFile) <> 0)
+        if in_js
+            set dynamic: true
+        if dynamic
+            this.for_each_dynamic_import_or_require_call(file, file, in_js, result)
+        import_files.add(file)
+        import_lists.add(result)
+        result
+    }
+
+    ; collectModuleReferences: the module name of an import or re-export, and
+    ; the imports inside an ambient module's body
+    procedure collect_module_references(this, file: ref[AstNode], node: ref[AstNode], in_ambient_module: bool, out: ref[Array[ref[AstNode]?]])
+    {
+        let k node.kind
+        var any_import false
+        if (k = KindImportDeclaration) or (k = KindJSImportDeclaration) or (k = KindExportDeclaration)
+            set any_import: true
+        if k = KindImportEqualsDeclaration
+        {
+            if AstNode.kind_of(AstNode.module_reference_of(node)) = KindExternalModuleReference
+                set any_import: true
+        }
+        if any_import
+        {
+            let module_name_expr AstNode.get_external_module_name(node)
+            if module_name_expr <> null
+            {
+                let mne module_name_expr as ref[AstNode]
+                if mne.kind = KindStringLiteral
+                {
+                    let module_name AstNode.literal_text_of(mne)
+                    if (module_name.length as int) > 0
+                    {
+                        if (in_ambient_module = false) or (is_external_module_name_relative(module_name) = false)
+                            out.add(mne)
+                    }
+                }
+            }
+            return
+        }
+        if k <> KindModuleDeclaration
+            return
+        if Binder.is_ambient_module(node) = false
+            return
+        var eligible in_ambient_module
+        if Transformer.has_syntactic_modifier(node, ModifierFlagsAmbient)
+            set eligible: true
+        let b checker.binder_of_node(file)
+        if b.is_declaration_file
+            set eligible: true
+        if eligible = false
+            return
+        ; a module augmentation contributes no imports of its own
+        if b.is_external_module
+            return
+        if in_ambient_module
+            return
+        let body AstNode.body_of(node)
+        if body = null
+            return
+        let statements AstNode.statements_of(body)
+        let n AstNode.list_count(statements)
+        var i 0
+        while i < n
+        {
+            let st AstNode.child_in_list(statements, i)
+            if st <> null
+                this.collect_module_references(file, st as ref[AstNode], true, out)
+            set i: i + 1
+        }
+    }
+
+    ; ast.ForEachDynamicImportOrRequireCall(file, includeTypeSpaceImports: true,
+    ; requireStringLiteralLikeArgument: true). The reference scans the TEXT for
+    ; `import`/`require` and asks GetNodeAtPosition for each hit; a hit resolves
+    ; to the innermost node that starts at or before it, which for an import call,
+    ; a require call and a literal import type is that node itself (their keyword
+    ; and callee are tokens, below KindFirstNode). A pre-order walk meets the same
+    ; nodes in the same order; the JSDoc of a JS file is walked where
+    ; GetNodeAtPosition would descend into it.
+    procedure for_each_dynamic_import_or_require_call(this, file: ref[AstNode], node: ref[AstNode], in_js: bool, out: ref[Array[ref[AstNode]?]])
+    {
+        let k node.kind
+        if k = KindCallExpression
+        {
+            if in_js and Parser.is_require_call(node, true)
+                out.add(AstNode.child_in_list(AstNode.call_arguments_of(node), 0))
+            else
+            {
+                if AstNode.is_import_call(node)
+                {
+                    let argument AstNode.child_in_list(AstNode.call_arguments_of(node), 0)
+                    if argument <> null
+                    {
+                        let ak (argument as ref[AstNode]).kind
+                        if (ak = KindStringLiteral) or (ak = KindNoSubstitutionTemplateLiteral)
+                            out.add(argument)
+                    }
+                }
+            }
+        }
+        if k = KindImportType
+        {
+            if Transformer.dt_is_literal_import_type_node(node)
+            {
+                let argument AstNode.import_type_argument_of(node)
+                out.add(AstNode.literal_type_inner_of(argument))
+            }
+        }
+        if in_js
+        {
+            let i files.index_of_file(file)
+            if i >= 0
+            {
+                let p files.parser_at(i)
+                if p <> null
+                {
+                    let docs Parser.jsdoc_for_node(p as ref[Parser], node)
+                    let dn AstNode.list_count(docs)
+                    var d 0
+                    while d < dn
+                    {
+                        let doc AstNode.child_in_list(docs, d)
+                        if doc <> null
+                            this.for_each_dynamic_import_or_require_call(file, doc as ref[AstNode], in_js, out)
+                        set d: d + 1
+                    }
+                }
+            }
+        }
+        var c 0
+        repeat
+        {
+            let child AstNode.child_at(node, c)
+            if child = null
+                break
+            this.for_each_dynamic_import_or_require_call(file, child as ref[AstNode], in_js, out)
+            set c: c + 1
+        }
+    }
+
+    ; outputpaths.GetCommonSourceDirectory over the program's emittable
+    ; non-declaration files (Program.CommonSourceDirectory)
+    procedure common_source_directory(this) returns Slice[char]
+    {
+        if common_source_directory_known
+            return common_source_directory_cache
+        var result Slice[char]()
+        if (options.root_dir.length as int) > 0
+            set result: get_normalized_absolute_path(host, options.root_dir, current_directory)
+        else
+        {
+            var common: ref[Array[Slice[char]]]? null
+            var empty false
+            let n files.count()
+            var i 0
+            while i < n
+            {
+                let path files.path_at(i)
+                var take files.emit_at(i)
+                if is_declaration_file_name_of(path)
+                    set take: false
+                if take
+                {
+                    let all reduce_path_components(host, get_path_components(host, path, current_directory))
+                    let components &Array[Slice[char]]^host()
+                    var j 0
+                    while j < ((all.get_length() as int) - 1)
+                    {
+                        components.add(all[j as size_t])
+                        set j: j + 1
+                    }
+                    if common = null
+                        set common: components
+                    else
+                    {
+                        let cc common as ref[Array[Slice[char]]]
+                        var limit cc.get_length() as int
+                        if (components.get_length() as int) < limit
+                            set limit: components.get_length() as int
+                        var cut 0 - 1
+                        var m 0
+                        while m < limit
+                        {
+                            let a cc[m as size_t]
+                            let b components[m as size_t]
+                            if a.equals(b) = false
+                            {
+                                set cut: m
+                                break
+                            }
+                            set m: m + 1
+                        }
+                        if cut = 0
+                        {
+                            set empty: true
+                            break
+                        }
+                        var keep cc.get_length() as int
+                        if cut > 0
+                            set keep: cut
+                        if (components.get_length() as int) < keep
+                            set keep: components.get_length() as int
+                        let trimmed &Array[Slice[char]]^host()
+                        var t 0
+                        while t < keep
+                        {
+                            trimmed.add(cc[t as size_t])
+                            set t: t + 1
+                        }
+                        set common: trimmed
+                    }
+                }
+                set i: i + 1
+            }
+            if empty = false
+            {
+                if common = null
+                    set result: current_directory
+                else
+                {
+                    let cc common as ref[Array[Slice[char]]]
+                    if (cc.get_length() as int) = 0
+                        set result: current_directory
+                    else
+                        set result: get_path_from_path_components(host, cc)
+                }
+            }
+        }
+        if (result.length as int) > 0
+            set result: ensure_trailing_directory_separator(host, result)
+        set this.common_source_directory_cache: result
+        set this.common_source_directory_known: true
+        result
+    }
+
+    ; ── tspath / stringutil / core, over Slice[char] ─────────────────────────
+
+    ; tspath.ToPath under a case-sensitive host
+    procedure to_path(this, file_name: Slice[char]) returns Slice[char]
+        get_normalized_absolute_path(host, file_name, current_directory)
+
+    ; tspath.PathIsAbsolute
+    function path_is_absolute(path: Slice[char]) returns bool
+        get_encoded_root_length(path) <> 0
+
+    ; PathIsBareSpecifier
+    function path_is_bare_specifier(path: Slice[char]) returns bool
+    {
+        if SpecifierHost.path_is_absolute(path)
+            return false
+        path_is_relative(path) = false
+    }
+
+    ; CountPathComponents
+    function count_path_components(path: Slice[char]) returns int
+    {
+        var initial 0
+        if path.starts_with("./")
+            set initial: 2
+        var count 0
+        var i initial
+        while i < (path.length as int)
+        {
+            if (path[i as size_t] as int) = ("/" as char) as int
+                set count: count + 1
+            set i: i + 1
+        }
+        count
+    }
+
+    function count_byte(s: Slice[char], c: int) returns int
+    {
+        var count 0
+        var i 0
+        while i < (s.length as int)
+        {
+            if (s[i as size_t] as int) = c
+                set count: count + 1
+            set i: i + 1
+        }
+        count
+    }
+
+    ; tspath.Path.ContainsPath: equal, or a longer child with the parent as a
+    ; directory prefix
+    function path_contains_path(p: Slice[char], child: Slice[char]) returns bool
+    {
+        if (p.length as int) = 0
+            return false
+        if p.equals(child)
+            return true
+        if child.length <= p.length
+            return false
+        if child.starts_with(p) = false
+            return false
+        if (p[p.length - 1] as int) = ("/" as char) as int
+            return true
+        (child[p.length] as int) = ("/" as char) as int
+    }
+
+    function contains_ignored_path(s: Slice[char]) returns bool
+    {
+        if SpecifierHost.contains_text(s, "/node_modules/.")
+            return true
+        if SpecifierHost.contains_text(s, "/.git")
+            return true
+        SpecifierHost.contains_text(s, ".#")
+    }
+
+    function contains_text(s: Slice[char], text: Slice[char]) returns bool
+        SpecifierHost.index_of_text(s, text, 0) >= 0
+
+    ; core.IndexAfter / strings.Index from a start
+    function index_of_text(s: Slice[char], text: Slice[char], start: int) returns int
+    {
+        var i start
+        if i < 0
+            set i: 0
+        let tn text.length as int
+        while (i + tn) <= (s.length as int)
+        {
+            var j 0
+            var same true
+            while j < tn
+            {
+                if (s[(i + j) as size_t] as int) <> (text[j as size_t] as int)
+                {
+                    set same: false
+                    break
+                }
+                set j: j + 1
+            }
+            if same
+                return i
+            set i: i + 1
+        }
+        0 - 1
+    }
+
+    function last_index_of_text(s: Slice[char], text: Slice[char]) returns int
+    {
+        var i (s.length as int) - (text.length as int)
+        while i >= 0
+        {
+            if SpecifierHost.index_of_text(s, text, i) = i
+                return i
+            set i: i - 1
+        }
+        0 - 1
+    }
+
+    ; tspath.FileExtensionIs: longer than the extension, and ending with it
+    function file_extension_is(path: Slice[char], ext: Slice[char]) returns bool
+    {
+        if (path.length as int) <= (ext.length as int)
+            return false
+        path.ends_with(ext)
+    }
+
+    ; TryGetExtensionFromPath over extensionsToRemove
+    function try_get_extension_from_path(path: Slice[char]) returns Slice[char]
+    {
+        let n remove_file_extension(path)
+        if n = (path.length as int)
+            return Slice[char]()
+        let ext path.slice_from(n as size_t)
+        if SpecifierHost.file_extension_is(path, ext)
+            return ext
+        Slice[char]()
+    }
+
+    ; RemoveFileExtension
+    function remove_file_extension_of(path: Slice[char]) returns Slice[char]
+        path.subslice(0, remove_file_extension(path) as size_t)
+
+    ; HasTSFileExtension: .ts .tsx .d.ts .cts .d.cts .mts .d.mts
+    function has_ts_file_extension(path: Slice[char]) returns bool
+    {
+        if SpecifierHost.file_extension_is(path, ".ts") or SpecifierHost.file_extension_is(path, ".tsx")
+            return true
+        SpecifierHost.file_extension_is(path, ".cts") or SpecifierHost.file_extension_is(path, ".mts")
+    }
+
+    ; HasJSFileExtension: .js .jsx .mjs .cjs
+    function has_js_file_extension(path: Slice[char]) returns bool
+    {
+        if SpecifierHost.file_extension_is(path, ".js") or SpecifierHost.file_extension_is(path, ".jsx")
+            return true
+        SpecifierHost.file_extension_is(path, ".mjs") or SpecifierHost.file_extension_is(path, ".cjs")
+    }
+
+    ; ExtensionsNotSupportingExtensionlessResolution
+    function extension_requires_extension(path: Slice[char]) returns bool
+    {
+        if SpecifierHost.file_extension_is(path, ".mts") or SpecifierHost.file_extension_is(path, ".d.mts") or SpecifierHost.file_extension_is(path, ".mjs")
+            return true
+        SpecifierHost.file_extension_is(path, ".cts") or SpecifierHost.file_extension_is(path, ".d.cts") or SpecifierHost.file_extension_is(path, ".cjs")
+    }
+
+    ; GetDeclarationFileExtension
+    procedure get_declaration_file_extension(this, file_name: Slice[char]) returns Slice[char]
+    {
+        let base get_base_file_name(host, file_name)
+        if base.ends_with(".d.ts")
+            return base.slice_from(base.length - 5)
+        if base.ends_with(".d.mts")
+            return base.slice_from(base.length - 6)
+        if base.ends_with(".d.cts")
+            return base.slice_from(base.length - 6)
+        if base.ends_with(".ts")
+        {
+            let index SpecifierHost.index_of_text(base, ".d.", 0)
+            if index >= 0
+                return base.slice_from(index as size_t)
+        }
+        Slice[char]()
+    }
+
+    ; GetJSExtensionForDeclarationFileExtension
+    procedure get_js_extension_for_declaration_file_extension(this, ext: Slice[char]) returns Slice[char]
+    {
+        if ext.equals(".d.ts")
+            return ".js"
+        if ext.equals(".d.mts")
+            return ".mjs"
+        if ext.equals(".d.cts")
+            return ".cjs"
+        ; .d.json.ts and the like
+        ext.subslice(2, ext.length - 3)
+    }
+
+    ; module.TryGetJSExtensionForFile
+    function try_get_js_extension_for_file(this, file_name: Slice[char]) returns Slice[char]
+    {
+        let ext SpecifierHost.try_get_extension_from_path(file_name)
+        if ext.equals(".ts") or ext.equals(".d.ts")
+            return ".js"
+        if ext.equals(".tsx")
+        {
+            if options.jsx_is_preserve()
+                return ".jsx"
+            return ".js"
+        }
+        if ext.equals(".js") or ext.equals(".jsx") or ext.equals(".json")
+            return ext
+        if ext.equals(".d.mts") or ext.equals(".mts") or ext.equals(".mjs")
+            return ".mjs"
+        if ext.equals(".d.cts") or ext.equals(".cts") or ext.equals(".cjs")
+            return ".cjs"
+        Slice[char]()
+    }
+
+    ; ChangeAnyExtension(path, ext, [pathExt], false)
+    procedure change_any_extension(this, path: Slice[char], ext: Slice[char], path_ext: Slice[char]) returns Slice[char]
+    {
+        if path.ends_with(path_ext) = false
+            return path
+        let stem path.subslice(0, path.length - path_ext.length)
+        join_slices(host, stem, ext)
+    }
+
+    ; ChangeExtension (over extensionsToRemove)
+    procedure change_extension(this, path: Slice[char], ext: Slice[char]) returns Slice[char]
+    {
+        let n remove_file_extension(path)
+        if n = (path.length as int)
+            return path
+        join_slices(host, path.subslice(0, n as size_t), ext)
+    }
+
+    ; ChangeFullExtension
+    procedure change_full_extension(this, path: Slice[char], ext: Slice[char]) returns Slice[char]
+    {
+        let dts this.get_declaration_file_extension(path)
+        if (dts.length as int) > 0
+            return join_slices(host, path.subslice(0, path.length - dts.length), ext)
+        this.change_extension(path, ext)
+    }
+
+    ; tspath.GetRelativePathFromDirectory
+    procedure get_relative_path_from_directory(this, from: Slice[char], to: Slice[char]) returns Slice[char]
+        get_path_from_path_components(host, get_path_components_relative_to(host, from, to, current_directory))
+
+    ; ensurePathIsNonModuleName
+    procedure ensure_path_is_non_module_name(this, path: Slice[char]) returns Slice[char]
+    {
+        if SpecifierHost.path_is_bare_specifier(path)
+            return join_slices(host, "./", path)
+        path
+    }
+
+    ; getRelativePathIfInSameVolume
+    procedure get_relative_path_if_in_same_volume(this, path: Slice[char], directory_path: Slice[char]) returns Slice[char]
+    {
+        let relative get_relative_path_to_directory_or_url(host, directory_path, path, false, directory_path)
+        if is_rooted_disk_path(relative)
+            return Slice[char]()
+        relative
+    }
+
+    ; tspath.ComparePaths for normalized absolute case-sensitive inputs: equal
+    ; after combining with the current directory and normalizing
+    procedure paths_equal(this, a: Slice[char], b: Slice[char]) returns bool
+    {
+        let na get_normalized_absolute_path(host, a, current_directory)
+        let nb get_normalized_absolute_path(host, b, current_directory)
+        na.equals(nb)
+    }
+
+    ; tspath.ComparePaths' order: the roots case-insensitively, then the rest
+    procedure compare_paths(this, a: Slice[char], b: Slice[char]) returns int
+    {
+        let na get_normalized_absolute_path(host, a, current_directory)
+        let nb get_normalized_absolute_path(host, b, current_directory)
+        if na.equals(nb)
+            return 0
+        let n (na.length as int)
+        let m (nb.length as int)
+        var i 0
+        while (i < n) and (i < m)
+        {
+            let ca na[i as size_t] as int
+            let cb nb[i as size_t] as int
+            if ca <> cb
+                return ca - cb
+            set i: i + 1
+        }
+        n - m
+    }
+
+    ; tspath.ContainsPath under a case-sensitive host
+    procedure contains_path(this, parent: Slice[char], child: Slice[char]) returns bool
+    {
+        let p combine_paths(host, current_directory, parent)
+        let c combine_paths(host, current_directory, child)
+        if ((p.length as int) = 0) or ((c.length as int) = 0)
+            return false
+        if p.equals(c)
+            return true
+        let pc reduce_path_components(host, get_path_components(host, p, Slice[char]()))
+        let cc reduce_path_components(host, get_path_components(host, c, Slice[char]()))
+        if (cc.get_length() as int) < (pc.get_length() as int)
+            return false
+        var i 0
+        while i < (pc.get_length() as int)
+        {
+            let a pc[i as size_t]
+            let b cc[i as size_t]
+            if i = 0
+            {
+                if slices_equal_case_insensitive(a, b) = false
+                    return false
+            }
+            else
+            {
+                if a.equals(b) = false
+                    return false
+            }
+            set i: i + 1
+        }
+        true
+    }
+
+    ; stringutil.HasPrefixAndSuffixWithoutOverlap (case-sensitive)
+    function has_prefix_and_suffix_without_overlap(s: Slice[char], prefix: Slice[char], suffix: Slice[char]) returns bool
+    {
+        if ((prefix.length + suffix.length) as int) > (s.length as int)
+            return false
+        s.starts_with(prefix) and s.ends_with(suffix)
+    }
+
+    ; replaceFirstStar
+    procedure replace_first_star(this, s: Slice[char], replacement: Slice[char]) returns Slice[char]
+    {
+        let star slice_index_of_byte(s, ("*" as char) as int)
+        if star < 0
+            return s
+        let head join_slices(host, s.subslice(0, star as size_t), replacement)
+        join_slices(host, head, s.slice_from((star + 1) as size_t))
+    }
+
+    ; module.GetPackageNameFromTypesPackageName: `@types/scope__name` → `@scope/name`
+    procedure get_package_name_from_types_package_name(this, mangled_name: Slice[char]) returns Slice[char]
+    {
+        if mangled_name.starts_with("@types/") = false
+            return mangled_name
+        let without mangled_name.slice_from(7)
+        let sep SpecifierHost.index_of_text(without, "__", 0)
+        if sep < 0
+            return without
+        let at_scope join_slices(host, "@", without.subslice(0, sep as size_t))
+        let with_slash join_slices(host, at_scope, "/")
+        join_slices(host, with_slash, without.slice_from((sep + 2) as size_t))
+    }
+
+    ; GetPackageNameFromDirectory is the language service's; not written
+
+    ; ── util.go ────────────────────────────────────────────────────────────
+
+    ; comparePathsByRedirect
+    procedure compare_paths_by_redirect(this, a: ModulePath, b: ModulePath) returns int
+    {
+        if b.is_redirect and (a.is_redirect = false)
+            return 1
+        if a.is_redirect and (b.is_redirect = false)
+            return 0 - 1
+        ; tspath.CompareNumberOfDirectorySeparators
+        let sa SpecifierHost.count_byte(a.file_name, ("/" as char) as int)
+        let sb SpecifierHost.count_byte(b.file_name, ("/" as char) as int)
+        if sa <> sb
+            return sa - sb
+        this.compare_paths(a.file_name, b.file_name)
+    }
+
+    ; TryGetRealFileNameForNonJSDeclarationFileName: `foo.d.json.ts` → `foo.json`
+    procedure try_get_real_file_name_for_non_js_declaration_file_name(this, file_name: Slice[char]) returns Slice[char]
+    {
+        let base get_base_file_name(host, file_name)
+        if file_name.ends_with(".ts") = false
+            return Slice[char]()
+        if SpecifierHost.contains_text(base, ".d.") = false
+            return Slice[char]()
+        if base.ends_with(".d.ts")
+            return Slice[char]()
+        let no_extension file_name.subslice(0, file_name.length - 3)
+        let last_dot slice_last_index_of_byte(no_extension, ("." as char) as int)
+        let ext no_extension.slice_from(last_dot as size_t)
+        let cut SpecifierHost.index_of_text(no_extension, ".d.", 0)
+        join_slices(host, no_extension.subslice(0, cut as size_t), ext)
+    }
+
+    ; getJSExtensionForFile (the reference panics on an unsupported extension)
+    procedure get_js_extension_for_file(this, file_name: Slice[char]) returns Slice[char]
+        this.try_get_js_extension_for_file(file_name)
+
+    ; tryGetAnyFileFromPath: AllSupportedExtensions (the `node` and `json` extras
+    ; are neither Deferred nor JS, so GetSupportedExtensions drops them)
+    procedure try_get_any_file_from_path(this, path: Slice[char]) returns bool
+    {
+        let exts &Array[Slice[char]]^host()
+        exts.add(".ts")
+        exts.add(".tsx")
+        exts.add(".d.ts")
+        exts.add(".js")
+        exts.add(".jsx")
+        exts.add(".cts")
+        exts.add(".d.cts")
+        exts.add(".cjs")
+        exts.add(".mts")
+        exts.add(".d.mts")
+        exts.add(".mjs")
+        var i 0
+        while i < (exts.get_length() as int)
+        {
+            let full join_slices(host, path, exts[i as size_t])
+            if this.file_exists(get_normalized_absolute_path(host, full, current_directory))
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    ; packageJsonPathsAreEqual
+    procedure package_json_paths_are_equal(this, a: Slice[char], b: Slice[char]) returns bool
+    {
+        if a.equals(b)
+            return true
+        if ((a.length as int) = 0) or ((b.length as int) = 0)
+            return false
+        this.paths_equal(a, b)
+    }
+
+    function index_of_ending(endings: ref[Array[int]], ending: int) returns int
+    {
+        var i 0
+        while i < (endings.get_length() as int)
+        {
+            if endings[i as size_t] = ending
+                return i
+            set i: i + 1
+        }
+        0 - 1
+    }
+
+    ; prefersTsExtension
+    function prefers_ts_extension(allowed_endings: ref[Array[int]]) returns bool
+    {
+        let js_priority SpecifierHost.index_of_ending(allowed_endings, SpecifierEndingJsExtension)
+        let ts_priority SpecifierHost.index_of_ending(allowed_endings, SpecifierEndingTsExtension)
+        if ts_priority > (0 - 1)
+            return ts_priority < js_priority
+        false
+    }
+
+    ; GetNodeModulePathParts: null when the path is no module file under node_modules
+    function get_node_module_path_parts(full_path: Slice[char]) returns NodeModulePathParts
+    {
+        var top_level_node_modules_index 0
+        var top_level_package_name_index 0
+        var package_root_index 0
+        var part_start 0
+        var part_end 0
+        ; 0 before node_modules, 1 node_modules, 2 scope, 3 package content
+        var state 0
+        while part_end >= 0
+        {
+            set part_start: part_end
+            set part_end: SpecifierHost.index_of_text(full_path, "/", part_start + 1)
+            if state = 0
+            {
+                if SpecifierHost.index_of_text(full_path, "/node_modules/", part_start) = part_start
+                {
+                    set top_level_node_modules_index: part_start
+                    set top_level_package_name_index: part_end
+                    set state: 1
+                }
+            }
+            else
+            {
+                if (state = 1) or (state = 2)
+                {
+                    var scoped false
+                    if state = 1
+                    {
+                        if (part_start + 1) < (full_path.length as int)
+                        {
+                            if (full_path[(part_start + 1) as size_t] as int) = ("@" as char) as int
+                                set scoped: true
+                        }
+                    }
+                    if scoped
+                        set state: 2
+                    else
+                    {
+                        set package_root_index: part_end
+                        set state: 3
+                    }
+                }
+                else
+                {
+                    if SpecifierHost.index_of_text(full_path, "/node_modules/", part_start) = part_start
+                        set state: 1
+                    else
+                        set state: 3
+                }
+            }
+        }
+        if state > 1
+            return NodeModulePathParts(true, top_level_node_modules_index, top_level_package_name_index, package_root_index, part_start)
+        NodeModulePathParts(false, 0, 0, 0, 0)
+    }
+
+    ; ── preferences.go ─────────────────────────────────────────────────────
+
+    ; shouldAllowImportingTsExtension
+    function should_allow_importing_ts_extension(this, from_file_name: Slice[char]) returns bool
+    {
+        if this.get_allow_importing_ts_extensions()
+            return true
+        if (from_file_name.length as int) = 0
+            return false
+        is_declaration_file_name_of(from_file_name)
+    }
+
+    ; usesExtensionsOnImports
+    procedure uses_extensions_on_imports(this, file: ref[AstNode]) returns bool
+    {
+        let imports this.imports_of(file)
+        var i 0
+        while i < (imports.get_length() as int)
+        {
+            let ref_node imports[i as size_t]
+            set i: i + 1
+            if ref_node = null
+                continue
+            let text AstNode.literal_text_of(ref_node)
+            if path_is_relative(text)
+            {
+                if SpecifierHost.extension_requires_extension(text) = false
+                {
+                    if SpecifierHost.has_ts_file_extension(text)
+                        return true
+                    return SpecifierHost.has_js_file_extension(text)
+                }
+            }
+        }
+        false
+    }
+
+    ; inferPreference
+    procedure infer_preference(this, resolution_mode: int, file: ref[AstNode], module_resolution_is_node_next: bool) returns int
+    {
+        var uses_js_extensions false
+        ; the JS require branch is `!!!` in the reference
+        let imports this.imports_of(file)
+        var i 0
+        while i < (imports.get_length() as int)
+        {
+            let specifier imports[i as size_t]
+            set i: i + 1
+            if specifier = null
+                continue
+            let path AstNode.literal_text_of(specifier)
+            if path_is_relative(path)
+            {
+                if module_resolution_is_node_next and (resolution_mode = ModuleKindCommonJS)
+                    continue
+                if SpecifierHost.extension_requires_extension(path)
+                    continue
+                if SpecifierHost.has_ts_file_extension(path)
+                    return SpecifierEndingTsExtension
+                if SpecifierHost.has_js_file_extension(path)
+                    set uses_js_extensions: true
+            }
+        }
+        if uses_js_extensions
+            return SpecifierEndingJsExtension
+        SpecifierEndingMinimal
+    }
+
+    function module_resolution_is_node_next(this) returns bool
+    {
+        let mr options.get_module_resolution_kind()
+        (mr >= ModuleResolutionKindNode16) and (mr <= ModuleResolutionKindNodeNext)
+    }
+
+    ; getModuleSpecifierEndingPreference
+    procedure get_module_specifier_ending_preference(this, pref: int, resolution_mode: int, file: ref[AstNode]) returns int
+    {
+        let node_next this.module_resolution_is_node_next()
+        var extensions_required (pref = ImportSpecifierEndingPreferenceJs)
+        if (resolution_mode = ModuleKindESNext) and node_next
+            set extensions_required: true
+        if extensions_required
+        {
+            let empty Slice[char]()
+            if this.should_allow_importing_ts_extension(empty) = false
+                return SpecifierEndingJsExtension
+            if this.infer_preference(resolution_mode, file, node_next) <> SpecifierEndingJsExtension
+                return SpecifierEndingTsExtension
+            return SpecifierEndingJsExtension
+        }
+        if pref = ImportSpecifierEndingPreferenceMinimal
+            return SpecifierEndingMinimal
+        if pref = ImportSpecifierEndingPreferenceIndex
+            return SpecifierEndingIndex
+        let empty Slice[char]()
+        if this.should_allow_importing_ts_extension(empty) = false
+        {
+            if this.uses_extensions_on_imports(file)
+                return SpecifierEndingJsExtension
+            return SpecifierEndingMinimal
+        }
+        this.infer_preference(resolution_mode, file, node_next)
+    }
+
+    ; getPreferredEnding
+    procedure get_preferred_ending(this, prefs: SpecifierPreferences, resolution_mode_in: int) returns int
+    {
+        let old prefs.old_import_specifier
+        if (old.length as int) > 0
+        {
+            if SpecifierHost.has_js_file_extension(old)
+                return SpecifierEndingJsExtension
+            if old.ends_with("/index")
+                return SpecifierEndingIndex
+        }
+        var resolution_mode resolution_mode_in
+        if resolution_mode = ModuleKindNone
+            set resolution_mode: this.get_default_resolution_mode_for_file(prefs.importing_file)
+        this.get_module_specifier_ending_preference(prefs.ending_preference, resolution_mode, prefs.importing_file)
+    }
+
+    ; GetAllowedEndingsInPreferredOrder
+    procedure allowed_endings_in_preferred_order(this, prefs: SpecifierPreferences, syntax_implied_node_format: int) returns ref[Array[int]]
+    {
+        var preferred_ending this.get_preferred_ending(prefs, ModuleKindNone)
+        let resolution_mode this.get_default_resolution_mode_for_file(prefs.importing_file)
+        if resolution_mode <> syntax_implied_node_format
+            set preferred_ending: this.get_preferred_ending(prefs, syntax_implied_node_format)
+        let node_next this.module_resolution_is_node_next()
+        let allow_ts this.should_allow_importing_ts_extension(this.file_name_of(prefs.importing_file))
+        let result &Array[int]^host()
+        if (syntax_implied_node_format = ModuleKindESNext) and node_next
+        {
+            if allow_ts
+                result.add(SpecifierEndingTsExtension)
+            result.add(SpecifierEndingJsExtension)
+            return result
+        }
+        if preferred_ending = SpecifierEndingJsExtension
+        {
+            result.add(SpecifierEndingJsExtension)
+            if allow_ts
+                result.add(SpecifierEndingTsExtension)
+            result.add(SpecifierEndingMinimal)
+            result.add(SpecifierEndingIndex)
+            return result
+        }
+        if preferred_ending = SpecifierEndingTsExtension
+        {
+            result.add(SpecifierEndingTsExtension)
+            result.add(SpecifierEndingMinimal)
+            result.add(SpecifierEndingJsExtension)
+            result.add(SpecifierEndingIndex)
+            return result
+        }
+        if preferred_ending = SpecifierEndingIndex
+        {
+            result.add(SpecifierEndingIndex)
+            result.add(SpecifierEndingMinimal)
+            if allow_ts
+                result.add(SpecifierEndingTsExtension)
+            result.add(SpecifierEndingJsExtension)
+            return result
+        }
+        result.add(SpecifierEndingMinimal)
+        result.add(SpecifierEndingIndex)
+        if allow_ts
+            result.add(SpecifierEndingTsExtension)
+        result.add(SpecifierEndingJsExtension)
+        result
+    }
+
+    ; getModuleSpecifierPreferences
+    function get_module_specifier_preferences(this, specifier_preference: int, ending_preference: int, importing_file: ref[AstNode], old_import_specifier: Slice[char]) returns SpecifierPreferences
+    {
+        var relative_preference RelativePreferenceShortest
+        if (old_import_specifier.length as int) > 0
+        {
+            if is_external_module_name_relative(old_import_specifier)
+                set relative_preference: RelativePreferenceRelative
+            else
+                set relative_preference: RelativePreferenceNonRelative
+        }
+        else
+        {
+            if specifier_preference = ImportSpecifierPreferenceRelative
+                set relative_preference: RelativePreferenceRelative
+            if specifier_preference = ImportSpecifierPreferenceNonRelative
+                set relative_preference: RelativePreferenceNonRelative
+            if specifier_preference = ImportSpecifierPreferenceProjectRelative
+                set relative_preference: RelativePreferenceExternalNonRelative
+        }
+        SpecifierPreferences(relative_preference, ending_preference, importing_file, old_import_specifier)
+    }
+
+    ; ── specifiers.go ──────────────────────────────────────────────────────
+
+    ; GetModuleSpecifiers (forAutoImports false): the candidates, best first
+    procedure get_module_specifiers(this, module_symbol: ref[Symbol], importing_file: ref[AstNode], specifier_preference: int, ending_preference: int, override_import_mode: int) returns ref[Array[Slice[char]]]
+    {
+        let result &Array[Slice[char]]^host()
+        let ambient this.try_get_module_name_from_ambient_module(module_symbol)
+        if (ambient.length as int) > 0
+        {
+            result.add(ambient)
+            return result
+        }
+        let module_source_file this.get_source_file_of_module(module_symbol)
+        if module_source_file = null
+            return result
+        ; GetSourceOfProjectReferenceIfOutputIncluded: no project references
+        let module_file_name this.file_name_of(module_source_file as ref[AstNode])
+        let info this.get_info(this.file_name_of(importing_file))
+        let module_paths this.get_all_module_paths_worker(info, module_file_name)
+        this.compute_module_specifiers(module_paths, importing_file, specifier_preference, ending_preference, override_import_mode)
+    }
+
+    ; ast.GetSourceFileOfModule
+    procedure get_source_file_of_module(this, module_symbol: ref[Symbol]) returns ref[AstNode]?
+    {
+        var declaration Symbol.value_declaration_of(module_symbol)
+        if declaration = null
+        {
+            ; GetNonAugmentationDeclaration
+            let n Symbol.declaration_count(module_symbol)
+            var i 0
+            while i < n
+            {
+                let d Symbol.declaration_at(module_symbol, i)
+                set i: i + 1
+                if d = null
+                    continue
+                let dn d as ref[AstNode]
+                var augmentation false
+                if Binder.is_ambient_module(dn)
+                {
+                    let b checker.binder_of_node(dn)
+                    if b.is_module_augmentation_external(dn)
+                        set augmentation: true
+                }
+                if Binder.is_global_scope_augmentation(dn)
+                    set augmentation: true
+                if augmentation = false
+                {
+                    set declaration: dn
+                    break
+                }
+            }
+        }
+        if declaration = null
+            return null
+        Checker.source_file_of_node(declaration)
+    }
+
+    ; tryGetModuleNameFromAmbientModule
+    procedure try_get_module_name_from_ambient_module(this, module_symbol: ref[Symbol]) returns Slice[char]
+    {
+        let n Symbol.declaration_count(module_symbol)
+        var i 0
+        while i < n
+        {
+            let d Symbol.declaration_at(module_symbol, i)
+            set i: i + 1
+            if d = null
+                continue
+            let dn d as ref[AstNode]
+            if SpecifierHost.is_module_with_string_literal_name(dn)
+            {
+                let name_text AstNode.literal_text_of(AstNode.name_of(dn))
+                let b checker.binder_of_node(dn)
+                let external b.is_module_augmentation_external(dn)
+                if external = false
+                    return name_text
+                if is_external_module_name_relative(name_text) = false
+                    return name_text
+            }
+        }
+        ; a namespace exported through `export =` from an ambient module
+        set i: 0
+        while i < n
+        {
+            let d Symbol.declaration_at(module_symbol, i)
+            set i: i + 1
+            if d = null
+                continue
+            let dn d as ref[AstNode]
+            if dn.kind <> KindModuleDeclaration
+                continue
+            var container: ref[AstNode]? dn
+            while container <> null
+            {
+                if SpecifierHost.is_module_with_string_literal_name(container as ref[AstNode])
+                    break
+                set container: AstNode.parent_node_of(container)
+            }
+            if container = null
+                continue
+            let possible container as ref[AstNode]
+            let pp AstNode.parent_node_of(possible)
+            if AstNode.kind_of(pp) <> KindSourceFile
+                continue
+            if possible.symbol = null
+                continue
+            let ed Binder.internal_name_unprefixed(host, "export=")
+            let sym SymbolTable.get(Symbol.exports_of(possible.symbol as ref[Symbol]), ed)
+            if sym = null
+                continue
+            let export_assignment_decl Symbol.value_declaration_of(sym as ref[Symbol])
+            if export_assignment_decl = null
+                continue
+            if (export_assignment_decl as ref[AstNode]).kind <> KindExportAssignment
+                continue
+            let expression AstNode.expression_of(export_assignment_decl)
+            if expression = null
+                continue
+            var export_symbol checker.get_symbol_at_location(expression as ref[AstNode], true)
+            if export_symbol = null
+                continue
+            if (Symbol.flags_of(export_symbol as ref[Symbol]) & SymbolFlagsAlias) <> 0
+                set export_symbol: checker.resolve_alias(export_symbol as ref[Symbol])
+            if export_symbol = dn.symbol
+                return AstNode.literal_text_of(AstNode.name_of(possible))
+        }
+        Slice[char]()
+    }
+
+    function is_module_with_string_literal_name(node: ref[AstNode]) returns bool
+    {
+        if node.kind <> KindModuleDeclaration
+            return false
+        AstNode.kind_of(AstNode.name_of(node)) = KindStringLiteral
+    }
+
+    ; getInfo
+    procedure get_info(this, importing_source_file_name: Slice[char]) returns SpecifierInfo
+    {
+        let source_directory get_directory_path(host, importing_source_file_name)
+        SpecifierInfo(true, importing_source_file_name, source_directory)
+    }
+
+    ; getAllModulePathsWorker: the paths nearest the importing directory first
+    procedure get_all_module_paths_worker(this, info: SpecifierInfo, imported_file_name: Slice[char]) returns ref[Array[ModulePath]]
+    {
+        let remaining this.get_each_file_name_of_module(info.importing_source_file_name, imported_file_name)
+        let sorted &Array[ModulePath]^host()
+        var directory info.source_directory
+        while (remaining.get_length() as int) > 0
+        {
+            let directory_start ensure_trailing_directory_separator(host, directory)
+            let in_directory &Array[ModulePath]^host()
+            let rest &Array[ModulePath]^host()
+            var i 0
+            while i < (remaining.get_length() as int)
+            {
+                let p remaining[i as size_t]
+                if p.file_name.starts_with(directory_start)
+                    in_directory.add(p)
+                else
+                    rest.add(p)
+                set i: i + 1
+            }
+            this.sort_module_paths(in_directory)
+            var j 0
+            while j < (in_directory.get_length() as int)
+            {
+                sorted.add(in_directory[j as size_t])
+                set j: j + 1
+            }
+            set remaining: rest
+            let new_directory get_directory_path(host, directory)
+            if new_directory.equals(directory)
+                break
+            set directory: new_directory
+        }
+        this.sort_module_paths(remaining)
+        var k 0
+        while k < (remaining.get_length() as int)
+        {
+            sorted.add(remaining[k as size_t])
+            set k: k + 1
+        }
+        sorted
+    }
+
+    ; slices.SortFunc(comparePathsByRedirect), an insertion sort
+    procedure sort_module_paths(this, paths: ref[Array[ModulePath]])
+    {
+        let n paths.get_length() as int
+        var i 1
+        while i < n
+        {
+            let current paths[i as size_t]
+            var j i - 1
+            while j >= 0
+            {
+                let prev paths[j as size_t]
+                if this.compare_paths_by_redirect(prev, current) <= 0
+                    break
+                paths.put((j + 1) as size_t, prev)
+                set j: j - 1
+            }
+            paths.put((j + 1) as size_t, current)
+            set i: i + 1
+        }
+    }
+
+    ; GetEachFileNameOfModule (preferSymlinks: true). With no symlink cache
+    ; entries and no redirects or project references (the file header), the
+    ; candidates are the imported file's normalized name, filtered when ignored.
+    procedure get_each_file_name_of_module(this, importing_file_name: Slice[char], imported_file_name: Slice[char]) returns ref[Array[ModulePath]]
+    {
+        let target get_normalized_absolute_path(host, imported_file_name, current_directory)
+        let should_filter_ignored_paths (SpecifierHost.contains_ignored_path(target) = false)
+        let results &Array[ModulePath]^host()
+        var keep true
+        if should_filter_ignored_paths
+        {
+            if SpecifierHost.contains_ignored_path(target)
+                set keep: false
+        }
+        if keep
+            results.add(ModulePath(target, slice_contains_node_modules(target), false))
+        results
+    }
+
+    ; computeModuleSpecifiers (forAutoImport false)
+    procedure compute_module_specifiers(this, module_paths: ref[Array[ModulePath]], importing_file: ref[AstNode], specifier_preference: int, ending_preference: int, override_import_mode: int) returns ref[Array[Slice[char]]]
+    {
+        let info this.get_info(this.file_name_of(importing_file))
+        let empty Slice[char]()
+        let preferences this.get_module_specifier_preferences(specifier_preference, ending_preference, importing_file, empty)
+        var existing_specifier Slice[char]()
+        let imports this.imports_of(importing_file)
+        var mp 0
+        while mp < (module_paths.get_length() as int)
+        {
+            let module_path module_paths[mp as size_t]
+            set mp: mp + 1
+            let target_path this.to_path(module_path.file_name)
+            var existing_import: ref[AstNode]? null
+            var ii 0
+            while ii < (imports.get_length() as int)
+            {
+                let import_specifier imports[ii as size_t]
+                set ii: ii + 1
+                if import_specifier = null
+                    continue
+                let resolved this.get_resolved_module_from_module_specifier(importing_file, import_specifier as ref[AstNode])
+                if (resolved.length as int) > 0
+                {
+                    let resolved_path this.to_path(resolved)
+                    if resolved_path.equals(target_path)
+                    {
+                        set existing_import: import_specifier
+                        break
+                    }
+                }
+            }
+            if existing_import <> null
+            {
+                let ei existing_import as ref[AstNode]
+                let existing_text AstNode.literal_text_of(ei)
+                if (preferences.relative_preference = RelativePreferenceNonRelative) and path_is_relative(existing_text)
+                    continue
+                let existing_mode this.get_mode_for_usage_location(importing_file, ei)
+                var target_mode override_import_mode
+                if target_mode = ModuleKindNone
+                    set target_mode: this.get_default_resolution_mode_for_file(importing_file)
+                if (existing_mode <> target_mode) and (existing_mode <> ModuleKindNone) and (target_mode <> ModuleKindNone)
+                    continue
+                set existing_specifier: existing_text
+                break
+            }
+        }
+        let result &Array[Slice[char]]^host()
+        if (existing_specifier.length as int) > 0
+        {
+            result.add(existing_specifier)
+            return result
+        }
+        var imported_file_is_in_node_modules false
+        var q 0
+        while q < (module_paths.get_length() as int)
+        {
+            let p module_paths[q as size_t]
+            if p.is_in_node_modules
+                set imported_file_is_in_node_modules: true
+            set q: q + 1
+        }
+        let paths_specifiers &Array[Slice[char]]^host()
+        let redirect_paths_specifiers &Array[Slice[char]]^host()
+        let node_modules_specifiers &Array[Slice[char]]^host()
+        let relative_specifiers &Array[Slice[char]]^host()
+        set mp: 0
+        while mp < (module_paths.get_length() as int)
+        {
+            let module_path module_paths[mp as size_t]
+            set mp: mp + 1
+            var specifier Slice[char]()
+            if module_path.is_in_node_modules
+                set specifier: this.try_get_module_name_as_node_module(module_path, info, importing_file, specifier_preference, ending_preference, false, override_import_mode)
+            if (specifier.length as int) > 0
+            {
+                node_modules_specifiers.add(specifier)
+                ; a bare package specifier for a redirect: nothing is better
+                if module_path.is_redirect
+                    return node_modules_specifiers
+            }
+            var import_mode override_import_mode
+            if import_mode = ModuleKindNone
+                set import_mode: this.get_default_resolution_mode_for_file(importing_file)
+            var paths_only module_path.is_redirect
+            if (specifier.length as int) > 0
+                set paths_only: true
+            let local this.get_local_module_specifier(module_path.file_name, info, import_mode, preferences, paths_only)
+            if (local.length as int) = 0
+                continue
+            if module_path.is_redirect
+                redirect_paths_specifiers.add(local)
+            else
+            {
+                if SpecifierHost.path_is_bare_specifier(local)
+                {
+                    ; a `/node_modules/` specifier from a misused baseUrl ranks last
+                    if slice_contains_node_modules(local)
+                        relative_specifiers.add(local)
+                    else
+                        paths_specifiers.add(local)
+                }
+                else
+                {
+                    ; through a SIBLING's node_modules only when no path is outside
+                    ; node_modules (declarationEmitReexportedSymlinkReference3)
+                    if (imported_file_is_in_node_modules = false) or module_path.is_in_node_modules
+                        relative_specifiers.add(local)
+                }
+            }
+        }
+        if (paths_specifiers.get_length() as int) > 0
+            return paths_specifiers
+        if (redirect_paths_specifiers.get_length() as int) > 0
+            return redirect_paths_specifiers
+        if (node_modules_specifiers.get_length() as int) > 0
+            return node_modules_specifiers
+        relative_specifiers
+    }
+
+    ; getLocalModuleSpecifier. `paths` is nil and `rootDirs` empty under this
+    ; harness (the file header), so the relative path is computed directly and
+    ; the non-relative candidates come from package.json `imports` alone.
+    procedure get_local_module_specifier(this, module_file_name: Slice[char], info: SpecifierInfo, import_mode: int, preferences: SpecifierPreferences, paths_only: bool) returns Slice[char]
+    {
+        ; `pathsOnly && paths == nil`
+        if paths_only
+            return Slice[char]()
+        let source_directory info.source_directory
+        let allowed_endings this.allowed_endings_in_preferred_order(preferences, import_mode)
+        let relative_from this.get_relative_path_from_directory(source_directory, module_file_name)
+        let relative_path this.process_ending(this.ensure_path_is_non_module_name(relative_from), allowed_endings, true)
+        if this.get_resolve_package_json_imports() = false
+            return relative_path
+        if preferences.relative_preference = RelativePreferenceRelative
+            return relative_path
+        ; GetPathsBasePath answers "" with no paths: the base is the current directory
+        let base_directory get_normalized_absolute_path(host, Slice[char](), current_directory)
+        let relative_to_base_url this.get_relative_path_if_in_same_volume(module_file_name, base_directory)
+        if (relative_to_base_url.length as int) = 0
+            return relative_path
+        let from_package_json_imports this.try_get_module_name_from_package_json_imports(module_file_name, source_directory, import_mode, SpecifierHost.prefers_ts_extension(allowed_endings))
+        if (from_package_json_imports.length as int) = 0
+            return relative_path
+        ; the exclusion regexes are empty on this route
+        if preferences.relative_preference = RelativePreferenceNonRelative
+        {
+            if path_is_relative(from_package_json_imports) = false
+                return from_package_json_imports
+        }
+        if preferences.relative_preference = RelativePreferenceExternalNonRelative
+        {
+            if path_is_relative(from_package_json_imports) = false
+            {
+                ; no config file: the project directory is the current directory
+                let project_directory this.to_path(current_directory)
+                let canonical_source_directory this.to_path(source_directory)
+                let module_path get_normalized_absolute_path(host, module_file_name, project_directory)
+                let source_is_internal SpecifierHost.path_contains_path(project_directory, canonical_source_directory)
+                let target_is_internal SpecifierHost.path_contains_path(project_directory, module_path)
+                if source_is_internal <> target_is_internal
+                    return from_package_json_imports
+                let nearest_target this.get_nearest_ancestor_directory_with_package_json(get_directory_path(host, module_path))
+                let nearest_source this.get_nearest_ancestor_directory_with_package_json(source_directory)
+                if this.package_json_paths_are_equal(nearest_target, nearest_source) = false
+                    return from_package_json_imports
+                return relative_path
+            }
+        }
+        ; a relative import over a baseUrl one when it has fewer components
+        if from_package_json_imports.starts_with("..")
+            return relative_path
+        if SpecifierHost.count_path_components(relative_path) < SpecifierHost.count_path_components(from_package_json_imports)
+            return relative_path
+        from_package_json_imports
+    }
+
+    ; processEnding; `with_host` false is the reference's nil host
+    procedure process_ending(this, file_name: Slice[char], allowed_endings: ref[Array[int]], with_host: bool) returns Slice[char]
+    {
+        if SpecifierHost.file_extension_is(file_name, ".json") or SpecifierHost.file_extension_is(file_name, ".mjs") or SpecifierHost.file_extension_is(file_name, ".cjs")
+            return file_name
+        let no_extension SpecifierHost.remove_file_extension_of(file_name)
+        if no_extension.length = file_name.length
+            return file_name
+        let js_priority SpecifierHost.index_of_ending(allowed_endings, SpecifierEndingJsExtension)
+        let ts_priority SpecifierHost.index_of_ending(allowed_endings, SpecifierEndingTsExtension)
+        let mts_or_cts (SpecifierHost.file_extension_is(file_name, ".mts") or SpecifierHost.file_extension_is(file_name, ".cts"))
+        if mts_or_cts and (ts_priority <> (0 - 1)) and (ts_priority < js_priority)
+            return file_name
+        if SpecifierHost.file_extension_is(file_name, ".d.mts") or SpecifierHost.file_extension_is(file_name, ".d.cts")
+        {
+            let input_ext this.get_declaration_file_extension(file_name)
+            let ext this.get_js_extension_for_declaration_file_extension(input_ext)
+            return join_slices(host, file_name.subslice(0, file_name.length - input_ext.length), ext)
+        }
+        if mts_or_cts
+            return join_slices(host, no_extension, this.get_js_extension_for_file(file_name))
+        if (SpecifierHost.file_extension_is(file_name, ".d.ts") = false) and SpecifierHost.file_extension_is(file_name, ".ts")
+        {
+            if SpecifierHost.contains_text(file_name, ".d.")
+            {
+                let real this.try_get_real_file_name_for_non_js_declaration_file_name(file_name)
+                if (real.length as int) > 0
+                    return real
+            }
+        }
+        let first allowed_endings[0]
+        if first = SpecifierEndingMinimal
+        {
+            if no_extension.ends_with("/index") = false
+                return no_extension
+            let without_index no_extension.subslice(0, no_extension.length - 6)
+            if with_host
+            {
+                ; a file named like the directory keeps the index
+                if this.try_get_any_file_from_path(without_index)
+                    return no_extension
+            }
+            return without_index
+        }
+        if first = SpecifierEndingIndex
+            return no_extension
+        if first = SpecifierEndingJsExtension
+            return join_slices(host, no_extension, this.get_js_extension_for_file(file_name))
+        ; TsExtension: a declaration file keeps no extension or takes a .js one
+        if is_declaration_file_name_of(file_name)
+        {
+            var extensionless_priority 0 - 1
+            var i 0
+            while i < (allowed_endings.get_length() as int)
+            {
+                let e allowed_endings[i as size_t]
+                if (e = SpecifierEndingMinimal) or (e = SpecifierEndingIndex)
+                {
+                    set extensionless_priority: i
+                    break
+                }
+                set i: i + 1
+            }
+            if (extensionless_priority <> (0 - 1)) and (extensionless_priority < js_priority)
+                return no_extension
+            return join_slices(host, no_extension, this.get_js_extension_for_file(file_name))
+        }
+        file_name
+    }
+
+    ; tryGetModuleNameAsNodeModule
+    procedure try_get_module_name_as_node_module(this, path_obj: ModulePath, info: SpecifierInfo, importing_file: ref[AstNode], specifier_preference: int, ending_preference: int, package_name_only: bool, override_mode: int) returns Slice[char]
+    {
+        let parts SpecifierHost.get_node_module_path_parts(path_obj.file_name)
+        if parts.found = false
+            return Slice[char]()
+        let empty Slice[char]()
+        let preferences this.get_module_specifier_preferences(specifier_preference, ending_preference, importing_file, empty)
+        let allowed_endings this.allowed_endings_in_preferred_order(preferences, ModuleKindNone)
+        var module_specifier path_obj.file_name
+        var is_package_root_path false
+        if package_name_only = false
+        {
+            var package_root_index parts.package_root_index
+            var module_file_name Slice[char]()
+            repeat
+            {
+                ; the directory name when the module could be imported by it.
+                ; ★ The reference hands the ORIGINAL parts on every round
+                ; (`*parts`); only the loop's own index moves.
+                let attempt this.try_directory_with_package_json(parts, path_obj, importing_file, override_mode, allowed_endings)
+                if attempt.blocked_by_exports
+                    return Slice[char]()
+                if attempt.verbatim_from_exports
+                    return attempt.module_file_to_try
+                if (attempt.package_root_path.length as int) > 0
+                {
+                    set module_specifier: attempt.package_root_path
+                    set is_package_root_path: true
+                    break
+                }
+                if (module_file_name.length as int) = 0
+                    set module_file_name: attempt.module_file_to_try
+                ; the next level of directory
+                set package_root_index: SpecifierHost.index_of_text(path_obj.file_name, "/", package_root_index + 1)
+                if package_root_index = (0 - 1)
+                {
+                    set module_specifier: this.process_ending(module_file_name, allowed_endings, true)
+                    break
+                }
+            }
+        }
+        if path_obj.is_redirect and (is_package_root_path = false)
+            return Slice[char]()
+        ; the global typings cache location is empty (the file header)
+        let path_to_top_level_node_modules module_specifier.subslice(0, parts.top_level_node_modules_index as size_t)
+        if info.source_directory.starts_with(path_to_top_level_node_modules) = false
+            return Slice[char]()
+        ; a module found in @types: the actual package name
+        let node_modules_directory_name module_specifier.slice_from((parts.top_level_package_name_index + 1) as size_t)
+        this.get_package_name_from_types_package_name(node_modules_directory_name)
+    }
+
+    ; tryDirectoryWithPackageJson
+    procedure try_directory_with_package_json(this, parts: NodeModulePathParts, path_obj: ModulePath, importing_file: ref[AstNode], override_mode: int, allowed_endings: ref[Array[int]]) returns PackageJsonDirAttempt
+    {
+        var root_idx parts.package_root_index
+        if root_idx = (0 - 1)
+            set root_idx: path_obj.file_name.length as int
+        let package_root_path path_obj.file_name.subslice(0, root_idx as size_t)
+        let package_json_path combine_paths(host, package_root_path, "package.json")
+        let module_file_to_try path_obj.file_name
+        let package_json this.get_package_json_info(package_json_path)
+        if package_json.exists = false
+        {
+            ; no package.json: an index file still resolves as the package name
+            let file_name module_file_to_try.slice_from((parts.package_root_index + 1) as size_t)
+            if file_name.equals("index.d.ts") or file_name.equals("index.js") or file_name.equals("index.ts") or file_name.equals("index.tsx")
+                return PackageJsonDirAttempt(module_file_to_try, package_root_path, false, false)
+            return PackageJsonDirAttempt(module_file_to_try, Slice[char](), false, false)
+        }
+        var import_mode override_mode
+        if import_mode = ModuleKindNone
+            set import_mode: this.get_default_resolution_mode_for_file(importing_file)
+        if this.get_resolve_package_json_exports()
+        {
+            ; the directory name, not the package.json's `name`
+            let node_modules_directory_name package_root_path.slice_from((parts.top_level_package_name_index + 1) as size_t)
+            let package_name this.get_package_name_from_types_package_name(node_modules_directory_name)
+            ; the TARGET file's extension decides the conditions (the reference's
+            ; own correction of Strada's importing-file mode)
+            let fname path_obj.file_name
+            if SpecifierHost.file_extension_is(fname, ".cjs") or SpecifierHost.file_extension_is(fname, ".cts") or SpecifierHost.file_extension_is(fname, ".d.cts")
+                set import_mode: ModuleKindCommonJS
+            else
+            {
+                if SpecifierHost.file_extension_is(fname, ".mjs") or SpecifierHost.file_extension_is(fname, ".mts") or SpecifierHost.file_extension_is(fname, ".d.mts")
+                    set import_mode: ModuleKindESNext
+            }
+            let conditions this.get_conditions(import_mode)
+            if package_json.exports <> null
+            {
+                let from_exports this.try_get_module_name_from_exports(path_obj.file_name, package_root_path, package_name, package_json.exports as ref[JsonValue], conditions)
+                if (from_exports.length as int) > 0
+                    return PackageJsonDirAttempt(from_exports, Slice[char](), false, true)
+                return PackageJsonDirAttempt(path_obj.file_name, Slice[char](), true, false)
+            }
+        }
+        if package_json.has_types_versions
+        {
+            this.stop("module-types-versions")
+            return PackageJsonDirAttempt(module_file_to_try, Slice[char](), false, false)
+        }
+        ; the main module is importable by the package name
+        var main_file_relative: Slice[char] "index.js"
+        if (package_json.typings.length as int) > 0
+            set main_file_relative: package_json.typings
+        else
+        {
+            if (package_json.types.length as int) > 0
+                set main_file_relative: package_json.types
+            else
+            {
+                if (package_json.main.length as int) > 0
+                    set main_file_relative: package_json.main
+            }
+        }
+        if (main_file_relative.length as int) > 0
+        {
+            let main_export_file get_normalized_absolute_path(host, main_file_relative, package_root_path)
+            let main_stem SpecifierHost.remove_file_extension_of(main_export_file)
+            let try_stem SpecifierHost.remove_file_extension_of(module_file_to_try)
+            if this.paths_equal(main_stem, try_stem)
+                return PackageJsonDirAttempt(module_file_to_try, package_root_path, false, false)
+            if package_json.type_field.equals("module") = false
+            {
+                if SpecifierHost.extension_requires_extension(module_file_to_try) = false
+                {
+                    if module_file_to_try.starts_with(main_export_file)
+                    {
+                        let try_directory get_directory_path(host, module_file_to_try)
+                        let main_directory remove_trailing_directory_separator(main_export_file)
+                        if this.paths_equal(try_directory, main_directory)
+                        {
+                            let base get_base_file_name(host, module_file_to_try)
+                            let base_stem SpecifierHost.remove_file_extension_of(base)
+                            if base_stem.equals("index")
+                                return PackageJsonDirAttempt(module_file_to_try, package_root_path, false, false)
+                        }
+                    }
+                }
+            }
+        }
+        PackageJsonDirAttempt(module_file_to_try, Slice[char](), false, false)
+    }
+
+    ; module.GetConditions (no customConditions, noDtsResolution unset)
+    procedure get_conditions(this, resolution_mode_in: int) returns ref[Array[Slice[char]]]
+    {
+        let module_resolution options.get_module_resolution_kind()
+        var resolution_mode resolution_mode_in
+        if (resolution_mode = ModuleKindNone) and (module_resolution = ModuleResolutionKindBundler)
+            set resolution_mode: ModuleKindESNext
+        let conditions &Array[Slice[char]]^host()
+        if resolution_mode = ModuleKindESNext
+            conditions.add("import")
+        else
+            conditions.add("require")
+        conditions.add("types")
+        if module_resolution <> ModuleResolutionKindBundler
+            conditions.add("node")
+        conditions
+    }
+
+    ; the resolver's said stop, recorded on the checker like its own
+    procedure stop(this, tag: Slice[char])
+        checker.record_unported(tag, 0)
+
+    ; tryGetModuleNameFromExports
+    procedure try_get_module_name_from_exports(this, target_file_path: Slice[char], package_directory: Slice[char], package_name: Slice[char], exports: ref[JsonValue], conditions: ref[Array[Slice[char]]]) returns Slice[char]
+    {
+        if (exports.kind = JsonKindObject) and (exports.object_kind() = JsonObjectKindSubpaths)
+        {
+            let n exports.size()
+            var i 0
+            while i < n
+            {
+                let k exports.key_at(i)
+                let subk exports.value_at(i)
+                set i: i + 1
+                if subk = null
+                    continue
+                let sub_package_name get_normalized_absolute_path(host, combine_paths(host, package_name, k), Slice[char]())
+                var mode MatchingModeExact
+                if k.ends_with("/")
+                    set mode: MatchingModeDirectory
+                else
+                {
+                    if slice_contains_byte(k, ("*" as char) as int)
+                        set mode: MatchingModePattern
+                }
+                let result this.try_get_module_name_from_exports_or_imports(target_file_path, package_directory, sub_package_name, subk as ref[JsonValue], conditions, mode, false, false)
+                if (result.length as int) > 0
+                    return result
+            }
+        }
+        this.try_get_module_name_from_exports_or_imports(target_file_path, package_directory, package_name, exports, conditions, MatchingModeExact, false, false)
+    }
+
+    ; tryGetModuleNameFromPackageJsonImports
+    procedure try_get_module_name_from_package_json_imports(this, module_file_name: Slice[char], source_directory: Slice[char], import_mode: int, prefer_ts_extension: bool) returns Slice[char]
+    {
+        if this.get_resolve_package_json_imports() = false
+            return Slice[char]()
+        let ancestor this.get_nearest_ancestor_directory_with_package_json(source_directory)
+        if (ancestor.length as int) = 0
+            return Slice[char]()
+        let package_json_path combine_paths(host, ancestor, "package.json")
+        let info this.get_package_json_info(package_json_path)
+        if info.exists = false
+            return Slice[char]()
+        if info.imports = null
+            return Slice[char]()
+        let imports info.imports as ref[JsonValue]
+        if imports.kind <> JsonKindObject
+            return Slice[char]()
+        let conditions this.get_conditions(import_mode)
+        let module_resolution options.get_module_resolution_kind()
+        let n imports.size()
+        var i 0
+        while i < n
+        {
+            let k imports.key_at(i)
+            let value imports.value_at(i)
+            set i: i + 1
+            if value = null
+                continue
+            if k.equals("#") or k.equals("#/")
+                continue
+            if k.starts_with("#") = false
+                continue
+            if k.starts_with("#/")
+            {
+                ; "#/" keys are only valid in nodenext/bundler
+                if (module_resolution <> ModuleResolutionKindNodeNext) and (module_resolution <> ModuleResolutionKindBundler)
+                    continue
+            }
+            var mode MatchingModeExact
+            if k.ends_with("/")
+                set mode: MatchingModeDirectory
+            else
+            {
+                if slice_contains_byte(k, ("*" as char) as int)
+                    set mode: MatchingModePattern
+            }
+            let result this.try_get_module_name_from_exports_or_imports(module_file_name, ancestor, k, value as ref[JsonValue], conditions, mode, true, prefer_ts_extension)
+            if (result.length as int) > 0
+                return result
+        }
+        Slice[char]()
+    }
+
+    ; outputpaths.GetOutputJSFileNameWorker
+    procedure get_output_js_file_name(this, input_file_name: Slice[char]) returns Slice[char]
+    {
+        let without this.get_output_path_without_changing_extension(input_file_name, options.out_dir)
+        var ext: Slice[char] ".js"
+        if SpecifierHost.file_extension_is(input_file_name, ".json")
+            set ext: ".json"
+        else
+        {
+            if options.jsx_is_preserve() and (SpecifierHost.file_extension_is(input_file_name, ".jsx") or SpecifierHost.file_extension_is(input_file_name, ".tsx"))
+                set ext: ".jsx"
+            else
+            {
+                if SpecifierHost.file_extension_is(input_file_name, ".mts") or SpecifierHost.file_extension_is(input_file_name, ".mjs")
+                    set ext: ".mjs"
+                else
+                {
+                    if SpecifierHost.file_extension_is(input_file_name, ".cts") or SpecifierHost.file_extension_is(input_file_name, ".cjs")
+                        set ext: ".cjs"
+                }
+            }
+        }
+        this.change_extension(without, ext)
+    }
+
+    ; outputpaths.GetOutputDeclarationFileNameWorker
+    procedure get_output_declaration_file_name(this, input_file_name: Slice[char]) returns Slice[char]
+    {
+        var dir options.declaration_dir
+        if (dir.length as int) = 0
+            set dir: options.out_dir
+        let without this.get_output_path_without_changing_extension(input_file_name, dir)
+        this.change_extension(without, this.get_declaration_emit_extension_for_path(input_file_name))
+    }
+
+    ; getOutputPathWithoutChangingExtension
+    procedure get_output_path_without_changing_extension(this, input_file_name: Slice[char], output_directory: Slice[char]) returns Slice[char]
+    {
+        if (output_directory.length as int) = 0
+            return input_file_name
+        let relative this.get_relative_path_from_directory(this.common_source_directory(), input_file_name)
+        get_normalized_absolute_path(host, combine_paths(host, output_directory, relative), Slice[char]())
+    }
+
+    ; tspath.GetDeclarationEmitExtensionForPath
+    procedure get_declaration_emit_extension_for_path(this, path: Slice[char]) returns Slice[char]
+    {
+        if SpecifierHost.file_extension_is(path, ".mjs") or SpecifierHost.file_extension_is(path, ".mts")
+            return ".d.mts"
+        if SpecifierHost.file_extension_is(path, ".cjs") or SpecifierHost.file_extension_is(path, ".cts")
+            return ".d.cts"
+        if SpecifierHost.file_extension_is(path, ".ts") or SpecifierHost.file_extension_is(path, ".tsx") or SpecifierHost.file_extension_is(path, ".js") or SpecifierHost.file_extension_is(path, ".jsx")
+            return ".d.ts"
+        let base get_base_file_name(host, path)
+        let dot slice_last_index_of_byte(base, ("." as char) as int)
+        if dot >= 0
+        {
+            let with_d join_slices(host, ".d", base.slice_from(dot as size_t))
+            return join_slices(host, with_d, ".ts")
+        }
+        ".d.ts"
+    }
+
+    ; tryGetModuleNameFromExportsOrImports
+    procedure try_get_module_name_from_exports_or_imports(this, target_file_path: Slice[char], package_directory: Slice[char], package_name: Slice[char], exports: ref[JsonValue], conditions: ref[Array[Slice[char]]], mode: int, is_imports: bool, prefer_ts_extension: bool) returns Slice[char]
+    {
+        if exports.kind = JsonKindString
+        {
+            let str_value exports.text
+            var output_file Slice[char]()
+            var declaration_file Slice[char]()
+            if is_imports
+            {
+                set output_file: this.get_output_js_file_name(target_file_path)
+                set declaration_file: this.get_output_declaration_file_name(target_file_path)
+            }
+            let path_or_pattern get_normalized_absolute_path(host, combine_paths(host, package_directory, str_value), Slice[char]())
+            var extension_swapped_target Slice[char]()
+            if SpecifierHost.has_ts_file_extension(target_file_path)
+                set extension_swapped_target: join_slices(host, SpecifierHost.remove_file_extension_of(target_file_path), this.try_get_js_extension_for_file(target_file_path))
+            var can_try_ts_extension false
+            if prefer_ts_extension
+                set can_try_ts_extension: has_implementation_ts_file_extension(target_file_path)
+            if mode = MatchingModeExact
+            {
+                if (extension_swapped_target.length as int) > 0
+                {
+                    if this.paths_equal(extension_swapped_target, path_or_pattern)
+                        return package_name
+                }
+                if this.paths_equal(target_file_path, path_or_pattern)
+                    return package_name
+                if (output_file.length as int) > 0
+                {
+                    if this.paths_equal(output_file, path_or_pattern)
+                        return package_name
+                }
+                if (declaration_file.length as int) > 0
+                {
+                    if this.paths_equal(declaration_file, path_or_pattern)
+                        return package_name
+                }
+            }
+            if mode = MatchingModeDirectory
+            {
+                let with_value combine_paths(host, package_name, str_value)
+                if can_try_ts_extension
+                {
+                    ; ★ the reference's argument order: target contains pattern
+                    if this.contains_path(target_file_path, path_or_pattern)
+                    {
+                        let fragment this.get_relative_path_from_directory(path_or_pattern, target_file_path)
+                        return get_normalized_absolute_path(host, combine_paths(host, with_value, fragment), Slice[char]())
+                    }
+                }
+                if (extension_swapped_target.length as int) > 0
+                {
+                    if this.contains_path(path_or_pattern, extension_swapped_target)
+                    {
+                        let fragment this.get_relative_path_from_directory(path_or_pattern, extension_swapped_target)
+                        return get_normalized_absolute_path(host, combine_paths(host, with_value, fragment), Slice[char]())
+                    }
+                }
+                if can_try_ts_extension = false
+                {
+                    if this.contains_path(path_or_pattern, target_file_path)
+                    {
+                        let fragment this.get_relative_path_from_directory(path_or_pattern, target_file_path)
+                        return get_normalized_absolute_path(host, combine_paths(host, with_value, fragment), Slice[char]())
+                    }
+                }
+                if (output_file.length as int) > 0
+                {
+                    if this.contains_path(path_or_pattern, output_file)
+                    {
+                        let fragment this.get_relative_path_from_directory(path_or_pattern, output_file)
+                        return combine_paths(host, package_name, fragment)
+                    }
+                }
+                if (declaration_file.length as int) > 0
+                {
+                    if this.contains_path(path_or_pattern, declaration_file)
+                    {
+                        let fragment this.get_relative_path_from_directory(path_or_pattern, declaration_file)
+                        let js_extension this.get_js_extension_for_file(declaration_file)
+                        let fragment_with_js_extension this.change_extension(fragment, js_extension)
+                        return combine_paths(host, package_name, fragment_with_js_extension)
+                    }
+                }
+            }
+            if mode = MatchingModePattern
+            {
+                let star slice_index_of_byte(path_or_pattern, ("*" as char) as int)
+                var leading path_or_pattern
+                var trailing Slice[char]()
+                if star >= 0
+                {
+                    set leading: path_or_pattern.subslice(0, star as size_t)
+                    set trailing: path_or_pattern.slice_from((star + 1) as size_t)
+                }
+                if can_try_ts_extension and SpecifierHost.has_prefix_and_suffix_without_overlap(target_file_path, leading, trailing)
+                {
+                    let replacement target_file_path.subslice(leading.length, target_file_path.length - trailing.length)
+                    return this.replace_first_star(package_name, replacement)
+                }
+                if (extension_swapped_target.length as int) > 0
+                {
+                    if SpecifierHost.has_prefix_and_suffix_without_overlap(extension_swapped_target, leading, trailing)
+                    {
+                        let replacement extension_swapped_target.subslice(leading.length, extension_swapped_target.length - trailing.length)
+                        return this.replace_first_star(package_name, replacement)
+                    }
+                }
+                if (can_try_ts_extension = false) and SpecifierHost.has_prefix_and_suffix_without_overlap(target_file_path, leading, trailing)
+                {
+                    let replacement target_file_path.subslice(leading.length, target_file_path.length - trailing.length)
+                    return this.replace_first_star(package_name, replacement)
+                }
+                if (output_file.length as int) > 0
+                {
+                    if SpecifierHost.has_prefix_and_suffix_without_overlap(output_file, leading, trailing)
+                    {
+                        let replacement output_file.subslice(leading.length, output_file.length - trailing.length)
+                        return this.replace_first_star(package_name, replacement)
+                    }
+                }
+                if (declaration_file.length as int) > 0
+                {
+                    if SpecifierHost.has_prefix_and_suffix_without_overlap(declaration_file, leading, trailing)
+                    {
+                        let replacement declaration_file.subslice(leading.length, declaration_file.length - trailing.length)
+                        let substituted this.replace_first_star(package_name, replacement)
+                        let js_extension this.try_get_js_extension_for_file(declaration_file)
+                        if (js_extension.length as int) > 0
+                            return this.change_full_extension(substituted, js_extension)
+                    }
+                }
+            }
+            return Slice[char]()
+        }
+        if exports.kind = JsonKindArray
+        {
+            let n exports.size()
+            var i 0
+            while i < n
+            {
+                let e exports.value_at(i)
+                set i: i + 1
+                if e = null
+                    continue
+                let result this.try_get_module_name_from_exports_or_imports(target_file_path, package_directory, package_name, e as ref[JsonValue], conditions, mode, is_imports, prefer_ts_extension)
+                if (result.length as int) > 0
+                    return result
+            }
+            return Slice[char]()
+        }
+        if exports.kind = JsonKindObject
+        {
+            ; conditional mapping
+            let n exports.size()
+            var i 0
+            while i < n
+            {
+                let key exports.key_at(i)
+                let value exports.value_at(i)
+                set i: i + 1
+                if value = null
+                    continue
+                var applies key.equals("default")
+                if applies = false
+                    set applies: SpecifierHost.contains_condition(conditions, key)
+                if applies = false
+                {
+                    let types_name: Slice[char] "types"
+                    if SpecifierHost.contains_condition(conditions, types_name)
+                    {
+                        if key.starts_with("types@")
+                            set applies: ModuleResolver.versioned_types_key_applies(key.slice_from(6))
+                    }
+                }
+                if applies
+                {
+                    let result this.try_get_module_name_from_exports_or_imports(target_file_path, package_directory, package_name, value as ref[JsonValue], conditions, mode, is_imports, prefer_ts_extension)
+                    if (result.length as int) > 0
+                        return result
+                }
+            }
+        }
+        Slice[char]()
+    }
+
+    function contains_condition(conditions: ref[Array[Slice[char]]], key: Slice[char]) returns bool
+    {
+        var i 0
+        while i < (conditions.get_length() as int)
+        {
+            let c conditions[i as size_t]
+            if c.equals(key)
+                return true
+            set i: i + 1
+        }
+        false
+    }
+}

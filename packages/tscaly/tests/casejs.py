@@ -231,13 +231,16 @@ def dts_program_path(ppath):
     return stem + ".d.ts"
 
 
-def emitted(unit_name, cfg):
+def emitted(unit_name, cfg, all_roots=True):
     base = os.path.basename(unit_name)
     low = base.lower()
     if low.endswith(".d.ts") or low.endswith(".d.mts") or low.endswith(".d.cts") or re.search(r"\.d\.[^./]+\.ts$", low):
         return False
-    # a file under node_modules is an external library: never emitted
-    if "/node_modules/" in ("/" + unit_name.replace("\\", "/").lower()):
+    # a unit under node_modules is an external library unless it is a ROOT file: the
+    # runner passes every unit as a root (compiler_runner.go) unless the last unit makes
+    # the rest non-root, and a root's lowest include depth is 0, so it is never
+    # IsSourceFileFromExternalLibrary (slice 253; until then it was never emitted)
+    if "/node_modules/" in ("/" + unit_name.replace("\\", "/").lower()) and not all_roots:
         return False
     ext = os.path.splitext(low)[1]
     if ext in (".ts", ".tsx", ".mts", ".cts"):
@@ -478,7 +481,10 @@ def main():
             if any(n == "DtsFileErrors" or n.startswith("!!!!") for n, _ in outputs) or "\n!!!! File " in btext:
                 skips["baseline carries declaration errors / noCheck notes"] += 1
                 continue
-            to_emit = [(n, c) for n, c in units if emitted(n, cfg)]
+            last_content0 = units[-1][1] if units else b""
+            last_text0 = last_content0.decode("utf-8", "replace") if isinstance(last_content0, bytes) else last_content0
+            all_roots = not bool(re.search(r"require\(", last_text0) or re.search(r"reference\s+path", last_text0) or cfg.get("noimplicitreferences"))
+            to_emit = [(n, c) for n, c in units if emitted(n, cfg, all_roots)]
             # compiler_runner.go: when the LAST unit carries a `require(` or a triple-slash
             # reference, it is the only root file and the rest reach the program through
             # references — a unit the reference did not emit was not in the program; and a
@@ -498,7 +504,7 @@ def main():
             parts = []
             for un, content in units:
                 body = content if isinstance(content, bytes) else content.encode("utf-8", "surrogateescape")
-                parts.append(b"==== TSCALY-FILE %d %d %s\n" % (len(body), 1 if emitted(un, cfg) else 0, un.encode("utf-8", "surrogateescape")))
+                parts.append(b"==== TSCALY-FILE %d %d %s\n" % (len(body), 1 if emitted(un, cfg, all_roots) else 0, un.encode("utf-8", "surrogateescape")))
                 parts.append(body)
                 parts.append(b"\n")
             groups[opts].append((vpath, b"".join(parts)))
@@ -509,12 +515,22 @@ def main():
                 for un, content in to_emit:
                     plan["units"].append((program_path(un), un, output_path(un, cfg, common), "js"))
             if declaration_on(cfg):
-                unit_names = set(os.path.basename(n) for n, _ in units)
+                unit_paths = set(program_path(n) for n, _ in units)
                 for un, content in to_emit:
                     dname = dts_output_path(un, cfg, common)
                     # a declaration output that would overwrite an input is not written
-                    # (the driver's overwrite error)
-                    if dname is not None and os.path.basename(dname) not in unit_names:
+                    # (the driver's overwrite error) — compared as FULL paths (slice 253:
+                    # by base name, `index.d.ts` beside `node_modules/inner/index.d.ts` was
+                    # never planned)
+                    if dname is None:
+                        continue
+                    out_dir = (cfg.get("declarationdir") or cfg.get("outdir") or "").replace("\\", "/")
+                    if out_dir:
+                        rel = posixpath.relpath(posixpath.dirname(program_path(un)), common) if common else "."
+                        full = posixpath.normpath(posixpath.join("/.src", out_dir, rel, os.path.basename(dname)))
+                    else:
+                        full = dts_program_path(program_path(un))
+                    if full not in unit_paths:
                         plan["units"].append((dts_program_path(program_path(un)), un, dname, "dts"))
             plans.append(plan)
 
@@ -566,7 +582,11 @@ def main():
             if okind == "dts" and ours.startswith("TSCALY-DECLARATION-BLOCKED"):
                 # the file's declaration emit reported: the reference writes no .d.ts
                 # for it, so the baseline must carry no section of that name
-                if any(n == oname for n, _ in plan["outputs"]):
+                # ★ another planned output of the same name (a node_modules unit's
+                # `index.d.ts` beside a root `index.d.ts`) owns one such section each
+                same_named = sum(1 for n, _ in plan["outputs"] if n == oname)
+                others = sum(1 for p2, u2, o2, k2 in plan["units"] if o2 == oname and u2 != un)
+                if same_named > others:
                     verdict, detail = "FAIL", "%s: declaration emit blocked here, emitted by the reference" % oname
                     break
                 continue
