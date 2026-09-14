@@ -405,62 +405,192 @@ procedure load_bundle(host: ref[Page], pf: ref[ProgramFiles], bundle: String, em
             pf.add(path_data, Slice[char](raw_copy.get_length() as int, raw_copy.get_buffer() as pointer[char]), null, null, null, false, 0)
             continue
         }
-        let script_kind Parser.supported_script_kind(path)
-        var emit_text content
-        let decoded StringBuilder^host()
-        let raw_view Slice[char](content.get_length() as int, content.get_buffer() as pointer[char])
-        if Emitter.decode_bytes(raw_view, &decoded)
-            set emit_text: decoded.to_string()
-        let text_copy String^host(emit_text)
-        var unported 0 - 1
-        var unported_tag: Slice[char] ""
-        var unported_detail 0
-        let p Parser.parse_ex(host, path, text_copy, script_kind, &unported, &unported_tag, &unported_detail)
-        if unported >= 0
-        {
-            let m String("UNPORTED `unported` `Parser.tag_text(unported_tag)` `unported_detail`")
-            Console.println(m.to_c_string())
+        if add_source_unit(host, pf, path_data, content, emit_flag, emit_options) = false
             return false
-        }
-        let file_opt Parser.source_file_of(p)
-        if file_opt = null
-        {
-            Console.println("UNPORTED 0 no-tree 0")
-            return false
-        }
-        let file file_opt as ref[AstNode]
-        var is_external Parser.external_module_indicator(file, AstNode.statements_of(file)) or Emitter.is_file_module_from_using_jsx_tag(file, script_kind, emit_options)
-        ; moduleDetection force (the default under node16..nodenext): every
-        ; non-declaration file is a module, by force alone when no statement says so
-        var forced false
-        if emit_options.module_detection_is_force() and (is_declaration_file_name(path) = false)
+    }
+    load_referenced_files(host, pf, emit_options)
+}
+
+; one source unit parsed, bound and added to the table (slice 256: load_bundle's
+; loop body, shared with the referenced files); false after an UNPORTED line
+procedure add_source_unit(host: ref[Page], pf: ref[ProgramFiles], path_data: Slice[char], content: String, emit_flag: bool, emit_options: EmitOptions) returns bool
+{
+    let path String(path_data.data as pointer[const_char], path_data.length as size_t)
+    let script_kind Parser.supported_script_kind(path)
+    var emit_text content
+    let decoded StringBuilder^host()
+    let raw_view Slice[char](content.get_length() as int, content.get_buffer() as pointer[char])
+    if Emitter.decode_bytes(raw_view, &decoded)
+        set emit_text: decoded.to_string()
+    let text_copy String^host(emit_text)
+    var unported 0 - 1
+    var unported_tag: Slice[char] ""
+    var unported_detail 0
+    let p Parser.parse_ex(host, path, text_copy, script_kind, &unported, &unported_tag, &unported_detail)
+    if unported >= 0
+    {
+        let m String("UNPORTED `unported` `Parser.tag_text(unported_tag)` `unported_detail`")
+        Console.println(m.to_c_string())
+        return false
+    }
+    let file_opt Parser.source_file_of(p)
+    if file_opt = null
+    {
+        Console.println("UNPORTED 0 no-tree 0")
+        return false
+    }
+    let file file_opt as ref[AstNode]
+    var is_external Parser.external_module_indicator(file, AstNode.statements_of(file)) or Emitter.is_file_module_from_using_jsx_tag(file, script_kind, emit_options)
+    ; moduleDetection force (the default under node16..nodenext): every
+    ; non-declaration file is a module, by force alone when no statement says so
+    var forced false
+    if emit_options.module_detection_is_force() and (is_declaration_file_name(path) = false)
+    {
+        if is_external = false
+            set forced: true
+        set is_external: true
+    }
+    ; moduleDetection auto: a `.mts`/`.cts` (or a node16+ ESM file) is a module
+    ; by its FORMAT (getSetExternalModuleIndicator's third disjunct; slice 250 —
+    ; the binder had only heard of it through the emitter's file info)
+    if is_declaration_file_name(path) = false
+    {
+        if Emitter.is_file_forced_to_be_module_by_format(path_data, emit_options)
         {
             if is_external = false
                 set forced: true
             set is_external: true
         }
-        ; moduleDetection auto: a `.mts`/`.cts` (or a node16+ ESM file) is a module
-        ; by its FORMAT (getSetExternalModuleIndicator's third disjunct; slice 250 —
-        ; the binder had only heard of it through the emitter's file info)
-        if is_declaration_file_name(path) = false
+    }
+    let b Binder.bind_source_file_ex(host, file, text_copy, path, is_external, forced)
+    if Binder.unported_at(b) >= 0
+    {
+        let m String("UNPORTED `Binder.unported_at(b)` `Parser.tag_text(Binder.unported_tag_at(b))` `Binder.unported_detail_at(b)`")
+        Console.println(m.to_c_string())
+        return false
+    }
+    pf.add(path_data, Slice[char](text_copy.get_length() as int, text_copy.get_buffer() as pointer[char]), file, b, p, emit_flag, emit_options.get_emit_module_format_of_file(path_data))
+    true
+}
+
+; the program's triple-slash `reference path` files (slice 256): filesparser.go's
+; ReferencedFiles loop over resolveTripleslashPathReference and
+; getSourceFileFromReference, over the table as it grows, so a referenced file's
+; own references are followed too. A name with an extension is taken as it is, one
+; without tries `.ts`, `.tsx`, `.d.ts`. A file that is not a bundle unit is read from
+; disk only under the harness's `/.lib` folder (harnessutil's testLibFolderMap: the
+; TypeScript submodule's tests/lib); anything else is the reference's "not found"
+; diagnostic, which no yardstick here reads.
+; ★ The reference adds a referenced file BEFORE its referrer; the table appends it.
+; The noResolve option is not one the port parses.
+procedure load_referenced_files(host: ref[Page], pf: ref[ProgramFiles], emit_options: EmitOptions) returns bool
+{
+    var i 0
+    while i < pf.count()
+    {
+        let f pf.file_at(i)
+        let containing pf.path_at(i)
+        set i: i + 1
+        if f = null
+            continue
+        let refs AstNode.referenced_files_of(f)
+        if refs = null
+            continue
+        let ra refs as ref[Array[Slice[char]]]
+        var dir_len 0
+        var s 0
+        while s < (containing.length as int)
         {
-            if Emitter.is_file_forced_to_be_module_by_format(path_data, emit_options)
+            if (containing[s as size_t] as int) = ("/" as char) as int
+                set dir_len: s
+            set s: s + 1
+        }
+        let dir containing.subslice(0, dir_len as size_t)
+        var k 0
+        while k < (ra.get_length() as int)
+        {
+            let name ra[k as size_t]
+            set k: k + 1
+            let full TsPath.normalized_absolute_path(host, name, dir)
+            if reference_has_extension(full)
             {
-                if is_external = false
-                    set forced: true
-                set is_external: true
+                if add_referenced_file(host, pf, full, emit_options) = false
+                    return false
+            }
+            else
+            {
+                var added false
+                if add_referenced_file_if_found(host, pf, Checker.concat_name(host, full, ".ts"), emit_options, &added) = false
+                    return false
+                if added = false
+                {
+                    if add_referenced_file_if_found(host, pf, Checker.concat_name(host, full, ".tsx"), emit_options, &added) = false
+                        return false
+                }
+                if added = false
+                {
+                    if add_referenced_file_if_found(host, pf, Checker.concat_name(host, full, ".d.ts"), emit_options, &added) = false
+                        return false
+                }
             }
         }
-        let b Binder.bind_source_file_ex(host, file, text_copy, path, is_external, forced)
-        if Binder.unported_at(b) >= 0
-        {
-            let m String("UNPORTED `Binder.unported_at(b)` `Parser.tag_text(Binder.unported_tag_at(b))` `Binder.unported_detail_at(b)`")
-            Console.println(m.to_c_string())
-            return false
-        }
-        pf.add(path_data, Slice[char](text_copy.get_length() as int, text_copy.get_buffer() as pointer[char]), file, b, p, emit_flag, emit_options.get_emit_module_format_of_file(path_data))
     }
     true
+}
+
+function reference_has_extension(path: Slice[char]) returns bool
+{
+    var i (path.length as int) - 1
+    while i >= 0
+    {
+        let c path[i as size_t] as int
+        if c = ("/" as char) as int
+            return false
+        if c = ("." as char) as int
+            return true
+        set i: i - 1
+    }
+    false
+}
+
+; the disk path of a `/.lib/<name>` reference, empty for any other path
+function test_lib_disk_path(host: ref[Page], path: Slice[char]) returns Slice[char]
+{
+    if path.length <= 6
+        return Slice[char]()
+    let head path.subslice(0, 6)
+    if head.equals("/.lib/") = false
+        return Slice[char]()
+    Checker.concat_name(host, "packages/tscaly/_submodules/typescript-go/_submodules/TypeScript/tests/lib/", path.slice_from(6))
+}
+
+procedure add_referenced_file(host: ref[Page], pf: ref[ProgramFiles], path: Slice[char], emit_options: EmitOptions) returns bool
+{
+    var added false
+    add_referenced_file_if_found(host, pf, path, emit_options, &added)
+}
+
+; the table's file of that path when it exists; otherwise a `/.lib` file read and
+; added (never emitted); `added` says whether the path is in the table afterwards
+procedure add_referenced_file_if_found(host: ref[Page], pf: ref[ProgramFiles], path: Slice[char], emit_options: EmitOptions, added: ref[bool]) returns bool
+{
+    if pf.index_of_path(path) >= 0
+    {
+        set added: true
+        return true
+    }
+    if bundle_unit_is_source(path) = false
+        return true
+    let disk test_lib_disk_path(host, path)
+    if disk.length = 0
+        return true
+    let disk_s String^host(disk.data as pointer[const_char], disk.length as size_t)
+    if File.exists(disk_s) = false
+        return true
+    let raw File.read_to_string(disk_s)
+    let text String^host(raw)
+    set added: true
+    add_source_unit(host, pf, path, text, false, emit_options)
 }
 
 ; the case BUNDLE (slice 248): `==== TSCALY-FILE <bytes> <emit 0|1> <unit>` lines
