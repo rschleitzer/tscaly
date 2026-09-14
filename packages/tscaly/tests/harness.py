@@ -385,6 +385,70 @@ def run_batch(binary, flag, units, scratch, jobs, timeout):
     return results
 
 
+def run_batch_groups(binary, groups, jobs, timeout, chunk_size=25):
+    """run_batch over MANY option groups at once: [(flag, units, scratch)] → one
+    {path: (rc, body, err)}. Every group is cut into chunks of about `chunk_size`
+    units and ALL chunks share one pool of `jobs` workers, largest first — the
+    per-group loop ran the long tail of one- and two-case groups one process at a
+    time on one core. Paths must be unique across the groups."""
+    tasks = []
+    for gi, (flag, units, scratch) in enumerate(groups):
+        units = list(units)
+        if not units:
+            continue
+        os.makedirs(scratch, exist_ok=True)
+        k = max(1, -(-len(units) // chunk_size))
+        for ci, chunk in enumerate(_chunks(units, k)):
+            tasks.append((len(chunk), gi, ci, flag, chunk, scratch))
+    tasks.sort(key=lambda t: (-t[0], t[1], t[2]))
+    results = {}
+    rlock = threading.Lock()
+    tlock = threading.Lock()
+
+    def one_chunk(ci, flag, pending, scratch):
+        attempt = 0
+        while pending:
+            path = os.path.join(scratch, "units.%d.%d" % (ci, attempt))
+            write_units_file(path, pending)
+            argv = [binary] + ([flag] if flag else []) + ["--batch", path]
+            rc, out, err, timed_out = stream_process(argv, None, timeout)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            complete, in_progress = parse_dump_stream(out)
+            with rlock:
+                for p, body in complete.items():
+                    results[p] = (0, body, b"")
+            done = len(complete)
+            if rc == 0 and not timed_out and in_progress is None and done == len(pending):
+                return
+            if in_progress is not None:
+                blamed = in_progress
+            elif done < len(pending):
+                blamed = pending[done][0]
+            else:
+                return
+            with rlock:
+                results[blamed] = (TIMED_OUT if timed_out else (rc if rc else 1), b"", err[-4000:])
+                pending = [u for u in pending if u[0] not in results]
+            attempt += 1
+
+    def worker():
+        while True:
+            with tlock:
+                if not tasks:
+                    return
+                _, _, ci, flag, chunk, scratch = tasks.pop(0)
+            one_chunk(ci, flag, chunk, scratch)
+
+    threads = [threading.Thread(target=worker) for _ in range(max(1, jobs))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
+
 def run_oracle(binary, out_dir, selected, jobs, timeout):
     """The reference side: `oracle_batch <out dir>` fed `<case file>\\t<name>` lines,
     in `jobs` chunks. → {name: case dict} (see parse_oracle_stream). A case the

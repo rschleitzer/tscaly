@@ -276,8 +276,8 @@ def main():
     binary = casejs.stack_wrapper(args)
     answers = {}
     print("cases planned %d, configurations skipped %d, in %d option groups" % (len(plans), sum(skips.values()), len(groups)), flush=True)
-    for gi, (opts, items) in enumerate(sorted(groups.items(), key=lambda kv: -len(kv[1]))):
-        answers.update(harness.run_batch(binary, "--errors=" + opts, items, os.path.join(args.scratch, "g%d" % gi), args.jobs, args.timeout))
+    answers.update(harness.run_batch_groups(binary, [("--errors=" + opts, items, os.path.join(args.scratch, "g%d" % gi))
+                                                     for gi, (opts, items) in enumerate(sorted(groups.items()))], args.jobs, args.timeout))
 
     counts, stops, verdicts = collections.Counter(), collections.Counter(), []
     missing_codes, extra_codes = collections.Counter(), collections.Counter()

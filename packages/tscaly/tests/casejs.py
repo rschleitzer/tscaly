@@ -520,9 +520,10 @@ def read_tsconfigs(args, case_rows):
         groups[settings.get("currentdirectory", "").strip()].append(("/tsconfig/" + name, b"".join(parts)))
     out = {}
     binary = stack_wrapper(args)
-    for gi, (cwd, items) in enumerate(sorted(groups.items())):
-        flag = "--tsconfig=" + (("currentdirectory=" + cwd) if cwd else "")
-        res = harness.run_batch(binary, flag, items, os.path.join(args.scratch, "t%d" % gi), args.jobs, args.timeout)
+    ordered = sorted(groups.items())
+    res = harness.run_batch_groups(binary, [("--tsconfig=" + (("currentdirectory=" + cwd) if cwd else ""), items, os.path.join(args.scratch, "t%d" % gi))
+                                            for gi, (cwd, items) in enumerate(ordered)], args.jobs, args.timeout)
+    for cwd, items in ordered:
         for vpath, _ in items:
             name = vpath[len("/tsconfig/"):]
             rc, body, err = res.get(vpath, (None, b"", b""))
@@ -782,9 +783,8 @@ def main():
     print("pairs whose DtsFileErrors section is not compared: %d" % dts_error_pairs[0])
     print("cases planned %d, configurations skipped %d, units to emit %d in %d option groups" % (
         len(plans), sum(skips.values()), total_units, len(groups)), flush=True)
-    for gi, (opts, units) in enumerate(sorted(groups.items(), key=lambda kv: -len(kv[1]))):
-        res = harness.run_batch(binary, "--emit=" + opts, units, os.path.join(args.scratch, "g%d" % gi), args.jobs, args.timeout)
-        answers.update(res)
+    answers.update(harness.run_batch_groups(binary, [("--emit=" + opts, units, os.path.join(args.scratch, "g%d" % gi))
+                                                     for gi, (opts, units) in enumerate(sorted(groups.items()))], args.jobs, args.timeout))
 
     # ── verdicts ──
     verdicts = []
