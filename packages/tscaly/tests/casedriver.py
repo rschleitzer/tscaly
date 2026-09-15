@@ -433,6 +433,8 @@ def sanitize_output(text, for_comparing=False):
     def add(line):
         line = line.replace("'%s'" % TS_VERSION, "'FakeTSVersion'")
         line = line.replace("Version " + TS_VERSION, "Version FakeTSVersion")
+        # czechVersion → fakeCzechVersion (Version_0 localized for "cs")
+        line = line.replace("Verze " + TS_VERSION, "Verze FakeTSVersion")
         out.append(sanitize_internal_symbol_names(line))
 
     i = 0
