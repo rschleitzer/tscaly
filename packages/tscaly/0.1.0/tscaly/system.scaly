@@ -23,6 +23,8 @@ use tscaly.program.JsonValue
 use tscaly.program.JsonParser
 use tscaly.buildinfojson.JsonText
 use tscaly.buildinfojson.ReadableBuildInfo
+use tscaly.watcher.Watcher
+use tscaly.build.Orchestrator
 
 ; one entry of the map file system: a regular file, or a symlink to `link_target`
 define VfsFile (path: Slice[char]  text: Slice[char]  mtime: int  is_link: bool  link_target: Slice[char])
@@ -57,13 +59,23 @@ define ExecSystem
     trace_cache_found: ref[Array[bool]]
     ; a tsc -b task's trace writer (its own output, no cache), null for the writer
     trace_target: ref[StringBuilder]?
+    ; the fsDiffer's serialized snapshot after a step's baseline: each regular file's
+    ; path, text and modification time (ChangedPaths compares against it)
+    post_files: ref[Array[ref[VfsFile]]]
+    ; the command's watcher (CommandLineResult.Watcher), null without --watch: tsc's
+    ; or the build orchestrator
+    watcher: ref[Watcher]?
+    build_watcher: ref[Orchestrator]?
+    ; the map file system's directories: every ancestor of a file or link ever
+    ; written (a removal leaves its directory behind)
+    directories: ref[Array[Slice[char]]]
 )
 {
     function create(host: ref[Page], cwd: Slice[char], case_sensitive: bool) returns ref[ExecSystem]
     {
         let lib_path: Slice[char] "/home/src/tslibs/TS/Lib"
         let none: Slice[char] ""
-        &ExecSystem^host(host, ExecSystem.copy(host, cwd), case_sensitive, &Array[ref[VfsFile]?]^host(), 0, &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), lib_path, &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &StringBuilder^host(), none, &StringBuilder^host(), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[bool]^host(), null)
+        &ExecSystem^host(host, ExecSystem.copy(host, cwd), case_sensitive, &Array[ref[VfsFile]?]^host(), 0, &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), lib_path, &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &StringBuilder^host(), none, &StringBuilder^host(), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[bool]^host(), null, &Array[ref[VfsFile]]^host(), null, null, &Array[Slice[char]]^host())
     }
 
     function copy(host: ref[Page], s: Slice[char]) returns Slice[char]
@@ -171,9 +183,27 @@ define ExecSystem
         }
     }
 
+    ; MkdirAll for a path's parent
+    procedure add_ancestors(this, path: Slice[char])
+    {
+        var end (path.length as int) - 1
+        while end > 0
+        {
+            if (path[end as size_t] as int) = ("/" as char) as int
+            {
+                let dir path.subslice(0, end as size_t)
+                if ExecSystem.contains(directories, dir)
+                    return
+                directories.add(ExecSystem.copy(host, dir))
+            }
+            set end: end - 1
+        }
+    }
+
     ; the map file system's write (vfstest): the modification time is the clock's
     procedure put_file(this, path: Slice[char], text: Slice[char])
     {
+        this.add_ancestors(path)
         let mtime this.now()
         let none: Slice[char] ""
         let entry &VfsFile^host(ExecSystem.copy(host, path), ExecSystem.copy(host, text), mtime, false, none)
@@ -186,6 +216,7 @@ define ExecSystem
 
     procedure put_link(this, path: Slice[char], target: Slice[char])
     {
+        this.add_ancestors(path)
         let none: Slice[char] ""
         let entry &VfsFile^host(ExecSystem.copy(host, path), none, 0, true, ExecSystem.copy(host, target))
         let i this.find_index(path)
@@ -246,8 +277,10 @@ define ExecSystem
             set use_cache: false
         }
         let text this.sanitize_trace(message, use_cache)
+        out.append("!!! Trace start\n")
         out.append(text.data, text.length)
         out.append("\n")
+        out.append("!!! Trace end\n")
     }
 
     procedure reset_trace_cache(this)
@@ -348,6 +381,76 @@ define ExecSystem
             snapshot_paths.add(f.path)
             snapshot_mtimes.add(f.mtime)
         }
+    }
+
+    ; FSDiffer.BaselineFSwithDiff's snapshot: the regular files as they are now
+    procedure take_post_snapshot(this)
+    {
+        set this.post_files: &Array[ref[VfsFile]]^host()
+        var i 0
+        while i < (files.get_length() as int)
+        {
+            let entry files[i as size_t]
+            set i: i + 1
+            if entry = null
+                continue
+            let f entry as ref[VfsFile]
+            if f.is_link
+                continue
+            post_files.add(&VfsFile^host(f.path, f.text, f.mtime, false, f.link_target))
+        }
+    }
+
+    ; FSDiffer.ChangedPaths: the files new, rewritten or touched since the snapshot,
+    ; then the ones deleted
+    procedure changed_paths(this, out_deleted: ref[Array[bool]]) returns ref[Array[Slice[char]]]
+    {
+        let out &Array[Slice[char]]^host()
+        var i 0
+        while i < (files.get_length() as int)
+        {
+            let entry files[i as size_t]
+            set i: i + 1
+            if entry = null
+                continue
+            let f entry as ref[VfsFile]
+            if f.is_link
+                continue
+            var found false
+            var changed false
+            var k 0
+            while k < (post_files.get_length() as int)
+            {
+                let old post_files[k as size_t]
+                set k: k + 1
+                if old.path.equals(f.path)
+                {
+                    set found: true
+                    if old.mtime <> f.mtime
+                        set changed: true
+                    if old.text.equals(f.text) = false
+                        set changed: true
+                    break
+                }
+            }
+            if (found = false) or changed
+            {
+                out.add(f.path)
+                out_deleted.add(false)
+            }
+        }
+        var d 0
+        while d < (post_files.get_length() as int)
+        {
+            let old post_files[d as size_t]
+            set d: d + 1
+            if this.find_index(old.path) < 0
+            {
+                out.add(old.path)
+                out_deleted.add(true)
+            }
+        }
+        out
     }
 
     ; the modification time of a file, -1 when there is none
@@ -479,6 +582,14 @@ define ExecSystem
                 if this.same_path(p.subslice(0, path.length), path)
                     return true
             }
+        }
+        var d 0
+        while d < (directories.get_length() as int)
+        {
+            let known directories[d as size_t]
+            if this.same_path(known, path)
+                return true
+            set d: d + 1
         }
         false
     }

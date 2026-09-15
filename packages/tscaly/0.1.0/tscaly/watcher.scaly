@@ -1,0 +1,1213 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; watcher — internal/execute/watcher.go (tsc --watch) and watchmanager, over the
+; harness's mock watch backend (tsctests/mock_watch_backend.go).
+;
+; ★ The backend is the harness's: a watch is a registration record, an edit is
+; delivered as the fsDiffer's changed paths (each file plus its ancestor
+; directories) through every open registration whose path covers it, and the
+; baseline prints the open registrations sorted. A cycle runs synchronously when
+; the runner asks (Watcher.DoCycle), so the watch manager's locks and its run loop
+; have no counterpart.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use tscaly.program.ProgramFiles
+use tscaly.program.JsonValue
+use tscaly.tsoptions.TsOptions
+use tscaly.tsoptions.TsGlobMatcher
+use tscaly.tsoptions.TsGlobPattern
+use tscaly.tsoptions.ProjectReference
+use tscaly.tsoptions.TsConfigParser
+use tscaly.tsoptions.TsParsedCommandLine
+use tscaly.buildinfojson.JsonText
+use tscaly.system.ExecSystem
+use tscaly.system.VfsFile
+use tscaly.commandline.CommandLine
+use tscaly.commandline.ParsedCommandLine
+use tscaly.diagnosticwriter.DriverDiagnostic
+use tscaly.diagnosticwriter.DiagnosticWriter
+use tscaly.programhost.DriverProgram
+use tscaly.programhost.ConfigFiles
+use tscaly.incremental.IncProgram
+use tscaly.incremental.IncSnapshot
+use tscaly.incremental.IncSort
+use tscaly.incremental.ToSnapshot
+use tscaly.execute.Execute
+use tscaly.execute.Reporter
+use tscaly.execute.CompileOutcome
+
+; one directory watch: the directory and whether it is recursive
+define WatchedDir (dir: Slice[char]  recursive: bool)
+
+; watchmanager.WatchManager with the mock backend's registrations
+define WatchManager
+(
+    host: ref[Page]
+    sys: ref[ExecSystem]
+    ; wm.watchedDirs (the backend's open registrations)
+    dirs: ref[Array[WatchedDir]]
+    ; MockWatchBackend.HasWatches: something was ever registered
+    registered: bool
+    ; the events accumulated since the last drain (changedPaths), and whether each
+    ; is a delete (its EventKind)
+    changed: ref[Array[Slice[char]]]
+    changed_deleted: ref[Array[bool]]
+)
+{
+    function create(host: ref[Page], sys: ref[ExecSystem]) returns ref[WatchManager]
+        &WatchManager^host(host, sys, &Array[WatchedDir]^host(), false, &Array[Slice[char]]^host(), &Array[bool]^host())
+
+    ; a map keyed by directory: the index of `dir` in `list`, -1 for none
+    function index_of_dir(list: ref[Array[WatchedDir]], dir: Slice[char]) returns int
+    {
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            let d list[i as size_t]
+            if d.dir.equals(dir)
+                return i
+            set i: i + 1
+        }
+        0 - 1
+    }
+
+    ; ResolveDesiredDirs: each directory, or its nearest existing ancestor (never
+    ; recursive), when that is watchable; two that meet are recursive if either is
+    procedure resolve_desired_dirs(this, desired: ref[Array[WatchedDir]]) returns ref[Array[WatchedDir]]
+    {
+        let resolved &Array[WatchedDir]^host()
+        var i 0
+        while i < (desired.get_length() as int)
+        {
+            let d desired[i as size_t]
+            set i: i + 1
+            var watch_dir d.dir
+            var recursive d.recursive
+            while sys.directory_exists(watch_dir) = false
+            {
+                let parent get_directory_path(host, watch_dir)
+                if parent.equals(watch_dir)
+                    break
+                set watch_dir: parent
+                set recursive: false
+            }
+            if sys.directory_exists(watch_dir) = false
+                continue
+            if WatchManager.can_watch_directory(host, watch_dir) = false
+                continue
+            let at WatchManager.index_of_dir(resolved, watch_dir)
+            if at >= 0
+            {
+                let existing resolved[at as size_t]
+                resolved.put(at as size_t, WatchedDir(watch_dir, existing.recursive or recursive))
+            }
+            else
+                resolved.add(WatchedDir(watch_dir, recursive))
+        }
+        resolved
+    }
+
+    ; ReconcileWatches: the open registrations become the desired ones
+    procedure reconcile_watches(this, desired: ref[Array[WatchedDir]])
+    {
+        var i 0
+        while i < (desired.get_length() as int)
+        {
+            let d desired[i as size_t]
+            set i: i + 1
+            let at WatchManager.index_of_dir(dirs, d.dir)
+            var added at < 0
+            if added = false
+            {
+                let old dirs[at as size_t]
+                if old.recursive <> d.recursive
+                    set added: true
+            }
+            if added
+                set registered: true
+        }
+        set dirs: desired
+    }
+
+    ; IsDirCoveredByWatch
+    function is_dir_covered_by_watch(sys: ref[ExecSystem], list: ref[Array[WatchedDir]], dir: Slice[char]) returns bool
+    {
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            let d list[i as size_t]
+            set i: i + 1
+            if d.recursive
+            {
+                if WatchManager.contains_path(sys, d.dir, dir)
+                    return true
+            }
+            else
+            {
+                if sys.same_path(d.dir, dir)
+                    return true
+            }
+        }
+        false
+    }
+
+    ; IsPathUnderWatch
+    function is_path_under_watch(this, path: Slice[char]) returns bool
+    {
+        var i 0
+        while i < (dirs.get_length() as int)
+        {
+            let d dirs[i as size_t]
+            set i: i + 1
+            if WatchManager.contains_path(sys, d.dir, path)
+                return true
+        }
+        false
+    }
+
+    ; tspath.ContainsPath over normalized absolute paths
+    function contains_path(sys: ref[ExecSystem], parent: Slice[char], child: Slice[char]) returns bool
+    {
+        if sys.same_path(parent, child)
+            return true
+        if child.length <= parent.length
+            return false
+        if sys.same_path(child.subslice(0, parent.length), parent) = false
+            return false
+        if parent.ends_with("/")
+            return true
+        (child[parent.length] as int) = ("/" as char) as int
+    }
+
+    ; CanWatchDirectory
+    function can_watch_directory(host: ref[Page], dir: Slice[char]) returns bool
+    {
+        let components get_path_components(host, dir, Slice[char]())
+        let length components.get_length() as int
+        if length <= 2
+            return false
+        let root_length WatchManager.perceived_os_root_length_for_watching(components)
+        length > (root_length + 1)
+    }
+
+    ; PerceivedOsRootLengthForWatching
+    function perceived_os_root_length_for_watching(components: ref[Array[Slice[char]]]) returns int
+    {
+        let length components.get_length() as int
+        if length <= 1
+            return 1
+        let root components[0]
+        var index_after_os_root 1
+        var is_dos_style WatchManager.is_volume_prefix(root)
+        if (root.equals("/") = false) and (is_dos_style = false)
+        {
+            let second components[1]
+            if WatchManager.is_volume_prefix_dollar(second)
+            {
+                if length = 2
+                    return 2
+                set index_after_os_root: 2
+                set is_dos_style: true
+            }
+        }
+        if is_dos_style
+        {
+            if index_after_os_root >= length
+                return index_after_os_root
+            if TsGlobPattern.equal_fold(components[index_after_os_root as size_t], "users") = false
+                return index_after_os_root
+        }
+        if index_after_os_root < length
+        {
+            if TsGlobPattern.equal_fold(components[index_after_os_root as size_t], "workspaces")
+                return index_after_os_root + 1
+        }
+        index_after_os_root + 2
+    }
+
+    ; `c:` at the start
+    function is_volume_prefix(s: Slice[char]) returns bool
+    {
+        if (s.length as int) < 2
+            return false
+        if is_volume_character(s[0] as int) = false
+            return false
+        (s[1] as int) = (":" as char) as int
+    }
+
+    ; `c$` (a UNC administrative share)
+    function is_volume_prefix_dollar(s: Slice[char]) returns bool
+    {
+        if (s.length as int) < 2
+            return false
+        if is_volume_character(s[0] as int) = false
+            return false
+        s.ends_with("$")
+    }
+
+    ; ShouldIgnoreWatchPath
+    function should_ignore_watch_path(path: Slice[char]) returns bool
+    {
+        if path.ends_with("/.git")
+            return true
+        if index_of_literal(path, "/.git/") >= 0
+            return true
+        if index_of_literal(path, "/node_modules/.") >= 0
+            return true
+        index_of_literal(path, "/.#") >= 0
+    }
+
+    ; pathIsUnder: a child of `dir`, a direct one unless recursive
+    function path_is_under(event_path: Slice[char], dir: Slice[char], recursive: bool) returns bool
+    {
+        if event_path.starts_with(dir) = false
+            return false
+        let rest event_path.slice_from(dir.length)
+        if (rest.length as int) = 0
+            return false
+        if (rest[0] as int) <> ("/" as char) as int
+            return false
+        if recursive
+            return true
+        index_of_byte(rest, 1, ("/" as char) as int) < 0
+    }
+
+    ; MockWatchBackend.SendChangedPaths: each changed file and its ancestor
+    ; directories, delivered through the registrations that cover them
+    procedure send_changed_paths(this, changes: ref[Array[Slice[char]]], changes_deleted: ref[Array[bool]])
+    {
+        let events &Array[Slice[char]]^host()
+        let events_deleted &Array[bool]^host()
+        let seen_dirs &Array[Slice[char]]^host()
+        var i 0
+        while i < (changes.get_length() as int)
+        {
+            let path changes[i as size_t]
+            events.add(path)
+            events_deleted.add(changes_deleted[i as size_t])
+            set i: i + 1
+            var dir WatchManager.path_dir(path)
+            while ((dir.length as int) > 0) and (dir.equals("/") = false) and (dir.equals(".") = false)
+            {
+                if ExecSystem.contains(seen_dirs, dir)
+                    break
+                seen_dirs.add(dir)
+                events.add(dir)
+                events_deleted.add(false)
+                let parent WatchManager.path_dir(dir)
+                if parent.equals(dir)
+                    break
+                set dir: parent
+            }
+        }
+        var e 0
+        while e < (events.get_length() as int)
+        {
+            let event events[e as size_t]
+            set e: e + 1
+            if WatchManager.should_ignore_watch_path(event)
+                continue
+            var delivered false
+            var w 0
+            while w < (dirs.get_length() as int)
+            {
+                let d dirs[w as size_t]
+                set w: w + 1
+                if WatchManager.path_is_under(event, d.dir, d.recursive)
+                {
+                    set delivered: true
+                    break
+                }
+            }
+            if delivered
+            {
+                var at 0 - 1
+                var c 0
+                while c < (changed.get_length() as int)
+                {
+                    let known changed[c as size_t]
+                    if known.equals(event)
+                    {
+                        set at: c
+                        break
+                    }
+                    set c: c + 1
+                }
+                if at >= 0
+                    changed_deleted.put(at as size_t, events_deleted[(e - 1) as size_t])
+                else
+                {
+                    changed.add(event)
+                    changed_deleted.add(events_deleted[(e - 1) as size_t])
+                }
+            }
+        }
+    }
+
+    ; path.Dir over a slash path: the part before the last slash, "/" for a root
+    ; child, "." for none
+    function path_dir(p: Slice[char]) returns Slice[char]
+    {
+        var i (p.length as int) - 1
+        while i >= 0
+        {
+            if (p[i as size_t] as int) = ("/" as char) as int
+                break
+            set i: i - 1
+        }
+        if i < 0
+            return "."
+        if i = 0
+            return "/"
+        p.subslice(0, i as size_t)
+    }
+
+    ; DrainEvents
+    procedure drain_events(this) returns ref[Array[Slice[char]]]
+    {
+        let drained changed
+        set changed: &Array[Slice[char]]^host()
+        set changed_deleted: &Array[bool]^host()
+        drained
+    }
+
+    ; CreateWatchStatusReporter: the harness's markers, the screen cleared for a
+    ; starting code, the time and the flattened message, then two newlines
+    procedure write_watch_status(sys: ref[ExecSystem], status_options: ref[TsOptions], code: int, args: ref[Array[String]]?)
+    {
+        let host sys.host
+        let out sys.output
+        out.append("!!! Watch Status Report Start\n")
+        var clear (code = DiagStarting_compilation_in_watch_mode) or (code = DiagFile_change_detected_Starting_incremental_compilation)
+        if status_options.tristate_of("preserveWatchOutput") = 1
+            set clear: false
+        if status_options.tristate_of("extendedDiagnostics") = 1
+            set clear: false
+        if status_options.tristate_of("diagnostics") = 1
+            set clear: false
+        if clear
+        {
+            out.append(27 as char)
+            out.append("[2J")
+            out.append(27 as char)
+            out.append("[3J")
+            out.append(27 as char)
+            out.append("[H")
+        }
+        sys.now()
+        let none: Slice[char] ""
+        let d &DriverDiagnostic^host(none, none, 0, 0, code, args, null, null)
+        if Execute.should_be_pretty(sys, status_options)
+        {
+            out.append("[")
+            out.append(27 as char)
+            out.append("[90m")
+            out.append("12:00:00 AM")
+            out.append(27 as char)
+            out.append("[0m")
+            out.append("] ")
+        }
+        else
+            out.append("12:00:00 AM - ")
+        DiagnosticWriter.write_flattened_message(out, d, "\n")
+        out.append("\n\n")
+        out.append("!!! Watch Status Report End\n")
+    }
+
+    procedure write_error_count(sys: ref[ExecSystem], status_options: ref[TsOptions], count: int)
+    {
+        let host sys.host
+        if count = 1
+        {
+            WatchManager.write_watch_status(sys, status_options, DiagFound_1_error_Watching_for_file_changes, null)
+            return
+        }
+        var sb StringBuilder()
+        sb.append(count)
+        let text String^host(sb.to_string())
+        WatchManager.write_watch_status(sys, status_options, DiagFound_0_errors_Watching_for_file_changes, CommandLine.args1(host, Slice[char](text.get_length(), text.get_buffer() as pointer[char])))
+    }
+
+    ; MockWatchBackend.WatchState
+    procedure watch_state(this, out: ref[StringBuilder])
+    {
+        out.append("Watch Registrations::\n")
+        out.append("Directory watches::\n")
+        let sorted &Array[Slice[char]]^host()
+        var i 0
+        while i < (dirs.get_length() as int)
+        {
+            let d dirs[i as size_t]
+            IncSort.insert_sorted(sorted, d.dir)
+            set i: i + 1
+        }
+        if sorted.get_length() = 0
+            out.append("  (none)\n")
+        var k 0
+        while k < (sorted.get_length() as int)
+        {
+            let dir sorted[k as size_t]
+            set k: k + 1
+            out.append("  ")
+            out.append(dir.data, dir.length)
+            let at WatchManager.index_of_dir(dirs, dir)
+            let d dirs[at as size_t]
+            if d.recursive
+                out.append(" (recursive)")
+            out.append("\n")
+        }
+    }
+}
+
+; a config file's modification time as doBuild recorded it
+define ConfigMtime (path: Slice[char]  mtime: int)
+
+; execute.Watcher
+define Watcher
+(
+    host: ref[Page]
+    sys: ref[ExecSystem]
+    ; compilerOptionsFromCommandLine and commandLineRaw
+    cl: ref[ParsedCommandLine]
+    config_file_name: Slice[char]
+    ; w.config: the options, the file names, the config text and its parse
+    ; diagnostics, the parse itself (null without a config)
+    options: ref[TsOptions]
+    root_names: ref[Array[Slice[char]]]
+    config_text: Slice[char]
+    config_diagnostics: ref[Array[ref[DriverDiagnostic]]]
+    config: ref[TsParsedCommandLine]?
+    report_diagnostic: Reporter
+    summary_pretty: bool
+    ; the watch status reporter's options (the config's at creation)
+    status_options: ref[TsOptions]
+    program: ref[IncProgram]?
+    ; the program before the first build: ReadBuildInfoProgram's snapshot
+    old_snapshot: ref[IncSnapshot]?
+    config_modified: bool
+    config_has_errors: bool
+    config_file_paths: ref[Array[Slice[char]]]
+    wm: ref[WatchManager]
+    ; seenFiles, as paths
+    seen_files: ref[Array[Slice[char]]]
+    config_mtimes: ref[Array[ConfigMtime]]
+)
+{
+    procedure create(sys: ref[ExecSystem], cl: ref[ParsedCommandLine], options: ref[TsOptions], root_names: ref[Array[Slice[char]]], config_file_name: Slice[char], config_text: Slice[char], config_diagnostics: ref[Array[ref[DriverDiagnostic]]], config: ref[TsParsedCommandLine]?, report_diagnostic: Reporter, summary_pretty: bool) returns ref[Watcher]
+    {
+        let host sys.host
+        &Watcher^host(host, sys, cl, config_file_name, options, root_names, config_text, config_diagnostics, config, report_diagnostic, summary_pretty, options, null, null, false, false, &Array[Slice[char]]^host(), WatchManager.create(host, sys), &Array[Slice[char]]^host(), &Array[ConfigMtime]^host())
+    }
+
+    function stopped(this) returns bool
+        (sys.stop_tag.length as int) > 0
+
+    procedure report_watch_status(this, code: int, args: ref[Array[String]]?)
+        WatchManager.write_watch_status(sys, status_options, code, args)
+
+    procedure report_error_count(this, count: int)
+        WatchManager.write_error_count(sys, status_options, count)
+
+    ; tspath.ToPath: the canonical form a path set is keyed on
+    function to_path(this, file_name: Slice[char]) returns Slice[char]
+        Watcher.to_path_of(sys, file_name)
+
+    function to_path_of(sys: ref[ExecSystem], file_name: Slice[char]) returns Slice[char]
+    {
+        let absolute get_normalized_absolute_path(sys.host, file_name, sys.cwd)
+        if sys.case_sensitive
+            return absolute
+        TsConfigParser.to_lower(sys.host, absolute)
+    }
+
+    ; the config file and the files it extends
+    procedure set_config_file_paths(this)
+    {
+        set config_file_paths: &Array[Slice[char]]^host()
+        if (config_file_name.length as int) = 0
+            return
+        config_file_paths.add(config_file_name)
+        if config = null
+            return
+        let extended (config as ref[TsParsedCommandLine]).extended_files
+        var i 0
+        while i < (extended.get_length() as int)
+        {
+            config_file_paths.add(extended[i as size_t])
+            set i: i + 1
+        }
+    }
+
+    ; Watcher.start
+    procedure start(this)
+    {
+        let shell DriverProgram.create(host, sys, options, root_names, config_file_name, config_text, config_diagnostics)
+        set shell.root_config: config
+        set this.old_snapshot: ToSnapshot.read(host, shell)
+        this.set_config_file_paths()
+        this.report_watch_status(DiagStarting_compilation_in_watch_mode, null)
+        this.do_build()
+    }
+
+    ; the map file system as a program's file table (for a glob or a realpath)
+    procedure files_of_system(this) returns ref[ProgramFiles]
+        Watcher.system_files(sys)
+
+    procedure system_files(sys: ref[ExecSystem]) returns ref[ProgramFiles]
+    {
+        let host sys.host
+        let pf ProgramFiles.create(host)
+        set pf.directory_paths: sys.directories
+        var fi 0
+        while fi < (sys.files.get_length() as int)
+        {
+            let entry sys.files[fi as size_t]
+            set fi: fi + 1
+            if entry = null
+                continue
+            let f entry as ref[VfsFile]
+            if f.is_link
+                pf.add_link(f.path, f.link_target)
+            else
+                pf.add(f.path, f.text, null, null, null, false, 0)
+        }
+        pf
+    }
+
+    ; ParsedCommandLine.WildcardDirectories (getWildcardDirectories)
+    procedure wildcard_directories(this) returns ref[Array[WatchedDir]]
+        Watcher.wildcard_directories_of(sys, config)
+
+    procedure wildcard_directories_of(sys: ref[ExecSystem], config: ref[TsParsedCommandLine]?) returns ref[Array[WatchedDir]]
+    {
+        let host sys.host
+        let out &Array[WatchedDir]^host()
+        if config = null
+            return out
+        let c config as ref[TsParsedCommandLine]
+        if c.include_specs.get_length() = 0
+            return out
+        let exclude_matcher TsGlobMatcher.create(host, &Array[Slice[char]]^host(), c.exclude_specs, c.base_path, TsGlobUsageFiles)
+        let keys &Array[Slice[char]]^host()
+        let key_paths &Array[Slice[char]]^host()
+        let recursive_keys &Array[Slice[char]]^host()
+        var i 0
+        while i < (c.include_specs.get_length() as int)
+        {
+            let file c.include_specs[i as size_t]
+            set i: i + 1
+            let spec get_normalized_absolute_path(host, file, c.base_path)
+            var excluded false
+            var e 0
+            while e < (exclude_matcher.excludes.get_length() as int)
+            {
+                let pattern exclude_matcher.excludes[e as size_t]
+                if pattern.matches(spec)
+                    set excluded: true
+                set e: e + 1
+            }
+            if excluded
+                continue
+            var path Slice[char]()
+            var recursive false
+            if Watcher.wildcard_directory_from_spec(spec, &path, &recursive) = false
+                continue
+            let key Watcher.canonical_key_of(sys, path)
+            let ki TsConfigParser.index_in(keys, key)
+            var existing_recursive false
+            var existing_path Slice[char]()
+            if ki >= 0
+            {
+                set existing_path: key_paths[ki as size_t]
+                let at WatchManager.index_of_dir(out, existing_path)
+                if at >= 0
+                {
+                    let existing out[at as size_t]
+                    set existing_recursive: existing.recursive
+                }
+            }
+            if (ki < 0) or ((existing_recursive = false) and recursive)
+            {
+                var path_to_use path
+                if ki >= 0
+                    set path_to_use: existing_path
+                let at WatchManager.index_of_dir(out, path_to_use)
+                if at >= 0
+                    out.put(at as size_t, WatchedDir(path_to_use, recursive))
+                else
+                    out.add(WatchedDir(path_to_use, recursive))
+                if ki < 0
+                {
+                    keys.add(key)
+                    key_paths.add(path)
+                }
+                if recursive
+                    recursive_keys.add(key)
+            }
+        }
+        ; subpaths under a recursively watched directory go
+        let kept &Array[WatchedDir]^host()
+        var k 0
+        while k < (out.get_length() as int)
+        {
+            let d out[k as size_t]
+            set k: k + 1
+            let key Watcher.canonical_key_of(sys, d.dir)
+            var covered false
+            var r 0
+            while r < (recursive_keys.get_length() as int)
+            {
+                let recursive_key recursive_keys[r as size_t]
+                set r: r + 1
+                if recursive_key.equals(key)
+                    continue
+                if WatchManager.contains_path(sys, recursive_key, key)
+                    set covered: true
+            }
+            if covered = false
+                kept.add(d)
+        }
+        kept
+    }
+
+    function canonical_key_of(sys: ref[ExecSystem], path: Slice[char]) returns Slice[char]
+    {
+        if sys.case_sensitive
+            return path
+        TsConfigParser.to_lower(sys.host, path)
+    }
+
+    ; getWildcardDirectoryFromSpec
+    function wildcard_directory_from_spec(spec: Slice[char], out_path: ref[Slice[char]], out_recursive: ref[bool]) returns bool
+    {
+        var first_wildcard 0 - 1
+        var i 0
+        while i < (spec.length as int)
+        {
+            let c spec[i as size_t] as int
+            if (c = ("*" as char) as int) or (c = ("?" as char) as int)
+            {
+                set first_wildcard: i
+                break
+            }
+            set i: i + 1
+        }
+        let last_sep Watcher.last_slash(spec, spec.length as int)
+        if first_wildcard >= 0
+        {
+            let last_sep_before Watcher.last_slash(spec, first_wildcard)
+            if last_sep_before >= 0
+            {
+                set out_path.data: spec.data
+                set out_path.length: last_sep_before as size_t
+                set out_recursive: first_wildcard < last_sep
+                return true
+            }
+        }
+        if last_sep >= 0
+        {
+            let last_segment spec.slice_from((last_sep + 1) as size_t)
+            if Watcher.is_implicit_glob(last_segment)
+            {
+                var n spec.length as int
+                if (n > 1) and ((spec[(n - 1) as size_t] as int) = ("/" as char) as int)
+                    set n: n - 1
+                set out_path.data: spec.data
+                set out_path.length: n as size_t
+                set out_recursive: true
+                return true
+            }
+        }
+        false
+    }
+
+    ; the last slash before `limit`, -1 for none
+    function last_slash(s: Slice[char], limit: int) returns int
+    {
+        var i limit - 1
+        while i >= 0
+        {
+            if (s[i as size_t] as int) = ("/" as char) as int
+                return i
+            set i: i - 1
+        }
+        0 - 1
+    }
+
+    ; vfsmatch.IsImplicitGlob
+    function is_implicit_glob(component: Slice[char]) returns bool
+    {
+        var i 0
+        while i < (component.length as int)
+        {
+            let c component[i as size_t] as int
+            if (c = ("." as char) as int) or (c = ("*" as char) as int) or (c = ("?" as char) as int)
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    ; computeDesiredWatches
+    procedure compute_desired_watches(this, pf: ref[ProgramFiles], seen_file_paths: ref[Array[Slice[char]]]) returns ref[Array[WatchedDir]]
+    {
+        let desired &Array[WatchedDir]^host()
+        if config <> null
+        {
+            let wildcards this.wildcard_directories()
+            var i 0
+            while i < (wildcards.get_length() as int)
+            {
+                let d wildcards[i as size_t]
+                set i: i + 1
+                let real_dir pf.real_path(d.dir)
+                let at WatchManager.index_of_dir(desired, real_dir)
+                if at >= 0
+                    desired.put(at as size_t, WatchedDir(real_dir, d.recursive))
+                else
+                    desired.add(WatchedDir(real_dir, d.recursive))
+            }
+        }
+        if (config = null) and (desired.get_length() = 0)
+            desired.add(WatchedDir(pf.real_path(sys.cwd), false))
+        var c 0
+        while c < (config_file_paths.get_length() as int)
+        {
+            let real_path pf.real_path(config_file_paths[c as size_t])
+            set c: c + 1
+            let dir get_directory_path(host, real_path)
+            if WatchManager.index_of_dir(desired, dir) < 0
+                desired.add(WatchedDir(dir, false))
+        }
+        if config = null
+        {
+            var f 0
+            while f < (root_names.get_length() as int)
+            {
+                let absolute get_normalized_absolute_path(host, root_names[f as size_t], sys.cwd)
+                set f: f + 1
+                let dir get_directory_path(host, pf.real_path(absolute))
+                if WatchManager.index_of_dir(desired, dir) < 0
+                    desired.add(WatchedDir(dir, false))
+            }
+        }
+        let resolved wm.resolve_desired_dirs(desired)
+        var s 0
+        while s < (seen_file_paths.get_length() as int)
+        {
+            let dir get_directory_path(host, seen_file_paths[s as size_t])
+            set s: s + 1
+            if WatchManager.is_dir_covered_by_watch(sys, resolved, dir)
+                continue
+            if WatchManager.can_watch_directory(host, dir) = false
+                continue
+            let at WatchManager.index_of_dir(resolved, dir)
+            if at >= 0
+                resolved.put(at as size_t, WatchedDir(dir, false))
+            else
+                resolved.add(WatchedDir(dir, false))
+        }
+        wm.resolve_desired_dirs(resolved)
+    }
+
+    ; Watcher.DoCycle
+    procedure do_cycle(this)
+    {
+        let changed_paths wm.drain_events()
+        let has_events changed_paths.get_length() > 0
+        if this.recheck_ts_config()
+            return
+        if has_events and (config_modified = false)
+        {
+            if this.is_relevant_change(changed_paths) = false
+            {
+                this.on_program()
+                return
+            }
+        }
+        else
+        {
+            if (has_events = false) and (config_modified = false)
+            {
+                this.on_program()
+                return
+            }
+        }
+        this.report_watch_status(DiagFile_change_detected_Starting_incremental_compilation, null)
+        this.do_build()
+    }
+
+    ; the harness's OnProgram
+    procedure on_program(this)
+    {
+        if program <> null
+            (program as ref[IncProgram]).baseline(sys.programs)
+    }
+
+    ; isRelevantChange
+    procedure is_relevant_change(this, changed_paths: ref[Array[Slice[char]]]) returns bool
+    {
+        var i 0
+        while i < (changed_paths.get_length() as int)
+        {
+            let event_path changed_paths[i as size_t]
+            set i: i + 1
+            let p this.to_path(event_path)
+            if ExecSystem.contains(seen_files, p)
+                return true
+            if config <> null
+            {
+                if this.possibly_matches_file_name(event_path)
+                    return true
+                if this.possibly_matches_directory_name(p)
+                    return true
+            }
+            if sys.directory_exists(event_path)
+            {
+                if wm.is_path_under_watch(event_path)
+                    return true
+            }
+        }
+        false
+    }
+
+    ; ParsedCommandLine.PossiblyMatchesFileName
+    procedure possibly_matches_file_name(this, file_name: Slice[char]) returns bool
+    {
+        let c config as ref[TsParsedCommandLine]
+        let path this.to_path(file_name)
+        var i 0
+        while i < (root_names.get_length() as int)
+        {
+            let name root_names[i as size_t]
+            set i: i + 1
+            let name_path this.to_path(name)
+            if name_path.equals(path)
+                return true
+        }
+        var k 0
+        while k < (c.include_specs.get_length() as int)
+        {
+            let include c.include_specs[k as size_t]
+            set k: k + 1
+            if Watcher.is_implicit_glob(include)
+                continue
+            var wild false
+            var j 0
+            while j < (include.length as int)
+            {
+                let ch include[j as size_t] as int
+                if (ch = ("*" as char) as int) or (ch = ("?" as char) as int)
+                    set wild: true
+                set j: j + 1
+            }
+            if wild
+                continue
+            let include_path this.to_path(get_normalized_absolute_path(host, include, c.base_path))
+            if include_path.equals(path)
+                return true
+        }
+        let wildcards this.wildcard_directories()
+        var w 0
+        while w < (wildcards.get_length() as int)
+        {
+            let d wildcards[w as size_t]
+            set w: w + 1
+            if Watcher.glob_matches(d.dir, d.recursive, file_name)
+                return true
+        }
+        false
+    }
+
+    ; `<dir>/**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,json}` (or `/*.{…}`) against a name
+    function glob_matches(dir: Slice[char], recursive: bool, file_name: Slice[char]) returns bool
+    {
+        if file_name.starts_with(dir) = false
+            return false
+        let rest file_name.slice_from(dir.length)
+        if (rest.length as int) < 2
+            return false
+        if (rest[0] as int) <> ("/" as char) as int
+            return false
+        let last Watcher.last_slash(rest, rest.length as int)
+        if (recursive = false) and (last > 0)
+            return false
+        let base rest.slice_from((last + 1) as size_t)
+        let dot Watcher.last_dot(base)
+        if dot < 1
+            return false
+        let ext base.slice_from(dot as size_t)
+        if ext.equals(".js") or ext.equals(".jsx") or ext.equals(".mjs") or ext.equals(".cjs")
+            return true
+        if ext.equals(".ts") or ext.equals(".tsx") or ext.equals(".mts") or ext.equals(".cts")
+            return true
+        ext.equals(".json")
+    }
+
+    function last_dot(s: Slice[char]) returns int
+    {
+        var i (s.length as int) - 1
+        while i >= 0
+        {
+            if (s[i as size_t] as int) = ("." as char) as int
+                return i
+            set i: i - 1
+        }
+        0 - 1
+    }
+
+    ; ParsedCommandLine.PossiblyMatchesDirectoryName
+    procedure possibly_matches_directory_name(this, directory_path: Slice[char]) returns bool
+    {
+        let wildcards this.wildcard_directories()
+        var i 0
+        while i < (wildcards.get_length() as int)
+        {
+            let d wildcards[i as size_t]
+            set i: i + 1
+            let dir_path this.to_path(d.dir)
+            if d.recursive
+            {
+                if WatchManager.contains_path(sys, dir_path, directory_path)
+                    return true
+            }
+            else
+            {
+                if dir_path.equals(directory_path)
+                    return true
+            }
+        }
+        false
+    }
+
+    ; Watcher.doBuild
+    procedure do_build(this)
+    {
+        if Execute.unported_compile_options(sys, options)
+            return
+        let seen &Array[Slice[char]]^host()
+        if config <> null
+        {
+            let wildcards this.wildcard_directories()
+            var i 0
+            while i < (wildcards.get_length() as int)
+            {
+                let wd wildcards[i as size_t]
+                seen.add(wd.dir)
+                set i: i + 1
+            }
+            if wildcards.get_length() > 0
+                this.reload_file_names()
+        }
+        var c 0
+        while c < (config_file_paths.get_length() as int)
+        {
+            seen.add(config_file_paths[c as size_t])
+            set c: c + 1
+        }
+        let driver DriverProgram.create(host, sys, options, root_names, config_file_name, config_text, config_diagnostics)
+        set driver.root_config: config
+        set driver.pf.seen: seen
+        let loaded driver.load()
+        set driver.pf.seen: null
+        if loaded = false
+            return
+        var old old_snapshot
+        if program <> null
+            set old: (program as ref[IncProgram]).snapshot
+        let created IncProgram.create(host, driver, old)
+        if created = null
+            return
+        let ip created as ref[IncProgram]
+        set this.program: ip
+        let outcome Execute.emit_files_and_report_errors(sys, ip, report_diagnostic, summary_pretty, null, null)
+        if outcome = null
+            return
+        ; the host reads every file of the program and each root it was given
+        var r 0
+        while r < (root_names.get_length() as int)
+        {
+            seen.add(get_normalized_absolute_path(host, root_names[r as size_t], sys.cwd))
+            set r: r + 1
+        }
+        var s 0
+        while s < driver.source_file_count()
+        {
+            seen.add(driver.source_path(s))
+            set s: s + 1
+        }
+        set this.seen_files: &Array[Slice[char]]^host()
+        var k 0
+        while k < (seen.get_length() as int)
+        {
+            let p this.to_path(seen[k as size_t])
+            set k: k + 1
+            if ExecSystem.contains(seen_files, p) = false
+                seen_files.add(p)
+        }
+        set this.config_mtimes: &Array[ConfigMtime]^host()
+        var m 0
+        while m < (config_file_paths.get_length() as int)
+        {
+            let path config_file_paths[m as size_t]
+            set m: m + 1
+            let mtime sys.mtime_of(path)
+            if mtime >= 0
+                config_mtimes.add(ConfigMtime(path, mtime))
+        }
+        let desired this.compute_desired_watches(driver.pf, seen)
+        wm.reconcile_watches(desired)
+        set this.config_modified: false
+        this.report_error_count((outcome as ref[CompileOutcome]).diagnostics.get_length() as int)
+        this.on_program()
+    }
+
+    ; ReloadFileNamesOfParsedCommandLine: the file names globbed again
+    procedure reload_file_names(this)
+    {
+        let c config as ref[TsParsedCommandLine]
+        let tp TsConfigParser.create(host, this.files_of_system(), sys.cwd)
+        set this.root_names: tp.get_file_names_from_config_specs(c.files_specs, c.include_specs, c.exclude_specs, c.base_path, options)
+    }
+
+    ; recheckTsConfig: true when the config could not be parsed
+    procedure recheck_ts_config(this) returns bool
+    {
+        if (config_file_name.length as int) = 0
+            return false
+        if (config_has_errors = false) and (config_file_paths.get_length() > 0)
+        {
+            var changed false
+            var i 0
+            while i < (config_file_paths.get_length() as int)
+            {
+                let path config_file_paths[i as size_t]
+                set i: i + 1
+                let now_mtime sys.mtime_of(path)
+                var old_mtime 0 - 2
+                var m 0
+                while m < (config_mtimes.get_length() as int)
+                {
+                    let entry config_mtimes[m as size_t]
+                    set m: m + 1
+                    if entry.path.equals(path)
+                    {
+                        set old_mtime: entry.mtime
+                        break
+                    }
+                }
+                if old_mtime = (0 - 2)
+                {
+                    if now_mtime >= 0
+                    {
+                        set changed: true
+                        break
+                    }
+                }
+                else
+                {
+                    if now_mtime <> old_mtime
+                    {
+                        set changed: true
+                        break
+                    }
+                }
+            }
+            if changed = false
+                return false
+        }
+        var text Slice[char]()
+        let diagnostics &Array[ref[DriverDiagnostic]]^host()
+        let parsed this.parse_config_file(&text, diagnostics)
+        if parsed = null
+            return true
+        let p parsed as ref[TsParsedCommandLine]
+        if config_has_errors
+            set this.config_modified: true
+        set this.config_has_errors: false
+        if Watcher.same_parsed_config(host, config, p) = false
+            set this.config_modified: true
+        set this.config: p
+        set this.options: p.options
+        set this.root_names: p.file_names
+        set this.config_text: text
+        set this.config_diagnostics: diagnostics
+        this.set_config_file_paths()
+        false
+    }
+
+    ; parseConfigFile: null after the errors are reported
+    procedure parse_config_file(this, out_text: ref[Slice[char]], diagnostics: ref[Array[ref[DriverDiagnostic]]]) returns ref[TsParsedCommandLine]?
+    {
+        var text Slice[char]()
+        if sys.read_file(config_file_name, &text) = false
+        {
+            Execute.report_compiler(sys, report_diagnostic, DiagCannot_read_file_0, Execute.arg1(host, config_file_name))
+            set this.config_has_errors: true
+            this.report_error_count(1)
+            return null
+        }
+        set out_text.data: text.data
+        set out_text.length: text.length
+        let parsed Execute.parse_config(sys, cl, config_file_name, text, diagnostics)
+        if parsed = null
+            return null
+        parsed
+    }
+
+    ; reflect.DeepEqual over the two ParsedConfigs: the options, the file names and
+    ; the project references
+    procedure same_parsed_config(host: ref[Page], a_opt: ref[TsParsedCommandLine]?, b: ref[TsParsedCommandLine]) returns bool
+    {
+        if a_opt = null
+            return false
+        let a a_opt as ref[TsParsedCommandLine]
+        let none: Slice[char] ""
+        let a_options JsonText.to_text(host, &JsonValue^host(JsonKindObject, none, false, a.options.names, a.options.values), false)
+        let b_options JsonText.to_text(host, &JsonValue^host(JsonKindObject, none, false, b.options.names, b.options.values), false)
+        if a_options.equals(b_options) = false
+            return false
+        if a.file_names.get_length() <> b.file_names.get_length()
+            return false
+        var i 0
+        while i < (a.file_names.get_length() as int)
+        {
+            let an a.file_names[i as size_t]
+            let bn b.file_names[i as size_t]
+            if an.equals(bn) = false
+                return false
+            set i: i + 1
+        }
+        let ar a.references
+        let br b.references
+        if ar = null
+        {
+            if br <> null
+                return false
+        }
+        else
+        {
+            if br = null
+                return false
+            let al ar as ref[Array[ProjectReference]]
+            let bl br as ref[Array[ProjectReference]]
+            if al.get_length() <> bl.get_length()
+                return false
+            var k 0
+            while k < (al.get_length() as int)
+            {
+                let x al[k as size_t]
+                let y bl[k as size_t]
+                if x.path.equals(y.path) = false
+                    return false
+                if x.circular <> y.circular
+                    return false
+                set k: k + 1
+            }
+        }
+        true
+    }
+}

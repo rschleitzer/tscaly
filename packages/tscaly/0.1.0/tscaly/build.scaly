@@ -8,15 +8,15 @@
 ; channels; with one builder the order is the graph's and every report follows its
 ; build, which is what a single-threaded run prints and what the port does.
 ;
-; ★ Project references are not here yet: a config with `references` is the
-; `project-references` stop, as it is for tsc, and a task therefore has no upstream
-; tasks; watch mode is the `watch` stop.
+; ★ Watch mode (Orchestrator.Watch, DoCycle) runs over the watcher module's watch
+; manager.
 
 use scaly.memory.Page
 use scaly.containers.Array
 use scaly.containers.String
 use scaly.containers.StringBuilder
 use tscaly.program.JsonValue
+use tscaly.program.ProgramFiles
 use tscaly.program.JsonParser
 use tscaly.buildinfojson.JsonText
 use tscaly.tsoptions.TsOptions
@@ -38,6 +38,10 @@ use tscaly.incremental.PathMap
 use tscaly.incremental.IncSnapshot
 use tscaly.incremental.ToSnapshot
 use tscaly.help.Help
+use tscaly.incremental.IncSort
+use tscaly.watcher.Watcher
+use tscaly.watcher.WatchManager
+use tscaly.watcher.WatchedDir
 use tscaly.emitter.Emitter
 use tscaly.execute.Execute
 use tscaly.execute.Reporter
@@ -123,6 +127,14 @@ define BuildTask
     ; upStream: the upstream tasks and the index of their reference
     upstream: ref[Array[int]]
     upstream_ref_index: ref[Array[int]]
+    ; watch mode: whether the task still has to be looked at this cycle, whether it
+    ; was created by the first graph, whether its config changed, the tasks that
+    ; reference it, and the package.json lookups its last program or build info made
+    pending: bool
+    is_initial_cycle: bool
+    dirty: bool
+    downstream: ref[Array[int]]
+    package_jsons: ref[Array[Slice[char]]]
 )
 
 define Orchestrator
@@ -141,6 +153,9 @@ define Orchestrator
     dry: bool
     force: bool
     clean: bool
+    ; watch mode and its watch manager
+    watch: bool
+    wm: ref[WatchManager]
 )
 {
     ; tscBuildCompilation
@@ -164,13 +179,11 @@ define Orchestrator
             Help.print_build_help(sys, Execute.default_is_pretty(sys))
             return ExitStatusSuccess
         }
-        if cl.options.tristate_of("watch") = 1
-        {
-            sys.stop("watch")
-            return ExitStatusNotImplemented
-        }
-        let o &Orchestrator^host(host, sys, cl, &Array[ref[BuildTask]]^host(), &Array[int]^host(), &Array[ref[DriverDiagnostic]]^host(), &Array[ref[ResolvedReference]]^host(), IncSnapshot.int_map(host), CommandLine.raw_true(cl.raw, "verbose"), CommandLine.raw_true(cl.raw, "dry"), CommandLine.raw_true(cl.raw, "force"), CommandLine.raw_true(cl.raw, "clean"))
-        o.start()
+        let o &Orchestrator^host(host, sys, cl, &Array[ref[BuildTask]]^host(), &Array[int]^host(), &Array[ref[DriverDiagnostic]]^host(), &Array[ref[ResolvedReference]]^host(), IncSnapshot.int_map(host), CommandLine.raw_true(cl.raw, "verbose"), CommandLine.raw_true(cl.raw, "dry"), CommandLine.raw_true(cl.raw, "force"), CommandLine.raw_true(cl.raw, "clean"), cl.options.tristate_of("watch") = 1, WatchManager.create(host, sys))
+        let status o.start()
+        if o.watch
+            set sys.build_watcher: o
+        status
     }
 
     function relative_file_name(this, file_name: Slice[char]) returns Slice[char]
@@ -183,10 +196,28 @@ define Orchestrator
         relative
     }
 
-    ; Orchestrator.Start without watch; ExitStatusNotImplemented after a stop
+    ; Orchestrator.Start; ExitStatusNotImplemented after a stop
     procedure start(this) returns int
     {
-        ; GenerateGraph: a task per project and per reference, then the order
+        if watch
+            WatchManager.write_watch_status(sys, cl.options, DiagStarting_compilation_in_watch_mode, null)
+        if this.generate_graph(null) = false
+            return ExitStatusNotImplemented
+        let status this.build_or_clean()
+        if (sys.stop_tag.length as int) > 0
+            return ExitStatusNotImplemented
+        if watch
+        {
+            this.update_watch()
+            wm.reconcile_watches(this.compute_desired_watches())
+        }
+        status
+    }
+
+    ; GenerateGraph: a task per project and per reference (reusing the old tasks a
+    ; watch cycle passes), then the order; false after a stop
+    procedure generate_graph(this, old_tasks: ref[Array[ref[BuildTask]]]?) returns bool
+    {
         let roots &Array[Slice[char]]^host()
         var i 0
         while i < (cl.file_names.get_length() as int)
@@ -195,18 +226,18 @@ define Orchestrator
             set i: i + 1
             roots.add(ConfigFiles.config_of_reference(host, get_normalized_absolute_path(host, project, sys.cwd)))
         }
-        if this.create_build_tasks(roots) = false
-            return ExitStatusNotImplemented
+        if this.create_build_tasks(roots, old_tasks) = false
+            return false
         let completed &Array[int]^host()
         let analyzing &Array[int]^host()
         let stack &Array[Slice[char]]^host()
         var r 0
         while r < (roots.get_length() as int)
         {
-            this.setup_build_task(roots[r as size_t], false, completed, analyzing, stack)
+            this.setup_build_task(roots[r as size_t], 0 - 1, false, completed, analyzing, stack)
             set r: r + 1
         }
-        this.build_or_clean()
+        true
     }
 
     function task_index_of(this, config: Slice[char]) returns int
@@ -223,7 +254,7 @@ define Orchestrator
     }
 
     ; createBuildTasks; false after a stop
-    procedure create_build_tasks(this, configs: ref[Array[Slice[char]]]) returns bool
+    procedure create_build_tasks(this, configs: ref[Array[Slice[char]]], old_tasks: ref[Array[ref[BuildTask]]]?) returns bool
     {
         var i 0
         while i < (configs.get_length() as int)
@@ -232,7 +263,37 @@ define Orchestrator
             set i: i + 1
             if this.task_index_of(config) >= 0
                 continue
-            let task &BuildTask^host(config, null, Slice[char](), &Array[ref[DriverDiagnostic]]^host(), null, null, &Array[ref[DriverDiagnostic]]^host(), &StringBuilder^host(), ExitStatusSuccess, null, BuildKindNone, &Array[Slice[char]]^host(), &Array[int]^host(), &Array[int]^host())
+            var reused: ref[BuildTask]? null
+            var carried: ref[BuildInfoEntry]? null
+            if old_tasks <> null
+            {
+                let old_list old_tasks as ref[Array[ref[BuildTask]]]
+                var o 0
+                while o < (old_list.get_length() as int)
+                {
+                    let existing old_list[o as size_t]
+                    set o: o + 1
+                    if existing.config.equals(config)
+                    {
+                        if existing.dirty
+                            set carried: existing.build_info_entry
+                        else
+                            set reused: existing
+                        break
+                    }
+                }
+            }
+            var task_opt reused
+            if task_opt = null
+            {
+                let made &BuildTask^host(config, null, Slice[char](), &Array[ref[DriverDiagnostic]]^host(), null, null, &Array[ref[DriverDiagnostic]]^host(), &StringBuilder^host(), ExitStatusSuccess, null, BuildKindNone, &Array[Slice[char]]^host(), &Array[int]^host(), &Array[int]^host(), true, old_tasks = null, false, &Array[int]^host(), &Array[Slice[char]]^host())
+                set made.build_info_entry: carried
+                set task_opt: made
+            }
+            let task task_opt as ref[BuildTask]
+            set task.upstream: &Array[int]^host()
+            set task.upstream_ref_index: &Array[int]^host()
+            set task.downstream: &Array[int]^host()
             tasks.add(task)
             let resolved this.resolved_project_reference(config)
             if resolved = null
@@ -255,7 +316,7 @@ define Orchestrator
                         children.add(ConfigFiles.config_of_reference(host, child_reference.path))
                         set c: c + 1
                     }
-                    if this.create_build_tasks(children) = false
+                    if this.create_build_tasks(children, old_tasks) = false
                         return false
                 }
             }
@@ -286,14 +347,18 @@ define Orchestrator
     }
 
     ; setupBuildTask: upstream first, then the task into the order
-    procedure setup_build_task(this, config: Slice[char], in_circular_context: bool, completed: ref[Array[int]], analyzing: ref[Array[int]], stack: ref[Array[Slice[char]]]) returns int
+    procedure setup_build_task(this, config: Slice[char], downstream: int, in_circular_context: bool, completed: ref[Array[int]], analyzing: ref[Array[int]], stack: ref[Array[Slice[char]]]) returns int
     {
         let index this.task_index_of(config)
         if index < 0
             return index
         let task tasks[index as size_t]
         if ExecSystem.contains_int(completed, index)
+        {
+            if watch and (downstream >= 0)
+                task.downstream.add(downstream)
             return index
+        }
         if ExecSystem.contains_int(analyzing, index)
         {
             if in_circular_context = false
@@ -326,7 +391,7 @@ define Orchestrator
                 while r < (refs.get_length() as int)
                 {
                     let reference refs[r as size_t]
-                    let upstream this.setup_build_task(ConfigFiles.config_of_reference(host, reference.path), in_circular_context or reference.circular, completed, analyzing, stack)
+                    let upstream this.setup_build_task(ConfigFiles.config_of_reference(host, reference.path), index, in_circular_context or reference.circular, completed, analyzing, stack)
                     if upstream >= 0
                     {
                         task.upstream.add(upstream)
@@ -339,6 +404,8 @@ define Orchestrator
         ExecSystem.pop_slice(host, stack)
         completed.add(index)
         order.add(index)
+        if watch and (downstream >= 0)
+            task.downstream.add(downstream)
         index
     }
 
@@ -381,6 +448,11 @@ define Orchestrator
         {
             let task tasks[order[k as size_t] as size_t]
             set k: k + 1
+            ; a fresh taskResult
+            set task.builder: &StringBuilder^host()
+            set task.exit_status: ExitStatusSuccess
+            set task.build_kind: BuildKindNone
+            set task.files_to_delete: &Array[Slice[char]]^host()
             if clean
                 this.clean_project(task)
             else
@@ -409,8 +481,13 @@ define Orchestrator
             }
         }
         ; orchestratorResult.report
-        if Execute.should_be_pretty(sys, cl.options)
-            DiagnosticWriter.write_error_summary(host, sys.output, errors, sys.cwd, "\n")
+        if watch
+            WatchManager.write_error_count(sys, cl.options, errors.get_length() as int)
+        else
+        {
+            if Execute.should_be_pretty(sys, cl.options)
+                DiagnosticWriter.write_error_summary(host, sys.output, errors, sys.cwd, "\n")
+        }
         if files_to_delete.get_length() > 0
         {
             var sb StringBuilder()
@@ -497,30 +574,132 @@ define Orchestrator
 
     procedure build_project(this, task: ref[BuildTask]) returns bool
     {
-        set task.status: this.up_to_date_status(task)
-        if (sys.stop_tag.length as int) > 0
-            return false
-        this.report_up_to_date_status(task)
-        if this.handle_status_that_doesnt_require_build(task) = false
+        if task.pending
         {
-            if this.compile_and_emit(task) = false
+            set task.status: this.up_to_date_status(task)
+            if (sys.stop_tag.length as int) > 0
                 return false
+            this.report_up_to_date_status(task)
+            if this.handle_status_that_doesnt_require_build(task) = false
+            {
+                if this.compile_and_emit(task) = false
+                    return false
+                this.update_downstream(task)
+            }
+            else
+            {
+                if task.resolved <> null
+                {
+                    var i 0
+                    while i < (task.config_diagnostics.get_length() as int)
+                    {
+                        this.report_task_diagnostic(task, task.config_diagnostics[i as size_t])
+                        set i: i + 1
+                    }
+                }
+                if task.errors.get_length() > 0
+                    set task.exit_status: ExitStatusDiagnosticsPresent_OutputsSkipped
+            }
         }
         else
         {
-            if task.resolved <> null
+            if task.errors.get_length() > 0
             {
-                var i 0
-                while i < (task.config_diagnostics.get_length() as int)
+                this.report_up_to_date_status(task)
+                ; reported again, not added again
+                let saved sys.output
+                set sys.output: task.builder
+                var e 0
+                while e < (task.errors.get_length() as int)
                 {
-                    this.report_task_diagnostic(task, task.config_diagnostics[i as size_t])
-                    set i: i + 1
+                    Execute.report(sys, Execute.reporter(sys, cl.options), task.errors[e as size_t])
+                    set e: e + 1
+                }
+                set sys.output: saved
+            }
+        }
+        ; unblockDownstream
+        set task.pending: false
+        set task.is_initial_cycle: false
+        true
+    }
+
+    ; updateDownstream: a rebuilt project marks the projects referencing it pending,
+    ; their up-to-date status moved by whether its declaration files changed
+    procedure update_downstream(this, task: ref[BuildTask])
+    {
+        if task.is_initial_cycle
+            return
+        let status task.status as ref[BuildStatus]
+        if CommandLine.raw_true(cl.raw, "stopBuildOnErrors") and status.is_error()
+            return
+        var changed_dts false
+        if task.program <> null
+            set changed_dts: (task.program as ref[IncProgram]).snapshot.has_changed_dts_file
+        let own_path Watcher.to_path_of(sys, task.config)
+        var i 0
+        while i < (task.downstream.get_length() as int)
+        {
+            let ds tasks[task.downstream[i as size_t] as size_t]
+            set i: i + 1
+            if ds.status <> null
+            {
+                let ds_status ds.status as ref[BuildStatus]
+                var kind ds_status.kind
+                if kind = UpToDateUpToDate
+                {
+                    if changed_dts = false
+                        set ds.status: &BuildStatus^host(UpToDateWithUpstreamTypes, ds_status.name, ds_status.input, ds_status.output, ds_status.has_names, ds_status.input_time, ds_status.output_time, ds_status.has_times, false)
+                    else
+                        set kind: UpToDateWithUpstreamTypes
+                }
+                if (kind = UpToDateWithUpstreamTypes) or (kind = UpToDateWithInputFileText)
+                {
+                    if changed_dts
+                        set ds.status: BuildStatus.input_output(host, UpToDateInputFileNewer, task.config, Orchestrator.oldest_output_file_name(ds_status))
+                }
+                if kind = UpToDateUpstreamErrors
+                {
+                    let ref_config ConfigFiles.config_of_reference(host, ds_status.name)
+                    let ref_path Watcher.to_path_of(sys, ref_config)
+                    if ref_path.equals(own_path)
+                        this.reset_status(ds)
                 }
             }
-            if task.errors.get_length() > 0
-                set task.exit_status: ExitStatusDiagnosticsPresent_OutputsSkipped
+            set ds.pending: true
         }
-        true
+    }
+
+    ; upToDateStatus.oldestOutputFileName
+    function oldest_output_file_name(status: ref[BuildStatus]) returns Slice[char]
+    {
+        if status.has_times or status.has_names
+            return status.output
+        status.name
+    }
+
+    ; BuildTask.resetStatus
+    procedure reset_status(this, task: ref[BuildTask])
+    {
+        set task.status: null
+        set task.pending: true
+        set task.errors: &Array[ref[DriverDiagnostic]]^host()
+    }
+
+    ; BuildTask.resetConfig: the config parsed again on the next graph
+    procedure reset_config(this, task: ref[BuildTask])
+    {
+        set task.dirty: true
+        let kept &Array[ref[ResolvedReference]]^host()
+        var i 0
+        while i < (resolved_references.get_length() as int)
+        {
+            let known resolved_references[i as size_t]
+            set i: i + 1
+            if known.config.equals(task.config) = false
+                kept.add(known)
+        }
+        set this.resolved_references: kept
     }
 
     procedure task_status(this, task: ref[BuildTask], code: int, args: ref[Array[String]]?)
@@ -635,6 +814,7 @@ define Orchestrator
         let outcome outcome_opt as ref[CompileOutcome]
         if ip.build_info_emitted
             this.on_build_info_emit(task, ip)
+        set task.package_jsons: this.package_json_lookup_paths(ip)
         set task.exit_status: outcome.status
         let no_emit_on_error options.tristate_of("noEmitOnError") = 1
         let status_kind (task.status as ref[BuildStatus]).kind
@@ -1049,6 +1229,14 @@ define Orchestrator
         let config_time this.mtime_of(task.config)
         if config_time > oldest_output_time
             return BuildStatus.input_output(host, UpToDateInputFileNewer, task.config, oldest_output_file)
+        var x 0
+        while x < (resolved.extended_files.get_length() as int)
+        {
+            let extended_config resolved.extended_files[x as size_t]
+            set x: x + 1
+            if this.mtime_of(extended_config) > oldest_output_time
+                return BuildStatus.input_output(host, UpToDateInputFileNewer, extended_config, oldest_output_file)
+        }
         let package_jsons info.get("packageJsons")
         if package_jsons <> null
         {
@@ -1078,6 +1266,7 @@ define Orchestrator
                     return BuildStatus.input_output(host, UpToDateInputFileNewer, package_json, oldest_output_file)
             }
         }
+        set task.package_jsons: this.build_info_package_jsons(info, build_info_directory)
         var kind UpToDateUpToDate
         if input_text_unchanged
             set kind: UpToDateWithInputFileText
@@ -1306,6 +1495,498 @@ define Orchestrator
             this.task_status(task, DiagProject_0_is_out_of_date_because_output_for_it_was_generated_with_version_1_that_differs_with_current_version_2, this.args3(config, this.relative_file_name(status.name), "7.0.0-dev"))
         if kind = UpToDateForceBuild
             this.task_status(task, DiagProject_0_is_being_forcibly_rebuilt, this.args1(config))
+    }
+
+    ; ── watch mode (Orchestrator.Watch, DoCycle) ─────────────────────────────
+
+    ; incremental.Program.PackageJsonLookupPaths: sorted, deduplicated, a found one
+    ; through its realpath
+    procedure package_json_lookup_paths(this, ip: ref[IncProgram]) returns ref[Array[Slice[char]]]
+    {
+        let out &Array[Slice[char]]^host()
+        if (ip.program.config_path.length as int) = 0
+            return out
+        let pfiles ip.program.pf
+        var i 0
+        while i < (pfiles.package_json_lookups.get_length() as int)
+        {
+            let path pfiles.package_json_lookups[i as size_t]
+            let exists pfiles.package_json_found[i as size_t]
+            set i: i + 1
+            var package_json path
+            if exists or pfiles.directory_exists(get_directory_path(host, path))
+                set package_json: pfiles.real_path(path)
+            if ExecSystem.contains(out, package_json) = false
+                IncSort.insert_sorted(out, package_json)
+        }
+        out
+    }
+
+    ; BuildInfo.GetPackageJsons then GetMissingPackageJsons
+    procedure build_info_package_jsons(this, info: ref[JsonValue], directory: Slice[char]) returns ref[Array[Slice[char]]]
+    {
+        let out &Array[Slice[char]]^host()
+        this.add_build_info_paths(out, info, "packageJsons", directory)
+        this.add_build_info_paths(out, info, "missingPackageJsons", directory)
+        out
+    }
+
+    procedure add_build_info_paths(this, out: ref[Array[Slice[char]]], info: ref[JsonValue], field: Slice[char], directory: Slice[char])
+    {
+        let list info.get(field)
+        if list = null
+            return
+        let lv list as ref[JsonValue]
+        var i 0
+        while i < lv.size()
+        {
+            let item lv.value_at(i) as ref[JsonValue]
+            set i: i + 1
+            out.add(get_normalized_absolute_path(host, item.text, directory))
+        }
+    }
+
+    ; resolveBuildInfoFileName
+    function resolve_build_info_file_name(this, file_name: Slice[char], build_info_dir: Slice[char]) returns Slice[char]
+    {
+        if (path_is_relative(file_name) = false) and (is_rooted_disk_path(file_name) = false)
+            return combine_paths(host, sys.default_library_path, file_name)
+        get_normalized_absolute_path(host, file_name, build_info_dir)
+    }
+
+    ; the build info's file names, resolved
+    procedure build_info_file_names(this, task: ref[BuildTask]) returns ref[Array[Slice[char]]]
+    {
+        let out &Array[Slice[char]]^host()
+        if task.build_info_entry = null
+            return out
+        let entry task.build_info_entry as ref[BuildInfoEntry]
+        if entry.info = null
+            return out
+        let info entry.info as ref[JsonValue]
+        let names info.get("fileNames")
+        if names = null
+            return out
+        let directory get_directory_path(host, entry.path)
+        let nv names as ref[JsonValue]
+        var i 0
+        while i < nv.size()
+        {
+            let item nv.value_at(i) as ref[JsonValue]
+            set i: i + 1
+            out.add(this.resolve_build_info_file_name(item.text, directory))
+        }
+        out
+    }
+
+    ; updateWatch: a fresh modification-time cache keeping the outputs' times
+    procedure update_watch(this)
+    {
+        let old_cache mtimes
+        set this.mtimes: IncSnapshot.int_map(host)
+        var k 0
+        while k < (order.get_length() as int)
+        {
+            let task tasks[order[k as size_t] as size_t]
+            set k: k + 1
+            if task.resolved = null
+                continue
+            if this.can_update_js_dts_output_timestamps(task) = false
+                continue
+            let outputs this.output_file_names(task)
+            var o 0
+            while o < (outputs.get_length() as int)
+            {
+                let output outputs[o as size_t]
+                set o: o + 1
+                let slot old_cache.slot_of(output)
+                if slot >= 0
+                    mtimes.store(output, old_cache.value_at(slot))
+            }
+        }
+    }
+
+    ; a map keyed by directory: added non-recursive unless covered (addWatchDir)
+    procedure add_watch_dir(this, desired: ref[Array[WatchedDir]], dir: Slice[char])
+    {
+        if WatchManager.is_dir_covered_by_watch(sys, desired, dir)
+            return
+        if WatchManager.can_watch_directory(host, dir) = false
+            return
+        let at WatchManager.index_of_dir(desired, dir)
+        if at >= 0
+            desired.put(at as size_t, WatchedDir(dir, false))
+        else
+            desired.add(WatchedDir(dir, false))
+    }
+
+    ; addPackageJsonWatchDirs
+    procedure add_package_json_watch_dirs(this, desired: ref[Array[WatchedDir]], package_json: Slice[char])
+    {
+        let dir get_directory_path(host, package_json)
+        let dirs &Array[Slice[char]]^host()
+        dirs.add(dir)
+        var found_node_modules false
+        var current dir
+        repeat
+        {
+            let parent get_directory_path(host, current)
+            if ((parent.length as int) = 0) or parent.equals(current)
+                break
+            dirs.add(parent)
+            let base get_base_file_name(host, parent)
+            if base.equals("node_modules")
+            {
+                set found_node_modules: true
+                let grandparent get_directory_path(host, parent)
+                if ((grandparent.length as int) > 0) and (grandparent.equals(parent) = false)
+                    dirs.add(grandparent)
+                break
+            }
+            set current: parent
+        }
+        if found_node_modules = false
+        {
+            this.add_watch_dir(desired, dir)
+            return
+        }
+        var i 0
+        while i < (dirs.get_length() as int)
+        {
+            this.add_watch_dir(desired, dirs[i as size_t])
+            set i: i + 1
+        }
+    }
+
+    ; computeDesiredWatches
+    procedure compute_desired_watches(this) returns ref[Array[WatchedDir]]
+    {
+        let desired &Array[WatchedDir]^host()
+        let pf Watcher.system_files(sys)
+        var k 0
+        while k < (order.get_length() as int)
+        {
+            let task tasks[order[k as size_t] as size_t]
+            set k: k + 1
+            let real_config_dir pf.real_path(get_directory_path(host, task.config))
+            if WatchManager.index_of_dir(desired, real_config_dir) < 0
+                desired.add(WatchedDir(real_config_dir, false))
+            if task.resolved = null
+                continue
+            let resolved task.resolved as ref[TsParsedCommandLine]
+            var e 0
+            while e < (resolved.extended_files.get_length() as int)
+            {
+                let dir get_directory_path(host, pf.real_path(resolved.extended_files[e as size_t]))
+                set e: e + 1
+                if WatchManager.index_of_dir(desired, dir) < 0
+                    desired.add(WatchedDir(dir, false))
+            }
+            let wildcards Watcher.wildcard_directories_of(sys, resolved)
+            var w 0
+            while w < (wildcards.get_length() as int)
+            {
+                let wd wildcards[w as size_t]
+                set w: w + 1
+                let real_dir pf.real_path(wd.dir)
+                let at WatchManager.index_of_dir(desired, real_dir)
+                if at >= 0
+                {
+                    let existing desired[at as size_t]
+                    desired.put(at as size_t, WatchedDir(real_dir, existing.recursive or wd.recursive))
+                }
+                else
+                    desired.add(WatchedDir(real_dir, wd.recursive))
+            }
+            var f 0
+            while f < (resolved.file_names.get_length() as int)
+            {
+                let absolute get_normalized_absolute_path(host, resolved.file_names[f as size_t], sys.cwd)
+                set f: f + 1
+                this.add_watch_dir(desired, get_directory_path(host, absolute))
+            }
+            if task.build_info_entry <> null
+            {
+                let entry task.build_info_entry as ref[BuildInfoEntry]
+                if entry.info <> null
+                {
+                    let roots &Array[Slice[char]]^host()
+                    var r 0
+                    while r < (resolved.file_names.get_length() as int)
+                    {
+                        roots.add(Watcher.to_path_of(sys, resolved.file_names[r as size_t]))
+                        set r: r + 1
+                    }
+                    let names this.build_info_file_names(task)
+                    var n 0
+                    while n < (names.get_length() as int)
+                    {
+                        let absolute pf.real_path(names[n as size_t])
+                        set n: n + 1
+                        if ExecSystem.contains(roots, Watcher.to_path_of(sys, absolute))
+                            continue
+                        this.add_watch_dir(desired, get_directory_path(host, absolute))
+                    }
+                    let lookups this.build_info_package_jsons(entry.info as ref[JsonValue], get_directory_path(host, entry.path))
+                    var l 0
+                    while l < (lookups.get_length() as int)
+                    {
+                        this.add_package_json_watch_dirs(desired, lookups[l as size_t])
+                        set l: l + 1
+                    }
+                }
+            }
+            var p 0
+            while p < (task.package_jsons.get_length() as int)
+            {
+                this.add_package_json_watch_dirs(desired, task.package_jsons[p as size_t])
+                set p: p + 1
+            }
+        }
+        wm.resolve_desired_dirs(desired)
+    }
+
+    ; Orchestrator.DoCycle; false after a stop
+    procedure do_cycle(this) returns bool
+    {
+        let deleted wm.changed_deleted
+        let changed_paths wm.drain_events()
+        if changed_paths.get_length() = 0
+            return true
+        var needs_config_update false
+        var needs_update false
+        this.check_tasks_for_event_changes(changed_paths, deleted, &needs_config_update, &needs_update)
+        if needs_update = false
+            return true
+        WatchManager.write_watch_status(sys, cl.options, DiagFile_change_detected_Starting_incremental_compilation, null)
+        if needs_config_update
+        {
+            ; GenerateGraphReusingOldTasks
+            let old_tasks tasks
+            set this.tasks: &Array[ref[BuildTask]]^host()
+            set this.order: &Array[int]^host()
+            set this.graph_errors: &Array[ref[DriverDiagnostic]]^host()
+            if this.generate_graph(old_tasks) = false
+                return false
+        }
+        this.build_or_clean()
+        if (sys.stop_tag.length as int) > 0
+            return false
+        this.update_watch()
+        wm.reconcile_watches(this.compute_desired_watches())
+        true
+    }
+
+    ; packageJsonLookupChanged
+    function package_json_lookup_changed(this, package_json: Slice[char], normalized: ref[Array[Slice[char]]], deleted: ref[Array[bool]]) returns bool
+    {
+        let package_json_path Watcher.to_path_of(sys, package_json)
+        if ExecSystem.contains(normalized, package_json_path)
+            return true
+        var i 0
+        while i < (normalized.get_length() as int)
+        {
+            let changed normalized[i as size_t]
+            let is_deleted deleted[i as size_t]
+            set i: i + 1
+            if is_deleted
+            {
+                if WatchManager.contains_path(sys, changed, package_json_path)
+                    return true
+            }
+        }
+        false
+    }
+
+    ; checkTasksForEventChanges
+    procedure check_tasks_for_event_changes(this, changed_paths: ref[Array[Slice[char]]], deleted: ref[Array[bool]], needs_config_update: ref[bool], needs_update: ref[bool])
+    {
+        let normalized &Array[Slice[char]]^host()
+        var c 0
+        while c < (changed_paths.get_length() as int)
+        {
+            normalized.add(Watcher.to_path_of(sys, changed_paths[c as size_t]))
+            set c: c + 1
+        }
+        var k 0
+        while k < (order.get_length() as int)
+        {
+            let task tasks[order[k as size_t] as size_t]
+            set k: k + 1
+            if ExecSystem.contains(normalized, Watcher.to_path_of(sys, task.config))
+            {
+                this.reset_config(task)
+                set needs_config_update: true
+                set needs_update: true
+                continue
+            }
+            if task.resolved = null
+                continue
+            let resolved task.resolved as ref[TsParsedCommandLine]
+            var config_changed false
+            var e 0
+            while e < (resolved.extended_files.get_length() as int)
+            {
+                let extended resolved.extended_files[e as size_t]
+                set e: e + 1
+                if ExecSystem.contains(normalized, Watcher.to_path_of(sys, extended))
+                {
+                    this.reset_config(task)
+                    set needs_config_update: true
+                    set needs_update: true
+                    set config_changed: true
+                    break
+                }
+            }
+            if config_changed
+                continue
+            var root_changed false
+            let roots &Array[Slice[char]]^host()
+            var f 0
+            while f < (resolved.file_names.get_length() as int)
+            {
+                let fp Watcher.to_path_of(sys, resolved.file_names[f as size_t])
+                set f: f + 1
+                roots.add(fp)
+                if root_changed = false
+                {
+                    if ExecSystem.contains(normalized, fp)
+                    {
+                        this.reset_status(task)
+                        set needs_update: true
+                        set root_changed: true
+                    }
+                }
+            }
+            if root_changed = false
+            {
+                if task.build_info_entry <> null
+                {
+                    let entry task.build_info_entry as ref[BuildInfoEntry]
+                    if entry.info <> null
+                    {
+                        let names this.build_info_file_names(task)
+                        var n 0
+                        while n < (names.get_length() as int)
+                        {
+                            let fp Watcher.to_path_of(sys, names[n as size_t])
+                            set n: n + 1
+                            if ExecSystem.contains(roots, fp)
+                                continue
+                            if ExecSystem.contains(normalized, fp)
+                            {
+                                this.reset_status(task)
+                                set needs_update: true
+                                break
+                            }
+                        }
+                        let directory get_directory_path(host, entry.path)
+                        let info entry.info as ref[JsonValue]
+                        let found &Array[Slice[char]]^host()
+                        this.add_build_info_paths(found, info, "packageJsons", directory)
+                        var p 0
+                        while p < (found.get_length() as int)
+                        {
+                            if this.package_json_lookup_changed(found[p as size_t], normalized, deleted)
+                            {
+                                this.reset_status(task)
+                                set needs_update: true
+                                break
+                            }
+                            set p: p + 1
+                        }
+                        let missing &Array[Slice[char]]^host()
+                        this.add_build_info_paths(missing, info, "missingPackageJsons", directory)
+                        var m 0
+                        while m < (missing.get_length() as int)
+                        {
+                            if this.package_json_lookup_changed(missing[m as size_t], normalized, deleted)
+                            {
+                                this.reset_status(task)
+                                set needs_update: true
+                                break
+                            }
+                            set m: m + 1
+                        }
+                    }
+                }
+                var j 0
+                while j < (task.package_jsons.get_length() as int)
+                {
+                    if this.package_json_lookup_changed(task.package_jsons[j as size_t], normalized, deleted)
+                    {
+                        this.reset_status(task)
+                        set needs_update: true
+                        break
+                    }
+                    set j: j + 1
+                }
+            }
+            ; ReloadFileNamesOfParsedCommandLine
+            let tp TsConfigParser.create(host, Watcher.system_files(sys), sys.cwd)
+            let names_now tp.get_file_names_from_config_specs(resolved.files_specs, resolved.include_specs, resolved.exclude_specs, resolved.base_path, resolved.options)
+            if Orchestrator.same_names(resolved.file_names, names_now) = false
+            {
+                let reloaded &TsParsedCommandLine^host(resolved.options, names_now, resolved.references, resolved.reference_ranges, resolved.files_specs, resolved.files_specs_raw, resolved.include_specs, resolved.include_specs_raw, resolved.is_default_include, resolved.base_path, resolved.exclude_specs, resolved.compile_on_save, resolved.extended_files)
+                this.store_reloaded(task, reloaded)
+                set task.resolved: reloaded
+                this.reset_status(task)
+                set needs_update: true
+            }
+        }
+        if needs_update = false
+        {
+            var i 0
+            while i < (changed_paths.get_length() as int)
+            {
+                let event_path changed_paths[i as size_t]
+                set i: i + 1
+                if sys.directory_exists(event_path) = false
+                    continue
+                if wm.is_path_under_watch(event_path) = false
+                    continue
+                var t 0
+                while t < (order.get_length() as int)
+                {
+                    this.reset_status(tasks[order[t as size_t] as size_t])
+                    set t: t + 1
+                }
+                set needs_update: true
+                break
+            }
+        }
+    }
+
+    function same_names(a: ref[Array[Slice[char]]], b: ref[Array[Slice[char]]]) returns bool
+    {
+        if a.get_length() <> b.get_length()
+            return false
+        var i 0
+        while i < (a.get_length() as int)
+        {
+            let x a[i as size_t]
+            let y b[i as size_t]
+            if x.equals(y) = false
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    ; host.resolvedReferences.store: the reloaded config replaces the cached one
+    procedure store_reloaded(this, task: ref[BuildTask], reloaded: ref[TsParsedCommandLine])
+    {
+        var i 0
+        while i < (resolved_references.get_length() as int)
+        {
+            let known resolved_references[i as size_t]
+            if known.config.equals(task.config)
+            {
+                resolved_references.put(i as size_t, &ResolvedReference^host(known.config, reloaded, known.text, known.diagnostics, &Array[int]^host()))
+                return
+            }
+            set i: i + 1
+        }
     }
 
     ; ── BuildTask.cleanProject ───────────────────────────────────────────────

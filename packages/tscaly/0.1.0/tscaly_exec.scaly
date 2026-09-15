@@ -40,6 +40,9 @@ use scaly.containers.StringBuilder
 use tscaly.system.ExecSystem
 use tscaly.system.VfsFile
 use tscaly.execute.Execute
+use tscaly.watcher.Watcher
+use tscaly.watcher.WatchManager
+use tscaly.build.Orchestrator
 use tscaly.xxh3.Xxh3
 use tscaly.TsOptionDecls.TsOptionDecls
 
@@ -199,6 +202,108 @@ procedure split_args(host: ref[Page], line: Slice[char]) returns ref[Array[Slice
     out
 }
 
+; one edit line at `pos` (its end at `eol`) applied to the file system; the position
+; after it (past a write's content)
+procedure apply_edit(sys: ref[ExecSystem], text: String, pos: int, eol: int, line: Slice[char]) returns int
+{
+    var next eol + 1
+    if line.starts_with("write ")
+    {
+        var num_end 0
+        let n read_number(text, pos + 6, &num_end)
+        let path slice_of(text, num_end + 1, eol - num_end - 1)
+        let content slice_of(text, eol + 1, n)
+        sys.put_file(path, content)
+        set next: eol + 1 + n + 1
+    }
+    if line.starts_with("delete ")
+        sys.remove_file(line.slice_from(7))
+    if line.starts_with("touch ")
+        sys.touch(line.slice_from(6))
+    if line.starts_with("link ")
+    {
+        var tab 5
+        while (tab < (line.length as int)) and (byte_at(line, tab) <> 9)
+            set tab: tab + 1
+        if tab < (line.length as int)
+            sys.put_link(line.subslice(5, tab as size_t), line.slice_from((tab + 1) as size_t))
+    }
+    next
+}
+
+; the harness's incremental-correctness build (getDiffForIncremental): a fresh
+; system with the scenario's files and every edit up to `step`, the command run once;
+; answers the files it wrote and its output (`==== SHADOW-FILE`, `==== SHADOW-OUTPUT`)
+; or the stop (`==== SHADOW-UNPORTED`)
+procedure run_shadow(text: String, step_starts: ref[Array[int]], step: int, end: int, cwd: Slice[char], case_sensitive: bool, env_names: ref[Array[Slice[char]]], env_values: ref[Array[Slice[char]]], deflib: Slice[char], args_line: Slice[char])
+{
+    let anchor String("shadow")
+    let host Page.get(anchor.get_buffer())
+    let s ExecSystem.create(host, cwd, case_sensitive)
+    set s.env_names: env_names
+    set s.env_values: env_values
+    var k 0
+    while k <= step
+    {
+        var pos step_starts[k as size_t]
+        ; past the `step` line
+        set pos: (text.index_of(10 as u8, pos as size_t) as int) + 1
+        repeat
+        {
+            if pos >= end
+                break
+            let eol text.index_of(10 as u8, pos as size_t) as int
+            if eol < 0
+                break
+            let line slice_of(text, pos, eol - pos)
+            if line.starts_with("run ") or line.equals("cycle") or line.starts_with("unsupported ") or line.starts_with("step ")
+                break
+            set pos: apply_edit(s, text, pos, eol, line)
+        }
+        if k = 0
+            ensure_default_libs(s, deflib)
+        set k: k + 1
+    }
+    set s.written: &Array[Slice[char]]^host()
+    Execute.command_line(s, split_args(host, args_line))
+    if (s.stop_tag.length as int) > 0
+    {
+        var sb StringBuilder()
+        sb.append("==== SHADOW-UNPORTED ")
+        sb.append(s.stop_tag.data, s.stop_tag.length)
+        sb.append("\n")
+        emit(sb.to_string())
+        return
+    }
+    var w 0
+    while w < (s.written.get_length() as int)
+    {
+        let path s.written[w as size_t]
+        set w: w + 1
+        let i s.find_index(path)
+        if i < 0
+            continue
+        let f s.files[i as size_t] as ref[VfsFile]
+        var sb StringBuilder()
+        sb.append("==== SHADOW-FILE ")
+        sb.append(f.text.length as int)
+        sb.append(" " as char)
+        sb.append(path.data, path.length)
+        sb.append("\n")
+        sb.append(f.text.data, f.text.length)
+        sb.append("\n")
+        emit(sb.to_string())
+    }
+    let out s.output.to_string()
+    var ob StringBuilder()
+    ob.append("==== SHADOW-OUTPUT ")
+    ob.append(out.get_length() as int)
+    ob.append("\n")
+    ob.append(out)
+    ob.append("\n")
+    emit(ob.to_string())
+}
+
 ; runs one scenario, text[start, end); answers on stdout
 procedure run_scenario(text: String, start: int, end: int, key: Slice[char])
 {
@@ -219,6 +324,9 @@ procedure run_scenario(text: String, start: int, end: int, key: Slice[char])
     var windows_root false
     let env_names &Array[Slice[char]]^host()
     let env_values &Array[Slice[char]]^host()
+    ; each step's `step` line, and the command of step 0 (a cycle's)
+    let step_starts &Array[int]^host()
+    var first_args Slice[char]()
     var pos start
     while (pos < end) and (stopped = false)
     {
@@ -263,28 +371,13 @@ procedure run_scenario(text: String, start: int, end: int, key: Slice[char])
             var num_end 0
             set step: read_number(text, pos + 5, &num_end)
         }
-        if line.starts_with("write ")
-        {
-            var num_end 0
-            let n read_number(text, pos + 6, &num_end)
-            let path slice_of(text, num_end + 1, eol - num_end - 1)
-            let content slice_of(text, eol + 1, n)
-            (sys as ref[ExecSystem]).put_file(path, content)
-            set next: eol + 1 + n + 1
-        }
-        if line.starts_with("delete ")
-            (sys as ref[ExecSystem]).remove_file(line.slice_from(7))
-        if line.starts_with("touch ")
-            (sys as ref[ExecSystem]).touch(line.slice_from(6))
-        if line.starts_with("link ")
-        {
-            var tab 5
-            while (tab < (line.length as int)) and (byte_at(line, tab) <> 9)
-                set tab: tab + 1
-            if tab < (line.length as int)
-                (sys as ref[ExecSystem]).put_link(line.subslice(5, tab as size_t), line.slice_from((tab + 1) as size_t))
-        }
+        if line.starts_with("step ")
+            step_starts.add(pos)
+        if sys <> null
+            set next: apply_edit(sys as ref[ExecSystem], text, pos, eol, line)
         var is_run line.starts_with("run ")
+        if is_run and (step = 0)
+            set first_args: line.slice_from(4)
         var is_cycle line.equals("cycle")
         var is_unsupported line.starts_with("unsupported ")
         if is_run or is_cycle or is_unsupported
@@ -301,7 +394,28 @@ procedure run_scenario(text: String, start: int, end: int, key: Slice[char])
             if is_unsupported
                 s.stop("scenario-edit-unsupported")
             if is_cycle
-                s.stop("watch-cycle")
+            {
+                ; SendChangedPaths, then DoCycle
+                let deleted &Array[bool]^host()
+                let changes s.changed_paths(deleted)
+                if s.watcher <> null
+                {
+                    let w s.watcher as ref[Watcher]
+                    w.wm.send_changed_paths(changes, deleted)
+                    w.do_cycle()
+                }
+                else
+                {
+                    if s.build_watcher <> null
+                    {
+                        let o s.build_watcher as ref[Orchestrator]
+                        o.wm.send_changed_paths(changes, deleted)
+                        o.do_cycle()
+                    }
+                    else
+                        s.stop("watch-cycle")
+                }
+            }
             if windows_root
                 s.stop("windows-root")
             if is_run
@@ -333,6 +447,29 @@ procedure run_scenario(text: String, start: int, end: int, key: Slice[char])
                 sb.append("\n==== POST\n")
                 emit(sb.to_string())
                 print_tree(s, deflib)
+                s.take_post_snapshot()
+                var wm_opt: ref[WatchManager]? null
+                if s.watcher <> null
+                    set wm_opt: (s.watcher as ref[Watcher]).wm
+                if s.build_watcher <> null
+                    set wm_opt: (s.build_watcher as ref[Orchestrator]).wm
+                if wm_opt <> null
+                {
+                    let wmr wm_opt as ref[WatchManager]
+                    if wmr.registered
+                    {
+                        var ws StringBuilder()
+                        wmr.watch_state(&ws)
+                        let state ws.to_string()
+                        var wb StringBuilder()
+                        wb.append("==== WATCH ")
+                        wb.append(state.get_length() as int)
+                        wb.append("\n")
+                        wb.append(state)
+                        wb.append("\n")
+                        emit(wb.to_string())
+                    }
+                }
                 if s.programs.get_length() > 0
                 {
                     let programs s.programs.to_string()
@@ -343,6 +480,13 @@ procedure run_scenario(text: String, start: int, end: int, key: Slice[char])
                     pb.append(programs)
                     pb.append("\n")
                     emit(pb.to_string())
+                }
+                if step > 0
+                {
+                    var args first_args
+                    if is_run
+                        set args: line.slice_from(4)
+                    run_shadow(text, step_starts, step, end, cwd, case_sensitive, env_names, env_values, deflib, args)
                 }
                 set s.written: &Array[Slice[char]]^host()
                 s.reset_trace_cache()

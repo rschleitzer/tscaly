@@ -203,6 +203,208 @@ def scenario_settings():
     return out
 
 
+def expected_diffs():
+    """(subScenario as its baseline file name, edit caption) → tscEdit.expectedDiff"""
+    out = {}
+    path = os.path.join(GO_TESTS, "tscwatch_test.go")
+    if os.path.exists(path):
+        src = open(path, encoding="utf-8").read()
+        for m in re.finditer(r'expectedDiff:\s*"((?:[^"\\]|\\.)*)"', src):
+            head = src[:m.start()]
+            captions = list(re.finditer(r'caption:\s*"((?:[^"\\]|\\.)*)"', head))
+            scenarios = list(re.finditer(r'subScenario:\s*"((?:[^"\\]|\\.)*)"', head))
+            if captions and scenarios:
+                out[(scenarios[-1].group(1).replace(" ", "-"), captions[-1].group(1))] = m.group(1)
+    # tscbuild_test.go's getIncrementalErrorTest: a Dedent chosen by the options
+    out[("reportErrors-when-stopBuildOnErrors-is-passed-on-command-line", "change core")] = (
+        "Clean build will stop on error in core and will not report error in logic\n"
+        "Watch build will retain previous errors from logic and report it")
+    return out
+
+
+# ── patience diff (github.com/peter-evans/patience, as baseline.DiffText uses it) ──
+
+def split_lines(text):
+    """stringutil.SplitLines"""
+    lines = []
+    start = pos = 0
+    n = len(text)
+    while pos < n:
+        c = text[pos]
+        if c == "\r":
+            if pos + 1 < n and text[pos + 1] == "\n":
+                lines.append(text[start:pos])
+                pos += 2
+                start = pos
+                continue
+            lines.append(text[start:pos])
+            pos += 1
+            start = pos
+            continue
+        if c == "\n":
+            lines.append(text[start:pos])
+            pos += 1
+            start = pos
+            continue
+        pos += 1
+    if start < n:
+        lines.append(text[start:])
+    return lines
+
+
+def patience_lcs(a, b):
+    table = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+    for i in range(1, len(a) + 1):
+        for j in range(1, len(b) + 1):
+            if a[i - 1] == b[j - 1]:
+                table[i][j] = table[i - 1][j - 1] + 1
+            else:
+                table[i][j] = max(table[i - 1][j], table[i][j - 1])
+    i, j = len(a), len(b)
+    s = []
+    while i > 0 and j > 0:
+        if a[i - 1] == b[j - 1]:
+            s.append([i - 1, j - 1])
+            i -= 1
+            j -= 1
+        elif table[i - 1][j] > table[i][j - 1]:
+            i -= 1
+        else:
+            j -= 1
+    s.reverse()
+    return s
+
+
+def patience_unique(a):
+    counts = collections.Counter(a)
+    elements, indices = [], []
+    for i, e in enumerate(a):
+        if counts[e] == 1:
+            elements.append(e)
+            indices.append(i)
+    return elements, indices
+
+
+def patience_diff(a, b):
+    """[(type, text)] with type -1 delete, 1 insert, 0 equal"""
+    if not a and not b:
+        return []
+    if not a:
+        return [(1, l) for l in b]
+    if not b:
+        return [(-1, l) for l in a]
+    i = 0
+    while i < len(a) and i < len(b) and a[i] == b[i]:
+        i += 1
+    if i > 0:
+        return [(0, l) for l in a[:i]] + patience_diff(a[i:], b[i:])
+    j = 0
+    while j < len(a) and j < len(b) and a[len(a) - 1 - j] == b[len(b) - 1 - j]:
+        j += 1
+    if j > 0:
+        return patience_diff(a[:len(a) - j], b[:len(b) - j]) + [(0, l) for l in a[len(a) - j:]]
+    ua, idxa = patience_unique(a)
+    ub, idxb = patience_unique(b)
+    lcs = patience_lcs(ua, ub)
+    if not lcs:
+        return [(-1, l) for l in a] + [(1, l) for l in b]
+    for pair in lcs:
+        pair[0] = idxa[pair[0]]
+        pair[1] = idxb[pair[1]]
+    diffs = []
+    ga = gb = 0
+    for ia, ib in lcs:
+        diffs += patience_diff(a[ga:ia], b[gb:ib])
+        diffs.append((0, a[ia]))
+        ga, gb = ia + 1, ib + 1
+    diffs += patience_diff(a[ga:], b[gb:])
+    return diffs
+
+
+def patience_hunks(diffs, pre, post):
+    """makeHunks: [ [diffs, src_start, src_lines, dst_start, dst_lines] ]"""
+    if not diffs:
+        return []
+    hunks = []
+
+    def update(block, last):
+        cur = len(hunks) - 1
+        bd = block[0]
+        if bd[0][0] == 0:
+            if not hunks:
+                ctx = min(pre, len(bd))
+                hunks.append([bd[len(bd) - ctx:], len(bd) - ctx + block[1], ctx, len(bd) - ctx + block[3], ctx])
+            else:
+                max_non_context = post if last else pre + post
+                if len(bd) <= max_non_context:
+                    hunks[cur][0] = hunks[cur][0] + bd
+                    hunks[cur][2] += len(bd)
+                    hunks[cur][4] += len(bd)
+                else:
+                    hunks[cur][0] = hunks[cur][0] + bd[:post]
+                    hunks[cur][2] += post
+                    hunks[cur][4] += post
+                    if not last:
+                        hunks.append([bd[len(bd) - pre:], len(bd) - pre + block[1], pre, len(bd) - pre + block[3], pre])
+                if hunks[cur][1] == 0:
+                    hunks[cur][1] = block[1]
+                if hunks[cur][3] == 0:
+                    hunks[cur][3] = block[3]
+        else:
+            if hunks:
+                hunks[cur][0] = hunks[cur][0] + bd
+                hunks[cur][2] += block[2]
+                hunks[cur][4] += block[4]
+            else:
+                hunks.append([bd, block[1], block[2], block[3], block[4]])
+
+    block = [[], 0, 0, 0, 0]
+    modified = 0
+    src = dst = 0
+    for l in diffs:
+        bd = block[0]
+        if not bd or bd[0][0] == l[0] or (bd[0][0] != 0 and l[0] != 0):
+            bd.append(l)
+        else:
+            update(block, False)
+            block = [[l], 0, 0, 0, 0]
+        if l[0] == -1:
+            src += 1
+            block[2] += 1
+            modified += 1
+        elif l[0] == 1:
+            dst += 1
+            block[4] += 1
+            modified += 1
+        else:
+            src += 1
+            dst += 1
+            block[2] += 1
+            block[4] += 1
+        if block[1] == 0 and l[0] in (0, -1):
+            block[1] = src
+        if block[3] == 0 and l[0] in (0, 1):
+            block[3] = dst
+    update(block, True)
+    if modified == 0:
+        return []
+    return hunks
+
+
+def diff_text(old_name, new_name, expected, actual):
+    """baseline.DiffText"""
+    diffs = patience_diff(split_lines(expected), split_lines(actual))
+    s = ["--- " + old_name, "+++ " + new_name]
+    for h in patience_hunks(diffs, 3, 3):
+        s.append("@@ -%d,%d +%d,%d @@" % (h[1], h[2], h[3], h[4]))
+        for t, text in h[0]:
+            if t == 0 and not text:
+                s.append("")
+            else:
+                s.append({0: " ", 1: "+", -1: "-"}[t] + text)
+    return "\n".join(s)
+
+
 # ── the harness's rendering of the port's facts ─────────────────────────────
 
 BUILD_STARTING_AT = "build starting at "
@@ -223,8 +425,8 @@ def sanitize_internal_symbol_names(s):
     return INTERNAL_SYMBOL_RE.sub(lambda m: m.group(0)[:m.group(0).rindex("@")] + "@<symbolId>", s)
 
 
-def sanitize_output(text):
-    """tsctests' outputSanitizer.transformLines, forComparing false"""
+def sanitize_output(text, for_comparing=False):
+    """tsctests' outputSanitizer.transformLines"""
     lines = text.split("\n")
     out = []
 
@@ -237,11 +439,13 @@ def sanitize_output(text):
     while i < len(lines):
         line = lines[i]
         if line.startswith(BUILD_STARTING_AT):
-            add(BUILD_STARTING_AT + "HH:MM:SS AM")
+            if not for_comparing:
+                add(BUILD_STARTING_AT + "HH:MM:SS AM")
             i += 1
             continue
         if line.startswith(BUILD_FINISHED_IN):
-            add(BUILD_FINISHED_IN + "d.ddds")
+            if not for_comparing:
+                add(BUILD_FINISHED_IN + "d.ddds")
             i += 1
             continue
         handled = False
@@ -252,7 +456,7 @@ def sanitize_output(text):
             i += 1
             first = True
             while i < len(lines) and lines[i] != end:
-                if not skip_always:
+                if not skip_always and not for_comparing:
                     l = lines[i]
                     if first and stamp:
                         colon = l.find(":")
@@ -404,6 +608,19 @@ def parse_answer(text):
             cur[m.group(1).lower()] = data
             i += 1 + data.count("\n") + 1
             continue
+        m = re.match(r"==== SHADOW-(FILE|OUTPUT) (\d+)(?: (.*))?$", line)
+        if m:
+            n = int(m.group(2))
+            data = "\n".join(lines[i + 1:]).encode("utf-8", "surrogateescape")[:n].decode("utf-8", "surrogateescape")
+            shadow = cur.setdefault("shadow", {"files": {}, "output": ""})
+            if m.group(1) == "FILE":
+                shadow["files"][m.group(3)] = data
+            else:
+                shadow["output"] = data
+            i += 1 + data.count("\n") + 1
+            continue
+        if line.startswith("==== SHADOW-UNPORTED "):
+            cur["unported"] = "shadow-" + line[len("==== SHADOW-UNPORTED "):]
         if line.startswith("==== EXIT "):
             cur["exit"] = line[len("==== EXIT "):]
         elif line.startswith("==== UNPORTED "):
@@ -412,7 +629,31 @@ def parse_answer(text):
     return steps
 
 
-def render_step(sc_step, ours, prev_post):
+def incremental_diff(ours):
+    """getDiffForIncremental over the port's shadow build and its step"""
+    shadow = ours.get("shadow")
+    if shadow is None:
+        return ""
+    post_snap, _ = ours["post"]
+    out = []
+    for path in sorted(shadow["files"], key=lambda p: p.encode("utf-8", "surrogateescape")):
+        text = shadow["files"][path]
+        entry = post_snap.get(path)
+        if path.endswith(".tsbuildinfo") or path.endswith(".readable.baseline.txt"):
+            if entry is None or entry[0] != "F":
+                out.append(diff_text("nonIncremental " + path, "incremental " + path, "Exists", "") + "\n")
+        else:
+            incremental = entry[1] if entry is not None and entry[0] == "F" else None
+            if incremental is None or incremental != sanitize_internal_symbol_names(text):
+                out.append(diff_text("nonIncremental " + path, "incremental " + path, text, incremental or "") + "\n")
+    non_incremental_output = sanitize_output(shadow["output"], True)
+    incremental_output = sanitize_output(ours.get("output", ""), True)
+    if incremental_output != non_incremental_output:
+        out.append(diff_text("nonIncremental.output.txt", "incremental.output.txt", non_incremental_output, incremental_output))
+    return "".join(out)
+
+
+def render_step(sc_step, ours, prev_post, expected_diff=""):
     """→ (input block, rest) as the harness would print this step"""
     pre_snap, pre_libs = ours["pre"]
     old_snap, old_libs = prev_post if prev_post is not None else (None, None)
@@ -425,13 +666,20 @@ def render_step(sc_step, ours, prev_post):
     rest.append("\nOutput::\n")
     rest.append(sanitize_output(ours.get("output", "")))
     rest.append(fs_diff(pre_snap, pre_libs, post_snap, post_libs))
-    rest.append(ours.get("programs", ""))
     rest.append(ours.get("watch", ""))
+    rest.append(ours.get("programs", ""))
+    diff = incremental_diff(ours)
+    if diff:
+        rest.append("\n\nDiff:: %s\n" % (expected_diff or "!!! Unexpected diff, please review and either fix or write explanation as expectedDiff !!!"))
+        rest.append(diff)
+    elif expected_diff and "shadow" in ours:
+        rest.append("\n\nDiff:: %s !!! Diff not found but explanation present, please review and remove the explanation !!!\n" % expected_diff)
     return block, "".join(rest)
 
 
 def run(args):
     settings = scenario_settings()
+    diffs_expected = expected_diffs()
     items = []
     for key, path in baselines(args.filter):
         sc = parse_baseline(open(path, encoding="utf-8", errors="surrogateescape", newline="").read())
@@ -489,7 +737,8 @@ def run(args):
                 fails.append((key, "step %d crashed (rc %d)" % (index, proc.returncode)))
                 detail = "step %d crash" % index
                 break
-            block, rest = render_step(step, ours, prev_post)
+            expected_diff = diffs_expected.get((os.path.basename(key), step["caption"]), "")
+            block, rest = render_step(step, ours, prev_post, expected_diff)
             expected_rest = step["text"][len(step["input_block"]):]
             if block != step["input_block"] or rest != expected_rest:
                 verdict = "FAIL"

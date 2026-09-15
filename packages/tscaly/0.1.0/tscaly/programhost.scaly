@@ -34,6 +34,8 @@ use tscaly.emitter.EmitOptions
 use tscaly.printer.Printer
 use tscaly.printer.SourceFileInfo
 use tscaly.compiler.ProgramLoader
+use tscaly.program.ModuleResolver
+use tscaly.incremental.IncSort
 use tscaly.compiler.ProgramDiagnostic
 use tscaly.compiler.OptionVerifier
 use tscaly.modulespecifiers.SpecifierHost
@@ -157,6 +159,7 @@ define ConfigFiles (reserved: int)
     {
         let host sys.host
         let pf ProgramFiles.create(host)
+        set pf.directory_paths: sys.directories
         var fi 0
         while fi < (sys.files.get_length() as int)
         {
@@ -295,12 +298,25 @@ define DriverProgram
     reference_diagnostics: ref[Array[ref[DriverDiagnostic]]]
     ; the lib chain's parsers (a program without a source file checks over a lib)
     lib_parsers: ref[Array[ref[Parser]?]]
+    ; per entry of `references`: the indices of its own references in this program
+    reference_children: ref[Array[ref[Array[int]]]]
+    ; per lib file the lib file name it was loaded for (its path is a replacement's
+    ; under libReplacement)
+    lib_file_names: ref[Array[Slice[char]]]
+    ; pathForLibFile's cache (the lib file name and its path) and, under
+    ; libReplacement, each resolution's key (resolveFrom) and traces
+    lib_resolution_names: ref[Array[Slice[char]]]
+    lib_resolution_paths: ref[Array[Slice[char]]]
+    lib_resolution_keys: ref[Array[Slice[char]]]
+    lib_resolution_traces: ref[Array[ref[Array[String]]]]
 )
 {
     function create(host: ref[Page], sys: ref[ExecSystem], ts: ref[TsOptions], root_names: ref[Array[Slice[char]]], config_path: Slice[char], config_text: Slice[char], config_diagnostics: ref[Array[ref[DriverDiagnostic]]]) returns ref[DriverProgram]
     {
         let options DriverProgram.emit_options_of(host, ts, sys.cwd, config_path)
-        &DriverProgram^host(host, sys, options, ts, ProgramFiles.create(host), root_names, null, null, config_path, config_text, config_diagnostics, &Array[Slice[char]]^host(), false, &Array[ref[DriverDiagnostic]]^host(), &Array[ref[AstNode]?]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), null, &Array[ref[ResolvedReference]]^host(), &Array[int]^host(), null, null, null, &Array[ref[DriverDiagnostic]]^host(), &Array[ref[Parser]?]^host())
+        let pf ProgramFiles.create(host)
+        set pf.directory_paths: sys.directories
+        &DriverProgram^host(host, sys, options, ts, pf, root_names, null, null, config_path, config_text, config_diagnostics, &Array[Slice[char]]^host(), false, &Array[ref[DriverDiagnostic]]^host(), &Array[ref[AstNode]?]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), null, &Array[ref[ResolvedReference]]^host(), &Array[int]^host(), null, null, null, &Array[ref[DriverDiagnostic]]^host(), &Array[ref[Parser]?]^host(), &Array[ref[Array[int]]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[ref[Array[String]]]^host())
     }
 
     ; ── project references ───────────────────────────────────────────────────
@@ -341,11 +357,13 @@ define DriverProgram
         }
         let r resolved as ref[ResolvedReference]
         references.add(r)
+        let children &Array[int]^host()
+        reference_children.add(children)
         let index (references.get_length() as int) - 1
         if r.parsed <> null
         {
             let parsed r.parsed as ref[TsParsedCommandLine]
-            if (r.children.get_length() = 0) and (parsed.references <> null)
+            if parsed.references <> null
             {
                 let refs parsed.references as ref[Array[ProjectReference]]
                 var c 0
@@ -356,7 +374,7 @@ define DriverProgram
                     let child this.resolve_reference(child_config)
                     if (sys.stop_tag.length as int) > 0
                         return 0 - 1
-                    r.children.add(child)
+                    children.add(child)
                     set c: c + 1
                 }
             }
@@ -526,7 +544,7 @@ define DriverProgram
                     }
                 }
             }
-            this.map_references(ld, r.children, seen)
+            this.map_references(ld, reference_children[index as size_t], seen)
         }
     }
 
@@ -625,7 +643,7 @@ define DriverProgram
                         (ld as ref[ProgramLoader]).blocked_paths.add(build_info_name)
                 }
             }
-            this.verify_references_of(config, r.config, r.text, r.children, seen, build_info_name, ld)
+            this.verify_references_of(config, r.config, r.text, reference_children[index as size_t], seen, build_info_name, ld)
         }
     }
 
@@ -861,6 +879,10 @@ define DriverProgram
         let lib_files &Array[ref[AstNode]?]^host()
         let lib_binders &Array[ref[Binder]?]^host()
         let seen &Array[Slice[char]]^host()
+        ; pathForLibFile resolves through the loader's resolver, whose package.json
+        ; lookups the program keeps
+        if this.flag("libReplacement")
+            set pf.package_json_recording: true
         if this.load_lib_chain(options.lib_names(host), lib_files, lib_binders, seen) = false
             return false
         this.sort_libs(lib_files, lib_binders)
@@ -893,6 +915,25 @@ define DriverProgram
             this.stop(ld.stop_tag)
             return false
         }
+        ; processLibReferenceDirectives: a program file's `/// <reference lib>` brings
+        ; its library in, and in collectFiles' order the directives' libraries come
+        ; before compilerOptions' (the program's checker is made over the set below)
+        if ld.lib_ref_names.get_length() > 0
+        {
+            lib_files.clear()
+            lib_binders.clear()
+            seen.clear()
+            lib_nodes.clear()
+            lib_paths.clear()
+            lib_texts.clear()
+            lib_parsers.clear()
+            lib_file_names.clear()
+            if this.load_lib_chain(ld.lib_ref_names, lib_files, lib_binders, seen) = false
+                return false
+            if this.load_lib_chain(options.lib_names(host), lib_files, lib_binders, seen) = false
+                return false
+            this.sort_libs(lib_files, lib_binders)
+        }
         ; the compiler host's Trace over collectFiles' traces
         var tl 0
         while tl < (ld.trace_lines.get_length() as int)
@@ -900,6 +941,36 @@ define DriverProgram
             let trace_line ld.trace_lines[tl as size_t]
             sys.trace(Slice[char](trace_line.get_length(), trace_line.get_buffer() as pointer[char]))
             set tl: tl + 1
+        }
+        ; pathForLibFileResolutions' traces, by key
+        let lib_keys &Array[Slice[char]]^host()
+        var lk 0
+        while lk < (lib_resolution_keys.get_length() as int)
+        {
+            IncSort.insert_sorted(lib_keys, lib_resolution_keys[lk as size_t])
+            set lk: lk + 1
+        }
+        var sk 0
+        while sk < (lib_keys.get_length() as int)
+        {
+            let key lib_keys[sk as size_t]
+            set sk: sk + 1
+            var at 0
+            while at < (lib_resolution_keys.get_length() as int)
+            {
+                let candidate lib_resolution_keys[at as size_t]
+                if candidate.equals(key)
+                    break
+                set at: at + 1
+            }
+            let traces lib_resolution_traces[at as size_t]
+            var t 0
+            while t < (traces.get_length() as int)
+            {
+                let line traces[t as size_t]
+                sys.trace(Slice[char](line.get_length(), line.get_buffer() as pointer[char]))
+                set t: t + 1
+            }
         }
         pf.set_members(ld.members)
         ; loadSourceFileMetaData's scope lookup of every file the program holds
@@ -1125,7 +1196,11 @@ define DriverProgram
         var i 0
         while i < n
         {
-            priorities.add(DriverProgram.lib_priority(host, lib_paths[i as size_t]))
+            let lib_path lib_paths[i as size_t]
+            if DriverProgram.under_directory(lib_path, sys.default_library_path)
+                priorities.add(DriverProgram.lib_priority(host, lib_path))
+            else
+                priorities.add(DriverProgram.lib_priority(host, "x"))
             set i: i + 1
         }
         var k 1
@@ -1138,6 +1213,7 @@ define DriverProgram
                     break
                 DriverProgram.swap_int(priorities, j)
                 DriverProgram.swap_slice(lib_paths, j)
+                DriverProgram.swap_slice(lib_file_names, j)
                 DriverProgram.swap_slice(lib_texts, j)
                 DriverProgram.swap_node(lib_nodes, j)
                 DriverProgram.swap_node(files, j)
@@ -1222,7 +1298,7 @@ define DriverProgram
             if ExecSystem.contains(seen, file_name)
                 continue
             seen.add(file_name)
-            let lib_path combine_paths(host, sys.default_library_path, file_name)
+            let lib_path this.path_for_lib_file(file_name)
             var raw Slice[char]()
             if sys.read_file(lib_path, &raw) = false
             {
@@ -1266,8 +1342,92 @@ define DriverProgram
             lib_paths.add(lib_path)
             lib_texts.add(Slice[char](text.get_length(), text.get_buffer() as pointer[char]))
             lib_parsers.add(lp)
+            lib_file_names.add(file_name)
         }
         true
+    }
+
+    ; fileLoader.pathForLibFile: the default library's file, or under libReplacement
+    ; the `@typescript/lib-*` package it resolves to from the config's directory
+    procedure path_for_lib_file(this, file_name: Slice[char]) returns Slice[char]
+    {
+        var c 0
+        while c < (lib_resolution_names.get_length() as int)
+        {
+            let known lib_resolution_names[c as size_t]
+            if known.equals(file_name)
+                return lib_resolution_paths[c as size_t]
+            set c: c + 1
+        }
+        var path combine_paths(host, sys.default_library_path, file_name)
+        if this.flag("libReplacement") and (file_name.equals("lib.d.ts") = false)
+        {
+            let library_name DriverProgram.library_name_from_lib_file_name(host, file_name)
+            var containing sys.cwd
+            if (config_path.length as int) > 0
+                set containing: get_directory_path(host, get_normalized_absolute_path(host, config_path, sys.cwd))
+            let resolve_from combine_paths(host, containing, join_slices(host, join_slices(host, "__lib_node_modules_lookup_", file_name), "__.ts"))
+            let o options
+            let resolver ModuleResolver.create(host, pf, o.get_module_resolution_kind(), o.get_resolve_json_module(), ModuleKindCommonJS, EmitOptions.on(o.allow_js), o.resolve_package_json_exports, o.resolve_package_json_imports, o.out_dir, o.project_root_directory(host))
+            if this.flag("traceResolution")
+                resolver.enable_trace(o.module_resolution = o.get_module_resolution_kind())
+            let r resolver.resolve(library_name, resolve_from)
+            if r >= 0
+                set path: pf.path_at(r)
+            let key_copy String^host(resolve_from.data as pointer[const_char], resolve_from.length as size_t)
+            lib_resolution_keys.add(Slice[char](key_copy.get_length(), key_copy.get_buffer() as pointer[char]))
+            let traces &Array[String]^host()
+            ProgramLoader.append_traces(traces, resolver)
+            lib_resolution_traces.add(traces)
+        }
+        let name_copy String^host(file_name.data as pointer[const_char], file_name.length as size_t)
+        let path_copy String^host(path.data as pointer[const_char], path.length as size_t)
+        lib_resolution_names.add(Slice[char](name_copy.get_length(), name_copy.get_buffer() as pointer[char]))
+        lib_resolution_paths.add(Slice[char](path_copy.get_length(), path_copy.get_buffer() as pointer[char]))
+        path
+    }
+
+    ; getLibraryNameFromLibFileName: lib.dom.iterable.d.ts → @typescript/lib-dom/iterable
+    function library_name_from_lib_file_name(host: ref[Page], lib_file_name: Slice[char]) returns Slice[char]
+    {
+        let components &Array[Slice[char]]^host()
+        var start 0
+        var i 0
+        while i <= (lib_file_name.length as int)
+        {
+            var at_end i = (lib_file_name.length as int)
+            var dot false
+            if at_end = false
+                set dot: (lib_file_name[i as size_t] as int) = ("." as char) as int
+            if at_end or dot
+            {
+                components.add(lib_file_name.subslice(start as size_t, i as size_t))
+                set start: i + 1
+            }
+            set i: i + 1
+        }
+        let sb StringBuilder^host()
+        sb.append("@typescript/lib-")
+        if components.get_length() > 1
+        {
+            let second components[1]
+            sb.append(second.data, second.length)
+        }
+        var k 2
+        while k < (components.get_length() as int)
+        {
+            let component components[k as size_t]
+            if ((component.length as int) = 0) or component.equals("d")
+                break
+            if k = 2
+                sb.append("/")
+            else
+                sb.append("-")
+            sb.append(component.data, component.length)
+            set k: k + 1
+        }
+        let text String^host(sb.to_string())
+        Slice[char](text.get_length(), text.get_buffer() as pointer[char])
     }
 
     ; ── GetDiagnosticsOfAnyProgram ───────────────────────────────────────────
@@ -1993,17 +2153,9 @@ define DriverProgram
     procedure list_files(this, emitted: ref[Array[Slice[char]]]) returns bool
     {
         let listing this.flag("explainFiles") or this.flag("listFiles") or this.flag("listFilesOnly")
-        if listing and (loader <> null)
-        {
-            let ld loader as ref[ProgramLoader]
-            ; a source file's `/// <reference lib>` adds a library the chain does not load
-            if ld.lib_reference_directive
-            {
-                this.stop("list-files-lib-reference")
-                return false
-            }
-        }
         let out sys.output
+        ; the harness's OnListFilesStart/End around whatever is listed
+        out.append("!!! List files start\n")
         if this.flag("listEmittedFiles")
         {
             var i 0
@@ -2017,18 +2169,25 @@ define DriverProgram
             }
         }
         if this.flag("explainFiles")
-            return this.explain_files()
-        if this.flag("listFiles") or this.flag("listFilesOnly")
         {
-            var k 0
-            while k < this.source_file_count()
+            if this.explain_files() = false
+                return false
+        }
+        else
+        {
+            if this.flag("listFiles") or this.flag("listFilesOnly")
             {
-                let path this.source_path(k)
-                set k: k + 1
-                out.append(path.data, path.length)
-                out.append("\n")
+                var k 0
+                while k < this.source_file_count()
+                {
+                    let path this.source_path(k)
+                    set k: k + 1
+                    out.append(path.data, path.length)
+                    out.append("\n")
+                }
             }
         }
+        out.append("!!! List files end\n")
         true
     }
 
@@ -2194,13 +2353,47 @@ define DriverProgram
                 return false
             }
         }
+        let base lib_file_names[k as size_t]
+        ; fileIncludeKindLibReferenceDirective: the source files' directives come first
+        ; (their tasks are reached from the root files before the lib tasks)
+        var referenced false
+        if loader <> null
+        {
+            let ld loader as ref[ProgramLoader]
+            var r 0
+            while r < (ld.lib_ref_names.get_length() as int)
+            {
+                let written ld.lib_ref_names[r as size_t]
+                let file_index ld.lib_ref_files[r as size_t]
+                set r: r + 1
+                let lib_file Checker.lib_file_name(host, written)
+                if lib_file.equals(base)
+                {
+                    let referencing this.explain_relative(pf.path_at(file_index))
+                    let args ProgramDiagnostic.args1(host, ProgramDiagnostic.text(written))
+                    args.add(ProgramDiagnostic.text(referencing))
+                    this.explain_line(1405, args)
+                    set referenced: true
+                }
+            }
+        }
         if (options.lib.length as int) = 0
         {
-            let t options.get_emit_script_target()
-            this.explain_line(1425, ProgramDiagnostic.args1(host, DriverProgram.script_target_name(t)))
+            let defaults options.lib_names(host)
+            var is_default referenced = false
+            if defaults.get_length() > 0
+            {
+                let default_name Checker.lib_file_name(host, defaults[0])
+                if default_name.equals(base)
+                    set is_default: true
+            }
+            if is_default
+            {
+                let t options.get_emit_script_target()
+                this.explain_line(1425, ProgramDiagnostic.args1(host, DriverProgram.script_target_name(t)))
+            }
             return true
         }
-        let base get_base_file_name(host, path)
         let names options.lib_names(host)
         var i 0
         while i < (names.get_length() as int)
@@ -2213,6 +2406,8 @@ define DriverProgram
                 return true
             }
         }
+        if referenced
+            return true
         this.stop("explain-lib-reason")
         false
     }
