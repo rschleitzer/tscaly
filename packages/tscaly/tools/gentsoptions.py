@@ -104,6 +104,8 @@ def main():
     m = re.search(r"var commandLineOptionEnumMap = map\[string\]\*collections\.OrderedMap\[string, any\]\{(.*?)\n\}", clo, re.S)
     enum_vars = dict(re.findall(r'"(\w+)":\s*(\w+),', m.group(1)))
 
+    md = re.search(r"var commandLineOptionDeprecated = map\[string\]\*collections\.Set\[string\]\{(.*?)\n\}", clo, re.S)
+    deprecated = {k: set(re.findall(r'"([^"]+)"', v)) for k, v in re.findall(r'"(\w+)":\s*collections\.NewSetFromItems\(([^)]*)\)', md.group(1))}
     enums_src = read("enummaps.go")
     enum_keys = {}
     for opt, var in enum_vars.items():
@@ -232,6 +234,19 @@ def main():
             p('            if key.equals("%s")' % k)
             p('                return "%s"' % v)
         p("        }")
+    p('        ""')
+    p("    }")
+    p("")
+    p("    ; formatEnumTypeKeys over the enum map of option `i`: its keys but the")
+    p("    ; deprecated ones, quoted and comma-joined")
+    p("    function enum_keys_text(i: int) returns Slice[char]")
+    p("    {")
+    for opt, pairs in enum_keys.items():
+        if opt not in last:
+            continue
+        keys = [k for k, v in pairs if k not in deprecated.get(opt, set())]
+        p("        if i = %d" % last[opt])
+        p('            return "%s"' % ", ".join("'%s'" % k for k in keys))
     p('        ""')
     p("    }")
     p("}")

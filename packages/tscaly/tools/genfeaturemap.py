@@ -71,6 +71,11 @@ for raw in lines[2:]:
         continue
     if in_props:
         pending_props.extend(re.findall(r'"([^"]*)"', line))
+        # a multi-line prop list closes with `}},` on its own line
+        if line.endswith("}},"):
+            in_props = False
+            entries.append((cur_type, pending_lib, pending_props))
+            pending_lib, pending_props = None, []
         continue
 
 assert entries, "parsed nothing — the reference's shape moved"
@@ -111,34 +116,35 @@ o.write("            set i: i + 1\n")
 o.write("        }\n")
 o.write("        true\n")
 o.write("    }\n\n")
-o.write("    ; getSuggestedLibForNonExistentProperty's inner two loops.\n")
-o.write("    ;\n")
-o.write("    ; \u2605\u2605 IT ANSWERS A BOOL WHERE THE REFERENCE ANSWERS THE LIB NAME, and that\n")
-o.write("    ; is exact rather than lossy: the name's ONLY use upstream is as an argument\n")
-o.write("    ; of TS2550, and a diagnostic here is (pos, end, code) \u2014 the caller asks\n")
-o.write("    ; `libSuggestion != \"\"` and nothing else. The rows still carry each lib in a\n")
-o.write("    ; comment so the table stays readable against the reference.\n")
-o.write("    function has_suggested_lib(type_name: Slice[char], prop: Slice[char]) returns bool\n")
+o.write("    ; getSuggestedLibForNonExistentProperty's inner two loops: the lib that adds the\n")
+o.write("    ; property to the type, or empty\n")
+o.write("    function suggested_lib(type_name: Slice[char], prop: Slice[char]) returns Slice[char]\n")
 o.write("    {\n")
 by_type = {}
 for t, lib, props in entries:
     by_type.setdefault(t, []).append((lib, props))
-first = True
 for t in by_type:
     o.write("        if FeatureMap.bytes_are(type_name, %s)\n" % scaly_str(t))
     o.write("        {\n")
     for lib, props in by_type[t]:
-        if props:
-            o.write("            ; %s\n" % lib)
         for p in props:
             o.write("            if FeatureMap.bytes_are(prop, %s)\n" % scaly_str(p))
-            o.write("                return true\n")
+            o.write("                return %s\n" % scaly_str(lib))
         if not props:
-            o.write("            ; `%s` adds no property names to this type — an empty row upstream.\n" % lib)
-    o.write("            return false\n")
+            o.write("            ; `%s` adds no property names to this type \u2014 an empty row upstream.\n" % lib)
+    o.write("            return \"\"\n")
     o.write("        }\n")
-    first = False
-o.write("        false\n")
+o.write("        \"\"\n")
+o.write("    }\n\n")
+o.write("    function has_suggested_lib(type_name: Slice[char], prop: Slice[char]) returns bool\n")
+o.write("        FeatureMap.suggested_lib(type_name, prop).length > 0\n\n")
+o.write("    ; getSuggestedLibForNonExistentName: the FIRST entry's lib of a type the map knows, or empty\n")
+o.write("    function first_lib(type_name: Slice[char]) returns Slice[char]\n")
+o.write("    {\n")
+for t in by_type:
+    o.write("        if FeatureMap.bytes_are(type_name, %s)\n" % scaly_str(t))
+    o.write("            return %s\n" % scaly_str(by_type[t][0][0]))
+o.write("        \"\"\n")
 o.write("    }\n")
 o.write("}\n")
 
