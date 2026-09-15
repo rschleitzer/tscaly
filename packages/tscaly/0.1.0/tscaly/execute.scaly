@@ -22,6 +22,7 @@ use tscaly.commandline.ParsedCommandLine
 use tscaly.diagnosticwriter.DriverDiagnostic
 use tscaly.diagnosticwriter.DiagnosticWriter
 use tscaly.programhost.DriverProgram
+use tscaly.programhost.ConfigFiles
 use tscaly.incremental.IncProgram
 use tscaly.incremental.IncEmitResult
 use tscaly.incremental.ToSnapshot
@@ -241,6 +242,7 @@ define Execute (reserved: int)
         var compile_options options
         var root_names cl.file_names
         var config_text Slice[char]()
+        var root_config: ref[TsParsedCommandLine]? null
         let config_diagnostics &Array[ref[DriverDiagnostic]]^host()
         if (config_file_name.length as int) > 0
         {
@@ -260,6 +262,7 @@ define Execute (reserved: int)
             if parsed = null
                 return ExitStatusNotImplemented
             let p parsed as ref[TsParsedCommandLine]
+            set root_config: p
             set compile_options: p.options
             set root_names: p.file_names
             set report_diagnostic: Execute.reporter(sys, options)
@@ -287,71 +290,14 @@ define Execute (reserved: int)
             return ExitStatusNotImplemented
         }
         if (compile_options.tristate_of("incremental") = 1) or (compile_options.tristate_of("composite") = 1)
-            return Execute.perform_incremental_compilation(sys, compile_options, root_names, config_file_name, config_text, config_diagnostics, report_diagnostic, summary_pretty)
-        Execute.perform_compilation(sys, compile_options, root_names, config_file_name, config_text, config_diagnostics, report_diagnostic, summary_pretty)
+            return Execute.perform_incremental_compilation(sys, compile_options, root_names, config_file_name, config_text, config_diagnostics, report_diagnostic, summary_pretty, root_config)
+        Execute.perform_compilation(sys, compile_options, root_names, config_file_name, config_text, config_diagnostics, report_diagnostic, summary_pretty, root_config)
     }
 
-    ; GetParsedCommandLineOfConfigFile: the config's parse diagnostics into
-    ; `diagnostics`; null after a stop
+    ; GetParsedCommandLineOfConfigFilePath with the command line's options: the
+    ; config's parse diagnostics into `diagnostics`; null after a stop
     procedure parse_config(sys: ref[ExecSystem], cl: ref[ParsedCommandLine], config_file_name: Slice[char], text: Slice[char], diagnostics: ref[Array[ref[DriverDiagnostic]]]) returns ref[TsParsedCommandLine]?
-    {
-        let host sys.host
-        let pf ProgramFiles.create(host)
-        var fi 0
-        while fi < (sys.files.get_length() as int)
-        {
-            let entry sys.files[fi as size_t]
-            set fi: fi + 1
-            if entry = null
-                continue
-            let f entry as ref[VfsFile]
-            if f.is_link
-                pf.add_link(f.path, f.link_target)
-            else
-                pf.add(f.path, f.text, null, null, null, false, 0)
-        }
-        let tp TsConfigParser.create(host, pf, sys.cwd)
-        set tp.existing_options: cl.options
-        set tp.extended_reporting: true
-        let none: Slice[char] ""
-        let wrapper_keys &Array[Slice[char]]^host()
-        wrapper_keys.add("compilerOptions")
-        let wrapper_values &Array[ref[JsonValue]?]^host()
-        wrapper_values.add(&JsonValue^host(JsonKindObject, none, false, cl.raw.names, cl.raw.values))
-        set tp.existing_raw: &JsonValue^host(JsonKindObject, none, false, wrapper_keys, wrapper_values)
-        let found tp.config_file_diagnostics(config_file_name, text)
-        if (found = null) or (tp.last_parsed = null)
-        {
-            sys.stop(tp.stop_tag)
-            if (sys.stop_tag.length as int) = 0
-                sys.stop("tsconfig")
-            return null
-        }
-        let references tp.root_property_initializer("references")
-        if TsConfigParser.element_node_at(references, 0) <> null
-        {
-            sys.stop("project-references")
-            return null
-        }
-        let fl found as ref[Array[int]]
-        var i 0
-        while i < ((fl.get_length() as int) / 3)
-        {
-            let pos fl[(3 * i) as size_t]
-            if pos < 0
-                diagnostics.add(&DriverDiagnostic^host(none, none, 0, 0, fl[(3 * i + 2) as size_t], tp.diagnostic_args_at(i), null, null))
-            else
-            {
-                let source tp.diagnostic_source_at(i)
-                if (source.length as int) > 0
-                    diagnostics.add(&DriverDiagnostic^host(source, pf.text_of_path(source), pos, fl[(3 * i + 1) as size_t], fl[(3 * i + 2) as size_t], tp.diagnostic_args_at(i), null, null))
-                else
-                    diagnostics.add(&DriverDiagnostic^host(config_file_name, text, pos, fl[(3 * i + 1) as size_t], fl[(3 * i + 2) as size_t], tp.diagnostic_args_at(i), null, null))
-            }
-            set i: i + 1
-        }
-        tp.last_parsed
-    }
+        ConfigFiles.parse(sys, cl.options, cl.raw, config_file_name, text, diagnostics)
 
     ; the compile options this port does not implement, as a stop; true when one stopped
     procedure unported_compile_options(sys: ref[ExecSystem], options: ref[TsOptions]) returns bool
@@ -364,11 +310,6 @@ define Execute (reserved: int)
         if (options.text_of("generateTrace").length as int) > 0
         {
             sys.stop("generate-trace")
-            return true
-        }
-        if (options.tristate_of("listFiles") = 1) or (options.tristate_of("explainFiles") = 1) or (options.tristate_of("listFilesOnly") = 1) or (options.tristate_of("listEmittedFiles") = 1)
-        {
-            sys.stop("list-files")
             return true
         }
         if (options.text_of("locale").length as int) > 0
@@ -386,12 +327,13 @@ define Execute (reserved: int)
 
     ; performIncrementalCompilation, then EmitAndReportStatistics and the harness's
     ; OnProgram
-    procedure perform_incremental_compilation(sys: ref[ExecSystem], options: ref[TsOptions], root_names: ref[Array[Slice[char]]], config_file_name: Slice[char], config_text: Slice[char], config_diagnostics: ref[Array[ref[DriverDiagnostic]]], r: Reporter, summary_pretty: bool) returns int
+    procedure perform_incremental_compilation(sys: ref[ExecSystem], options: ref[TsOptions], root_names: ref[Array[Slice[char]]], config_file_name: Slice[char], config_text: Slice[char], config_diagnostics: ref[Array[ref[DriverDiagnostic]]], r: Reporter, summary_pretty: bool, root_config: ref[TsParsedCommandLine]?) returns int
     {
         let host sys.host
         if Execute.unported_compile_options(sys, options)
             return ExitStatusNotImplemented
         let program DriverProgram.create(host, sys, options, root_names, config_file_name, config_text, config_diagnostics)
+        set program.root_config: root_config
         sys.now()
         let old ToSnapshot.read(host, program)
         sys.now()
@@ -422,10 +364,14 @@ define Execute (reserved: int)
         if ip.diagnostics_of_any_program(all, false, true) = false
             return null
         sys.now()
-        let emitted ip.emit()
-        if emitted = null
-            return null
-        let result emitted as ref[IncEmitResult]
+        var result IncEmitResult.create(host, true)
+        if ip.program.flag("listFilesOnly") = false
+        {
+            let emitted ip.emit()
+            if emitted = null
+                return null
+            set result: emitted as ref[IncEmitResult]
+        }
         sys.now()
         var ei 0
         while ei < (result.diagnostics.get_length() as int)
@@ -448,6 +394,8 @@ define Execute (reserved: int)
         }
         let sorted DriverProgram.sort_and_deduplicate(host, all)
         Execute.report_all(sys, r, sorted)
+        if ip.program.list_files(result.emitted_files) = false
+            return null
         if collected <> null
         {
             let list collected as ref[Array[ref[DriverDiagnostic]]]
@@ -474,7 +422,7 @@ define Execute (reserved: int)
     }
 
     ; performCompilation, then EmitAndReportStatistics
-    procedure perform_compilation(sys: ref[ExecSystem], options: ref[TsOptions], root_names: ref[Array[Slice[char]]], config_file_name: Slice[char], config_text: Slice[char], config_diagnostics: ref[Array[ref[DriverDiagnostic]]], r: Reporter, summary_pretty: bool) returns int
+    procedure perform_compilation(sys: ref[ExecSystem], options: ref[TsOptions], root_names: ref[Array[Slice[char]]], config_file_name: Slice[char], config_text: Slice[char], config_diagnostics: ref[Array[ref[DriverDiagnostic]]], r: Reporter, summary_pretty: bool, root_config: ref[TsParsedCommandLine]?) returns int
     {
         let host sys.host
         if options.tristate_of("traceResolution") = 1
@@ -492,11 +440,6 @@ define Execute (reserved: int)
             sys.stop("generate-trace")
             return ExitStatusNotImplemented
         }
-        if (options.tristate_of("listFiles") = 1) or (options.tristate_of("explainFiles") = 1) or (options.tristate_of("listFilesOnly") = 1) or (options.tristate_of("listEmittedFiles") = 1)
-        {
-            sys.stop("list-files")
-            return ExitStatusNotImplemented
-        }
         if (options.text_of("locale").length as int) > 0
         {
             sys.stop("locale")
@@ -504,6 +447,7 @@ define Execute (reserved: int)
         }
         sys.now()
         let program DriverProgram.create(host, sys, options, root_names, config_file_name, config_text, config_diagnostics)
+        set program.root_config: root_config
         if program.load() = false
             return ExitStatusNotImplemented
         sys.now()
@@ -512,8 +456,13 @@ define Execute (reserved: int)
         if program.diagnostics_of_any_program(all, false, true) = false
             return ExitStatusNotImplemented
         sys.now()
-        if program.emit() = false
-            return ExitStatusNotImplemented
+        if program.flag("listFilesOnly")
+            set program.emit_skipped: true
+        else
+        {
+            if program.emit() = false
+                return ExitStatusNotImplemented
+        }
         sys.now()
         var ei 0
         while ei < (program.emit_diagnostics.get_length() as int)
@@ -530,6 +479,8 @@ define Execute (reserved: int)
         }
         let sorted DriverProgram.sort_and_deduplicate(host, all)
         Execute.report_all(sys, r, sorted)
+        if program.list_files(program.emitted_files) = false
+            return ExitStatusNotImplemented
         if summary_pretty
             DiagnosticWriter.write_error_summary(host, sys.output, sorted, sys.cwd, "\n")
         if sorted.get_length() = 0

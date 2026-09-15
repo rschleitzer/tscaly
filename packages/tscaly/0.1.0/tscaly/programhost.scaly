@@ -35,9 +35,14 @@ use tscaly.printer.Printer
 use tscaly.printer.SourceFileInfo
 use tscaly.compiler.ProgramLoader
 use tscaly.compiler.ProgramDiagnostic
+use tscaly.compiler.OptionVerifier
 use tscaly.modulespecifiers.SpecifierHost
 use tscaly.tsoptions.TsOptions
 use tscaly.tsoptions.TsConfigParser
+use tscaly.tsoptions.TsParsedCommandLine
+use tscaly.tsoptions.ProjectReference
+use tscaly.tsoptions.TsGlobPattern
+use tscaly.TsOptionDecls.TsOptionDecls
 use tscaly.Diagnostics.DiagnosticList
 use tscaly.Diagnostics.ChainLine
 use tscaly.Diagnostics.RelatedInfo
@@ -45,6 +50,180 @@ use tscaly.diagnosticwriter.DriverDiagnostic
 use tscaly.diagnosticwriter.DiagnosticWriter
 use tscaly.system.ExecSystem
 use tscaly.system.VfsFile
+
+; the messages of an explanation in order, a code and its arguments each
+define ExplainMessages (codes: ref[Array[int]]  args: ref[Array[ref[Array[String]]?]])
+{
+    function create(host: ref[Page]) returns ref[ExplainMessages]
+        &ExplainMessages^host(&Array[int]^host(), &Array[ref[Array[String]]?]^host())
+
+    procedure add(this, code: int, a: ref[Array[String]]?)
+    {
+        codes.add(code)
+        args.add(a)
+    }
+}
+
+; tsoptions' config file reading for the driver
+define ConfigFiles (reserved: int)
+{
+    ; core.ResolveConfigFileNameOfProjectReference
+    function config_of_reference(host: ref[Page], path: Slice[char]) returns Slice[char]
+    {
+        if path.ends_with(".json")
+            return path
+        combine_paths(host, path, "tsconfig.json")
+    }
+
+    ; GetParsedCommandLineOfConfigFilePath through a host: the reference, its parse
+    ; null when the file cannot be read; null after a stop
+    procedure resolve(sys: ref[ExecSystem], config: Slice[char], options: ref[TsOptions]?, raw: ref[TsOptions]?) returns ref[ResolvedReference]?
+    {
+        let host sys.host
+        let diagnostics &Array[ref[DriverDiagnostic]]^host()
+        var text Slice[char]()
+        var parsed: ref[TsParsedCommandLine]? null
+        if sys.read_file(config, &text)
+        {
+            set parsed: ConfigFiles.parse(sys, options, raw, config, text, diagnostics)
+            if parsed = null
+                return null
+        }
+        &ResolvedReference^host(config, parsed, text, diagnostics, &Array[int]^host())
+    }
+
+    ; outputpaths.GetOutputDeclarationFileNameWorker over a config's own options:
+    ; below declarationDir (else outDir) relative to the common source directory
+    ; (rootDir, else the config's directory)
+    function declaration_output_path(host: ref[Page], config: Slice[char], options: ref[TsOptions], file: Slice[char], cwd: Slice[char]) returns Slice[char]
+    {
+        var ext: Slice[char] ".d.ts"
+        if file.ends_with(".mts") or file.ends_with(".mjs")
+            set ext: ".d.mts"
+        if file.ends_with(".cts") or file.ends_with(".cjs")
+            set ext: ".d.cts"
+        var dir options.text_of("declarationDir")
+        if (dir.length as int) = 0
+            set dir: options.text_of("outDir")
+        ConfigFiles.output_path(host, config, options, file, ext, dir, cwd)
+    }
+
+    ; getOutputPathWithoutChangingExtension + ChangeExtension
+    function output_path(host: ref[Page], config: Slice[char], options: ref[TsOptions], file: Slice[char], ext: Slice[char], out_dir: Slice[char], cwd: Slice[char]) returns Slice[char]
+    {
+        var path file
+        if (out_dir.length as int) > 0
+        {
+            var common options.text_of("rootDir")
+            if (common.length as int) = 0
+                set common: get_directory_path(host, config)
+            else
+                set common: get_normalized_absolute_path(host, common, cwd)
+            let new_dir get_normalized_absolute_path(host, out_dir, cwd)
+            set path: Emitter.source_file_path_in_new_dir(host, file, new_dir, cwd, common)
+        }
+        let without path.subslice(0, remove_file_extension(path) as size_t)
+        join_slices(host, without, ext)
+    }
+
+    ; outputpaths.GetBuildInfoFileName, absolute
+    function build_info_file_name_of(host: ref[Page], o: ref[TsOptions], config: Slice[char], cwd: Slice[char]) returns Slice[char]
+    {
+        if (o.tristate_of("incremental") <> 1) and (o.tristate_of("composite") <> 1) and (o.tristate_of("build") <> 1)
+            return ""
+        let explicit o.text_of("tsBuildInfoFile")
+        if (explicit.length as int) > 0
+            return get_normalized_absolute_path(host, explicit, cwd)
+        if (config.length as int) = 0
+            return ""
+        let ext_len remove_file_extension(config)
+        let extension_less config.subslice(0, ext_len as size_t)
+        var result extension_less
+        let out_dir o.text_of("outDir")
+        if (out_dir.length as int) > 0
+        {
+            let root_dir o.text_of("rootDir")
+            if (root_dir.length as int) > 0
+                set result: get_normalized_absolute_path(host, get_relative_path_to_directory_or_url(host, get_normalized_absolute_path(host, root_dir, cwd), extension_less, false, cwd), get_normalized_absolute_path(host, out_dir, cwd))
+            else
+                set result: combine_paths(host, get_normalized_absolute_path(host, out_dir, cwd), get_base_file_name(host, extension_less))
+        }
+        join_slices(host, result, ".tsbuildinfo")
+    }
+
+    ; GetParsedCommandLineOfConfigFile: the config's parse diagnostics into
+    ; `diagnostics`; null after a stop
+    procedure parse(sys: ref[ExecSystem], existing_options: ref[TsOptions]?, existing_raw: ref[TsOptions]?, config_file_name: Slice[char], text: Slice[char], diagnostics: ref[Array[ref[DriverDiagnostic]]]) returns ref[TsParsedCommandLine]?
+    {
+        let host sys.host
+        let pf ProgramFiles.create(host)
+        var fi 0
+        while fi < (sys.files.get_length() as int)
+        {
+            let entry sys.files[fi as size_t]
+            set fi: fi + 1
+            if entry = null
+                continue
+            let f entry as ref[VfsFile]
+            if f.is_link
+                pf.add_link(f.path, f.link_target)
+            else
+                pf.add(f.path, f.text, null, null, null, false, 0)
+        }
+        let tp TsConfigParser.create(host, pf, sys.cwd)
+        set tp.existing_options: existing_options
+        set tp.extended_reporting: true
+        let none: Slice[char] ""
+        if existing_raw <> null
+        {
+            let raw existing_raw as ref[TsOptions]
+            let wrapper_keys &Array[Slice[char]]^host()
+            wrapper_keys.add("compilerOptions")
+            let wrapper_values &Array[ref[JsonValue]?]^host()
+            wrapper_values.add(&JsonValue^host(JsonKindObject, none, false, raw.names, raw.values))
+            set tp.existing_raw: &JsonValue^host(JsonKindObject, none, false, wrapper_keys, wrapper_values)
+        }
+        let found tp.config_file_diagnostics(config_file_name, text)
+        if (found = null) or (tp.last_parsed = null)
+        {
+            sys.stop(tp.stop_tag)
+            if (sys.stop_tag.length as int) = 0
+                sys.stop("tsconfig")
+            return null
+        }
+        let fl found as ref[Array[int]]
+        var i 0
+        while i < ((fl.get_length() as int) / 3)
+        {
+            let pos fl[(3 * i) as size_t]
+            if pos < 0
+                diagnostics.add(&DriverDiagnostic^host(none, none, 0, 0, fl[(3 * i + 2) as size_t], tp.diagnostic_args_at(i), null, null))
+            else
+            {
+                let source tp.diagnostic_source_at(i)
+                if (source.length as int) > 0
+                    diagnostics.add(&DriverDiagnostic^host(source, pf.text_of_path(source), pos, fl[(3 * i + 1) as size_t], fl[(3 * i + 2) as size_t], tp.diagnostic_args_at(i), null, null))
+                else
+                    diagnostics.add(&DriverDiagnostic^host(config_file_name, text, pos, fl[(3 * i + 1) as size_t], fl[(3 * i + 2) as size_t], tp.diagnostic_args_at(i), null, null))
+            }
+            set i: i + 1
+        }
+        tp.last_parsed
+    }
+
+}
+
+; a resolved project reference (projectReferenceParseTask): the config, its
+; parse (null when the file could not be read), and the references it holds
+; by index into the program's reference list
+define ResolvedReference
+(
+    config: Slice[char]
+    parsed: ref[TsParsedCommandLine]?
+    text: Slice[char]
+    diagnostics: ref[Array[ref[DriverDiagnostic]]]
+    children: ref[Array[int]]
+)
 
 ; EmitOptions.EmitOnly
 define EmitOnlyAll: int 0
@@ -63,7 +242,23 @@ define FileEmitOutput
     dts_path: Slice[char]
     dts_text: Slice[char]
     diagnostics: ref[Array[ref[DriverDiagnostic]]]
+    ; the map files written before their outputs (empty for none), and the
+    ; declaration text's sourceMappingURL position (-1 for none)
+    js_map_path: Slice[char]
+    js_map_text: Slice[char]
+    dts_map_path: Slice[char]
+    dts_map_text: Slice[char]
+    dts_url_pos: int
 )
+{
+    ; getTextHandlingSourceMapForSignature over the declaration text
+    function dts_signature_text(this) returns Slice[char]
+    {
+        if dts_url_pos < 0
+            return dts_text
+        dts_text.subslice(0, dts_url_pos as size_t)
+    }
+}
 
 define DriverProgram
 (
@@ -86,12 +281,297 @@ define DriverProgram
     lib_nodes: ref[Array[ref[AstNode]?]]
     lib_paths: ref[Array[Slice[char]]]
     lib_texts: ref[Array[Slice[char]]]
+    ; the root config's parse (its project references), null without a config
+    root_config: ref[TsParsedCommandLine]?
+    ; the resolved project references (projectReferenceParser), shared with a build's
+    ; other programs through `known_references`
+    references: ref[Array[ref[ResolvedReference]]]
+    root_references: ref[Array[int]]
+    known_references: ref[Array[ref[ResolvedReference]]]?
+    ; the command line's options a build host parses a reference with
+    reference_options: ref[TsOptions]?
+    reference_raw: ref[TsOptions]?
+    ; verifyProjectReferences' diagnostics (a program diagnostic each)
+    reference_diagnostics: ref[Array[ref[DriverDiagnostic]]]
 )
 {
     function create(host: ref[Page], sys: ref[ExecSystem], ts: ref[TsOptions], root_names: ref[Array[Slice[char]]], config_path: Slice[char], config_text: Slice[char], config_diagnostics: ref[Array[ref[DriverDiagnostic]]]) returns ref[DriverProgram]
     {
         let options DriverProgram.emit_options_of(host, ts, sys.cwd, config_path)
-        &DriverProgram^host(host, sys, options, ts, ProgramFiles.create(host), root_names, null, null, config_path, config_text, config_diagnostics, &Array[Slice[char]]^host(), false, &Array[ref[DriverDiagnostic]]^host(), &Array[ref[AstNode]?]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host())
+        &DriverProgram^host(host, sys, options, ts, ProgramFiles.create(host), root_names, null, null, config_path, config_text, config_diagnostics, &Array[Slice[char]]^host(), false, &Array[ref[DriverDiagnostic]]^host(), &Array[ref[AstNode]?]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), null, &Array[ref[ResolvedReference]]^host(), &Array[int]^host(), null, null, null, &Array[ref[DriverDiagnostic]]^host())
+    }
+
+    ; ── project references ───────────────────────────────────────────────────
+
+    ; host.GetResolvedProjectReference: the reference at `config`, parsed once;
+    ; its index in `references`
+    procedure resolve_reference(this, config: Slice[char]) returns int
+    {
+        var i 0
+        while i < (references.get_length() as int)
+        {
+            let known references[i as size_t]
+            if known.config.equals(config)
+                return i
+            set i: i + 1
+        }
+        var resolved: ref[ResolvedReference]? null
+        if known_references <> null
+        {
+            let cache known_references as ref[Array[ref[ResolvedReference]]]
+            var k 0
+            while k < (cache.get_length() as int)
+            {
+                let candidate cache[k as size_t]
+                if candidate.config.equals(config)
+                    set resolved: candidate
+                set k: k + 1
+            }
+        }
+        if resolved = null
+        {
+            let made ConfigFiles.resolve(sys, config, reference_options, reference_raw)
+            if made = null
+                return 0 - 1
+            set resolved: made
+            if known_references <> null
+                (known_references as ref[Array[ref[ResolvedReference]]]).add(made as ref[ResolvedReference])
+        }
+        let r resolved as ref[ResolvedReference]
+        references.add(r)
+        let index (references.get_length() as int) - 1
+        if r.parsed <> null
+        {
+            let parsed r.parsed as ref[TsParsedCommandLine]
+            if (r.children.get_length() = 0) and (parsed.references <> null)
+            {
+                let refs parsed.references as ref[Array[ProjectReference]]
+                var c 0
+                while c < (refs.get_length() as int)
+                {
+                    let child_reference refs[c as size_t]
+                    let child_config ConfigFiles.config_of_reference(host, child_reference.path)
+                    let child this.resolve_reference(child_config)
+                    if (sys.stop_tag.length as int) > 0
+                        return 0 - 1
+                    r.children.add(child)
+                    set c: c + 1
+                }
+            }
+        }
+        index
+    }
+
+    ; addProjectReferenceTasks and initMapper: the references parsed, every
+    ; referenced project's sources mapped to their output declaration files (a
+    ; later project overwriting an earlier one's entry); false after a stop
+    procedure load_references(this, ld: ref[ProgramLoader]?) returns bool
+    {
+        if root_config = null
+            return true
+        let rc root_config as ref[TsParsedCommandLine]
+        if rc.references = null
+            return true
+        let refs rc.references as ref[Array[ProjectReference]]
+        var i 0
+        while i < (refs.get_length() as int)
+        {
+            let root_reference refs[i as size_t]
+            let index this.resolve_reference(ConfigFiles.config_of_reference(host, root_reference.path))
+            if (sys.stop_tag.length as int) > 0
+                return false
+            root_references.add(index)
+            set i: i + 1
+        }
+        if ld = null
+            return true
+        let loader_ref ld as ref[ProgramLoader]
+        let seen &Array[int]^host()
+        this.map_references(loader_ref, root_references, seen)
+        true
+    }
+
+    procedure map_references(this, ld: ref[ProgramLoader], list: ref[Array[int]], seen: ref[Array[int]])
+    {
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            let index list[i as size_t]
+            set i: i + 1
+            if index < 0
+                continue
+            var was_seen false
+            var s 0
+            while s < (seen.get_length() as int)
+            {
+                if seen[s as size_t] = index
+                    set was_seen: true
+                set s: s + 1
+            }
+            ; rangeResolvedProjectReference seeds the seen set with the root config
+            let seen_ref references[index as size_t]
+            let root_config_path get_normalized_absolute_path(host, config_path, sys.cwd)
+            if seen_ref.config.equals(root_config_path)
+                set was_seen: true
+            if was_seen
+                continue
+            seen.add(index)
+            let r references[index as size_t]
+            if r.parsed <> null
+            {
+                let parsed r.parsed as ref[TsParsedCommandLine]
+                if r.config.equals(config_path) = false
+                {
+                    var f 0
+                    while f < (parsed.file_names.get_length() as int)
+                    {
+                        let source get_normalized_absolute_path(host, parsed.file_names[f as size_t], sys.cwd)
+                        set f: f + 1
+                        var output Slice[char]()
+                        if (is_declaration_file_name_of(source) = false) and (source.ends_with(".json") = false)
+                        {
+                            set output: ConfigFiles.declaration_output_path(host, r.config, parsed.options, source, sys.cwd)
+                            let di pf.index_of_path(output)
+                            if di >= 0
+                            {
+                                let po parsed.options
+                                pf.set_reference_dts_preserve(di, (po.tristate_of("preserveConstEnums") = 1) or (po.tristate_of("isolatedModules") = 1) or (po.tristate_of("verbatimModuleSyntax") = 1))
+                            }
+                        }
+                        var replaced false
+                        var k 0
+                        while k < (ld.reference_sources.get_length() as int)
+                        {
+                            let known ld.reference_sources[k as size_t]
+                            if known.equals(source)
+                            {
+                                ld.reference_outputs.put(k as size_t, output)
+                                set replaced: true
+                            }
+                            set k: k + 1
+                        }
+                        if replaced = false
+                        {
+                            ld.reference_sources.add(source)
+                            ld.reference_outputs.add(output)
+                        }
+                    }
+                }
+            }
+            this.map_references(ld, r.children, seen)
+        }
+    }
+
+    ; the redirects the checker follows (GetSourceFileForResolvedModule) and the
+    ; outputs it names when one was not built
+    procedure apply_reference_redirects(this, ld: ref[ProgramLoader])
+    {
+        var i 0
+        while i < (ld.reference_sources.get_length() as int)
+        {
+            let source ld.reference_sources[i as size_t]
+            let output ld.reference_outputs[i as size_t]
+            set i: i + 1
+            if (output.length as int) = 0
+                continue
+            let source_node ld.find_node(source)
+            if source_node <> null
+            {
+                if (source_node as ref[LoaderNode]).redirected
+                    pf.add_included_output(output, source)
+            }
+            let si pf.index_of_path(source)
+            if si < 0
+                continue
+            pf.set_reference_output(si, output)
+            let di pf.index_of_path(output)
+            if (di >= 0) and ld.holds(di)
+                pf.set_redirect(si, di)
+        }
+    }
+
+    ; verifyProjectReferences over RangeResolvedProjectReference
+    procedure verify_project_references(this, ld: ref[ProgramLoader]?)
+    {
+        if root_config = null
+            return
+        let build_info_name ConfigFiles.build_info_file_name_of(host, ts, config_path, sys.cwd)
+        let seen &Array[int]^host()
+        this.verify_references_of(root_config as ref[TsParsedCommandLine], config_path, config_text, root_references, seen, build_info_name, ld)
+    }
+
+    procedure verify_references_of(this, parent: ref[TsParsedCommandLine], parent_path: Slice[char], parent_text: Slice[char], list: ref[Array[int]], seen: ref[Array[int]], build_info_name: Slice[char], ld: ref[ProgramLoader]?)
+    {
+        if parent.references = null
+            return
+        let refs parent.references as ref[Array[ProjectReference]]
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            let index list[i as size_t]
+            let position i
+            set i: i + 1
+            if index < 0
+                continue
+            var was_seen false
+            var s 0
+            while s < (seen.get_length() as int)
+            {
+                if seen[s as size_t] = index
+                    set was_seen: true
+                set s: s + 1
+            }
+            ; rangeResolvedProjectReference seeds the seen set with the root config
+            let seen_ref references[index as size_t]
+            let root_config_path get_normalized_absolute_path(host, config_path, sys.cwd)
+            if seen_ref.config.equals(root_config_path)
+                set was_seen: true
+            if was_seen
+                continue
+            seen.add(index)
+            let r references[index as size_t]
+            let reference_entry refs[position as size_t]
+            let ref_path reference_entry.path
+            if r.parsed = null
+            {
+                this.add_reference_diagnostic(parent, parent_path, parent_text, position, DiagFile_0_not_found, ref_path, Slice[char]())
+                continue
+            }
+            let config r.parsed as ref[TsParsedCommandLine]
+            let composite config.options.tristate_of("composite") = 1
+            let no_emit config.options.tristate_of("noEmit") = 1
+            if ((composite = false) or no_emit) and (parent.file_names.get_length() > 0)
+            {
+                if composite = false
+                    this.add_reference_diagnostic(parent, parent_path, parent_text, position, DiagReferenced_project_0_must_have_setting_composite_Colon_true, ref_path, Slice[char]())
+                if no_emit
+                    this.add_reference_diagnostic(parent, parent_path, parent_text, position, DiagReferenced_project_0_may_not_disable_emit, ref_path, Slice[char]())
+            }
+            if (build_info_name.length as int) > 0
+            {
+                let ref_build_info ConfigFiles.build_info_file_name_of(host, config.options, r.config, sys.cwd)
+                if build_info_name.equals(ref_build_info)
+                {
+                    this.add_reference_diagnostic(parent, parent_path, parent_text, position, DiagCannot_write_file_0_because_it_will_overwrite_tsbuildinfo_file_generated_by_referenced_project_1, build_info_name, ref_path)
+                    if ld <> null
+                        (ld as ref[ProgramLoader]).blocked_paths.add(build_info_name)
+                }
+            }
+            this.verify_references_of(config, r.config, r.text, r.children, seen, build_info_name, ld)
+        }
+    }
+
+    ; CreateDiagnosticAtReferenceSyntax, else a compiler diagnostic
+    procedure add_reference_diagnostic(this, parent: ref[TsParsedCommandLine], parent_path: Slice[char], parent_text: Slice[char], position: int, code: int, a0: Slice[char], a1: Slice[char])
+    {
+        let args ProgramDiagnostic.args1(host, ProgramDiagnostic.text(a0))
+        if (a1.length as int) > 0
+            args.add(ProgramDiagnostic.text(a1))
+        let none: Slice[char] ""
+        if ((2 * position + 1) < (parent.reference_ranges.get_length() as int))
+            reference_diagnostics.add(&DriverDiagnostic^host(parent_path, parent_text, parent.reference_ranges[(2 * position) as size_t], parent.reference_ranges[(2 * position + 1) as size_t], code, args, null, null))
+        else
+            reference_diagnostics.add(&DriverDiagnostic^host(none, none, 0, 0, code, args, null, null))
     }
 
     ; the compiler options as the case yardsticks spell them (`name=value`, the
@@ -156,14 +636,65 @@ define DriverProgram
             return true
         if (ts.tristate_of("alwaysStrict") = 0) or (ts.tristate_of("esModuleInterop") = 0) or (ts.tristate_of("allowSyntheticDefaultImports") = 0)
             return true
-        let target TsConfigParser.to_lower(host, TsOptions.render(host, this.value_or_empty("target")))
-        if target.equals("es5") or target.equals("1")
-            return true
         let module_kind TsConfigParser.to_lower(host, TsOptions.render(host, this.value_or_empty("module")))
         if module_kind.equals("amd") or module_kind.equals("system") or module_kind.equals("umd") or module_kind.equals("2") or module_kind.equals("3") or module_kind.equals("4")
             return true
         let resolution TsConfigParser.to_lower(host, TsOptions.render(host, this.value_or_empty("moduleResolution")))
         resolution.equals("classic") or resolution.equals("node10") or resolution.equals("node") or resolution.equals("1") or resolution.equals("2")
+    }
+
+    ; verifyCompilerOptions' paths loop would report: a key or substitution with
+    ; two stars, a substitution list that is not a non-empty array, a substitution
+    ; neither relative nor absolute
+    function paths_need_validation(paths: ref[JsonValue]) returns bool
+    {
+        if paths.kind <> JsonKindObject
+            return true
+        var i 0
+        while i < paths.size()
+        {
+            let key paths.key_at(i)
+            let value paths.value_at(i)
+            set i: i + 1
+            if DriverProgram.star_count(key) > 1
+                return true
+            if value = null
+                return true
+            let list value as ref[JsonValue]
+            if list.kind <> JsonKindArray
+                return true
+            if list.size() = 0
+                return true
+            var k 0
+            while k < list.size()
+            {
+                let element list.value_at(k)
+                set k: k + 1
+                if element = null
+                    return true
+                let e element as ref[JsonValue]
+                if e.kind <> JsonKindString
+                    return true
+                if DriverProgram.star_count(e.text) > 1
+                    return true
+                if (path_is_relative(e.text) = false) and (get_root_length(e.text) = 0)
+                    return true
+            }
+        }
+        false
+    }
+
+    function star_count(text: Slice[char]) returns int
+    {
+        var n 0
+        var i 0
+        while i < (text.length as int)
+        {
+            if (text[i as size_t] as int) = ("*" as char) as int
+                set n: n + 1
+            set i: i + 1
+        }
+        n
     }
 
     function value_or_empty(this, name: Slice[char]) returns ref[JsonValue]
@@ -181,6 +712,23 @@ define DriverProgram
         {
             this.stop("removed-option")
             return false
+        }
+        ; compilerOptions.paths: the resolver's optional resolution setting; its
+        ; validation diagnostics are a stop
+        let paths_value ts.get("paths")
+        if paths_value <> null
+        {
+            let pv paths_value as ref[JsonValue]
+            if DriverProgram.paths_need_validation(pv)
+            {
+                this.stop("paths-validation")
+                return false
+            }
+            var paths_base sys.cwd
+            let recorded_base ts.text_of("pathsBasePath")
+            if (recorded_base.length as int) > 0
+                set paths_base: get_normalized_absolute_path(host, recorded_base, sys.cwd)
+            pf.set_paths(pv, paths_base)
         }
         let cwd options.get_current_directory()
         var fi 0
@@ -230,7 +778,12 @@ define DriverProgram
         }
         ; processAllProgramFiles: no root file, no lib and no file at all
         if root_names.get_length() = 0
+        {
+            if this.load_references(null) = false
+                return false
+            this.verify_project_references(null)
             return true
+        }
         var first 0 - 1
         var k 0
         while k < pf.count()
@@ -249,6 +802,7 @@ define DriverProgram
         let seen &Array[Slice[char]]^host()
         if this.load_lib_chain(options.lib_names(host), lib_files, lib_binders, seen) = false
             return false
+        this.sort_libs(lib_files, lib_binders)
         let o options
         Checker.set_strict_null_checks(o.strict_null_checks_on())
         Checker.set_exact_optional_property_types(o.exact_optional_property_types_on())
@@ -264,6 +818,8 @@ define DriverProgram
         let ld ProgramLoader.create(host, pf, options, cd)
         pf.enable_resolution_records()
         set pf.package_json_recording: true
+        if this.load_references(ld) = false
+            return false
         ld.load(root_names)
         if (ld.stop_tag.length as int) > 0
         {
@@ -290,6 +846,8 @@ define DriverProgram
             this.stop(ld.stop_tag)
             return false
         }
+        this.verify_project_references(ld)
+        this.apply_reference_redirects(ld)
         set this.loader: ld
         Checker.set_defer_initialize(true)
         let pc this.checker_over(first, lib_files, lib_binders)
@@ -454,6 +1012,97 @@ define DriverProgram
         }
         pf.add(path_data, Slice[char](text_copy.get_length() as int, text_copy.get_buffer() as pointer[char]), file, b, p, false, options.get_emit_module_format_of_file(path_data))
         true
+    }
+
+    ; fileLoader.sortLibs: lib.d.ts and lib.es6.d.ts first, then by the lib's
+    ; position in tsoptions.Libs (stable)
+    procedure sort_libs(this, files: ref[Array[ref[AstNode]?]], binders: ref[Array[ref[Binder]?]])
+    {
+        let n lib_paths.get_length() as int
+        let priorities &Array[int]^host()
+        var i 0
+        while i < n
+        {
+            priorities.add(DriverProgram.lib_priority(host, lib_paths[i as size_t]))
+            set i: i + 1
+        }
+        var k 1
+        while k < n
+        {
+            var j k
+            while j > 0
+            {
+                if priorities[(j - 1) as size_t] <= priorities[j as size_t]
+                    break
+                DriverProgram.swap_int(priorities, j)
+                DriverProgram.swap_slice(lib_paths, j)
+                DriverProgram.swap_slice(lib_texts, j)
+                DriverProgram.swap_node(lib_nodes, j)
+                DriverProgram.swap_node(files, j)
+                let b binders[j as size_t]
+                binders.put(j as size_t, binders[(j - 1) as size_t])
+                binders.put((j - 1) as size_t, b)
+                set j: j - 1
+            }
+            set k: k + 1
+        }
+    }
+
+    procedure swap_int(list: ref[Array[int]], j: int)
+    {
+        let t list[j as size_t]
+        list.put(j as size_t, list[(j - 1) as size_t])
+        list.put((j - 1) as size_t, t)
+    }
+
+    procedure swap_slice(list: ref[Array[Slice[char]]], j: int)
+    {
+        let t list[j as size_t]
+        list.put(j as size_t, list[(j - 1) as size_t])
+        list.put((j - 1) as size_t, t)
+    }
+
+    procedure swap_node(list: ref[Array[ref[AstNode]?]], j: int)
+    {
+        let t list[j as size_t]
+        list.put(j as size_t, list[(j - 1) as size_t])
+        list.put((j - 1) as size_t, t)
+    }
+
+    ; getDefaultLibFilePriority
+    function lib_priority(host: ref[Page], path: Slice[char]) returns int
+    {
+        let base get_base_file_name(host, path)
+        if base.equals("lib.d.ts") or base.equals("lib.es6.d.ts")
+            return 0
+        let keys TsOptionDecls.enum_keys_text(TsOptionDecls.index_of("lib"))
+        var count 1
+        var i 0
+        while i < (keys.length as int)
+        {
+            if (keys[i as size_t] as int) = ("," as char) as int
+                set count: count + 1
+            set i: i + 1
+        }
+        if base.starts_with("lib.") and base.ends_with(".d.ts") and ((base.length as int) > 9)
+        {
+            let name base.subslice(4, ((base.length as int) - 5) as size_t)
+            let quoted join_slices(host, join_slices(host, "'", name), "'")
+            let at TsConfigParser.index_of_text(keys, quoted)
+            if at >= 0
+            {
+                var commas 0
+                var c 0
+                while c < at
+                {
+                    if (keys[c as size_t] as int) = ("," as char) as int
+                        set commas: commas + 1
+                    set c: c + 1
+                }
+                return commas + 1
+            }
+        }
+        count + 2
     }
 
     ; the lib chain read through the System (a read ends a default lib's status),
@@ -717,6 +1366,17 @@ define DriverProgram
         {
             let pd ld.diagnostics[li as size_t]
             set li: li + 1
+            if (pd.reason <> null) or (pd.explained_file >= 0)
+            {
+                let explained this.explaining_diagnostic(pd.explained_file, pd.reason, pd.code, pd.args)
+                if explained <> null
+                {
+                    let e explained as ref[DriverDiagnostic]
+                    if e.file_name.equals(path)
+                        includes.add(e)
+                }
+                continue
+            }
             if pd.file_index = index
                 includes.add(&DriverDiagnostic^host(path, pf.text_at(index), pd.pos, pd.end, pd.code, pd.args, pd.chain, null))
         }
@@ -850,6 +1510,12 @@ define DriverProgram
     ; GetProgramDiagnostics: the options diagnostics, global or in the config file
     procedure program_diagnostics(this, out: ref[Array[ref[DriverDiagnostic]]])
     {
+        var ri 0
+        while ri < (reference_diagnostics.get_length() as int)
+        {
+            out.add(reference_diagnostics[ri as size_t])
+            set ri: ri + 1
+        }
         if loader = null
             return
         let ld loader as ref[ProgramLoader]
@@ -859,6 +1525,17 @@ define DriverProgram
         {
             let pd ld.diagnostics[i as size_t]
             set i: i + 1
+            if (pd.reason <> null) or (pd.explained_file >= 0)
+            {
+                let explained this.explaining_diagnostic(pd.explained_file, pd.reason, pd.code, pd.args)
+                if explained <> null
+                {
+                    let e explained as ref[DriverDiagnostic]
+                    if e.has_file() = false
+                        out.add(e)
+                }
+                continue
+            }
             if pd.file_index = ProgramDiagnosticGlobal
                 out.add(&DriverDiagnostic^host(none, none, pd.pos, pd.end, pd.code, pd.args, pd.chain, null))
             if pd.file_index = ProgramDiagnosticConfig
@@ -1043,11 +1720,21 @@ define DriverProgram
             }
             if r.has_js
             {
+                if (r.js_map_path.length as int) > 0
+                {
+                    sys.write_file(r.js_map_path, r.js_map_text)
+                    emitted_files.add(r.js_map_path)
+                }
                 sys.write_file(r.js_path, r.js_text)
                 emitted_files.add(slice_copy_on(host, r.js_path))
             }
             if r.has_dts
             {
+                if (r.dts_map_path.length as int) > 0
+                {
+                    sys.write_file(r.dts_map_path, r.dts_map_text)
+                    emitted_files.add(r.dts_map_path)
+                }
                 sys.write_file(r.dts_path, r.dts_text)
                 emitted_files.add(slice_copy_on(host, r.dts_path))
             }
@@ -1064,7 +1751,7 @@ define DriverProgram
         let ld loader as ref[ProgramLoader]
         let cd checker as ref[Checker]
         let none: Slice[char] ""
-        let result &FileEmitOutput^host(false, false, none, none, false, none, none, &Array[ref[DriverDiagnostic]]^host())
+        let result &FileEmitOutput^host(false, false, none, none, false, none, none, &Array[ref[DriverDiagnostic]]^host(), none, none, none, none, 0 - 1)
         let file pf.file_at(index) as ref[AstNode]
         let b pf.binder_at(index) as ref[Binder]
         let path pf.path_at(index)
@@ -1086,11 +1773,6 @@ define DriverProgram
                 set result.skipped: true
             else
             {
-                if EmitOptions.on(options.source_map)
-                {
-                    this.stop("emit-source-map-file")
-                    return null
-                }
                 let out StringBuilder^host()
                 em.emit_js(file, info, uo, cd, b, &out)
                 if em.unported_count > 0
@@ -1104,6 +1786,11 @@ define DriverProgram
                 set result.has_js: true
                 set result.js_path: slice_copy_on(host, js_path)
                 set result.js_text: Slice[char](js_text.get_length(), js_text.get_buffer() as pointer[char])
+                if (em.map_text.length as int) > 0
+                {
+                    set result.js_map_path: join_slices(host, result.js_path, ".map")
+                    set result.js_map_text: em.map_text
+                }
             }
         }
         var wants_dts emit_only <> EmitOnlyJs
@@ -1129,11 +1816,6 @@ define DriverProgram
                 set result.skipped: true
             else
             {
-                if (forced = false) and EmitOptions.on(options.declaration_map)
-                {
-                    this.stop("emit-source-map-file")
-                    return null
-                }
                 let dout StringBuilder^host()
                 dem.emit_dts(file, dinfo, uo, cd, b, &dout)
                 if dem.unported_count > 0
@@ -1147,6 +1829,12 @@ define DriverProgram
                 set result.has_dts: true
                 set result.dts_path: slice_copy_on(host, dts_path)
                 set result.dts_text: Slice[char](dts_text.get_length(), dts_text.get_buffer() as pointer[char])
+                set result.dts_url_pos: dem.url_pos
+                if (dem.map_text.length as int) > 0
+                {
+                    set result.dts_map_path: join_slices(host, result.dts_path, ".map")
+                    set result.dts_map_text: dem.map_text
+                }
             }
         }
         result
@@ -1190,6 +1878,666 @@ define DriverProgram
         if index < 0
             return lib_texts[i as size_t]
         pf.text_at(index)
+    }
+
+    ; ── listFiles / explainFiles (execute/tsc/emit.go, Program.ExplainFiles) ──
+
+    ; listFiles: the emitted files, then the explanation or the file list; false
+    ; after a stop
+    procedure list_files(this, emitted: ref[Array[Slice[char]]]) returns bool
+    {
+        let listing this.flag("explainFiles") or this.flag("listFiles") or this.flag("listFilesOnly")
+        if listing and (loader <> null)
+        {
+            let ld loader as ref[ProgramLoader]
+            ; a source file's `/// <reference lib>` adds a library the chain does not load
+            if ld.lib_reference_directive
+            {
+                this.stop("list-files-lib-reference")
+                return false
+            }
+        }
+        let out sys.output
+        if this.flag("listEmittedFiles")
+        {
+            var i 0
+            while i < (emitted.get_length() as int)
+            {
+                let file get_normalized_absolute_path(host, emitted[i as size_t], sys.cwd)
+                set i: i + 1
+                out.append("TSFILE: ")
+                out.append(file.data, file.length)
+                out.append("\n")
+            }
+        }
+        if this.flag("explainFiles")
+            return this.explain_files()
+        if this.flag("listFiles") or this.flag("listFilesOnly")
+        {
+            var k 0
+            while k < this.source_file_count()
+            {
+                let path this.source_path(k)
+                set k: k + 1
+                out.append(path.data, path.length)
+                out.append("\n")
+            }
+        }
+        true
+    }
+
+    ; Program.ExplainFiles: the source files in order, a package redirect at its
+    ; own position between them
+    procedure explain_files(this) returns bool
+    {
+        if loader = null
+            return true
+        let ld loader as ref[ProgramLoader]
+        let lib_n this.lib_count()
+        let total this.source_file_count()
+        var explained 0
+        var next_source 0
+        var r 0
+        while r < (ld.redirect_paths.get_length() as int)
+        {
+            let position ld.redirect_positions[r as size_t] + lib_n
+            while explained < position
+            {
+                if this.explain_source_file(next_source) = false
+                    return false
+                set next_source: next_source + 1
+                set explained: explained + 1
+            }
+            if this.explain_redirect_file(r) = false
+                return false
+            set explained: explained + 1
+            set r: r + 1
+        }
+        while next_source < total
+        {
+            if this.explain_source_file(next_source) = false
+                return false
+            set next_source: next_source + 1
+        }
+        true
+    }
+
+    function explain_relative(this, file_name: Slice[char]) returns Slice[char]
+        get_relative_path_to_directory_or_url(host, sys.cwd, file_name, false, sys.cwd)
+
+    procedure explain_line(this, code: int, args: ref[Array[String]]?)
+    {
+        let out sys.output
+        out.append("   ")
+        out.append(DiagnosticWriter.format_message(code, args))
+        out.append("\n")
+    }
+
+    procedure explain_name(this, file_name: Slice[char])
+    {
+        let out sys.output
+        let relative this.explain_relative(file_name)
+        out.append(relative.data, relative.length)
+        out.append("\n")
+    }
+
+    ; the explanation's file names: relative to the current directory for
+    ; ExplainFiles, as they are for a diagnostic's chain
+    function explain_file_name(this, file_name: Slice[char], relative: bool) returns String
+    {
+        if relative
+            return ProgramDiagnostic.text(this.explain_relative(file_name))
+        ProgramDiagnostic.text(file_name)
+    }
+
+    procedure explain_messages(this, messages: ref[ExplainMessages])
+    {
+        var i 0
+        while i < (messages.codes.get_length() as int)
+        {
+            this.explain_line(messages.codes[i as size_t], messages.args[i as size_t])
+            set i: i + 1
+        }
+    }
+
+    ; explainFile over source file `k`
+    procedure explain_source_file(this, k: int) returns bool
+    {
+        let ld loader as ref[ProgramLoader]
+        let path this.source_path(k)
+        this.explain_name(path)
+        let index this.source_pf_index(k)
+        if index < 0
+            return this.explain_lib_file(k)
+        let node ld.node_for(ld.program_paths[(k - this.lib_count()) as size_t])
+        let messages ExplainMessages.create(host)
+        if this.reason_messages(node.reasons, true, messages) = false
+            return false
+        this.redirect_and_format_messages(path, index, 0 - 1, true, messages)
+        this.explain_messages(messages)
+        true
+    }
+
+    ; explainFile over the package redirect `r`
+    procedure explain_redirect_file(this, r: int) returns bool
+    {
+        let ld loader as ref[ProgramLoader]
+        let path ld.redirect_paths[r as size_t]
+        this.explain_name(path)
+        let node ld.node_for(path)
+        let messages ExplainMessages.create(host)
+        if this.reason_messages(node.reasons, true, messages) = false
+            return false
+        this.redirect_and_format_messages(path, 0 - 1, ld.redirect_targets[r as size_t], true, messages)
+        this.explain_messages(messages)
+        true
+    }
+
+    ; includeProcessor.explainRedirectAndImpliedFormat: the project reference
+    ; source, the package redirect's target (`target` >= 0 for a redirect file), the
+    ; implied module format of a source file (`index` >= 0)
+    procedure redirect_and_format_messages(this, path: Slice[char], index: int, target: int, relative: bool, out: ref[ExplainMessages])
+    {
+        let source pf.source_of_reference_output(path)
+        if source.equals(path) = false
+            out.add(1428, ProgramDiagnostic.args1(host, this.explain_file_name(source, relative)))
+        if target >= 0
+            out.add(1429, ProgramDiagnostic.args1(host, this.explain_file_name(pf.path_at(target), relative)))
+        if index < 0
+            return
+        let b pf.binder_at(index)
+        if b = null
+            return
+        if (b as ref[Binder]).is_external_or_common_js_module() = false
+            return
+        var uo options
+        set uo.package_json_type: pf.package_json_type_at(index)
+        let format uo.implied_node_format_for_emit_of_file(path)
+        let package_type pf.package_json_type_at(index)
+        let directory pf.package_json_directory_of(host, path)
+        let package_json join_slices(host, directory, "/package.json")
+        if format = ModuleKindESNext
+        {
+            if package_type.equals("module")
+                out.add(1458, ProgramDiagnostic.args1(host, this.explain_file_name(package_json, relative)))
+        }
+        if format = ModuleKindCommonJS
+        {
+            if (package_type.length as int) > 0
+                out.add(1459, ProgramDiagnostic.args1(host, this.explain_file_name(package_json, relative)))
+            else
+            {
+                if (directory.length as int) > 0
+                    out.add(1460, ProgramDiagnostic.args1(host, this.explain_file_name(package_json, relative)))
+                else
+                    out.add(1461, null)
+            }
+        }
+    }
+
+    ; a default library's reasons: the lib option's entry, else the target's default
+    procedure explain_lib_file(this, k: int) returns bool
+    {
+        let path this.source_path(k)
+        let node lib_nodes[k as size_t]
+        if node <> null
+        {
+            if AstNode.lib_references_of(node as ref[AstNode]) <> null
+            {
+                this.stop("explain-lib-reference")
+                return false
+            }
+        }
+        if (options.lib.length as int) = 0
+        {
+            let t options.get_emit_script_target()
+            this.explain_line(1425, ProgramDiagnostic.args1(host, DriverProgram.script_target_name(t)))
+            return true
+        }
+        let base get_base_file_name(host, path)
+        let names options.lib_names(host)
+        var i 0
+        while i < (names.get_length() as int)
+        {
+            let file_name Checker.lib_file_name(host, names[i as size_t])
+            set i: i + 1
+            if file_name.equals(base)
+            {
+                this.explain_line(1422, ProgramDiagnostic.args1(host, ProgramDiagnostic.text(file_name)))
+                return true
+            }
+        }
+        this.stop("explain-lib-reason")
+        false
+    }
+
+    ; core.ScriptTarget.String
+    function script_target_name(t: int) returns String
+    {
+        if t = 1
+            return String("ES5")
+        if t = 99
+            return String("ESNext")
+        if (t >= 2) and (t <= 12)
+        {
+            var sb StringBuilder()
+            sb.append("ES")
+            sb.append(2013 + t)
+            return sb.to_string()
+        }
+        String("None")
+    }
+
+    ; FileIncludeReason.toDiagnostic per reason; false after a stop
+    procedure reason_messages(this, reasons: ref[Array[ref[IncludeReason]]], relative: bool, out: ref[ExplainMessages]) returns bool
+    {
+        var i 0
+        while i < (reasons.get_length() as int)
+        {
+            let reason reasons[i as size_t]
+            set i: i + 1
+            if this.reason_message(reason, relative, out) = false
+                return false
+        }
+        true
+    }
+
+    procedure reason_message(this, reason: ref[IncludeReason], relative: bool, out: ref[ExplainMessages]) returns bool
+    {
+        let kind reason.kind
+        if kind = FileIncludeKindRootFile
+        {
+            this.root_reason_message(reason.name, relative, out)
+            return true
+        }
+        if kind = FileIncludeKindAutomaticTypeDirectiveFile
+        {
+            let wildcard DriverProgram.uses_wildcard_types(options.types)
+            let has_package (reason.package_id.length as int) > 0
+            let name ProgramDiagnostic.text(reason.name)
+            if wildcard
+            {
+                if has_package
+                    out.add(1421, ProgramDiagnostic.args2(host, name, DriverProgram.package_id_text(reason.package_id)))
+                else
+                    out.add(1420, ProgramDiagnostic.args1(host, name))
+            }
+            else
+            {
+                if has_package
+                    out.add(1418, ProgramDiagnostic.args2(host, name, DriverProgram.package_id_text(reason.package_id)))
+                else
+                    out.add(1417, ProgramDiagnostic.args1(host, name))
+            }
+            return true
+        }
+        if reason.synthetic
+        {
+            this.stop("explain-synthetic-import")
+            return false
+        }
+        let referencing pf.path_at(reason.file_index)
+        let text ProgramDiagnostic.text(pf.text_at(reason.file_index).subslice(reason.pos as size_t, reason.end as size_t))
+        let from this.explain_file_name(referencing, relative)
+        let has_package (reason.package_id.length as int) > 0
+        if kind = FileIncludeKindImport
+        {
+            if has_package
+                out.add(1394, ProgramDiagnostic.args3(host, text, from, DriverProgram.package_id_text(reason.package_id)))
+            else
+                out.add(1393, ProgramDiagnostic.args2(host, text, from))
+            return true
+        }
+        if kind = FileIncludeKindReferenceFile
+        {
+            out.add(1400, ProgramDiagnostic.args2(host, text, from))
+            return true
+        }
+        if kind = FileIncludeKindTypeReferenceDirective
+        {
+            if has_package
+                out.add(1403, ProgramDiagnostic.args3(host, text, from, DriverProgram.package_id_text(reason.package_id)))
+            else
+                out.add(1402, ProgramDiagnostic.args2(host, text, from))
+            return true
+        }
+        this.stop("explain-reason-kind")
+        false
+    }
+
+    ; GetMatchedFileSpec against the root config: its index, -1 for none
+    function matched_file_spec(this, config: ref[TsParsedCommandLine], file_name: Slice[char]) returns int
+    {
+        let file_path get_normalized_absolute_path(host, file_name, config.base_path)
+        var i 0
+        while i < (config.files_specs.get_length() as int)
+        {
+            let spec_path get_normalized_absolute_path(host, config.files_specs[i as size_t], config.base_path)
+            if spec_path.equals(file_path)
+                return i
+            set i: i + 1
+        }
+        0 - 1
+    }
+
+    ; GetMatchedIncludeSpec's match (the default include aside): its index, -1 for none
+    function matched_include_spec(this, config: ref[TsParsedCommandLine], file_name: Slice[char]) returns int
+    {
+        var j 0
+        while j < (config.include_specs.get_length() as int)
+        {
+            let pattern TsGlobPattern.compile(host, config.include_specs[j as size_t], config.base_path, TsGlobUsageFiles)
+            if pattern <> null
+            {
+                if (pattern as ref[TsGlobPattern]).matches(file_name)
+                    return j
+            }
+            set j: j + 1
+        }
+        0 - 1
+    }
+
+    ; the root file reason against the config's specs
+    procedure root_reason_message(this, root_name: Slice[char], relative: bool, out: ref[ExplainMessages])
+    {
+        if root_config = null
+        {
+            out.add(1427, null)
+            return
+        }
+        let config root_config as ref[TsParsedCommandLine]
+        let file_name get_normalized_absolute_path(host, root_name, sys.cwd)
+        if this.matched_file_spec(config, file_name) >= 0
+        {
+            out.add(1409, null)
+            return
+        }
+        if config.include_specs.get_length() > 0
+        {
+            if config.is_default_include
+            {
+                out.add(1457, null)
+                return
+            }
+            let j this.matched_include_spec(config, file_name)
+            if j >= 0
+            {
+                let spec ProgramDiagnostic.text(config.include_specs_raw[j as size_t])
+                out.add(1407, ProgramDiagnostic.args2(host, spec, this.explain_file_name(get_normalized_absolute_path(host, config_path, sys.cwd), relative)))
+                return
+            }
+        }
+        out.add(1427, null)
+    }
+
+    ; FileIncludeReason.toRelatedInfo: null for none; false after a stop
+    procedure reason_related_info(this, reason: ref[IncludeReason], out: ref[ref[DriverDiagnostic]?]) returns bool
+    {
+        set out: null
+        let kind reason.kind
+        if kind <= FileIncludeKindLibReferenceDirective
+        {
+            if reason.synthetic
+                return true
+            var code 1399
+            if kind = FileIncludeKindReferenceFile
+                set code: 1401
+            if kind = FileIncludeKindTypeReferenceDirective
+                set code: 1404
+            if kind = FileIncludeKindLibReferenceDirective
+                set code: 1406
+            let made &DriverDiagnostic^host(pf.path_at(reason.file_index), pf.text_at(reason.file_index), reason.pos, reason.end, code, null, null, null)
+            set out: made
+            return true
+        }
+        if root_config = null
+            return true
+        let config root_config as ref[TsParsedCommandLine]
+        if kind = FileIncludeKindRootFile
+        {
+            let file_name get_normalized_absolute_path(host, reason.name, sys.cwd)
+            let fi this.matched_file_spec(config, file_name)
+            if fi >= 0
+            {
+                set out: this.config_array_element_info(false, "files", config.files_specs_raw[fi as size_t], 1410)
+                return true
+            }
+            if (config.include_specs.get_length() > 0) and (config.is_default_include = false)
+            {
+                let ii this.matched_include_spec(config, file_name)
+                if ii >= 0
+                    set out: this.config_array_element_info(false, "include", config.include_specs_raw[ii as size_t], 1408)
+            }
+            return true
+        }
+        if kind = FileIncludeKindAutomaticTypeDirectiveFile
+        {
+            if DriverProgram.uses_wildcard_types(options.types) = false
+                set out: this.config_array_element_info(true, "types", reason.name, 1419)
+        }
+        true
+    }
+
+    ; processingDiagnostic.createDiagnosticExplainingFile: about a program file
+    ; (`file_index` >= 0, its include reasons) and/or for one include reason; at the
+    ; first reference that includes it, with the reasons as a chain unless that
+    ; reference is the only one, the other reasons as related information; null
+    ; after a stop
+    procedure explaining_diagnostic(this, file_index: int, diagnostic_reason: ref[IncludeReason]?, code: int, args: ref[Array[String]]?) returns ref[DriverDiagnostic]?
+    {
+        let ld loader as ref[ProgramLoader]
+        let reasons &Array[ref[IncludeReason]]^host()
+        if file_index >= 0
+        {
+            let node ld.node_for(pf.path_at(file_index))
+            var k 0
+            while k < (node.reasons.get_length() as int)
+            {
+                reasons.add(node.reasons[k as size_t])
+                set k: k + 1
+            }
+        }
+        if diagnostic_reason <> null
+        {
+            let dr diagnostic_reason as ref[IncludeReason]
+            var known false
+            var k 0
+            while k < (reasons.get_length() as int)
+            {
+                if (reasons[k as size_t] as ref[IncludeReason]) = dr
+                    set known: true
+                set k: k + 1
+            }
+            if known = false
+                reasons.add(dr)
+        }
+        let details ExplainMessages.create(host)
+        let related &Array[ref[DriverDiagnostic]]^host()
+        var preferred: ref[IncludeReason]? null
+        if diagnostic_reason <> null
+        {
+            let dr diagnostic_reason as ref[IncludeReason]
+            if (dr.kind <= FileIncludeKindLibReferenceDirective) and (dr.synthetic = false)
+                set preferred: dr
+        }
+        var i 0
+        while i < (reasons.get_length() as int)
+        {
+            let reason reasons[i as size_t]
+            set i: i + 1
+            if this.reason_message(reason, false, details) = false
+                return null
+            if (preferred = null) and (reason.kind <= FileIncludeKindLibReferenceDirective) and (reason.synthetic = false)
+            {
+                set preferred: reason
+                continue
+            }
+            if (preferred <> null) and ((preferred as ref[IncludeReason]) = reason)
+                continue
+            var info: ref[DriverDiagnostic]? null
+            if this.reason_related_info(reason, &info) = false
+                return null
+            if info <> null
+                related.add(info as ref[DriverDiagnostic])
+        }
+        let chain &Array[ChainLine]^host()
+        if (file_index >= 0) or (reasons.get_length() > 0)
+        {
+            if (preferred = null) or (reasons.get_length() <> 1)
+            {
+                chain.add(ChainLine(1, 1430, null))
+                var d 0
+                while d < (details.codes.get_length() as int)
+                {
+                    chain.add(ChainLine(2, details.codes[d as size_t], details.args[d as size_t]))
+                    set d: d + 1
+                }
+            }
+        }
+        if file_index >= 0
+        {
+            let redirects ExplainMessages.create(host)
+            this.redirect_and_format_messages(pf.path_at(file_index), file_index, 0 - 1, false, redirects)
+            var r 0
+            while r < (redirects.codes.get_length() as int)
+            {
+                chain.add(ChainLine(1, redirects.codes[r as size_t], redirects.args[r as size_t]))
+                set r: r + 1
+            }
+        }
+        var chain_or_null: ref[Array[ChainLine]]? null
+        if chain.get_length() > 0
+            set chain_or_null: chain
+        var related_or_null: ref[Array[ref[DriverDiagnostic]]]? null
+        if related.get_length() > 0
+            set related_or_null: related
+        let none: Slice[char] ""
+        if preferred <> null
+        {
+            let p preferred as ref[IncludeReason]
+            return &DriverDiagnostic^host(pf.path_at(p.file_index), pf.text_at(p.file_index), p.pos, p.end, code, args, chain_or_null, related_or_null)
+        }
+        &DriverDiagnostic^host(none, none, 0, 0, code, args, chain_or_null, related_or_null)
+    }
+
+    ; GetTsConfigPropArrayElementValue / GetOptionsSyntaxByArrayElementValue: the
+    ; config's string element `value` of the array at `property` (inside
+    ; compilerOptions when `in_compiler_options`) as a related diagnostic; null
+    ; when the config has none
+    procedure config_array_element_info(this, in_compiler_options: bool, property: Slice[char], value: Slice[char], code: int) returns ref[DriverDiagnostic]?
+    {
+        if (config_path.length as int) = 0
+            return null
+        let ld loader as ref[ProgramLoader]
+        let name String^host(config_path.data as pointer[const_char], config_path.length)
+        let source String^host(config_text.data as pointer[const_char], config_text.length)
+        var unported 0 - 1
+        var tag: Slice[char] ""
+        var detail 0
+        let parsed Parser.parse_ex(host, name, source, ScriptKindJSON, &unported, &tag, &detail)
+        if unported >= 0
+            return null
+        let verifier &OptionVerifier^host(host, ld, Parser.source_file_of(parsed), config_text)
+        var object verifier.root_object()
+        if in_compiler_options
+        {
+            let options_property verifier.property_named(object, "compilerOptions", "")
+            if options_property = null
+                return null
+            set object: AstNode.initializer_of(options_property)
+            if AstNode.kind_of(object) <> KindObjectLiteralExpression
+                return null
+        }
+        let found verifier.property_named(object, property, "")
+        if found = null
+            return null
+        let array AstNode.initializer_of(found)
+        var e 0
+        repeat
+        {
+            let element TsConfigParser.element_node_at(array, e)
+            if element = null
+                return null
+            set e: e + 1
+            let en element as ref[AstNode]
+            if AstNode.kind_of(en) <> KindStringLiteral
+                continue
+            let text AstNode.literal_text_of(en)
+            if text.equals(value)
+            {
+                let start Scanner.skip_trivia(config_text, AstNode.pos_of(en))
+                return &DriverDiagnostic^host(config_path, config_text, start, AstNode.end_of(en), code, null, null, null)
+            }
+        }
+    }
+
+    ; CompilerOptions.UsesWildcardTypes
+    function uses_wildcard_types(types: Slice[char]) returns bool
+    {
+        var start 0
+        var i 0
+        while i <= (types.length as int)
+        {
+            var at_end i = (types.length as int)
+            var is_comma false
+            if at_end = false
+                set is_comma: (types[i as size_t] as int) = ("," as char) as int
+            if at_end or is_comma
+            {
+                var s start
+                var e i
+                while (s < e) and ((types[s as size_t] as int) = (" " as char) as int)
+                    set s: s + 1
+                while (e > s) and ((types[(e - 1) as size_t] as int) = (" " as char) as int)
+                    set e: e - 1
+                if ((e - s) = 1) and ((types[s as size_t] as int) = ("*" as char) as int)
+                    return true
+                set start: i + 1
+            }
+            set i: i + 1
+        }
+        false
+    }
+
+    ; PackageId.String over the resolver's `name|sub|version|peers` key
+    function package_id_text(key: Slice[char]) returns String
+    {
+        var parts 0
+        var sb StringBuilder()
+        var start 0
+        var i 0
+        while i <= (key.length as int)
+        {
+            var at_end i = (key.length as int)
+            var is_bar false
+            if at_end = false
+                set is_bar: (key[i as size_t] as int) = ("|" as char) as int
+            if at_end or is_bar
+            {
+                let piece key.subslice(start as size_t, i as size_t)
+                if parts = 0
+                    sb.append(piece.data, piece.length)
+                if parts = 1
+                {
+                    if (piece.length as int) > 0
+                    {
+                        sb.append("/")
+                        sb.append(piece.data, piece.length)
+                    }
+                }
+                if parts = 2
+                {
+                    sb.append("@")
+                    sb.append(piece.data, piece.length)
+                }
+                if parts = 3
+                    sb.append(piece.data, piece.length)
+                set parts: parts + 1
+                set start: i + 1
+            }
+            set i: i + 1
+        }
+        sb.to_string()
     }
 
     function source_node(this, i: int) returns ref[AstNode]?

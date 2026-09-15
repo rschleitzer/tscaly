@@ -29,6 +29,9 @@ use tscaly.commandline.ParsedCommandLine
 use tscaly.diagnosticwriter.DriverDiagnostic
 use tscaly.diagnosticwriter.DiagnosticWriter
 use tscaly.programhost.DriverProgram
+use tscaly.programhost.ConfigFiles
+use tscaly.programhost.ResolvedReference
+use tscaly.tsoptions.ProjectReference
 use tscaly.incremental.IncProgram
 use tscaly.incremental.IncOptions
 use tscaly.incremental.PathMap
@@ -75,16 +78,21 @@ define BuildStatus
     input_time: int
     output_time: int
     has_times: bool
+    ; upstreamErrors.refHasUpstreamErrors (the reference is `name`)
+    ref_has_upstream_errors: bool
 )
 {
     function simple(host: ref[Page], kind: int) returns ref[BuildStatus]
-        &BuildStatus^host(kind, Slice[char](), Slice[char](), Slice[char](), false, 0, 0, false)
+        &BuildStatus^host(kind, Slice[char](), Slice[char](), Slice[char](), false, 0, 0, false, false)
 
     function named(host: ref[Page], kind: int, name: Slice[char]) returns ref[BuildStatus]
-        &BuildStatus^host(kind, name, Slice[char](), Slice[char](), false, 0, 0, false)
+        &BuildStatus^host(kind, name, Slice[char](), Slice[char](), false, 0, 0, false, false)
 
     function input_output(host: ref[Page], kind: int, input: Slice[char], output: Slice[char]) returns ref[BuildStatus]
-        &BuildStatus^host(kind, Slice[char](), input, output, true, 0, 0, false)
+        &BuildStatus^host(kind, Slice[char](), input, output, true, 0, 0, false, false)
+
+    function upstream_errors(host: ref[Page], ref_path: Slice[char], ref_has_upstream_errors: bool) returns ref[BuildStatus]
+        &BuildStatus^host(UpToDateUpstreamErrors, ref_path, Slice[char](), Slice[char](), false, 0, 0, false, ref_has_upstream_errors)
 
     function is_pseudo_build(this) returns bool
         (kind = UpToDateWithUpstreamTypes) or (kind = UpToDateWithInputFileText)
@@ -112,6 +120,9 @@ define BuildTask
     program: ref[IncProgram]?
     build_kind: int
     files_to_delete: ref[Array[Slice[char]]]
+    ; upStream: the upstream tasks and the index of their reference
+    upstream: ref[Array[int]]
+    upstream_ref_index: ref[Array[int]]
 )
 
 define Orchestrator
@@ -120,6 +131,11 @@ define Orchestrator
     sys: ref[ExecSystem]
     cl: ref[ParsedCommandLine]
     tasks: ref[Array[ref[BuildTask]]]
+    ; the graph's order (task indices) and its circularity errors
+    order: ref[Array[int]]
+    graph_errors: ref[Array[ref[DriverDiagnostic]]]
+    ; host.resolvedReferences
+    resolved_references: ref[Array[ref[ResolvedReference]]]
     mtimes: ref[PathMap[int]]
     verbose: bool
     dry: bool
@@ -148,7 +164,7 @@ define Orchestrator
             sys.stop("watch")
             return ExitStatusNotImplemented
         }
-        let o &Orchestrator^host(host, sys, cl, &Array[ref[BuildTask]]^host(), IncSnapshot.int_map(host), CommandLine.raw_true(cl.raw, "verbose"), CommandLine.raw_true(cl.raw, "dry"), CommandLine.raw_true(cl.raw, "force"), CommandLine.raw_true(cl.raw, "clean"))
+        let o &Orchestrator^host(host, sys, cl, &Array[ref[BuildTask]]^host(), &Array[int]^host(), &Array[ref[DriverDiagnostic]]^host(), &Array[ref[ResolvedReference]]^host(), IncSnapshot.int_map(host), CommandLine.raw_true(cl.raw, "verbose"), CommandLine.raw_true(cl.raw, "dry"), CommandLine.raw_true(cl.raw, "force"), CommandLine.raw_true(cl.raw, "clean"))
         o.start()
     }
 
@@ -165,50 +181,160 @@ define Orchestrator
     ; Orchestrator.Start without watch; ExitStatusNotImplemented after a stop
     procedure start(this) returns int
     {
-        ; GenerateGraph: ResolvedProjectPaths, a task per project
+        ; GenerateGraph: a task per project and per reference, then the order
+        let roots &Array[Slice[char]]^host()
         var i 0
         while i < (cl.file_names.get_length() as int)
         {
             let project cl.file_names[i as size_t]
             set i: i + 1
-            var resolved get_normalized_absolute_path(host, project, sys.cwd)
-            if resolved.ends_with(".json") = false
-                set resolved: combine_paths(host, resolved, "tsconfig.json")
-            var known false
-            var k 0
-            while k < (tasks.get_length() as int)
-            {
-                let existing tasks[k as size_t]
-                if existing.config.equals(resolved)
-                    set known: true
-                set k: k + 1
-            }
-            if known
-                continue
-            let task &BuildTask^host(resolved, null, Slice[char](), &Array[ref[DriverDiagnostic]]^host(), null, null, &Array[ref[DriverDiagnostic]]^host(), &StringBuilder^host(), ExitStatusSuccess, null, BuildKindNone, &Array[Slice[char]]^host())
-            if this.resolve_project(task) = false
-                return ExitStatusNotImplemented
-            tasks.add(task)
+            roots.add(ConfigFiles.config_of_reference(host, get_normalized_absolute_path(host, project, sys.cwd)))
+        }
+        if this.create_build_tasks(roots) = false
+            return ExitStatusNotImplemented
+        let completed &Array[int]^host()
+        let analyzing &Array[int]^host()
+        let stack &Array[Slice[char]]^host()
+        var r 0
+        while r < (roots.get_length() as int)
+        {
+            this.setup_build_task(roots[r as size_t], false, completed, analyzing, stack)
+            set r: r + 1
         }
         this.build_or_clean()
     }
 
-    ; host.GetResolvedProjectReference: the config parsed, null when unreadable;
-    ; false after a stop
-    procedure resolve_project(this, task: ref[BuildTask]) returns bool
+    function task_index_of(this, config: Slice[char]) returns int
     {
-        sys.now()
-        var text Slice[char]()
-        if sys.read_file(task.config, &text)
+        var k 0
+        while k < (tasks.get_length() as int)
         {
-            set task.config_text: text
-            let parsed Execute.parse_config(sys, cl, task.config, text, task.config_diagnostics)
-            if parsed = null
+            let existing tasks[k as size_t]
+            if existing.config.equals(config)
+                return k
+            set k: k + 1
+        }
+        0 - 1
+    }
+
+    ; createBuildTasks; false after a stop
+    procedure create_build_tasks(this, configs: ref[Array[Slice[char]]]) returns bool
+    {
+        var i 0
+        while i < (configs.get_length() as int)
+        {
+            let config configs[i as size_t]
+            set i: i + 1
+            if this.task_index_of(config) >= 0
+                continue
+            let task &BuildTask^host(config, null, Slice[char](), &Array[ref[DriverDiagnostic]]^host(), null, null, &Array[ref[DriverDiagnostic]]^host(), &StringBuilder^host(), ExitStatusSuccess, null, BuildKindNone, &Array[Slice[char]]^host(), &Array[int]^host(), &Array[int]^host())
+            tasks.add(task)
+            let resolved this.resolved_project_reference(config)
+            if resolved = null
                 return false
-            set task.resolved: parsed
+            let rr resolved as ref[ResolvedReference]
+            set task.resolved: rr.parsed
+            set task.config_text: rr.text
+            set task.config_diagnostics: rr.diagnostics
+            if rr.parsed <> null
+            {
+                let parsed rr.parsed as ref[TsParsedCommandLine]
+                if parsed.references <> null
+                {
+                    let refs parsed.references as ref[Array[ProjectReference]]
+                    let children &Array[Slice[char]]^host()
+                    var c 0
+                    while c < (refs.get_length() as int)
+                    {
+                        let child_reference refs[c as size_t]
+                        children.add(ConfigFiles.config_of_reference(host, child_reference.path))
+                        set c: c + 1
+                    }
+                    if this.create_build_tasks(children) = false
+                        return false
+                }
+            }
+        }
+        true
+    }
+
+    ; host.GetResolvedProjectReference: parsed once, the clock read around it; null
+    ; after a stop
+    procedure resolved_project_reference(this, config: Slice[char]) returns ref[ResolvedReference]?
+    {
+        var i 0
+        while i < (resolved_references.get_length() as int)
+        {
+            let known resolved_references[i as size_t]
+            if known.config.equals(config)
+                return known
+            set i: i + 1
         }
         sys.now()
-        true
+        let made ConfigFiles.resolve(sys, config, cl.options, cl.raw)
+        sys.now()
+        if made = null
+            return null
+        let r made as ref[ResolvedReference]
+        resolved_references.add(r)
+        r
+    }
+
+    ; setupBuildTask: upstream first, then the task into the order
+    procedure setup_build_task(this, config: Slice[char], in_circular_context: bool, completed: ref[Array[int]], analyzing: ref[Array[int]], stack: ref[Array[Slice[char]]]) returns int
+    {
+        let index this.task_index_of(config)
+        if index < 0
+            return index
+        let task tasks[index as size_t]
+        if ExecSystem.contains_int(completed, index)
+            return index
+        if ExecSystem.contains_int(analyzing, index)
+        {
+            if in_circular_context = false
+            {
+                var sb StringBuilder()
+                var k 0
+                while k < (stack.get_length() as int)
+                {
+                    if k > 0
+                        sb.append("\n")
+                    let entry stack[k as size_t]
+                    sb.append(entry.data, entry.length)
+                    set k: k + 1
+                }
+                let joined String^host(sb.to_string())
+                let none: Slice[char] ""
+                graph_errors.add(&DriverDiagnostic^host(none, none, 0, 0, DiagProject_references_may_not_form_a_circular_graph_Cycle_detected_Colon_0, this.args1(Slice[char](joined.get_length(), joined.get_buffer() as pointer[char])), null, null))
+            }
+            return 0 - 1
+        }
+        analyzing.add(index)
+        stack.add(config)
+        if task.resolved <> null
+        {
+            let parsed task.resolved as ref[TsParsedCommandLine]
+            if parsed.references <> null
+            {
+                let refs parsed.references as ref[Array[ProjectReference]]
+                var r 0
+                while r < (refs.get_length() as int)
+                {
+                    let reference refs[r as size_t]
+                    let upstream this.setup_build_task(ConfigFiles.config_of_reference(host, reference.path), in_circular_context or reference.circular, completed, analyzing, stack)
+                    if upstream >= 0
+                    {
+                        task.upstream.add(upstream)
+                        task.upstream_ref_index.add(r)
+                    }
+                    set r: r + 1
+                }
+            }
+        }
+        ExecSystem.pop_slice(host, stack)
+        completed.add(index)
+        order.add(index)
+        index
     }
 
     ; buildOrClean; the exit status
@@ -218,9 +344,9 @@ define Orchestrator
         {
             var sb StringBuilder()
             var i 0
-            while i < (tasks.get_length() as int)
+            while i < (order.get_length() as int)
             {
-                let task tasks[i as size_t]
+                let task tasks[order[i as size_t] as size_t]
                 let name this.relative_file_name(task.config)
                 sb.append("\r\n    * ")
                 sb.append(name.data, name.length)
@@ -232,10 +358,23 @@ define Orchestrator
         var status ExitStatusSuccess
         let errors &Array[ref[DriverDiagnostic]]^host()
         let files_to_delete &Array[Slice[char]]^host()
-        var k 0
-        while k < (tasks.get_length() as int)
+        if graph_errors.get_length() > 0
         {
-            let task tasks[k as size_t]
+            set status: ExitStatusProjectReferenceCycle_OutputsSkipped
+            var g 0
+            while g < (graph_errors.get_length() as int)
+            {
+                let d graph_errors[g as size_t]
+                Execute.report(sys, Execute.reporter(sys, cl.options), d)
+                errors.add(d)
+                set g: g + 1
+            }
+        }
+        var k 0
+        let task_count order.get_length() as int
+        while (k < task_count) and (graph_errors.get_length() = 0)
+        {
+            let task tasks[order[k as size_t] as size_t]
             set k: k + 1
             if clean
                 this.clean_project(task)
@@ -406,7 +545,18 @@ define Orchestrator
                 this.task_status(task, DiagProject_0_is_up_to_date, this.args1(task.config))
             return true
         }
-        if (kind = UpToDateUpstreamErrors) or (kind = UpToDateSolution)
+        if kind = UpToDateUpstreamErrors
+        {
+            if verbose
+            {
+                if status.ref_has_upstream_errors
+                    this.task_status(task, DiagSkipping_build_of_project_0_because_its_dependency_1_was_not_built, this.args2(this.relative_file_name(task.config), this.relative_file_name(status.name)))
+                else
+                    this.task_status(task, DiagSkipping_build_of_project_0_because_its_dependency_1_has_errors, this.args2(this.relative_file_name(task.config), this.relative_file_name(status.name)))
+            }
+            return true
+        }
+        if kind = UpToDateSolution
             return true
         if kind = UpToDateConfigFileNotFound
         {
@@ -423,7 +573,7 @@ define Orchestrator
                 return true
             }
             this.update_time_stamps(task, null, DiagUpdating_output_timestamps_of_project_0)
-            set task.status: &BuildStatus^host(UpToDateUpToDate, status.name, status.input, status.output, status.has_names, status.input_time, status.output_time, status.has_times)
+            set task.status: &BuildStatus^host(UpToDateUpToDate, status.name, status.input, status.output, status.has_names, status.input_time, status.output_time, status.has_times, false)
             set task.build_kind: BuildKindPseudo
             return true
         }
@@ -447,6 +597,10 @@ define Orchestrator
         if Execute.unported_compile_options(sys, options)
             return false
         let program DriverProgram.create(host, sys, options, resolved.file_names, task.config, task.config_text, task.config_diagnostics)
+        set program.root_config: resolved
+        set program.known_references: resolved_references
+        set program.reference_options: cl.options
+        set program.reference_raw: cl.raw
         sys.now()
         var old: ref[IncSnapshot]? null
         if force = false
@@ -692,6 +846,25 @@ define Orchestrator
             return BuildStatus.simple(host, UpToDateConfigFileNotFound)
         let resolved task.resolved as ref[TsParsedCommandLine]
         let options resolved.options
+        if (resolved.file_names.get_length() = 0) and (resolved.references <> null)
+            return BuildStatus.simple(host, UpToDateSolution)
+        let refs_opt resolved.references
+        var u 0
+        while u < (task.upstream.get_length() as int)
+        {
+            let upstream_task tasks[task.upstream[u as size_t] as size_t]
+            if CommandLine.raw_true(cl.raw, "stopBuildOnErrors") and (upstream_task.status <> null)
+            {
+                let upstream_status upstream_task.status as ref[BuildStatus]
+                if upstream_status.is_error()
+                {
+                    let refs refs_opt as ref[Array[ProjectReference]]
+                    let upstream_reference refs[task.upstream_ref_index[u as size_t] as size_t]
+                    return BuildStatus.upstream_errors(host, upstream_reference.path, upstream_status.kind = UpToDateUpstreamErrors)
+                }
+            }
+            set u: u + 1
+        }
         if force
             return BuildStatus.simple(host, UpToDateForceBuild)
         let build_info_path IncProgram.build_info_file_name_of(host, options, task.config, sys.cwd)
@@ -727,7 +900,8 @@ define Orchestrator
         var newest_input_file Slice[char]()
         var newest_input_time 0
         let seen_roots &Array[Slice[char]]^host()
-        let roots this.build_info_roots(info, build_info_directory)
+        let resolved_roots &Array[Slice[char]]^host()
+        let roots this.build_info_roots(info, build_info_directory, resolved_roots)
         var i 0
         while i < (resolved.file_names.get_length() as int)
         {
@@ -742,11 +916,12 @@ define Orchestrator
                 var matched false
                 if is_incremental_info
                 {
-                    let version_text this.root_file_version(info, roots, input_path, build_info_directory)
+                    var resolved_input input_path
+                    let version_text this.root_file_version(info, roots, resolved_roots, input_path, build_info_directory, &resolved_input)
                     if (version_text.length as int) > 0
                     {
                         var text Slice[char]()
-                        if sys.read_file(input_path, &text)
+                        if sys.read_file(resolved_input, &text)
                         {
                             let current IncOptions.compute_hash(host, text, true)
                             if current.equals(version_text)
@@ -791,7 +966,7 @@ define Orchestrator
                     if (get_root_length(name) = 0) and (path_is_relative(name) = false)
                         continue
                     let input_file get_normalized_absolute_path(host, name, build_info_directory)
-                    if ExecSystem.contains(seen_roots, input_file)
+                    if ExecSystem.contains(seen_roots, input_file) or ExecSystem.contains(resolved_roots, input_file)
                         continue
                     let input_time this.mtime_of(input_file)
                     if input_time = 0
@@ -837,6 +1012,32 @@ define Orchestrator
                 }
             }
         }
+        var ref_dts_unchanged false
+        var up 0
+        while up < (task.upstream.get_length() as int)
+        {
+            let upstream_task tasks[task.upstream[up as size_t] as size_t]
+            let ref_index task.upstream_ref_index[up as size_t]
+            set up: up + 1
+            if upstream_task.status = null
+                continue
+            let upstream_status upstream_task.status as ref[BuildStatus]
+            if upstream_status.kind = UpToDateSolution
+                continue
+            if upstream_status.has_times and (upstream_status.input_time <> 0) and (upstream_status.input_time < oldest_output_time)
+                continue
+            let refs refs_opt as ref[Array[ProjectReference]]
+            let upstream_reference refs[ref_index as size_t]
+            if this.has_conflicting_build_info(task, upstream_task)
+                return BuildStatus.input_output(host, UpToDateInputFileNewer, upstream_reference.path, oldest_output_file)
+            let newest_dts this.latest_changed_dts_mtime(upstream_task)
+            if (newest_dts <> 0) and (newest_dts < oldest_output_time)
+            {
+                set ref_dts_unchanged: true
+                continue
+            }
+            return BuildStatus.input_output(host, UpToDateInputFileNewer, upstream_reference.path, oldest_output_file)
+        }
         let config_time this.mtime_of(task.config)
         if config_time > oldest_output_time
             return BuildStatus.input_output(host, UpToDateInputFileNewer, task.config, oldest_output_file)
@@ -872,7 +1073,39 @@ define Orchestrator
         var kind UpToDateUpToDate
         if input_text_unchanged
             set kind: UpToDateWithInputFileText
-        &BuildStatus^host(kind, Slice[char](), newest_input_file, oldest_output_file, false, newest_input_time, oldest_output_time, true)
+        if ref_dts_unchanged
+            set kind: UpToDateWithUpstreamTypes
+        &BuildStatus^host(kind, Slice[char](), newest_input_file, oldest_output_file, false, newest_input_time, oldest_output_time, true, false)
+    }
+
+    ; hasConflictingBuildInfo
+    function has_conflicting_build_info(this, task: ref[BuildTask], upstream: ref[BuildTask]) returns bool
+    {
+        if (task.build_info_entry = null) or (upstream.build_info_entry = null)
+            return false
+        let a task.build_info_entry as ref[BuildInfoEntry]
+        let b upstream.build_info_entry as ref[BuildInfoEntry]
+        a.path.equals(b.path)
+    }
+
+    ; getLatestChangedDtsMTime
+    procedure latest_changed_dts_mtime(this, task: ref[BuildTask]) returns int
+    {
+        if task.build_info_entry = null
+            return 0
+        let entry task.build_info_entry as ref[BuildInfoEntry]
+        if entry.has_dts_time
+            return entry.dts_time
+        var t 0
+        if entry.info <> null
+        {
+            let latest (entry.info as ref[JsonValue]).string_of("latestChangedDtsFile")
+            if (latest.length as int) > 0
+                set t: this.mtime_of(get_normalized_absolute_path(host, latest, get_directory_path(host, entry.path)))
+        }
+        set entry.dts_time: t
+        set entry.has_dts_time: true
+        t
     }
 
     ; BuildInfo.IsEmitPending
@@ -905,8 +1138,10 @@ define Orchestrator
         false
     }
 
-    ; GetBuildInfoRootInfoReader's roots, as absolute paths in the build info's order
-    procedure build_info_roots(this, info: ref[JsonValue], directory: Slice[char]) returns ref[Array[Slice[char]]]
+    ; GetBuildInfoRootInfoReader: the roots (resolved roots mapped back to their
+    ; root through resolvedRoot) and, beside each, the resolved file, as absolute
+    ; paths in the build info's order
+    procedure build_info_roots(this, info: ref[JsonValue], directory: Slice[char], out_resolved: ref[Array[Slice[char]]]) returns ref[Array[Slice[char]]]
     {
         let out &Array[Slice[char]]^host()
         let root info.get("root")
@@ -921,12 +1156,13 @@ define Orchestrator
             set i: i + 1
             if entry.kind = JsonKindString
             {
-                out.add(get_normalized_absolute_path(host, entry.text, directory))
+                let path get_normalized_absolute_path(host, entry.text, directory)
+                out.add(path)
+                out_resolved.add(path)
                 continue
             }
             if names = null
                 continue
-            let nv names as ref[JsonValue]
             var start 0
             var stop 0
             if entry.kind = JsonKindNumber
@@ -942,39 +1178,76 @@ define Orchestrator
             var id start
             while id <= stop
             {
-                let name (nv.value_at(id - 1) as ref[JsonValue]).text
-                out.add(get_normalized_absolute_path(host, name, directory))
+                let resolved this.build_info_file_path(info, id, directory)
+                out.add(this.root_of_resolved(info, id, directory, resolved))
+                out_resolved.add(resolved)
                 set id: id + 1
             }
         }
         out
     }
 
-    ; BuildInfoRootInfoReader.GetBuildInfoFileInfo's version for a root file,
-    ; empty when the build info records none
-    function root_file_version(this, info: ref[JsonValue], roots: ref[Array[Slice[char]]], input_path: Slice[char], directory: Slice[char]) returns Slice[char]
+    function build_info_file_path(this, info: ref[JsonValue], id: int, directory: Slice[char]) returns Slice[char]
     {
         let names info.get("fileNames")
-        let infos info.get("fileInfos")
-        if (names = null) or (infos = null)
-            return ""
-        if ExecSystem.contains(roots, input_path) = false
+        if names = null
             return ""
         let nv names as ref[JsonValue]
-        let iv infos as ref[JsonValue]
-        var f 0
-        while (f < nv.size()) and (f < iv.size())
+        if (id < 1) or (id > nv.size())
+            return ""
+        let name (nv.value_at(id - 1) as ref[JsonValue]).text
+        get_normalized_absolute_path(host, name, directory)
+    }
+
+    function root_of_resolved(this, info: ref[JsonValue], id: int, directory: Slice[char], resolved: Slice[char]) returns Slice[char]
+    {
+        let pairs info.get("resolvedRoot")
+        if pairs = null
+            return resolved
+        let pv pairs as ref[JsonValue]
+        var i 0
+        while i < pv.size()
         {
-            let name (nv.value_at(f) as ref[JsonValue]).text
-            let absolute get_normalized_absolute_path(host, name, directory)
-            if absolute.equals(input_path)
+            let pair pv.value_at(i) as ref[JsonValue]
+            if JsonText.int_of(pair.value_at(0)) = id
+                return this.build_info_file_path(info, JsonText.int_of(pair.value_at(1)), directory)
+            set i: i + 1
+        }
+        resolved
+    }
+
+    ; GetBuildInfoFileInfo's version for a root, the file it read through the cell
+    procedure root_file_version(this, info: ref[JsonValue], roots: ref[Array[Slice[char]]], resolved_roots: ref[Array[Slice[char]]], input_path: Slice[char], directory: Slice[char], out_resolved: ref[Slice[char]]) returns Slice[char]
+    {
+        let infos info.get("fileInfos")
+        if infos = null
+            return ""
+        var k 0
+        while k < (roots.get_length() as int)
+        {
+            let root roots[k as size_t]
+            let resolved resolved_roots[k as size_t]
+            if root.equals(input_path) or resolved.equals(input_path)
             {
-                let file_info iv.value_at(f) as ref[JsonValue]
-                if file_info.kind = JsonKindString
-                    return file_info.text
-                return file_info.string_of("version")
+                set out_resolved.data: resolved.data
+                set out_resolved.length: resolved.length
+                let names info.get("fileNames") as ref[JsonValue]
+                let iv infos as ref[JsonValue]
+                var f 0
+                while (f < names.size()) and (f < iv.size())
+                {
+                    if this.build_info_file_path(info, f + 1, directory).equals(resolved)
+                    {
+                        let file_info iv.value_at(f) as ref[JsonValue]
+                        if file_info.kind = JsonKindString
+                            return file_info.text
+                        return file_info.string_of("version")
+                    }
+                    set f: f + 1
+                }
+                return ""
             }
-            set f: f + 1
+            set k: k + 1
         }
         ""
     }
@@ -989,6 +1262,13 @@ define Orchestrator
         let kind status.kind
         if kind = UpToDateConfigFileNotFound
             this.task_status(task, DiagProject_0_is_out_of_date_because_config_file_does_not_exist, this.args1(config))
+        if kind = UpToDateUpstreamErrors
+        {
+            if status.ref_has_upstream_errors
+                this.task_status(task, DiagProject_0_can_t_be_built_because_its_dependency_1_was_not_built, this.args2(config, this.relative_file_name(status.name)))
+            else
+                this.task_status(task, DiagProject_0_can_t_be_built_because_its_dependency_1_has_errors, this.args2(config, this.relative_file_name(status.name)))
+        }
         if kind = UpToDateBuildErrors
             this.task_status(task, DiagProject_0_is_out_of_date_because_it_has_errors, this.args1(config))
         if kind = UpToDateUpToDate

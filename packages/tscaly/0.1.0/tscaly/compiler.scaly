@@ -41,12 +41,16 @@ define FileIncludeKindReferenceFile: int 1
 define FileIncludeKindTypeReferenceDirective: int 2
 define FileIncludeKindLibReferenceDirective: int 3
 define FileIncludeKindRootFile: int 4
+define FileIncludeKindAutomaticTypeDirectiveFile: int 5
 
 ; where a program diagnostic lies: a program file's index, or one of these
 define ProgramDiagnosticGlobal: int -1
 define ProgramDiagnosticConfig: int -2
 
-define ProgramDiagnostic (file_index: int  pos: int  end: int  code: int  args: ref[Array[String]]?  chain: ref[Array[ChainLine]]?)
+; `reason` and `explained_file` (-1 for none) mark a createDiagnosticExplainingFile
+; diagnostic: the driver's program builds its location, chain and related
+; information from them
+define ProgramDiagnostic (file_index: int  pos: int  end: int  code: int  args: ref[Array[String]]?  chain: ref[Array[ChainLine]]?  reason: ref[IncludeReason]?  explained_file: int)
 {
     ; the message arguments, copied onto host
     function args1(host: ref[Page], a0: String) returns ref[Array[String]]
@@ -85,8 +89,9 @@ define ProgramDiagnostic (file_index: int  pos: int  end: int  code: int  args: 
 
 ; a FileIncludeReason: a root, or a reference in a program file — an import
 ; specifier (synthetic for tslib and the JSX runtime) or a triple-slash reference's
-; range
-define IncludeReason (kind: int  file_index: int  pos: int  end: int  synthetic: bool)
+; range; `name` is a root's file name or an automatic type directive's, `package_id`
+; the resolution's PackageId key
+define IncludeReason (kind: int  file_index: int  pos: int  end: int  synthetic: bool  name: Slice[char]  package_id: Slice[char])
 
 ; a parse task as its parent created it
 define LoaderEdge (path: Slice[char]  increase_depth: bool  elide_on_depth: bool  reason: ref[IncludeReason]  package_id: Slice[char])
@@ -105,6 +110,9 @@ define LoaderNode
     package_id: Slice[char]
     ; includeProcessor.fileIncludeReasons of the file, in collectFiles' order
     reasons: ref[Array[ref[IncludeReason]]]
+    ; parseTask.redirectedParseTask: a project reference's source, loaded as its
+    ; output declaration file
+    redirected: bool
 )
 
 define ProgramLoader
@@ -130,6 +138,17 @@ define ProgramLoader
     package_files: ref[Array[int]]
     ; blockEmittingOfFile: the output paths an input would overwrite
     blocked_paths: ref[Array[Slice[char]]]
+    ; projectReferenceFileMapper.sourceToProjectReference: a referenced project's
+    ; source file and its output declaration file (empty for none)
+    reference_sources: ref[Array[Slice[char]]]
+    reference_outputs: ref[Array[Slice[char]]]
+    ; redirectFilesByPath: a deduplicated package file, its target's table index
+    ; and its position among the program's files
+    redirect_paths: ref[Array[Slice[char]]]
+    redirect_targets: ref[Array[int]]
+    redirect_positions: ref[Array[int]]
+    ; a program file carries a `/// <reference lib>` (the lib chain does not follow it)
+    lib_reference_directive: bool
 )
 {
     function create(host: ref[Page], files: ref[ProgramFiles], options: EmitOptions, checker: ref[Checker]) returns ref[ProgramLoader]
@@ -147,7 +166,7 @@ define ProgramLoader
         if options.max_node_module_js_depth > 0
             set depth: options.max_node_module_js_depth
         let sh SpecifierHost.create(host, checker, files, options)
-        &ProgramLoader^host(host, files, options, checker, sh, &Array[ref[LoaderNode]]^host(), &Array[ref[LoaderEdge]]^host(), depth, &Array[int]^host(), &Array[Slice[char]]^host(), members, searched, &Array[ProgramDiagnostic]^host(), Slice[char](), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host())
+        &ProgramLoader^host(host, files, options, checker, sh, &Array[ref[LoaderNode]]^host(), &Array[ref[LoaderEdge]]^host(), depth, &Array[int]^host(), &Array[Slice[char]]^host(), members, searched, &Array[ProgramDiagnostic]^host(), Slice[char](), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[int]^host(), false)
     }
 
     procedure stop(this, tag: Slice[char])
@@ -179,6 +198,35 @@ define ProgramLoader
         }
     }
 
+    ; getRedirectForResolution's file name: a referenced project's output declaration
+    ; file resolves from its source
+    function resolution_containing_path(this, path: Slice[char]) returns Slice[char]
+    {
+        var i 0
+        while i < (reference_outputs.get_length() as int)
+        {
+            let output reference_outputs[i as size_t]
+            if ((output.length as int) > 0) and output.equals(path)
+                return reference_sources[i as size_t]
+            set i: i + 1
+        }
+        path
+    }
+
+    ; the task data at `path`, null when no task named it
+    function find_node(this, path: Slice[char]) returns ref[LoaderNode]?
+    {
+        var i 0
+        while i < (nodes.get_length() as int)
+        {
+            let n nodes[i as size_t]
+            if n.path.equals(path)
+                return n
+            set i: i + 1
+        }
+        null
+    }
+
     function node_for(this, path: Slice[char]) returns ref[LoaderNode]
     {
         var i 0
@@ -189,7 +237,7 @@ define ProgramLoader
                 return n
             set i: i + 1
         }
-        let made &LoaderNode^host(slice_copy_on(host, path), 1000000000, false, false, &Array[ref[LoaderEdge]]^host(), &Array[ProgramDiagnostic]^host(), 0 - 1, null, &Array[ref[IncludeReason]]^host())
+        let made &LoaderNode^host(slice_copy_on(host, path), 1000000000, false, false, &Array[ref[LoaderEdge]]^host(), &Array[ProgramDiagnostic]^host(), 0 - 1, null, &Array[ref[IncludeReason]]^host(), false)
         nodes.add(made)
         made
     }
@@ -202,7 +250,7 @@ define ProgramLoader
         var containing cwd
         if (options.config_file_path.length as int) > 0
             set containing: get_normalized_absolute_path(host, options.config_file_path, cwd)
-        let reason &IncludeReason^host(FileIncludeKindRootFile, 0 - 1, 0, 0, false)
+        let reason &IncludeReason^host(FileIncludeKindRootFile, 0 - 1, 0, 0, false, file_name, null)
         var resolved Slice[char]()
         let code this.source_file_from_reference(abs_path, containing, false, &resolved)
         var path resolved
@@ -285,28 +333,30 @@ define ProgramLoader
     procedure add_explaining_diagnostic(this, out: ref[Array[ProgramDiagnostic]], reason: ref[IncludeReason], code: int, args: ref[Array[String]]?)
     {
         if (reason.kind <= FileIncludeKindLibReferenceDirective) and (reason.synthetic = false)
-            out.add(ProgramDiagnostic(reason.file_index, reason.pos, reason.end, code, args, null))
+            out.add(ProgramDiagnostic(reason.file_index, reason.pos, reason.end, code, args, null, reason, 0 - 1))
         else
-            out.add(ProgramDiagnostic(ProgramDiagnosticGlobal, 0, 0, code, args, null))
+            out.add(ProgramDiagnostic(ProgramDiagnosticGlobal, 0, 0, code, args, null, reason, 0 - 1))
     }
 
     ; createDiagnosticExplainingFile for a diagnostic about a file the program
-    ; holds: at the file's one include reason when that is a reference in a file;
-    ; the chained forms (several reasons, or none in a file) are a stop
+    ; holds: recorded with the file, the driver's program builds its location, chain
+    ; and related information from the file's include reasons
     procedure add_file_explaining_diagnostic(this, file_index: int, code: int, args: ref[Array[String]]?)
     {
-        let node this.node_for(files.path_at(file_index))
-        let reasons node.reasons
-        if reasons.get_length() = 1
+        ; located at the file's first non-synthetic reference, the driver adds the rest
+        let reasons this.node_for(files.path_at(file_index)).reasons
+        var i 0
+        while i < (reasons.get_length() as int)
         {
-            let reason reasons[0]
+            let reason reasons[i as size_t]
+            set i: i + 1
             if (reason.kind <= FileIncludeKindLibReferenceDirective) and (reason.synthetic = false)
             {
-                diagnostics.add(ProgramDiagnostic(reason.file_index, reason.pos, reason.end, code, args, null))
+                diagnostics.add(ProgramDiagnostic(reason.file_index, reason.pos, reason.end, code, args, null, null, file_index))
                 return
             }
         }
-        this.stop("explain-file-include-chain")
+        diagnostics.add(ProgramDiagnostic(ProgramDiagnosticGlobal, 0, 0, code, args, null, null, file_index))
     }
 
     ; the arguments of getSourceFileFromReference's diagnostic
@@ -363,11 +413,34 @@ define ProgramLoader
         }
     }
 
+    ; getParseFileRedirect: the output declaration file of a referenced project's
+    ; source, empty for none
+    function parse_file_redirect(this, path: Slice[char]) returns Slice[char]
+    {
+        var result Slice[char]()
+        var i 0
+        while i < (reference_sources.get_length() as int)
+        {
+            let source reference_sources[i as size_t]
+            if source.equals(path)
+                set result: reference_outputs[i as size_t]
+            set i: i + 1
+        }
+        result
+    }
+
     ; parseTask.load
     procedure load_node(this, node: ref[LoaderNode], reason: ref[IncludeReason])
     {
         set node.loaded: true
         let path node.path
+        let redirect this.parse_file_redirect(path)
+        if (redirect.length as int) > 0
+        {
+            set node.redirected: true
+            node.edges.add(&LoaderEdge^host(redirect, false, false, reason, null))
+            return
+        }
         if ProgramLoader.has_extension(host, path)
         {
             if this.is_supported_extension(path) = false
@@ -440,6 +513,7 @@ define ProgramLoader
                     let name text.subslice(rs as size_t, re as size_t)
                     if ProgramLoader.is_known_lib(host, name) = false
                         this.stop("unknown-lib-reference")
+                    set this.lib_reference_directive: true
                 }
             }
         }
@@ -540,10 +614,10 @@ define ProgramLoader
             this.stop(resolver.stop_tag)
             return
         }
-        let reason &IncludeReason^host(FileIncludeKindTypeReferenceDirective, index, start, stop, false)
+        let reason &IncludeReason^host(FileIncludeKindTypeReferenceDirective, index, start, stop, false, null, resolver.package_id)
         if r < 0
         {
-            node.diagnostics.add(ProgramDiagnostic(index, start, stop, DiagCannot_find_type_definition_file_for_0, ProgramDiagnostic.args1(host, ProgramDiagnostic.text(type_name)), null))
+            node.diagnostics.add(ProgramDiagnostic(index, start, stop, DiagCannot_find_type_definition_file_for_0, ProgramDiagnostic.args1(host, ProgramDiagnostic.text(type_name)), null, null, 0 - 1))
             return
         }
         let resolved files.path_at(r)
@@ -582,7 +656,7 @@ define ProgramLoader
         let type_roots this.effective_type_roots(&from_config)
         let node this.node_for(containing)
         set node.loaded: true
-        let reason &IncludeReason^host(FileIncludeKindRootFile, 0 - 1, 0, 0, false)
+        let reason &IncludeReason^host(FileIncludeKindRootFile, 0 - 1, 0, 0, false, null, null)
         root_edges.add(&LoaderEdge^host(containing, false, false, reason, null))
         var start 0
         var i 0
@@ -727,11 +801,12 @@ define ProgramLoader
             return
         }
         if r < 0
-            node.diagnostics.add(ProgramDiagnostic(ProgramDiagnosticGlobal, 0, 0, DiagCannot_find_type_definition_file_for_0, ProgramDiagnostic.args1(host, ProgramDiagnostic.text(type_name)), null))
+            node.diagnostics.add(ProgramDiagnostic(ProgramDiagnosticGlobal, 0, 0, DiagCannot_find_type_definition_file_for_0, ProgramDiagnostic.args1(host, ProgramDiagnostic.text(type_name)), null, null, 0 - 1))
         else
         {
             let resolved files.path_at(r)
-            node.edges.add(&LoaderEdge^host(slice_copy_on(host, resolved), slice_contains_node_modules(resolved), false, reason, resolver.package_id))
+            let own &IncludeReason^host(FileIncludeKindAutomaticTypeDirectiveFile, reason.file_index, 0, 0, false, type_name, resolver.package_id)
+            node.edges.add(&LoaderEdge^host(slice_copy_on(host, resolved), slice_contains_node_modules(resolved), false, own, resolver.package_id))
         }
     }
 
@@ -745,7 +820,7 @@ define ProgramLoader
         if is_rooted_disk_path(module_name) = false
             set referenced: combine_paths(host, get_directory_path(host, containing), module_name)
         let normalized get_normalized_absolute_path(host, referenced, Slice[char]())
-        let reason &IncludeReason^host(FileIncludeKindReferenceFile, index, start, stop, false)
+        let reason &IncludeReason^host(FileIncludeKindReferenceFile, index, start, stop, false, null, null)
         var resolved Slice[char]()
         let code this.source_file_from_reference(normalized, containing, true, &resolved)
         if code <> 0
@@ -880,7 +955,7 @@ define ProgramLoader
         else
             set mode: checker.usage_mode_of(null, files.format_at(index))
         let resolver ModuleResolver.create(host, files, options.get_module_resolution_kind(), options.get_resolve_json_module(), mode, EmitOptions.on(options.allow_js), options.resolve_package_json_exports, options.resolve_package_json_imports, options.out_dir, options.project_root_directory(host))
-        let r resolver.resolve(module_name, path)
+        let r resolver.resolve(module_name, this.resolution_containing_path(path))
         if (resolver.stop_tag.length as int) > 0
         {
             this.stop(resolver.stop_tag)
@@ -892,7 +967,7 @@ define ProgramLoader
         {
             let entry resolver.diagnostic_args[(2 * rd) as size_t]
             let package_path resolver.diagnostic_args[(2 * rd + 1) as size_t]
-            diagnostics.add(ProgramDiagnostic(ProgramDiagnosticGlobal, 0, 0, resolver.diagnostic_codes[rd as size_t], ProgramDiagnostic.args2(host, ProgramDiagnostic.text(entry), ProgramDiagnostic.text(package_path)), null))
+            diagnostics.add(ProgramDiagnostic(ProgramDiagnosticGlobal, 0, 0, resolver.diagnostic_codes[rd as size_t], ProgramDiagnostic.args2(host, ProgramDiagnostic.text(entry), ProgramDiagnostic.text(package_path)), null, null, 0 - 1))
             set rd: rd + 1
         }
         if r < 0
@@ -924,7 +999,7 @@ define ProgramLoader
                     return
             }
         }
-        var reason &IncludeReason^host(FileIncludeKindImport, index, 0, 0, true)
+        var reason &IncludeReason^host(FileIncludeKindImport, index, 0, 0, true, null, resolver.package_id)
         if entry <> null
         {
             let en entry as ref[AstNode]
@@ -939,7 +1014,7 @@ define ProgramLoader
                     set e: AstNode.end_of(en)
                 }
             }
-            set reason: &IncludeReason^host(FileIncludeKindImport, index, s, e, false)
+            set reason: &IncludeReason^host(FileIncludeKindImport, index, s, e, false, null, resolver.package_id)
         }
         node.edges.add(&LoaderEdge^host(slice_copy_on(host, resolved_path), is_external_library_import, is_js_from_node_modules, reason, resolver.package_id))
     }
@@ -982,9 +1057,6 @@ define ProgramLoader
             let node this.node_for(edge.path)
             if node.loaded = false
                 continue
-            ; addIncludeReason, but for the automatic type directives' own task
-            if edge.path.ends_with("__inferred type names__.ts") = false
-                node.reasons.add(edge.reason)
             var was_seen false
             var s 0
             while s < (seen.get_length() as int)
@@ -995,6 +1067,24 @@ define ProgramLoader
                     break
                 }
                 set s: s + 1
+            }
+            ; addIncludeReason, but for the automatic type directives' own task; a
+            ; redirected task's first walk records it through its redirect edge, a
+            ; later one on the redirect's target
+            if edge.path.ends_with("__inferred type names__.ts") = false
+            {
+                if node.redirected = false
+                    node.reasons.add(edge.reason)
+                else
+                {
+                    if was_seen and (node.edges.get_length() > 0)
+                    {
+                        let redirect_edge node.edges[0]
+                        let target_node this.node_for(redirect_edge.path)
+                        if target_node.loaded
+                            target_node.reasons.add(edge.reason)
+                    }
+                }
             }
             if was_seen
                 continue
@@ -1019,6 +1109,9 @@ define ProgramLoader
                 {
                     if node.file_index >= 0
                     {
+                        redirect_positions.add((program_files.get_length() + redirect_paths.get_length()) as int)
+                        redirect_paths.add(node.path)
+                        redirect_targets.add(first_index)
                         files.set_redirect(node.file_index, first_index)
                         if node.lowest_depth > 0
                             from_node_modules_search.put(node.file_index as size_t, true)
@@ -1099,7 +1192,10 @@ define ProgramLoader
         }
         let verifier &OptionVerifier^host(host, this, config_file, config_text)
 
-        ; removed in TS7 (the harness skips a configuration carrying the others)
+        ; removed in TS7 (the harness skips a configuration carrying the others; the
+        ; driver stops on those)
+        if o.target = 1
+            verifier.for_option(false, "target", "", DiagOption_0_1_has_been_removed_Please_remove_it_from_your_configuration, ProgramDiagnostic.args2(host, "target", "ES5"))
         if o.downlevel_iteration <> TristateUnknown
             verifier.for_option(true, "downlevelIteration", "", DiagOption_0_has_been_removed_Please_remove_it_from_your_configuration, ProgramDiagnostic.args1(host, "downlevelIteration"))
 
@@ -1465,7 +1561,7 @@ define ProgramLoader
         {
             if members[index as size_t]
             {
-                diagnostics.add(ProgramDiagnostic(ProgramDiagnosticGlobal, 0, 0, DiagCannot_write_file_0_because_it_would_overwrite_input_file, ProgramDiagnostic.args1(host, ProgramDiagnostic.text(emit_file_name)), null))
+                diagnostics.add(ProgramDiagnostic(ProgramDiagnosticGlobal, 0, 0, DiagCannot_write_file_0_because_it_would_overwrite_input_file, ProgramDiagnostic.args1(host, ProgramDiagnostic.text(emit_file_name)), null, null, 0 - 1))
                 blocked_paths.add(emit_file_name)
             }
         }
@@ -1475,7 +1571,7 @@ define ProgramLoader
             let seen_name seen[i as size_t]
             if seen_name.equals(emit_file_name)
             {
-                diagnostics.add(ProgramDiagnostic(ProgramDiagnosticGlobal, 0, 0, DiagCannot_write_file_0_because_it_would_be_overwritten_by_multiple_input_files, ProgramDiagnostic.args1(host, ProgramDiagnostic.text(emit_file_name)), null))
+                diagnostics.add(ProgramDiagnostic(ProgramDiagnosticGlobal, 0, 0, DiagCannot_write_file_0_because_it_would_be_overwritten_by_multiple_input_files, ProgramDiagnostic.args1(host, ProgramDiagnostic.text(emit_file_name)), null, null, 0 - 1))
                 blocked_paths.add(emit_file_name)
                 return
             }
@@ -1544,7 +1640,7 @@ define OptionVerifier
             return
         let n node as ref[AstNode]
         let start Scanner.skip_trivia(config_text, AstNode.pos_of(n))
-        loader.diagnostics.add(ProgramDiagnostic(ProgramDiagnosticConfig, start, AstNode.end_of(n), code, args, null))
+        loader.diagnostics.add(ProgramDiagnostic(ProgramDiagnosticConfig, start, AstNode.end_of(n), code, args, null, null, 0 - 1))
     }
 
     ; createCompilerOptionsDiagnostic
@@ -1554,7 +1650,7 @@ define OptionVerifier
         if compiler_options <> null
             this.add_at_node(AstNode.name_of(compiler_options), code, args)
         else
-            loader.diagnostics.add(ProgramDiagnostic(ProgramDiagnosticGlobal, 0, 0, code, args, null))
+            loader.diagnostics.add(ProgramDiagnostic(ProgramDiagnosticGlobal, 0, 0, code, args, null, null, 0 - 1))
     }
 
     ; createDiagnosticForOption: the option's key (or value) inside compilerOptions,
