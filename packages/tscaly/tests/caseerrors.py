@@ -98,7 +98,7 @@ def parse_answer(body):
     cur = None
     for line in body.decode("utf-8", "replace").split("\n"):
         if line.startswith("==== TSCALY-FILE "):
-            cur = {"K": 0, "D": [], "J": [], "B": [], "C": [], "R": [], "S": [], "P": [], "G": []}
+            cur = {"K": 0, "D": [], "J": [], "B": [], "C": [], "R": [], "S": [], "P": [], "G": [], "X": []}
             files[line[len("==== TSCALY-FILE "):]] = cur
             continue
         if cur is None or len(line) < 2:
@@ -106,7 +106,7 @@ def parse_answer(body):
         tag, rest = line[0], line[2:].split()
         if tag == "K":
             cur["K"] = int(rest[0])
-        elif tag in "DJBCRSPG" and len(rest) == 3:
+        elif tag in "DJBCRSPGX" and len(rest) == 3:
             cur[tag].append(tuple(int(x) for x in rest))
     return files
 
@@ -329,6 +329,15 @@ def main():
             verdict, detail = "UNPORTED", body.decode("utf-8", "replace").split("\n")[0]
         else:
             for path, entry in parse_answer(body).items():
+                if path.startswith("TSCALY-DECL "):
+                    dpath = path[len("TSCALY-DECL "):]
+                    dtext = plan["texts"].get(dpath)
+                    if dtext is not None:
+                        dshown = casejs.remove_test_path_prefixes(dpath)
+                        for pos, end, code in entry["X"]:
+                            line, col = line_col(dtext, pos)
+                            ours[(dshown, line, col, code)] += 1
+                    continue
                 if path == "TSCALY-GLOBAL":
                     for _, _, code in entry["G"]:
                         ours[("", 0, 0, code)] += 1
