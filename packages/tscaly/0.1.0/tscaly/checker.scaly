@@ -5538,6 +5538,7 @@ define ModuleKindNode16: int 100
 ; ModuleKindNode18 (slice 129) — the LOW end of SupportsImportAttributes' range,
 ; which is the one reader either of the two node1x members has here.
 define ModuleKindNode18: int 101
+define ModuleKindNode20: int 102
 define ModuleKindNodeNext: int 199
 define ModuleKindPreserve: int 200
 
@@ -5909,6 +5910,10 @@ mutable checker_allow_importing_ts_extensions: bool false
 mutable checker_allow_arbitrary_extensions: bool false
 mutable checker_rewrite_relative_import_extensions: bool false
 mutable checker_no_implicit_any_explicit: bool false
+; noEmit: a diagnostic SetSkippedOnNoEmit is left out (the program's FilterNoEmitSemanticDiagnostics)
+mutable checker_no_emit: bool false
+; `slices.Contains(compilerOptions.Lib, "lib.dom.d.ts")`: the explicit lib option names dom
+mutable checker_lib_option_has_dom: bool false
 mutable checker_no_implicit_returns: bool false
 mutable checker_no_unchecked_indexed_access: bool false
 ; noUnusedLocals / noUnusedParameters (slice 265): checkUnusedIdentifiers' gate
@@ -5922,6 +5927,14 @@ mutable checker_allow_unreachable_code: int 2
 mutable checker_allow_unused_labels: int 2
 mutable checker_no_fallthrough_cases_in_switch: bool false
 mutable checker_allow_umd_global_access: bool false
+
+; addDeferredDiagnostic's callbacks, as one ordered list of what each closure
+; captured: the WeakMap/WeakSet and Reflect collision checks (a node) and the
+; not-iterable report (a node, a type and the async flag)
+define DeferredCheckKindWeakMapSet: int 0
+define DeferredCheckKindReflect: int 1
+define DeferredCheckKindNotIterable: int 2
+define DeferredCheck (kind: int  node: ref[AstNode]?  t: ref[Type]?  flag: bool)
 
 define Checker
 (
@@ -6186,6 +6199,12 @@ define Checker
     global_diagnostic_count: int
     ; the global diagnostics' codes (slice 268), for the program's GetGlobalDiagnostics
     global_diagnostic_codes: ref[Array[int]]
+    ; the keys of the reporting global resolvers already asked (their memo)
+    checked_global_reports: ref[Array[Slice[char]]]
+    ; patternAmbientModuleAugmentations: a module name augmenting a pattern ambient
+    ; module, and the augmentation merged over the pattern (two parallel lists)
+    pattern_augmentation_names: ref[Array[Slice[char]]]
+    pattern_augmentation_symbols: ref[Array[ref[Symbol]?]]
 
     ; nextTypeId, in creation order.
     type_count: int
@@ -7227,8 +7246,7 @@ define Checker
     jsx_import_source_option: Slice[char]
     ; addDeferredDiagnostic's two collision checks (slice 258): the nodes whose
     ; check runs in produce_deferred_diagnostics, after the markers are set
-    deferred_weak_map_set_nodes: ref[Array[ref[AstNode]?]]?
-    deferred_reflect_nodes: ref[Array[ref[AstNode]?]]?
+    deferred_checks: ref[Array[DeferredCheck]]?
 
     ; ── NewChecker's four singleton signatures (slices 89 and 108) ──────────
     ;
@@ -7849,6 +7867,145 @@ define Checker
 
     ; the lib chain of a list of names: each file's own `/// <reference lib>`s first
     ; (the program's order), every file once; answers false when one cannot be read
+    ; fileloader.go getLibraryNameFromLibFileName: lib.dom.d.ts → @typescript/lib-dom,
+    ; lib.dom.iterable.d.ts → @typescript/lib-dom/iterable,
+    ; lib.es2015.symbol.wellknown.d.ts → @typescript/lib-es2015/symbol-wellknown
+    function library_name_from_lib_file_name(host: ref[Page], file_name: Slice[char]) returns Slice[char]
+    {
+        let sb StringBuilder^host()
+        sb.append("@typescript/lib-")
+        var index 0
+        var start 0
+        var i 0
+        while i <= (file_name.length as int)
+        {
+            var at_dot i = (file_name.length as int)
+            if at_dot = false
+                set at_dot: (file_name[i as size_t] as int) = ("." as char) as int
+            if at_dot
+            {
+                let component file_name.subslice(start as size_t, i as size_t)
+                if index = 1
+                    sb.append(component.data, component.length)
+                if index >= 2
+                {
+                    if (component.length as int) = 0
+                        break
+                    if Checker.name_bytes_are(component, "d")
+                        break
+                    if index = 2
+                        sb.append("/")
+                    else
+                        sb.append("-")
+                    sb.append(component.data, component.length)
+                }
+                set index: index + 1
+                set start: i + 1
+            }
+            set i: i + 1
+        }
+        let out sb.to_string()
+        slice_copy_on(host, Slice[char](out.get_length(), out.get_buffer() as pointer[char]))
+    }
+
+    ; the lib chain under `libReplacement` (and with a program's own lib reference
+    ; directives): pathForLibFile resolves `@typescript/lib-<name>` from the
+    ; configuration's directory and takes the resolved program file for the lib
+    function load_lib_chain_replacing(host: ref[Page], names: ref[Array[Slice[char]]], out_files: ref[Array[ref[AstNode]?]], out_binders: ref[Array[ref[Binder]?]], seen: ref[Array[Slice[char]]], pf: ref[ProgramFiles], replace: bool, module_resolution: int, resolve_from_directory: Slice[char]) returns bool
+    {
+        var i 0
+        while i < (names.get_length() as int)
+        {
+            let file_name Checker.lib_file_name(host, names[i as size_t])
+            set i: i + 1
+            var already false
+            var k 0
+            while k < (seen.get_length() as int)
+            {
+                let sk seen[k as size_t]
+                if sk.equals(file_name)
+                    set already: true
+                set k: k + 1
+            }
+            if already
+                continue
+            var replaced 0 - 1
+            if replace and (Checker.name_bytes_are(file_name, "lib.d.ts") = false)
+            {
+                let library_name Checker.library_name_from_lib_file_name(host, file_name)
+                let resolve_from combine_paths(host, resolve_from_directory, join_slices(host, join_slices(host, "__lib_node_modules_lookup_", file_name), "__.ts"))
+                let resolver ModuleResolver.create(host, pf, module_resolution, false, ModuleKindCommonJS, false, 2, 2, Slice[char](), Slice[char]())
+                let r resolver.resolve(library_name, resolve_from)
+                if (r >= 0) and ((resolver.stop_tag.length as int) = 0)
+                {
+                    if (pf.file_at(r) <> null) and (pf.binder_at(r) <> null)
+                        set replaced: r
+                }
+            }
+            if replaced < 0
+            {
+                let one &Array[Slice[char]]^host()
+                one.add(names[(i - 1) as size_t])
+                if Checker.load_lib_chain_once(host, one, out_files, out_binders, seen, pf, replace, module_resolution, resolve_from_directory) = false
+                    return false
+                continue
+            }
+            seen.add(file_name)
+            let rf pf.file_at(replaced) as ref[AstNode]
+            let refs AstNode.lib_references_of(rf)
+            if refs <> null
+            {
+                if Checker.load_lib_chain_replacing(host, refs as ref[Array[Slice[char]]], out_files, out_binders, seen, pf, replace, module_resolution, resolve_from_directory) = false
+                    return false
+            }
+            out_files.add(rf)
+            out_binders.add(pf.binder_at(replaced))
+        }
+        true
+    }
+
+    ; one bundled lib file and its references, the references through the
+    ; replacing loader again
+    function load_lib_chain_once(host: ref[Page], names: ref[Array[Slice[char]]], out_files: ref[Array[ref[AstNode]?]], out_binders: ref[Array[ref[Binder]?]], seen: ref[Array[Slice[char]]], pf: ref[ProgramFiles], replace: bool, module_resolution: int, resolve_from_directory: Slice[char]) returns bool
+    {
+        let file_name Checker.lib_file_name(host, names[0])
+        seen.add(file_name)
+        let dir Checker.lib_dir(host)
+        let sb StringBuilder^host()
+        sb.append(dir.get_buffer(), dir.get_length())
+        sb.append("/")
+        sb.append(file_name.data, file_name.length as size_t)
+        let path String^host(sb.to_string())
+        if File.exists(path) = false
+            return false
+        let raw File.read_to_string(path)
+        let text String^host(raw)
+        var unported 0 - 1
+        var unported_tag: Slice[char] ""
+        var unported_detail 0
+        let script_kind Parser.supported_script_kind(path)
+        let lp Parser.parse_ex(host, path, text, script_kind, &unported, &unported_tag, &unported_detail)
+        if unported >= 0
+            return false
+        let f Parser.source_file_of(lp)
+        if f = null
+            return false
+        let lf f as ref[AstNode]
+        let refs AstNode.lib_references_of(lf)
+        if refs <> null
+        {
+            if Checker.load_lib_chain_replacing(host, refs as ref[Array[Slice[char]]], out_files, out_binders, seen, pf, replace, module_resolution, resolve_from_directory) = false
+                return false
+        }
+        let is_external Parser.external_module_indicator(lf, AstNode.statements_of(lf))
+        let lb Binder.bind_source_file(host, lf, text, path, is_external)
+        if Binder.unported_at(lb) >= 0
+            return false
+        out_files.add(lf)
+        out_binders.add(lb)
+        true
+    }
+
     function load_lib_chain(host: ref[Page], names: ref[Array[Slice[char]]], out_files: ref[Array[ref[AstNode]?]], out_binders: ref[Array[ref[Binder]?]], seen: ref[Array[Slice[char]]]) returns bool
     {
         var i 0
@@ -8015,6 +8172,12 @@ define Checker
         set c.global_diagnostic_count: 0
         let gdc &Array[int]^host()
         set c.global_diagnostic_codes: gdc
+        let cgr &Array[Slice[char]]^host()
+        set c.checked_global_reports: cgr
+        let pan &Array[Slice[char]]^host()
+        set c.pattern_augmentation_names: pan
+        let pas &Array[ref[Symbol]?]^host()
+        set c.pattern_augmentation_symbols: pas
         set c.type_count: 0
         let ra &Array[ref[AstNode]?]^host()
         set c.reported_ambient: ra
@@ -8103,8 +8266,7 @@ define Checker
         set c.react_namespace_option: Slice[char]()
         set c.jsx_fragment_factory_option: Slice[char]()
         set c.jsx_import_source_option: Slice[char]()
-        set c.deferred_weak_map_set_nodes: null
-        set c.deferred_reflect_nodes: null
+        set c.deferred_checks: null
         set c.decl_visibility_marked_files: null
         set c.flow_analysis_disabled: false
         let fnr &Array[ref[FlowReachableLink]?]^host()
@@ -8264,14 +8426,14 @@ define Checker
         set c.stop_log: stops
         var args_data Slice[char]()
         set args_data: Binder.internal_name_unprefixed(host, "arguments")
-        set c.arguments_symbol: Symbol.create(host, SymbolFlagsProperty, args_data)
+        set c.arguments_symbol: Symbol.create(host, SymbolFlagsProperty | SymbolFlagsTransient, args_data)
         ; Minted between `arguments` and `unknown`, where NewChecker mints it.
         var require_data Slice[char]()
         set require_data: Binder.internal_name_unprefixed(host, "require")
-        set c.require_symbol: Symbol.create(host, SymbolFlagsProperty, require_data)
+        set c.require_symbol: Symbol.create(host, SymbolFlagsProperty | SymbolFlagsTransient, require_data)
         var unknown_data Slice[char]()
         set unknown_data: Binder.internal_name_unprefixed(host, "unknown")
-        set c.unknown_symbol: Symbol.create(host, SymbolFlagsProperty, unknown_data)
+        set c.unknown_symbol: Symbol.create(host, SymbolFlagsProperty | SymbolFlagsTransient, unknown_data)
         ; c.undefinedSymbol and c.globalThisSymbol, minted in NewChecker in the same
         ; run as the two above. The globals table is made here too, because
         ; globalThis's exports slot IS it and the seeding line below writes the
@@ -8279,10 +8441,10 @@ define Checker
         ; points of NewChecker for no reason this port can reproduce.
         var undefined_data Slice[char]()
         set undefined_data: Binder.internal_name_unprefixed(host, "undefined")
-        set c.undefined_symbol: Symbol.create(host, SymbolFlagsProperty, undefined_data)
+        set c.undefined_symbol: Symbol.create(host, SymbolFlagsProperty | SymbolFlagsTransient, undefined_data)
         var global_this_data Slice[char]()
         set global_this_data: Binder.internal_name_unprefixed(host, "globalThis")
-        let gts Symbol.create(host, SymbolFlagsModule, global_this_data)
+        let gts Symbol.create(host, SymbolFlagsModule | SymbolFlagsTransient, global_this_data)
         Symbol.set_check_flags(gts, CheckFlagsReadonly)
         set c.global_this_symbol: gts
         let g SymbolTable.create(host)
@@ -18000,7 +18162,10 @@ define Checker
     ; report: the reference does the same, because a missing `Omit` has already been
     ; reported by the global-type resolution itself.
     function get_global_omit_symbol(this) returns ref[Symbol]?
+    {
+        this.report_checked_global_type_alias("Omit", 2)
         this.get_global_type_alias_symbol("Omit", 2)
+    }
 
     ; isValidSpreadType — the object BINDING pattern's rest guard (slice 145).
     ; ★★ THE UNION ARM RECURSES ON THE FILTERED TYPE'S OWN CONSTITUENTS and not on
@@ -23555,6 +23720,31 @@ define Checker
     ; FindBestPatternMatch over the ambient modules whose quoted name carries a
     ; `*` (slice 248; the reference keeps them in c.patternAmbientModules, this
     ; port scans the globals — they are bound there under their quoted name)
+    ; `core.Some(c.patternAmbientModules, mainModule == module.Symbol)`
+    function is_pattern_ambient_module_symbol(this, symbol: ref[Symbol]) returns bool
+    {
+        let n SymbolTable.length(globals)
+        var i 0
+        while i < n
+        {
+            let nd SymbolTable.entry_name_at(globals, i)
+            if Checker.is_ambient_module_symbol_name(nd)
+            {
+                if slice_index_of_byte(nd, ("*" as char) as int) >= 0
+                {
+                    let es SymbolTable.entry_symbol_at(globals, i)
+                    if es <> null
+                    {
+                        if (es as ref[Symbol]) = symbol
+                            return true
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        false
+    }
+
     function find_best_pattern_ambient_module(this, d: Slice[char]) returns ref[Symbol]?
     {
         var best: ref[Symbol]? null
@@ -23617,6 +23807,13 @@ define Checker
             set importing_index: this.program_index_of_node(location)
             if importing_index < 0
                 set importing_index: pf.index_of_file(file)
+            ; program.GetResolvedModule: only a name the file loader resolved for
+            ; the file (an import inside a module augmentation is not collected)
+            if importing_index >= 0
+            {
+                if pf.has_resolution(importing_index, d) = false
+                    set importing_index: 0 - 1
+            }
             if importing_index >= 0
             {
                 let containing_path pf.path_at(importing_index)
@@ -23631,14 +23828,17 @@ define Checker
                 if resolved_index >= 0
                 {
                     let rpath pf.path_at(resolved_index)
-                    set resolved_ext: Checker.resolution_extension_of(rpath)
+                    set resolved_ext: Checker.resolution_extension_for(rpath, resolver.resolved_arbitrary_extension)
                     set resolved_using_ts_extension: resolver.resolved_using_ts_extension
                     if error_node <> null
                         set resolution_diagnostic: this.get_resolution_diagnostic(resolved_ext, pf.path_at(importing_index))
                     if (resolution_diagnostic = 0) or (resolution_diagnostic = DiagModule_0_was_resolved_to_1_but_jsx_is_not_set)
                     {
-                        if this.program_holds_file(pf, resolved_index)
-                            set in_program_index: resolved_index
+                        ; GetSourceFileForResolvedModule: a deduplicated package's
+                        ; second instance answers the first one's file
+                        let target_index pf.redirect_target_of(resolved_index)
+                        if this.program_holds_file(pf, target_index)
+                            set in_program_index: target_index
                     }
                 }
             }
@@ -23710,7 +23910,17 @@ define Checker
         ; is the one with the longest prefix before its `*` (core.FindBestPatternMatch)
         let pattern this.find_best_pattern_ambient_module(d)
         if pattern <> null
+        {
+            var pai 0
+            while pai < (pattern_augmentation_names.get_length() as int)
+            {
+                let pan pattern_augmentation_names[pai as size_t]
+                if pan.equals(d)
+                    return this.get_merged_symbol(pattern_augmentation_symbols[pai as size_t])
+                set pai: pai + 1
+            }
             return this.get_merged_symbol(pattern)
+        }
         if error_node = null
             return null
         let en error_node as ref[AstNode]
@@ -23934,6 +24144,15 @@ define Checker
 
     ; the extension a resolution reports (the resolved file's known extension, else
     ; an arbitrary one)
+    ; the resolution's extension: `arbitrary` when the resolver found the
+    ; `.d<ext>.ts` declaration file of an arbitrary extension
+    function resolution_extension_for(path: Slice[char], arbitrary: bool) returns Slice[char]
+    {
+        if arbitrary
+            return ".arbitrary"
+        Checker.resolution_extension_of(path)
+    }
+
     function resolution_extension_of(path: Slice[char]) returns Slice[char]
     {
         if path.ends_with(".d.ts")
@@ -23949,15 +24168,7 @@ define Checker
         if path.ends_with(".cts")
             return ".cts"
         if path.ends_with(".ts")
-        {
-            ; `.d.<ext>.ts`: an arbitrary extension's declaration file
-            let slash slice_last_index_of_byte(path, ("/" as char) as int)
-            let base path.slice_from((slash + 1) as size_t)
-            let dot_d Checker.index_of_text_in(base, ".d.")
-            if (dot_d >= 0) and ((dot_d + 3) < ((base.length as int) - 3))
-                return ".arbitrary"
             return ".ts"
-        }
         if path.ends_with(".jsx")
             return ".jsx"
         if path.ends_with(".mjs")
@@ -24079,7 +24290,8 @@ define Checker
 
     function allow_importing_ts_extensions_from(file_name: Slice[char]) returns bool
     {
-        if checker_allow_importing_ts_extensions
+        ; GetAllowImportingTsExtensions: the option or rewriteRelativeImportExtensions
+        if checker_allow_importing_ts_extensions or checker_rewrite_relative_import_extensions
             return true
         is_declaration_file_name_of(file_name)
     }
@@ -24837,6 +25049,21 @@ define Checker
         emit_module_format
     }
 
+    ; program.GetImpliedNodeFormatForEmit of a program file; ModuleKindNone off the
+    ; table (the stub program's answer)
+    function implied_node_format_for_emit_of_file(this, sf: ref[AstNode]?) returns int
+    {
+        if program = null
+            return ModuleKindNone
+        let pf program as ref[ProgramFiles]
+        let fi pf.index_of_file(sf)
+        if fi < 0
+            return ModuleKindNone
+        let path pf.path_at(fi)
+        let package_type pf.package_json_type_at(fi)
+        Checker.implied_node_format_for_emit_of(path, module_kind, Checker.implied_node_format_for_file(path, package_type), package_type)
+    }
+
     function current_file_emit_format(this) returns int
         this.file_emit_format_of(file)
 
@@ -24895,7 +25122,7 @@ define Checker
             let usage_mode this.get_emit_syntax_for_module_specifier_expression(usage)
             if usage_mode <> ModuleKindNone
             {
-                let target_mode this.file_emit_format_of(file)
+                let target_mode this.implied_node_format_for_emit_of_file(file)
                 if (usage_mode = ModuleKindESNext) and (target_mode = ModuleKindCommonJS) and (module_kind >= ModuleKindNode16) and (module_kind <= ModuleKindNodeNext)
                     return true
                 if (usage_mode = ModuleKindESNext) and (target_mode = ModuleKindESNext)
@@ -25246,6 +25473,25 @@ define Checker
         let unported_before this.unported_mark()
         let file Checker.find_source_file_declaration(module_symbol)
         let specifier this.get_module_specifier_for_import_or_export(node)
+        if (file <> null) and (specifier <> null) and (module_kind >= ModuleKindNode20) and (module_kind <= ModuleKindNodeNext)
+        {
+            if Checker.is_shorthand_ambient_module_symbol(module_symbol) = false
+            {
+                if (this.get_emit_syntax_for_module_specifier_expression(specifier) = ModuleKindCommonJS) and (this.implied_node_format_for_emit_of_file(file) = ModuleKindESNext)
+                {
+                    var me Slice[char]()
+                    set me: Binder.internal_name_unprefixed(host, "module.exports")
+                    let export_module_dot_exports_symbol this.resolve_export_by_name(module_symbol, me, node, dont_resolve_alias)
+                    if this.unported_mark() <> unported_before
+                        return null
+                    if export_module_dot_exports_symbol <> null
+                    {
+                        this.mark_symbol_of_alias_declaration_if_type_only(node, null)
+                        return export_module_dot_exports_symbol
+                    }
+                }
+            }
+        }
         var dd Slice[char]()
         set dd: Binder.internal_name_unprefixed(host, "default")
         let export_default_symbol this.resolve_export_by_name(module_symbol, dd, node, dont_resolve_alias)
@@ -25376,7 +25622,31 @@ define Checker
                 return null
             if default_only <> null
                 return this.clone_type_as_module_type(sym, default_only as ref[Type], reference_parent)
+            let target_file Checker.find_source_file_declaration(sym)
+            let usage_mode this.get_emit_syntax_for_module_specifier_expression(reference)
+            if (namespace_import <> null) and (target_file <> null) and (module_kind >= ModuleKindNode20) and (module_kind <= ModuleKindNodeNext) and (usage_mode = ModuleKindCommonJS)
+            {
+                if this.implied_node_format_for_emit_of_file(target_file) = ModuleKindESNext
+                {
+                    var me Slice[char]()
+                    set me: Binder.internal_name_unprefixed(host, "module.exports")
+                    let export_module_dot_exports_symbol this.get_export_of_module(sym, me, namespace_import, true)
+                    if this.unported_mark() <> unported_before
+                        return null
+                    if export_module_dot_exports_symbol <> null
+                    {
+                        if this.has_signatures(t)
+                            return this.clone_type_as_module_type(export_module_dot_exports_symbol as ref[Symbol], t, reference_parent)
+                        return export_module_dot_exports_symbol
+                    }
+                }
+            }
             var wrap false
+            if (target_file <> null) and (usage_mode = ModuleKindESNext)
+            {
+                if this.implied_node_format_for_emit_of_file(target_file) = ModuleKindCommonJS
+                    set wrap: true
+            }
             if this.has_signatures(t)
                 set wrap: true
             if this.unported_mark() <> unported_before
@@ -25639,10 +25909,16 @@ define Checker
                     return null
             }
         }
-        ; The JSON-named-import report's guard is is_only_importable_as_default,
-        ; which is constant false here, so the else is the live arm.
-        if symbol = null
-            this.error_no_module_member_symbol(module_symbol, target_symbol, node, nm)
+        var named_json_import false
+        if AstNode.is_import_or_export_specifier(specifier) and (Checker.name_bytes_are(nt, "default") = false)
+            set named_json_import: this.is_only_importable_as_default(module_specifier, module_symbol)
+        if named_json_import
+            this.error_on_node(nm, DiagNamed_imports_from_a_JSON_file_into_an_ECMAScript_module_are_not_allowed_when_module_is_set_to_0)
+        else
+        {
+            if symbol = null
+                this.error_no_module_member_symbol(module_symbol, target_symbol, node, nm)
+        }
         symbol
     }
 
@@ -25670,6 +25946,16 @@ define Checker
                 return null
             let immediate this.resolve_external_module_name(node, module_reference, false)
             let resolved this.resolve_external_module_symbol(immediate, true)
+            if (resolved <> null) and (module_kind >= ModuleKindNode20) and (module_kind <= ModuleKindNodeNext)
+            {
+                var me Slice[char]()
+                set me: Binder.internal_name_unprefixed(host, "module.exports")
+                let module_exports this.get_export_of_module(resolved as ref[Symbol], me, node, true)
+                if this.unported_mark() <> unported_before
+                    return null
+                if module_exports <> null
+                    return module_exports
+            }
             this.mark_symbol_of_alias_declaration_if_type_only(node, null)
             return resolved
         }
@@ -26857,7 +27143,22 @@ define Checker
                 set i: i + 1
             }
         }
-        let symbol this.rr_referenced_value_symbol(node, false)
+        ; emitresolver.go: getReferencedValueOrAliasSymbol — the cached resolution,
+        ; else resolveName from the identifier itself with isUse (it marks the
+        ; symbol referenced, which checkUnused reads afterwards)
+        var symbol this.get_resolved_symbol_or_nil(node)
+        if symbol <> null
+        {
+            if (symbol as ref[Symbol]) = unknown_symbol
+                set symbol: null
+        }
+        if symbol = null
+        {
+            let mark this.unported_mark()
+            set symbol: this.resolve_name(node, AstNode.identifier_text_of(node), SymbolFlagsValue | SymbolFlagsExportValue | SymbolFlagsAlias, 0, true, false)
+            if this.unported_mark() <> mark
+                return null
+        }
         if symbol = null
             return null
         let s symbol as ref[Symbol]
@@ -28780,7 +29081,7 @@ define Checker
             return true
         if Symbol.declaration_count(s) = 0
             return false
-        Checker.is_global_source_file(c.b, Checker.get_declaration_container(Symbol.declaration_at(s, 0) as ref[AstNode]))
+        c.is_global_source_file_node(Checker.get_declaration_container(Symbol.declaration_at(s, 0) as ref[AstNode]))
     }
 
     ; markIdentifierAliasReferenced.
@@ -29056,6 +29357,26 @@ define Checker
                         else
                             this.error_on_node(node, DiagX_0_resolves_to_a_type_only_declaration_and_must_be_re_exported_using_a_type_only_re_export_when_1_is_enabled)
                     }
+                }
+            }
+            let nk2 AstNode.kind_of(node)
+            let node_format this.file_emit_format_of(Checker.source_file_of_node(node))
+            if verbatim_module_syntax and (nk2 <> KindImportEqualsDeclaration) and (Parser.is_in_js_file(node) = false) and (node_format = ModuleKindCommonJS)
+                this.report_verbatim_module_syntax_error(node)
+            else
+            {
+                if (module_kind = ModuleKindPreserve) and (nk2 <> KindImportEqualsDeclaration) and (nk2 <> KindVariableDeclaration) and (node_format = ModuleKindCommonJS)
+                    this.error_on_node(node, DiagECMAScript_module_syntax_is_not_allowed_in_a_CommonJS_module_when_module_is_set_to_preserve)
+            }
+            ; the ambient const enum under verbatimModuleSyntax (project-reference
+            ; redirects are not ported: the redirect is nil)
+            if verbatim_module_syntax and (Checker.is_type_only_import_or_export_declaration(node) = false) and ((AstNode.flags_of(node) & NodeFlagsAmbient) = 0) and ((target_flags & SymbolFlagsConstEnum) <> 0)
+            {
+                let ced Symbol.value_declaration_of(t)
+                if ced <> null
+                {
+                    if (AstNode.flags_of(ced as ref[AstNode]) & NodeFlagsAmbient) <> 0
+                        this.error_on_node(node, DiagCannot_access_ambient_const_enums_when_0_is_enabled)
                 }
             }
         }
@@ -29382,7 +29703,7 @@ define Checker
     {
         if Binder.is_ambient_module(node) = false
             return false
-        c.b.is_module_augmentation_external(node)
+        c.binder_of_node(node).is_module_augmentation_external(node)
     }
 
     ; resolveTypeReferenceName, whole. ★The `name == nil` answer is unknownSymbol
@@ -29822,7 +30143,7 @@ define Checker
         if (args_len = 0) and (Checker.no_implicit_any() = false)
         {
             if Checker.name_bytes_are(d, "array")
-                return any_array_type
+                return this.get_any_array_type()
             if Checker.name_bytes_are(d, "promise")
                 return this.create_promise_type(any_type)
         }
@@ -29839,6 +30160,7 @@ define Checker
                 let list args as ref[Array[ref[AstNode]?]]
                 var rd Slice[char]()
                 set rd: Checker.plain_name(host, "Record")
+                this.report_checked_global_type_alias("Record", 2)
                 let record_symbol this.get_global_type_alias_symbol(rd, 2)
                 if this.unported_mark() <> mark
                     return null
@@ -34347,6 +34669,12 @@ define Checker
         set checker_no_implicit_returns: no_implicit_returns
         set checker_no_unchecked_indexed_access: no_unchecked_indexed_access
     }
+
+    procedure set_no_emit(v: bool)
+        set checker_no_emit: v
+
+    procedure set_lib_option_has_dom(v: bool)
+        set checker_lib_option_has_dom: v
 
     procedure set_resolution_options(allow_importing_ts_extensions: bool, allow_arbitrary_extensions: bool, rewrite_relative_import_extensions: bool, no_implicit_any_explicit: bool)
     {
@@ -40410,9 +40738,10 @@ define Checker
         if t = null
         {
             var dd Slice[char]()
-            set dd: Binder.internal_name(host, "default")
+            ; InternalSymbolNameDefault is the plain `default` (no internal prefix)
+            set dd: Binder.internal_name_unprefixed(host, "default")
             if SymbolTable.names_equal(Symbol.name_of(prop), dd)
-                set t: this.get_string_literal_type(dd)
+                set t: this.get_string_literal_type("default")
             else
             {
                 let name b.get_name_of_declaration(Symbol.value_declaration_of(prop))
@@ -49235,7 +49564,7 @@ define Checker
                 let locals AstNode.locals_of(loc)
                 if locals <> null
                 {
-                    if Checker.is_global_source_file(b, loc) = false
+                    if this.is_global_source_file_node(loc) = false
                     {
                         tables.add(locals)
                         kinds.add(ScopeTableLocalNameLookup)
@@ -49245,7 +49574,7 @@ define Checker
             var module_like false
             if k = KindSourceFile
             {
-                if b.is_external_or_common_js_module()
+                if this.binder_of_node(loc).is_external_or_common_js_module()
                     set module_like: true
             }
             if k = KindModuleDeclaration
@@ -49569,7 +49898,7 @@ define Checker
         {
             if printer_enclosing_declaration <> null
             {
-                if b.is_external_module_of()
+                if this.binder_of_node(printer_enclosing_declaration).is_external_module_of()
                     return false
             }
         }
@@ -49962,7 +50291,7 @@ define Checker
             var external false
             if AstNode.kind_of(node) = KindSourceFile
             {
-                if b.is_external_or_common_js_module()
+                if this.binder_of_node(node).is_external_or_common_js_module()
                     set external: true
             }
             if Checker.is_ambient_module_or_null(node)
@@ -54848,6 +55177,32 @@ define Checker
             set ok: true
         if ok = false
             this.error_on_node(node, DiagX_const_enums_can_only_be_used_in_property_or_index_access_expressions_or_the_right_hand_side_of_an_import_declaration_or_export_assignment_or_type_query)
+        ; the second half: an ambient const enum under isolatedModules, or under
+        ; verbatimModuleSyntax when the usage does not resolve to an import
+        ; (project-reference redirects are not ported: the redirect is nil)
+        var check_ambient isolated_modules
+        if (check_ambient = false) and verbatim_module_syntax and ok
+        {
+            let first Checker.get_first_identifier(node)
+            if first <> null
+            {
+                let unported_before this.unported_mark()
+                let alias this.resolve_name(node, AstNode.identifier_text_of(first as ref[AstNode]), SymbolFlagsAlias, 0, false, true)
+                if this.unported_mark() <> unported_before
+                    return
+                if alias = null
+                    set check_ambient: true
+            }
+        }
+        if check_ambient and (t.symbol <> null)
+        {
+            let ced Symbol.value_declaration_of(t.symbol as ref[Symbol])
+            if ced <> null
+            {
+                if ((AstNode.flags_of(ced as ref[AstNode]) & NodeFlagsAmbient) <> 0) and (this.is_valid_type_only_alias_use_site(node) = false)
+                    this.error_on_node(node, DiagCannot_access_ambient_const_enums_when_0_is_enabled)
+            }
+        }
     }
 
     ; isConstEnumObjectType + isConstEnumSymbol, both whole and both one line.
@@ -58577,7 +58932,7 @@ define Checker
             return global_callable_function_type
         if Checker.strict_bind_call_apply() = false
             return this.get_global_function_type()
-        let d this.get_global_type_zero_arity_ex("CallableFunction", SymbolFlagsType, true)
+        let d this.get_global_type_zero_arity_ex("CallableFunction", SymbolFlagsType, false)
         if d = null
             return null
         set global_callable_function_type: d
@@ -58590,7 +58945,7 @@ define Checker
             return global_newable_function_type
         if Checker.strict_bind_call_apply() = false
             return this.get_global_function_type()
-        let d this.get_global_type_zero_arity_ex("NewableFunction", SymbolFlagsType, true)
+        let d this.get_global_type_zero_arity_ex("NewableFunction", SymbolFlagsType, false)
         if d = null
             return null
         set global_newable_function_type: d
@@ -61355,6 +61710,7 @@ define Checker
         ; `Record` answers the type unchanged, which is the reference's own tail.
         var rd Slice[char]()
         set rd: Checker.plain_name(host, "Record")
+        this.report_checked_global_type_alias("Record", 2)
         let record_symbol this.get_global_type_alias_symbol(rd, 2)
         if this.unported_mark() <> mark
             return null
@@ -65054,7 +65410,7 @@ define Checker
         let stmt sp as ref[AstNode]
         if AstNode.kind_of(stmt) <> KindVariableStatement
             return true
-        Checker.is_global_source_file(b, AstNode.parent_node_of(stmt)) = false
+        this.is_global_source_file_node(AstNode.parent_node_of(stmt)) = false
     }
 
     ; isConstantVariable.
@@ -68389,7 +68745,25 @@ define Checker
             return
         if target_type = null
             return
-        this.check_type_assignable_to_and_optionally_elaborate(right_type as ref[Type], target_type as ref[Type], left, right, 0)
+        var head_message 0
+        if Checker.exact_optional_property_types() and (AstNode.kind_of(left) = KindPropertyAccessExpression)
+        {
+            if Checker.maybe_type_of_kind(right_type as ref[Type], TypeFlagsUndefined)
+            {
+                let object_type this.get_type_of_expression(AstNode.expression_of(left) as ref[AstNode])
+                let pname AstNode.name_of(left)
+                if (object_type <> null) and (pname <> null)
+                {
+                    let target this.get_type_of_property_of_type(object_type as ref[Type], AstNode.identifier_text_of(pname as ref[AstNode]))
+                    if target <> null
+                    {
+                        if this.is_exact_optional_property_mismatch(right_type as ref[Type], target as ref[Type])
+                            set head_message: DiagType_0_is_not_assignable_to_type_1_with_exactOptionalPropertyTypes_Colon_true_Consider_adding_undefined_to_the_type_of_the_target
+                    }
+                }
+            }
+        }
+        this.check_type_assignable_to_and_optionally_elaborate(right_type as ref[Type], target_type as ref[Type], left, right, head_message)
     }
 
     ; checkReferenceExpression, whole. Both of its reports are node-driven, which
@@ -69093,6 +69467,7 @@ define Checker
     ; the contextual type of the second argument, which is unported.
     function get_global_import_call_options_type_checked(this) returns ref[Type]?
     {
+        this.report_checked_global_type("ImportCallOptions", 0)
         if global_import_call_options_type <> null
             return global_import_call_options_type
         let t this.get_global_type_of_arity("ImportCallOptions", 0)
@@ -69159,6 +69534,15 @@ define Checker
                 return this.grammar_error_on_node(arg as ref[AstNode], DiagArgument_of_dynamic_import_cannot_be_spread_element)
         }
         false
+    }
+
+    ; c.error(node, getVerbatimModuleSyntaxErrorMessage(node))
+    procedure report_verbatim_module_syntax_error(this, node: ref[AstNode])
+    {
+        if this.is_mts_or_cts_file_name_cjs(node)
+            this.error_on_node(node, DiagECMAScript_imports_and_exports_cannot_be_written_in_a_CommonJS_file_under_verbatimModuleSyntax)
+        else
+            this.error_on_node(node, DiagECMAScript_imports_and_exports_cannot_be_written_in_a_CommonJS_file_under_verbatimModuleSyntax_Adjust_the_type_field_in_the_nearest_package_json_to_make_this_file_an_ECMAScript_module_or_adjust_your_verbatimModuleSyntax_module_and_moduleResolution_settings_in_TypeScript)
     }
 
     ; getVerbatimModuleSyntaxErrorMessage's test: a `.cts`/`.cjs` file
@@ -71834,10 +72218,12 @@ define Checker
         ; `reportErrors` upstream is `!c.isInferencePartiallyBlocked &&
         ; candidatesOutArray == nil`, and BOTH halves are constants here: the flag
         ; is written only by services.go, and no caller in this port passes an out
-        ; array. ★The `isInstanceof` head is constant too — the BinaryExpression
-        ; route into resolve_call is resolveInstanceof, which is a row of its own in
-        ; resolve_signature.
-        this.report_call_resolution_errors(node, state, signatures as ref[Array[ref[Signature]?]], head_code)
+        ; array. A synthetic `[Symbol.hasInstance]` call (`left instanceof right`)
+        ; heads its argument reports.
+        var failure_head head_code
+        if (failure_head = 0) and (AstNode.kind_of(node) = KindBinaryExpression)
+            set failure_head: DiagThe_left_hand_side_of_an_instanceof_expression_must_be_assignable_to_the_first_argument_of_the_right_hand_side_s_Symbol_hasInstance_method
+        this.report_call_resolution_errors(node, state, signatures as ref[Array[ref[Signature]?]], failure_head)
         if this.unported_mark() <> mark
             return null
         fallback
@@ -73902,7 +74288,7 @@ define Checker
                         }
                     }
                 }
-                if this.symbol_is_value(sym as ref[Symbol])
+                if this.symbol_is_value_ex(sym as ref[Symbol], include_type_only_members)
                     return sym
             }
             if skip_object_function_property_augment
@@ -75052,6 +75438,8 @@ define Checker
     ; moves the fold is the thing to undo.
     function container_seems_to_be_empty_dom_element(this, containing_type: ref[Type]) returns bool
     {
+        if checker_lib_option_has_dom
+            return false
         if this.every_contained_type_has_common_dom_type_name(containing_type) = false
             return false
         this.is_empty_object_type(containing_type)
@@ -77493,6 +77881,7 @@ define Checker
     ; shape get_global_function_type carries with its own note.
     function get_global_import_meta_type(this) returns ref[Type]?
     {
+        this.report_checked_global_type("ImportMeta", 0)
         if global_import_meta_type <> null
             return global_import_meta_type
         let symbol this.lookup_globals("ImportMeta", SymbolFlagsType)
@@ -86403,6 +86792,21 @@ define Checker
         ; ★★ THE COLLECTION IS BEHIND THE PREDICATE, so a unit with no augmentation
         ; pays one statement walk and nothing else — the shape the stop already had.
         let augmentations &Array[ref[AstNode]?]^host()
+        ; the lib files come first in `c.files`, and a module lib (es2025.iterator's
+        ; `export {}`) augments the globals with `declare global`
+        if lib_file <> null
+            this.collect_module_augmentations(augmentations, lib_file, lib_b as ref[Binder], false)
+        if extra_lib_files <> null
+        {
+            let aefs extra_lib_files as ref[Array[ref[AstNode]?]]
+            let aebs extra_lib_binders as ref[Array[ref[Binder]?]]
+            var ali 0
+            while ali < (aefs.get_length() as int)
+            {
+                this.collect_module_augmentations(augmentations, aefs[ali as size_t], aebs[ali as size_t] as ref[Binder], false)
+                set ali: ali + 1
+            }
+        }
         if program <> null
         {
             let pfa program as ref[ProgramFiles]
@@ -86434,9 +86838,10 @@ define Checker
             if Binder.is_global_scope_augmentation(AstNode.parent_node_of(a as ref[AstNode]))
                 this.merge_module_augmentation(a as ref[AstNode])
         }
-        ; Every `getGlobalType` line is still left out, on §3.5be's rule: a call
-        ; with no reader stays out rather than in as a stub.
         this.add_undefined_to_globals_or_error_on_redeclaration()
+        ; the REPORT half of initializeChecker's eager getGlobalType lines; the
+        ; answers stay lazy (the memo fields), so the lazy getters ask without it
+        this.report_initialize_checker_global_types()
         ; `c.valueSymbolLinks.Get(c.undefinedSymbol).resolvedType =
         ; c.undefinedWideningType`, and it is why `undefined` gets a TYPE out of
         ; this slice where `arguments` does not: the latter's assignment on the very
@@ -86616,13 +87021,15 @@ define Checker
             this.error_on_node(module_name, DiagCannot_augment_module_0_because_it_resolves_to_a_non_module_entity)
             return
         }
-        ; ★★★ THE PATTERN-AMBIENT-MODULE FORK IS UNREACHABLE HERE AND IT IS NOT A
-        ; HOLE: `resolve_external_module_name_worker` reports `pattern-ambient-module`
-        ; and answers null one function up, so the line above has already returned by
-        ; the time this branch could be asked. It is written down rather than left
-        ; out because the fork's OTHER half is what this port takes, and a reader who
-        ; finds only one half has to re-derive why.
-        ;
+        ; an augmentation of a pattern ambient module merges unidirectionally from
+        ; the augmentation ('a.foo') into a copy over the pattern ('*.foo')
+        if this.is_pattern_ambient_module_symbol(mm)
+        {
+            let merged this.merge_symbol(augmentation, mm, true)
+            pattern_augmentation_names.add(slice_copy_on(host, AstNode.literal_text_of(module_name)))
+            pattern_augmentation_symbols.add(merged)
+            return
+        }
         ; "We may need to merge the module augmentation's exports into the target
         ; symbols of the resolved exports" — the `export *` case, and its condition
         ; is asked on the MAIN module's own exports table rather than on the resolved
@@ -87247,7 +87654,7 @@ define Checker
             let locals AstNode.locals_of(l)
             if locals <> null
             {
-                if Checker.is_global_source_file(this.b, l) = false
+                if this.is_global_source_file_node(l) = false
                 {
                     set result: this.lookup_in_table(locals, name_data, meaning, &lookup_stopped, for_suggestion)
                     if lookup_stopped
@@ -87356,9 +87763,8 @@ define Checker
             {
                 ; The reference's `case KindSourceFile:` breaks unless the file is an
                 ; external or CommonJS module and otherwise FALLS THROUGH into the
-                ; module case. ★This port binds ONE file, so a SourceFile location IS
-                ; that file and the binder's own answer is the right one.
-                if this.b.is_external_or_common_js_module()
+                ; module case — asked of the location's own file.
+                if this.binder_of_node(l).is_external_or_common_js_module()
                     set module_like: true
             }
             if module_like
@@ -89973,7 +90379,7 @@ define Checker
         {
             if AstNode.kind_of(last_location as ref[AstNode]) = KindSourceFile
             {
-                if b.is_external_or_common_js_module()
+                if this.binder_of_node(last_location).is_external_or_common_js_module()
                     set is_in_external_module: true
             }
         }
@@ -90447,6 +90853,9 @@ define Checker
     procedure check_using_initializer(this, node: ref[AstNode], initializer: ref[AstNode], initializer_type: ref[Type], is_await: bool)
     {
         let mark this.unported_mark()
+        if is_await
+            this.report_checked_global_type("AsyncDisposable", 0)
+        this.report_checked_global_type("Disposable", 0)
         let disposable this.get_global_type_of_arity("Disposable", 0)
         if this.unported_mark() <> mark
             return
@@ -92419,12 +92828,12 @@ define Checker
             if this.should_check_erasable_syntax(node)
                 this.error_on_node(node, DiagThis_syntax_is_not_allowed_when_erasableSyntaxOnly_is_enabled)
 
-            ; `GetIsolatedModules() && GetSourceFileOfNode(node).ExternalModuleIndicator
-            ; == nil` — TS1250, and the option is unset, so the term is false without
-            ; asking. ★Its second half is the binder's is_external_module and would be
-            ; free; the option is the whole of the hole, which is why this is a
-            ; comment and not a tag (§3.5v: an unset option is not an unported
-            ; construct).
+            if this.get_isolated_modules() and (this.binder_of_node(node).is_external_module_of() = false)
+            {
+                let nm AstNode.name_of(node)
+                if nm <> null
+                    this.error_on_node(nm as ref[AstNode], DiagNamespaces_are_not_allowed_in_global_script_files_when_0_is_enabled_If_this_file_is_not_intended_to_be_a_global_script_set_moduleDetection_to_force_or_add_an_empty_export_statement)
+            }
 
             ; ★★ THE TWO MERGE-ORDER REPORTS ARE THE ONES THIS TAIL IS FOR. A
             ; namespace may merge with a class or a function, and it must come AFTER
@@ -92516,7 +92925,7 @@ define Checker
         ; namespace, while a NON-global ambient module gets *cannot specify relative
         ; module name* in the first case and *cannot be nested* in the second.
         let name AstNode.name_of(node)
-        if Checker.is_global_source_file(b, AstNode.parent_node_of(node))
+        if this.is_global_source_file_node(AstNode.parent_node_of(node))
         {
             if is_global_augmentation
                 this.error_on_node(name, DiagAugmentations_for_the_global_scope_can_only_be_directly_nested_in_external_modules_or_ambient_module_declarations)
@@ -93106,9 +93515,9 @@ define Checker
         {
             let name AstNode.name_of(node)
             let nk Checker.kind_or_unknown(name)
-            if (nk = KindIdentifier) and AstNode.identifier_text_of(name).equals("__proto__")
+            if (nk = KindIdentifier) and Checker.name_bytes_are(AstNode.identifier_text_of(name), "__proto__")
                 return false
-            if (nk = KindStringLiteral) and AstNode.literal_text_of(name).equals("__proto__")
+            if (nk = KindStringLiteral) and Checker.name_bytes_are(AstNode.literal_text_of(name), "__proto__")
                 return false
             return true
         }
@@ -93283,6 +93692,7 @@ define Checker
             ; exclusive) and, one option further, the JSON-import error, whose gate
             ; is `Node18 <= moduleKind <= NodeNext` and whose value is ES2022. The
             ; flag is not modelled because neither reader exists.
+            var resolved_module_of_clause: ref[Symbol]? null
             if import_clause <> null
             {
                 if this.check_grammar_import_clause(import_clause) = false
@@ -93315,6 +93725,7 @@ define Checker
                             let resolved_module this.resolve_external_module_name(node, module_specifier, false)
                             if this.unported_mark() <> um25
                                 return
+                            set resolved_module_of_clause: resolved_module
                             if resolved_module <> null
                             {
                                 let els AstNode.elements_of(named_bindings)
@@ -93334,10 +93745,45 @@ define Checker
                             }
                         }
                     }
+                    ; a JSON file imported into an ECMAScript module without
+                    ; `with { type: "json" }` (node18..nodenext)
+                    if (Checker.is_type_only_import_or_export_declaration(import_clause) = false) and (module_kind >= ModuleKindNode18) and (module_kind <= ModuleKindNodeNext)
+                    {
+                        if this.is_only_importable_as_default(module_specifier, resolved_module_of_clause) and (Checker.has_type_json_import_attribute(node) = false)
+                            this.error_on_node(module_specifier, DiagImporting_a_JSON_file_into_an_ECMAScript_module_requires_a_type_Colon_json_import_attribute_when_module_is_set_to_0)
+                    }
                 }
             }
         }
         this.check_import_attributes(node)
+    }
+
+    ; hasTypeJsonImportAttribute
+    function has_type_json_import_attribute(node: ref[AstNode]) returns bool
+    {
+        let attributes AstNode.import_attributes_of(node)
+        if attributes = null
+            return false
+        let list AstNode.import_attribute_list_of(attributes)
+        let n AstNode.list_count(list)
+        var i 0
+        while i < n
+        {
+            let attr AstNode.child_in_list(list, i)
+            set i: i + 1
+            if attr = null
+                continue
+            if Checker.identifier_text_is(AstNode.name_of(attr as ref[AstNode]), "type") = false
+                continue
+            let value AstNode.import_attribute_value_of(attr as ref[AstNode])
+            let vk Checker.kind_or_unknown(value)
+            if (vk = KindStringLiteral) or (vk = KindNoSubstitutionTemplateLiteral)
+            {
+                if Checker.name_bytes_are(AstNode.literal_text_of(value as ref[AstNode]), "json")
+                    return true
+            }
+        }
+        false
     }
 
     ; checkImportEqualsDeclaration's prefix. It shares the import declaration's two
@@ -93671,6 +94117,9 @@ define Checker
         ; every verbatimModuleSyntax and isolatedModules report below it, has no
         ; host; what is left of that branch is the resolution, the reference
         ; marking, and checkExpressionCached for a value.
+        var illegal_default_in_cjs false
+        if (is_export_equals = false) and ((AstNode.flags_of(node) & NodeFlagsAmbient) = 0) and verbatim_module_syntax and (this.file_emit_format_of(Checker.source_file_of_node(node)) = ModuleKindCommonJS)
+            set illegal_default_in_cjs: true
         let e AstNode.expression_of(node)
         if Checker.kind_or_unknown(e) = KindIdentifier
         {
@@ -93687,9 +94136,6 @@ define Checker
                 ; of a type or a type-only alias is reported, unless it is the illegal
                 ; default in a CommonJS-format file (reported elsewhere)
                 let ambient (AstNode.flags_of(node) & NodeFlagsAmbient) <> 0
-                var illegal_default_in_cjs false
-                if (is_export_equals = false) and (ambient = false) and verbatim_module_syntax and (this.current_file_emit_format() = ModuleKindCommonJS)
-                    set illegal_default_in_cjs: true
                 let type_only_declaration this.get_type_only_alias_declaration_ex(sym as ref[Symbol], SymbolFlagsValue)
                 if (this.get_symbol_flags(sym as ref[Symbol]) & SymbolFlagsValue) <> 0
                 {
@@ -93712,6 +94158,30 @@ define Checker
                             this.error_on_node(id, DiagAn_export_default_must_reference_a_value_when_verbatimModuleSyntax_is_enabled_but_0_only_refers_to_a_type)
                     }
                 }
+                if (illegal_default_in_cjs = false) and (ambient = false) and this.get_isolated_modules() and ((Symbol.flags_of(sym as ref[Symbol]) & SymbolFlagsValue) = 0)
+                {
+                    let non_local_meanings this.get_symbol_flags_ex(sym as ref[Symbol], false, true)
+                    var same_file false
+                    if type_only_declaration <> null
+                        set same_file: Checker.source_file_of_node(type_only_declaration) = Checker.source_file_of_node(node)
+                    if ((Symbol.flags_of(sym as ref[Symbol]) & SymbolFlagsAlias) <> 0) and ((non_local_meanings & SymbolFlagsType) <> 0) and ((non_local_meanings & SymbolFlagsValue) = 0) and (same_file = false)
+                    {
+                        if is_export_equals
+                            this.error_on_node(id, DiagX_0_resolves_to_a_type_and_must_be_marked_type_only_in_this_file_before_re_exporting_when_1_is_enabled_Consider_using_import_type_where_0_is_imported)
+                        else
+                            this.error_on_node(id, DiagX_0_resolves_to_a_type_and_must_be_marked_type_only_in_this_file_before_re_exporting_when_1_is_enabled_Consider_using_export_type_0_as_default)
+                    }
+                    else
+                    {
+                        if (type_only_declaration <> null) and (same_file = false)
+                        {
+                            if is_export_equals
+                                this.error_on_node(id, DiagX_0_resolves_to_a_type_only_declaration_and_must_be_marked_type_only_in_this_file_before_re_exporting_when_1_is_enabled_Consider_using_import_type_where_0_is_imported)
+                            else
+                                this.error_on_node(id, DiagX_0_resolves_to_a_type_only_declaration_and_must_be_marked_type_only_in_this_file_before_re_exporting_when_1_is_enabled_Consider_using_export_type_0_as_default)
+                        }
+                    }
+                }
                 if this.unported_mark() <> unported_before
                     return
             }
@@ -93729,6 +94199,8 @@ define Checker
             if export_type = null
                 return
         }
+        if illegal_default_in_cjs
+            this.report_verbatim_module_syntax_error(node)
         if container = null
             return
         this.check_external_module_exports(container as ref[AstNode])
@@ -93806,6 +94278,7 @@ define Checker
         if na = null
             return
         let node na as ref[AstNode]
+        this.report_checked_global_type("ImportAttributes", 0)
         let attributes_type this.get_global_type_of_arity("ImportAttributes", 0)
         if attributes_type = null
             return
@@ -94058,7 +94531,7 @@ define Checker
                 ; `isTopLevelInExternalModuleAugmentation` — a question about the
                 ; enclosing module's relationship to its FILE — rather than
                 ; anything about this declaration.
-                if Checker.is_top_level_in_external_module_augmentation(this.b, node) = false
+                if Checker.is_top_level_in_external_module_augmentation(this.binder_of_node(node), node) = false
                 {
                     this.error_on_node(node, DiagImport_or_export_declaration_in_an_ambient_module_declaration_cannot_reference_module_through_relative_module_name)
                     return false
@@ -94125,6 +94598,15 @@ define Checker
     ; ★ It takes the binder for is_top_level_in_external_module_augmentation's
     ; reason: the second half of the question is a property of the FILE, which the
     ; binder computed once at construction, and not of the node handed in.
+    ; ast.IsGlobalSourceFile over the binder of the node's OWN file: a declaration
+    ; container in another program file is global by that file's module-ness.
+    function is_global_source_file_node(this, node: ref[AstNode]?) returns bool
+    {
+        if Checker.kind_or_unknown(node) <> KindSourceFile
+            return false
+        this.binder_of_node(node).is_external_or_common_js_module() = false
+    }
+
     function is_global_source_file(b: ref[Binder], node: ref[AstNode]?) returns bool
     {
         if Checker.kind_or_unknown(node) <> KindSourceFile
@@ -94451,6 +94933,7 @@ define Checker
 
     function get_global_typed_property_descriptor_type(this) returns ref[Type]?
     {
+        this.report_checked_global_type("TypedPropertyDescriptor", 1)
         if global_typed_property_descriptor_type <> null
             return global_typed_property_descriptor_type
         let t this.get_global_type_of_arity("TypedPropertyDescriptor", 1)
@@ -94473,6 +94956,7 @@ define Checker
 
     function get_global_class_decorator_context_type(this) returns ref[Type]?
     {
+        this.report_checked_global_type("ClassDecoratorContext", 1)
         if global_class_decorator_context_type <> null
             return global_class_decorator_context_type
         let t this.get_global_type_of_arity("ClassDecoratorContext", 1)
@@ -94482,6 +94966,7 @@ define Checker
 
     function get_global_class_method_decorator_context_type(this) returns ref[Type]?
     {
+        this.report_checked_global_type("ClassMethodDecoratorContext", 2)
         if global_class_method_decorator_context_type <> null
             return global_class_method_decorator_context_type
         let t this.get_global_type_of_arity("ClassMethodDecoratorContext", 2)
@@ -94491,6 +94976,7 @@ define Checker
 
     function get_global_class_getter_decorator_context_type(this) returns ref[Type]?
     {
+        this.report_checked_global_type("ClassGetterDecoratorContext", 2)
         if global_class_getter_decorator_context_type <> null
             return global_class_getter_decorator_context_type
         let t this.get_global_type_of_arity("ClassGetterDecoratorContext", 2)
@@ -94500,6 +94986,7 @@ define Checker
 
     function get_global_class_setter_decorator_context_type(this) returns ref[Type]?
     {
+        this.report_checked_global_type("ClassSetterDecoratorContext", 2)
         if global_class_setter_decorator_context_type <> null
             return global_class_setter_decorator_context_type
         let t this.get_global_type_of_arity("ClassSetterDecoratorContext", 2)
@@ -94509,6 +94996,7 @@ define Checker
 
     function get_global_class_accessor_decorator_context_type(this) returns ref[Type]?
     {
+        this.report_checked_global_type("ClassAccessorDecoratorContext", 2)
         if global_class_accessor_decorator_context_type <> null
             return global_class_accessor_decorator_context_type
         let t this.get_global_type_of_arity("ClassAccessorDecoratorContext", 2)
@@ -94518,6 +95006,7 @@ define Checker
 
     function get_global_class_accessor_decorator_target_type(this) returns ref[Type]?
     {
+        this.report_checked_global_type("ClassAccessorDecoratorTarget", 2)
         if global_class_accessor_decorator_target_type <> null
             return global_class_accessor_decorator_target_type
         let t this.get_global_type_of_arity("ClassAccessorDecoratorTarget", 2)
@@ -94527,6 +95016,7 @@ define Checker
 
     function get_global_class_accessor_decorator_result_type(this) returns ref[Type]?
     {
+        this.report_checked_global_type("ClassAccessorDecoratorResult", 2)
         if global_class_accessor_decorator_result_type <> null
             return global_class_accessor_decorator_result_type
         let t this.get_global_type_of_arity("ClassAccessorDecoratorResult", 2)
@@ -94536,6 +95026,7 @@ define Checker
 
     function get_global_class_field_decorator_context_type(this) returns ref[Type]?
     {
+        this.report_checked_global_type("ClassFieldDecoratorContext", 2)
         if global_class_field_decorator_context_type <> null
             return global_class_field_decorator_context_type
         let t this.get_global_type_of_arity("ClassFieldDecoratorContext", 2)
@@ -99699,7 +100190,7 @@ define Checker
             return
         if b.is_external_or_common_js_module() = false
             return
-        this.error_on_node(name, DiagDuplicate_identifier_0_Compiler_reserves_name_1_in_top_level_scope_of_a_module)
+        this.error_skipped_on_no_emit(name, DiagDuplicate_identifier_0_Compiler_reserves_name_1_in_top_level_scope_of_a_module)
     }
 
     ; checkCollisionWithGlobalObjectInGeneratedCode, whole. It runs to its last
@@ -99738,7 +100229,7 @@ define Checker
             return
         if emit_module_format <> ModuleKindCommonJS
             return
-        this.error_on_node(name, DiagDuplicate_identifier_0_Compiler_reserves_name_1_in_top_level_scope_of_a_module)
+        this.error_skipped_on_no_emit(name, DiagDuplicate_identifier_0_Compiler_reserves_name_1_in_top_level_scope_of_a_module)
     }
 
     ; checkCollisionWithGlobalPromiseInGeneratedCode's GUARD, which is the whole of
@@ -99773,7 +100264,7 @@ define Checker
         if pb.is_external_or_common_js_module() = false
             return
         if (AstNode.flags_of(parent as ref[AstNode]) & NodeFlagsHasAsyncFunctions) <> 0
-            this.error_on_node(name, DiagDuplicate_identifier_0_Compiler_reserves_name_1_in_top_level_scope_of_a_module_containing_async_functions)
+            this.error_skipped_on_no_emit(name, DiagDuplicate_identifier_0_Compiler_reserves_name_1_in_top_level_scope_of_a_module_containing_async_functions)
     }
 
     ; recordPotentialCollisionWithWeakMapSetInGeneratedCode's GUARD. Behind it:
@@ -99796,9 +100287,7 @@ define Checker
             set wanted: true
         if wanted = false
             return
-        if deferred_weak_map_set_nodes = null
-            set this.deferred_weak_map_set_nodes: &Array[ref[AstNode]?]^host()
-        (deferred_weak_map_set_nodes as ref[Array[ref[AstNode]?]]).add(node)
+        this.add_deferred_check(DeferredCheckKindWeakMapSet, node, null, false)
     }
 
     ; checkWeakMapSetCollision
@@ -99811,7 +100300,7 @@ define Checker
         {
             let name AstNode.name_of(node)
             if Checker.kind_or_unknown(name) = KindIdentifier
-                this.error_on_node(node, DiagCompiler_reserves_name_0_when_emitting_private_identifier_downlevel)
+                this.error_skipped_on_no_emit(node, DiagCompiler_reserves_name_0_when_emitting_private_identifier_downlevel)
         }
     }
 
@@ -99851,9 +100340,7 @@ define Checker
             return
         if Checker.need_collision_check_for_identifier(node, name, "Reflect") = false
             return
-        if deferred_reflect_nodes = null
-            set this.deferred_reflect_nodes: &Array[ref[AstNode]?]^host()
-        (deferred_reflect_nodes as ref[Array[ref[AstNode]?]]).add(node)
+        this.add_deferred_check(DeferredCheckKindReflect, node, null, false)
     }
 
     ; checkReflectCollision
@@ -99901,7 +100388,7 @@ define Checker
         if has_collision
         {
             if Checker.kind_or_unknown(AstNode.name_of(node)) = KindIdentifier
-                this.error_on_node(node, DiagDuplicate_identifier_0_Compiler_reserves_name_1_when_emitting_super_references_in_static_initializers)
+                this.error_skipped_on_no_emit(node, DiagDuplicate_identifier_0_Compiler_reserves_name_1_when_emitting_super_references_in_static_initializers)
         }
     }
 
@@ -106332,6 +106819,18 @@ define Checker
     ; here. It cannot be folded to `false`: an `import { x } from "m"` re-exported
     ; into a type literal's members would then vanish from the property list, which
     ; is a well-formed WRONG answer rather than a missing one (§3.5bk).
+    ; symbolIsValueEx: an alias counts through its type-only meanings too when
+    ; type-only members are included (a qualified name in a type query)
+    function symbol_is_value_ex(this, symbol: ref[Symbol], include_type_only_members: bool) returns bool
+    {
+        let flags Symbol.flags_of(symbol)
+        if (flags & SymbolFlagsValue) <> 0
+            return true
+        if (flags & SymbolFlagsAlias) = 0
+            return false
+        (this.get_symbol_flags_ex(symbol, include_type_only_members = false, false) & SymbolFlagsValue) <> 0
+    }
+
     function symbol_is_value(this, symbol: ref[Symbol]) returns bool
     {
         let flags Symbol.flags_of(symbol)
@@ -119060,35 +119559,36 @@ define Checker
     ; same reason again — addDeferredDiagnostic's callers are all inside arms that
     ; report — and kept for the same reason: a diagnostic that is deferred and
     ; never produced is invisible, so the drain belongs in place from the start.
+    procedure add_deferred_check(this, kind: int, node: ref[AstNode]?, t: ref[Type]?, flag: bool)
+    {
+        if deferred_checks = null
+            set this.deferred_checks: &Array[DeferredCheck]^host()
+        (deferred_checks as ref[Array[DeferredCheck]]).add(DeferredCheck(kind, node, t, flag))
+    }
+
+    ; produceDeferredDiagnostics: the callbacks in the order they were deferred
+    ; (a callback may defer another, which runs in the same drain)
     procedure produce_deferred_diagnostics(this)
     {
-        ; the two collision checks (slice 258), in the order they were deferred
-        if deferred_weak_map_set_nodes <> null
+        if deferred_checks = null
+            return
+        let list deferred_checks as ref[Array[DeferredCheck]]
+        var i 0
+        while i < (list.get_length() as int)
         {
-            let wl deferred_weak_map_set_nodes as ref[Array[ref[AstNode]?]]
-            var i 0
-            while i < (wl.get_length() as int)
-            {
-                let n wl[i as size_t]
-                set i: i + 1
-                if n <> null
-                    this.check_weak_map_set_collision(n as ref[AstNode])
-            }
-            set this.deferred_weak_map_set_nodes: null
+            let d list[i as size_t]
+            set i: i + 1
+            if d.node = null
+                continue
+            let n d.node as ref[AstNode]
+            if d.kind = DeferredCheckKindWeakMapSet
+                this.check_weak_map_set_collision(n)
+            if d.kind = DeferredCheckKindReflect
+                this.check_reflect_collision(n)
+            if (d.kind = DeferredCheckKindNotIterable) and (d.t <> null)
+                this.report_type_not_iterable_error(n, d.t as ref[Type], d.flag)
         }
-        if deferred_reflect_nodes <> null
-        {
-            let rl deferred_reflect_nodes as ref[Array[ref[AstNode]?]]
-            var j 0
-            while j < (rl.get_length() as int)
-            {
-                let n rl[j as size_t]
-                set j: j + 1
-                if n <> null
-                    this.check_reflect_collision(n as ref[AstNode])
-            }
-            set this.deferred_reflect_nodes: null
-        }
+        set this.deferred_checks: null
     }
 
     ; ── slice 65: the merged declarations, and the symbol every arm asks for ──
@@ -120576,9 +121076,8 @@ define Checker
     ; the loop counts and reports in one pass and the directive's report follows it.
     function check_grammar_for_use_strict_simple_parameter_list(this, node: ref[AstNode]) returns bool
     {
-        ; c.languageVersion >= core.ScriptTargetES2016 — always true here, see the
-        ; header. Written as the condition it is rather than dropped, because a
-        ; harness that reads @target turns it back into a question.
+        if language_version < ScriptTargetES2016
+            return false
         let body AstNode.body_of(node)
         if body = null
             return false
@@ -121182,7 +121681,7 @@ define Checker
         ; note that it is the ORACLE's answer and not the real compiler's.
         if grandparent <> null
         {
-            if (AstNode.flags_of(grandparent) & NodeFlagsAmbient) = 0
+            if ((AstNode.flags_of(grandparent) & NodeFlagsAmbient) = 0) and (this.file_emit_format_of(Checker.source_file_of_node(node)) < ModuleKindSystem)
             {
                 if b.has_syntactic_modifier(grandparent, ModifierFlagsExport)
                 {
@@ -121240,7 +121739,22 @@ define Checker
     ; The flag becomes observable on the day something in this repository EMITS,
     ; and until then a field for it would be a field nothing reads.
     function grammar_error_on_node_skipped_on_no_emit(this, n: ref[AstNode], code: int) returns bool
+    {
+        if checker_no_emit
+        {
+            if this.has_parse_diagnostics()
+                return false
+            return true
+        }
         this.grammar_error_on_node(n, code)
+    }
+
+    ; errorSkippedOnNoEmit
+    procedure error_skipped_on_no_emit(this, n: ref[AstNode]?, code: int)
+    {
+        if checker_no_emit = false
+            this.error_on_node(n, code)
+    }
 
     ; checkGrammarNameInLetOrConstDeclarations, whole.
     ;
@@ -124911,7 +125425,7 @@ define Checker
     {
         if global_object_type <> null
             return global_object_type
-        let d this.get_global_type_zero_arity_ex("Object", SymbolFlagsType, true)
+        let d this.get_global_type_zero_arity_ex("Object", SymbolFlagsType, false)
         if d = null
             return null
         set global_object_type: d
@@ -124982,6 +125496,134 @@ define Checker
         null
     }
 
+    ; initializeChecker's `getGlobalType(name, arity, true)` lines, the report
+    ; only: IArguments, Array, Object, Function, the two strict function types
+    ; under strictBindCallApply, String, Number, Boolean, RegExp. ★The arity
+    ; report (TS2317) needs the declared type and is not ported.
+    procedure report_initialize_checker_global_types(this)
+    {
+        this.report_global_type_presence("IArguments")
+        this.report_global_type_presence("Array")
+        this.report_global_type_presence("Object")
+        this.report_global_type_presence("Function")
+        if Checker.strict_bind_call_apply()
+        {
+            this.report_global_type_presence("CallableFunction")
+            this.report_global_type_presence("NewableFunction")
+        }
+        this.report_global_type_presence("String")
+        this.report_global_type_presence("Number")
+        this.report_global_type_presence("Boolean")
+        this.report_global_type_presence("RegExp")
+    }
+
+    procedure report_global_type_presence(this, name: Slice[char])
+    {
+        let symbol this.lookup_globals(name, SymbolFlagsType)
+        if symbol = null
+        {
+            this.add_global_diagnostic(DiagCannot_find_global_type_0)
+            return
+        }
+        let sym symbol as ref[Symbol]
+        if (Symbol.flags_of(sym) & (SymbolFlagsClass | SymbolFlagsInterface)) = 0
+            this.error_on_node(Checker.get_global_type_declaration(sym), DiagGlobal_type_0_must_be_a_class_or_interface_type)
+    }
+
+    ; the REPORT of a memoised reporting resolver — getGlobalTypeResolver(name,
+    ; arity, true), getGlobalTypeAliasResolver(name, arity, true) and
+    ; getGlobalValueSymbolResolver(name, true) — once per resolver; the answer
+    ; comes from the unreporting getter at the call site
+    function checked_global_first_ask(this, kind: Slice[char], name: Slice[char]) returns bool
+    {
+        let key StringBuilder^host()
+        key.append(kind.data, kind.length)
+        key.append(":")
+        key.append(name.data, name.length)
+        let ks key.to_string()
+        let kv slice_copy_on(host, Slice[char](ks.get_length(), ks.get_buffer() as pointer[char]))
+        var i: size_t 0
+        while i < checked_global_reports.length
+        {
+            let existing checked_global_reports[i]
+            if existing.equals(kv)
+                return false
+            set i: i + 1
+        }
+        checked_global_reports.add(kv)
+        true
+    }
+
+    procedure report_checked_global_type(this, name: Slice[char], arity: int)
+    {
+        if this.checked_global_first_ask("T", name) = false
+            return
+        let symbol this.lookup_globals(name, SymbolFlagsType)
+        if symbol = null
+        {
+            this.add_global_diagnostic(DiagCannot_find_global_type_0)
+            return
+        }
+        let sym symbol as ref[Symbol]
+        if (Symbol.flags_of(sym) & (SymbolFlagsClass | SymbolFlagsInterface)) <> 0
+        {
+            let mark this.unported_mark()
+            let declared this.get_declared_type_of_symbol(sym)
+            if this.unported_mark() <> mark
+                return
+            if declared = null
+                return
+            if Checker.type_parameter_count_of(declared as ref[Type]) <> arity
+                this.error_on_node(Checker.get_global_type_declaration(sym), DiagGlobal_type_0_must_have_1_type_parameter_s)
+        }
+        else
+            this.error_on_node(Checker.get_global_type_declaration(sym), DiagGlobal_type_0_must_be_a_class_or_interface_type)
+    }
+
+    procedure report_checked_global_type_alias(this, name: Slice[char], arity: int)
+    {
+        if this.checked_global_first_ask("A", name) = false
+            return
+        let symbol this.lookup_globals(name, SymbolFlagsTypeAlias)
+        if symbol = null
+        {
+            this.add_global_diagnostic(DiagCannot_find_global_type_0)
+            return
+        }
+        let sym symbol as ref[Symbol]
+        let mark this.unported_mark()
+        this.get_declared_type_of_symbol(sym)
+        if this.unported_mark() <> mark
+            return
+        let links this.type_alias_link_of(sym)
+        var n 0
+        if links.type_parameters <> null
+            set n: (links.type_parameters as ref[Array[ref[Type]?]]).get_length() as int
+        if n <> arity
+        {
+            var i 0
+            while i < Symbol.declaration_count(sym)
+            {
+                let d Symbol.declaration_at(sym, i)
+                set i: i + 1
+                if Checker.kind_or_unknown(d) = KindTypeAliasDeclaration
+                {
+                    this.error_on_node(d, DiagGlobal_type_0_must_have_1_type_parameter_s)
+                    return
+                }
+            }
+            this.error_on_node(null, DiagGlobal_type_0_must_have_1_type_parameter_s)
+        }
+    }
+
+    procedure report_checked_global_value(this, name: Slice[char])
+    {
+        if this.checked_global_first_ask("V", name) = false
+            return
+        if this.lookup_globals(name, SymbolFlagsValue) = null
+            this.add_global_diagnostic(DiagCannot_find_global_value_0)
+    }
+
     ; a locationless diagnostic (slice 254): counted, never printed
     procedure add_global_diagnostic(this, code: int)
     {
@@ -125004,7 +125646,7 @@ define Checker
     {
         if global_string_type <> null
             return global_string_type
-        let d this.get_global_type_zero_arity_ex("String", SymbolFlagsType, true)
+        let d this.get_global_type_zero_arity_ex("String", SymbolFlagsType, false)
         if d = null
             return null
         set global_string_type: d
@@ -125015,7 +125657,7 @@ define Checker
     {
         if global_number_type <> null
             return global_number_type
-        let d this.get_global_type_zero_arity_ex("Number", SymbolFlagsType, true)
+        let d this.get_global_type_zero_arity_ex("Number", SymbolFlagsType, false)
         if d = null
             return null
         set global_number_type: d
@@ -125026,7 +125668,7 @@ define Checker
     {
         if global_boolean_type <> null
             return global_boolean_type
-        let d this.get_global_type_zero_arity_ex("Boolean", SymbolFlagsType, true)
+        let d this.get_global_type_zero_arity_ex("Boolean", SymbolFlagsType, false)
         if d = null
             return null
         set global_boolean_type: d
@@ -133052,6 +133694,14 @@ define Checker
                     return
                 }
             }
+            if Checker.exact_optional_property_types()
+            {
+                if this.has_exact_optional_unassignable_properties(source, target)
+                    set code: DiagType_0_is_not_assignable_to_type_1_with_exactOptionalPropertyTypes_Colon_true_Consider_adding_undefined_to_the_types_of_the_target_s_properties
+            }
+        }
+        if code = 0
+        {
             ; ★★★ THE SUGGESTION IS CONSULTED BEFORE TS2322 AND NOT AFTER IT — the
             ; reference's `default` fork asks it first and RETURNS on a hit, so a
             ; missing suggestion is not a missing extra message but a WRONG code. It
@@ -133073,6 +133723,14 @@ define Checker
                 }
             }
             set code: DiagType_0_is_not_assignable_to_type_1
+        }
+        else
+        {
+            if (code = DiagArgument_of_type_0_is_not_assignable_to_parameter_of_type_1) and Checker.exact_optional_property_types()
+            {
+                if this.has_exact_optional_unassignable_properties(source, target)
+                    set code: DiagArgument_of_type_0_is_not_assignable_to_parameter_of_type_1_with_exactOptionalPropertyTypes_Colon_true_Consider_adding_undefined_to_the_types_of_the_target_s_properties
+            }
         }
         ; ── the suppression switch on the chain's HEAD ──────────────────────
         ;
@@ -133920,6 +134578,31 @@ define Checker
     ; target, under exactOptionalPropertyTypes, carries the MISSING type instead*.
     ; The option is unset in this harness, so the predicate has no live caller; it
     ; is written because its caller's fork is.
+    ; len(getExactOptionalUnassignableProperties(source, target)) != 0
+    function has_exact_optional_unassignable_properties(this, source: ref[Type], target: ref[Type]) returns bool
+    {
+        if Checker.is_tuple_type(source) and Checker.is_tuple_type(target)
+            return false
+        let props this.get_properties_of_type(target)
+        var i 0
+        while i < Checker.symbol_count(props)
+        {
+            let row (props as ref[Array[ref[Symbol]?]])[i]
+            set i: i + 1
+            if row = null
+                continue
+            let tps row as ref[Symbol]
+            let st this.get_type_of_property_of_type(source, Symbol.name_of(tps))
+            let tt this.get_type_of_symbol(tps)
+            if (st <> null) and (tt <> null)
+            {
+                if this.is_exact_optional_property_mismatch(st as ref[Type], tt as ref[Type])
+                    return true
+            }
+        }
+        false
+    }
+
     function is_exact_optional_property_mismatch(this, source: ref[Type], target: ref[Type]) returns bool
     {
         if Checker.maybe_type_of_kind(source, TypeFlagsUndefined) = false
@@ -137679,11 +138362,13 @@ define Checker
                 set param_count: (params as ref[Array[ref[Type]?]]).get_length() as int
             if param_count >= arg_count
             {
-                if type_arguments = null
-                    return d
                 if params = null
                     return d
-                let args this.fill_missing_type_arguments(type_arguments as ref[Array[ref[Type]?]], params as ref[Array[ref[Type]?]], arg_count, in_java_script)
+                ; nil type arguments are an empty list: the defaults are filled in
+                var given: ref[Array[ref[Type]?]]? type_arguments
+                if given = null
+                    set given: this.new_type_list(null)
+                let args this.fill_missing_type_arguments(given as ref[Array[ref[Type]?]], params as ref[Array[ref[Type]?]], arg_count, in_java_script)
                 if this.unported_mark() <> mark
                     return null
                 if args = null
@@ -137701,11 +138386,12 @@ define Checker
                 set tp_count: (tps as ref[Array[ref[Type]?]]).get_length() as int
             if tp_count >= arg_count
             {
-                if type_arguments = null
-                    return this.create_type_reference(d, null, ObjectFlagsNone)
                 if tps = null
                     return this.create_type_reference(d, null, ObjectFlagsNone)
-                let args this.fill_missing_type_arguments(type_arguments as ref[Array[ref[Type]?]], tps as ref[Array[ref[Type]?]], arg_count, in_java_script)
+                var given_i: ref[Array[ref[Type]?]]? type_arguments
+                if given_i = null
+                    set given_i: this.new_type_list(null)
+                let args this.fill_missing_type_arguments(given_i as ref[Array[ref[Type]?]], tps as ref[Array[ref[Type]?]], arg_count, in_java_script)
                 if this.unported_mark() <> mark
                     return null
                 return this.create_type_reference(d, args, ObjectFlagsNone)
@@ -145824,6 +146510,7 @@ define Checker
 
     function get_global_template_strings_array_type(this) returns ref[Type]?
     {
+        this.report_checked_global_type("TemplateStringsArray", 0)
         if global_template_strings_array_type <> null
             return global_template_strings_array_type
         let t this.get_global_type_of_arity("TemplateStringsArray", 0)
@@ -145892,6 +146579,7 @@ define Checker
         if global_extract_symbol_asked
             return global_extract_symbol
         let mark this.unported_mark()
+        this.report_checked_global_type_alias("Extract", 2)
         let s this.get_global_type_alias_symbol("Extract", 2)
         if this.unported_mark() <> mark
             return null
@@ -146350,7 +147038,7 @@ define Checker
                         return Checker.no_iteration_types()
                     if Checker.iteration_types_has_types(one) = false
                     {
-                        this.report_type_not_iterable_error(error_node, t, (iteration_use & IterationUseAllowsAsyncIterablesFlag) <> 0)
+                        this.add_deferred_check(DeferredCheckKindNotIterable, error_node, t, (iteration_use & IterationUseAllowsAsyncIterablesFlag) <> 0)
                         return Checker.no_iteration_types()
                     }
                     rows.add(one)
@@ -146401,7 +147089,7 @@ define Checker
         ; are dropped here (see the chapter header), so the list rewinds to the mark
         ; before the one diagnostic that is compared.
         diagnostics.truncate(diag_mark)
-        this.report_type_not_iterable_error(error_node, t, (iteration_use & IterationUseAllowsAsyncIterablesFlag) <> 0)
+        this.add_deferred_check(DeferredCheckKindNotIterable, error_node, t, (iteration_use & IterationUseAllowsAsyncIterablesFlag) <> 0)
         Checker.no_iteration_types()
     }
 
@@ -146547,6 +147235,10 @@ define Checker
         {
             if all_count <> 0
             {
+                if is_async
+                    this.report_checked_global_type("AsyncIterable", 3)
+                else
+                    this.report_checked_global_type("Iterable", 3)
                 let target this.resolver_get_global_iterable_type(is_async)
                 if this.unported_mark() <> mark
                     return Checker.no_iteration_types()
@@ -147445,6 +148137,7 @@ define Checker
         ; "if we're requesting diagnostics, report errors for a missing `Awaited<T>`."
         if error_node <> null
         {
+            this.report_checked_global_type_alias("Awaited", 1)
             this.get_global_awaited_symbol()
             if this.unported_mark() <> mark
                 return Checker.no_iteration_types()
@@ -147804,6 +148497,7 @@ define Checker
     function try_create_awaited_type(this, t: ref[Type]) returns ref[Type]?
     {
         let mark this.unported_mark()
+        this.report_checked_global_type_alias("Awaited", 1)
         let sym this.get_global_awaited_symbol()
         if this.unported_mark() <> mark
             return null
@@ -148102,6 +148796,7 @@ define Checker
     function create_promise_type(this, promised_type: ref[Type]?) returns ref[Type]?
     {
         let mark this.unported_mark()
+        this.report_checked_global_type("Promise", 1)
         let g this.get_global_promise_type()
         if this.unported_mark() <> mark
             return null
@@ -148132,6 +148827,7 @@ define Checker
     function create_promise_like_type(this, promised_type: ref[Type]?) returns ref[Type]?
     {
         let mark this.unported_mark()
+        this.report_checked_global_type("PromiseLike", 1)
         let g this.get_global_promise_like_type()
         if this.unported_mark() <> mark
             return null
@@ -148180,6 +148876,7 @@ define Checker
             this.error_on_node(fn, code)
             return error_type
         }
+        this.report_checked_global_value("Promise")
         let ctor this.get_global_promise_constructor_symbol()
         if this.unported_mark() <> mark
             return null
@@ -148240,8 +148937,11 @@ define Checker
                 if (gii as ref[Type]) <> empty_generic_type
                     return this.create_type_from_generic_global_type(gii, args)
             }
-            ; "The global Generator type doesn't exist, so report an error" — the
-            ; `_Checked` read, i.e. §3.11's TS2318.
+            ; "The global Generator type doesn't exist, so report an error"
+            if is_async_generator
+                this.report_checked_global_type("AsyncIterableIterator", 3)
+            else
+                this.report_checked_global_type("IterableIterator", 3)
             return empty_object_type
         }
         this.create_type_from_generic_global_type(gg, args)
@@ -148251,6 +148951,7 @@ define Checker
     function create_iterable_type(this, iterated_type: ref[Type]?) returns ref[Type]?
     {
         let mark this.unported_mark()
+        this.report_checked_global_type("Iterable", 3)
         let g this.get_global_iterable_type()
         if this.unported_mark() <> mark
             return null
@@ -148975,6 +149676,7 @@ define Checker
         let rt return_type as ref[Type]
         if this.is_error_type(rt)
             return
+        this.report_checked_global_type("Promise", 1)
         let g this.get_global_promise_type()
         if this.unported_mark() <> mark
             return

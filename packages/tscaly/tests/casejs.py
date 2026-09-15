@@ -196,7 +196,10 @@ def output_name(unit_name, cfg):
 
 
 def allow_js(cfg):
-    return cfg.get("allowjs", "").lower() == "true" or cfg.get("checkjs", "").lower() == "true"
+    """core.CompilerOptions.GetAllowJS: allowJs when set, else checkJs"""
+    if cfg.get("allowjs", "").strip() != "":
+        return cfg.get("allowjs", "").strip().lower() == "true"
+    return cfg.get("checkjs", "").lower() == "true"
 
 
 def declaration_on(cfg):
@@ -478,8 +481,8 @@ def case_links(text):
 
 def options_string(cfg):
     items = dict(cfg)
-    if allow_js(cfg):
-        items["allowjs"] = "true"     # GetAllowJS: checkJs implies allowJs
+    if allow_js(cfg) and "allowjs" not in items:
+        items["allowjs"] = "true"     # GetAllowJS: checkJs implies an unset allowJs
     return ";".join("%s=%s" % (k, str(v).strip() if k in TEXT_OPTIONS else str(v).strip().lower()) for k, v in sorted(items.items()))
 
 

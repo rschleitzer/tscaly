@@ -34,12 +34,19 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 PRETTY_RE = re.compile(r"^(\S.*?):(\d+):(\d+) - (error|warning|message) TS(\d+): ")
 PRETTY_GLOBAL_RE = re.compile(r"^(error|warning|message) TS(\d+): ")
 
-# compiler/program.go plainJSErrors
-PLAIN_JS_ERRORS = {1013, 1014, 1048, 1049, 1053, 1054, 1091, 1100, 1101, 1102, 1104, 1105, 1106, 1107, 1113, 1114,
-                   1115, 1116, 1162, 1171, 1174, 1182, 1184, 1186, 1188, 1189, 1190, 1191, 1193, 1197, 1200, 1210,
-                   1211, 1214, 1215, 1248, 1255, 1258, 1262, 1312, 1325, 1344, 1358, 1359, 1450, 1451, 1473, 1474,
-                   2451, 2462, 2492, 2501, 2528, 2566, 2633, 2752, 2753, 2803, 17000, 17001, 18006, 18007, 18012,
-                   18013, 18016, 18036, 18038, 18041}
+# compiler/program.go plainJSErrors, read in place: the message names mapped to their codes through
+# diagnostics_generated.go (a hand-copied list had lost 23 of the 91)
+def plain_js_errors():
+    ref = os.path.join(PKG, "_submodules", "typescript-go", "internal")
+    src = open(os.path.join(ref, "compiler", "program.go")).read()
+    block = src[src.index("var plainJSErrors = collections.NewSetFromItems("):]
+    block = block[:block.index("\n)")]
+    gen = open(os.path.join(ref, "diagnostics", "diagnostics_generated.go")).read()
+    codes = {m.group(1): int(m.group(2)) for m in re.finditer(r"^var (\w+) = &Message\{code: (\d+)", gen, re.M)}
+    return {codes[n] for n in re.findall(r"diagnostics\.(\w+)\.Code\(\)", block)}
+
+
+PLAIN_JS_ERRORS = plain_js_errors()
 
 
 def expected_errors(path):
@@ -323,37 +330,25 @@ def main():
         rc, body, err = answers.get(plan["vpath"], (None, b"", b""))
         verdict, detail = "MATCH", ""
         ours = collections.Counter()
+        # harnessutil compiles twice — a pre-emit program and a post-emit one whose
+        # Emit runs first — and keeps the SHORTER diagnostic list (the post one on a
+        # tie); the dump answers the second after a TSCALY-POST marker
+        post_body = None
+        marker = b"==== TSCALY-FILE TSCALY-POST\n"
+        if marker in body:
+            body, post_body = body.split(marker, 1)
         if rc is None or rc != 0:
             verdict, detail = "CRASH", "rc %s: %s" % (rc, (err.decode("utf-8", "replace").strip().split("\n") or [""])[-1][:120])
         elif body.startswith(b"UNPORTED "):
             verdict, detail = "UNPORTED", body.decode("utf-8", "replace").split("\n")[0]
+        elif post_body is not None and post_body.startswith(b"UNPORTED "):
+            verdict, detail = "UNPORTED", "post-emit " + post_body.decode("utf-8", "replace").split("\n")[0]
         else:
-            for path, entry in parse_answer(body).items():
-                if path.startswith("TSCALY-DECL "):
-                    dpath = path[len("TSCALY-DECL "):]
-                    dtext = plan["texts"].get(dpath)
-                    if dtext is not None:
-                        dshown = casejs.remove_test_path_prefixes(dpath)
-                        for pos, end, code in entry["X"]:
-                            line, col = line_col(dtext, pos)
-                            ours[(dshown, line, col, code)] += 1
-                    continue
-                if path == "TSCALY-GLOBAL":
-                    for _, _, code in entry["G"]:
-                        ours[("", 0, 0, code)] += 1
-                    continue
-                text = plan["texts"].get(path)
-                if text is None:
-                    continue
-                shown = casejs.remove_test_path_prefixes(path)
-                if casejs.is_config_unit(path):
-                    for pos, end, code in entry["P"]:
-                        line, col = line_col(text, pos)
-                        ours[(shown, line, col, code)] += 1
-                    continue
-                for pos, end, code in compose(path, entry, plan["cfg"], text):
-                    line, col = line_col(text, pos)
-                    ours[(shown, line, col, code)] += 1
+            ours = answer_counter(plan, body)
+            if post_body is not None:
+                post = answer_counter(plan, post_body)
+                if sum(post.values()) <= sum(ours.values()):
+                    ours = post
             exp = plan["expected"]
             # the port has no message text: a key counts once on each side
             if set(ours) != set(exp):
@@ -373,7 +368,42 @@ def main():
             print("==== %s %s" % (plan["case"], plan["config"]))
             print("  expected", sorted(plan["expected"]))
             print("  ours    ", sorted(ours))
+    report(args, plans, counts, skips, stops, missing_codes, extra_codes, verdicts)
 
+
+def answer_counter(plan, body):
+    """one program's answer → Counter of (file, line, col, code)"""
+    ours = collections.Counter()
+    for path, entry in parse_answer(body).items():
+        if path.startswith("TSCALY-DECL "):
+            dpath = path[len("TSCALY-DECL "):]
+            dtext = plan["texts"].get(dpath)
+            if dtext is not None:
+                dshown = casejs.remove_test_path_prefixes(dpath)
+                for pos, end, code in entry["X"]:
+                    line, col = line_col(dtext, pos)
+                    ours[(dshown, line, col, code)] += 1
+            continue
+        if path == "TSCALY-GLOBAL":
+            for _, _, code in entry["G"]:
+                ours[("", 0, 0, code)] += 1
+            continue
+        text = plan["texts"].get(path)
+        if text is None:
+            continue
+        shown = casejs.remove_test_path_prefixes(path)
+        if casejs.is_config_unit(path):
+            for pos, end, code in entry["P"]:
+                line, col = line_col(text, pos)
+                ours[(shown, line, col, code)] += 1
+            continue
+        for pos, end, code in compose(path, entry, plan["cfg"], text):
+            line, col = line_col(text, pos)
+            ours[(shown, line, col, code)] += 1
+    return ours
+
+
+def report(args, plans, counts, skips, stops, missing_codes, extra_codes, verdicts):
     print()
     print("caseerrors yardstick — %d (case, configuration) pairs against the reference error baselines" % len(plans))
     for k in ("MATCH", "UNPORTED", "FAIL", "CRASH"):
