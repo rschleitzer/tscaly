@@ -1,0 +1,630 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; diagnosticwriter — internal/diagnosticwriter/diagnosticwriter.go: a diagnostic as a
+; terminal prints it (the plain `file(line,col): error TSn: message` line and the
+; pretty form with its colours, code snippet and related information), the error
+; summary, and diagnostics.Format.
+;
+; ★ A driver diagnostic carries its file's NAME and TEXT rather than a source file:
+; everything the writer asks of `FileLike` is those two and the ECMA line map, which
+; is computed from the text where the reference caches it on the file.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use tscaly.Diagnostics.ChainLine
+use tscaly.DiagnosticMessages.DiagnosticMessages
+use tscaly.printer.Printer
+use tscaly.printer.TextWriter
+
+define DriverDiagnostic
+(
+    ; the file's name, empty for a diagnostic without a file
+    file_name: Slice[char]
+    text: Slice[char]
+    pos: int
+    end: int
+    code: int
+    args: ref[Array[String]]?
+    chain: ref[Array[ChainLine]]?
+    related: ref[Array[ref[DriverDiagnostic]]]?
+)
+{
+    function has_file(this) returns bool
+        (file_name.length as int) > 0
+
+    function category(this) returns int
+        DiagnosticMessages.category_of(code)
+}
+
+define DiagnosticWriter (reserved: int)
+{
+    ; diagnostics.Format over the message table's text
+    function format_message(code: int, args: ref[Array[String]]?) returns String
+    {
+        let text DiagnosticMessages.text_of(code)
+        var sb StringBuilder()
+        if args = null
+        {
+            sb.append(text.data, text.length)
+            return sb.to_string()
+        }
+        let list args as ref[Array[String]]
+        let n text.length as int
+        var i 0
+        while i < n
+        {
+            let c DiagnosticWriter.byte_at(text, i)
+            if c = 123
+            {
+                var j i + 1
+                var index 0
+                var digits 0
+                while (j < n) and (DiagnosticWriter.byte_at(text, j) >= 48) and (DiagnosticWriter.byte_at(text, j) <= 57)
+                {
+                    set index: index * 10 + (DiagnosticWriter.byte_at(text, j) - 48)
+                    set digits: digits + 1
+                    set j: j + 1
+                }
+                if (digits > 0) and (j < n) and (DiagnosticWriter.byte_at(text, j) = 125) and (index < (list.get_length() as int))
+                {
+                    let arg list[index as size_t]
+                    DiagnosticWriter.append_valid_utf8(&sb, Slice[char](arg.get_length(), arg.get_buffer() as pointer[char]))
+                    set i: j + 1
+                    continue
+                }
+            }
+            sb.append(c as char)
+            set i: i + 1
+        }
+        sb.to_string()
+    }
+
+    ; strings.ToValidUTF8(s, "\uFFFD"): each run of invalid bytes one replacement
+    procedure append_valid_utf8(sb: ref[StringBuilder], s: Slice[char])
+    {
+        let n s.length as int
+        var i 0
+        var in_invalid false
+        while i < n
+        {
+            let c DiagnosticWriter.byte_at(s, i)
+            var size 0
+            if c < 128
+                set size: 1
+            else
+            {
+                var need 0
+                var lo 128
+                var hi 191
+                if (c >= 194) and (c <= 223)
+                    set need: 1
+                if (c >= 224) and (c <= 239)
+                {
+                    set need: 2
+                    if c = 224
+                        set lo: 160
+                    if c = 237
+                        set hi: 159
+                }
+                if (c >= 240) and (c <= 244)
+                {
+                    set need: 3
+                    if c = 240
+                        set lo: 144
+                    if c = 244
+                        set hi: 143
+                }
+                if (need > 0) and ((i + need) < n)
+                {
+                    var ok true
+                    var k 1
+                    while k <= need
+                    {
+                        let b DiagnosticWriter.byte_at(s, i + k)
+                        var blo 128
+                        var bhi 191
+                        if k = 1
+                        {
+                            set blo: lo
+                            set bhi: hi
+                        }
+                        if (b < blo) or (b > bhi)
+                            set ok: false
+                        set k: k + 1
+                    }
+                    if ok
+                        set size: need + 1
+                }
+            }
+            if size = 0
+            {
+                if in_invalid = false
+                {
+                    sb.append(0xEF as char)
+                    sb.append(0xBF as char)
+                    sb.append(0xBD as char)
+                }
+                set in_invalid: true
+                set i: i + 1
+                continue
+            }
+            set in_invalid: false
+            var k 0
+            while k < size
+            {
+                sb.append(*(s.data + i + k))
+                set k: k + 1
+            }
+            set i: i + size
+        }
+    }
+
+    function byte_at(s: Slice[char], i: int) returns int
+        (*(s.data + i) as int) & 255
+
+    ; diagnostics.Category.Name
+    function category_name(category: int) returns Slice[char]
+    {
+        if category = 0
+            return "warning"
+        if category = 1
+            return "error"
+        if category = 2
+            return "suggestion"
+        "message"
+    }
+
+    ; getCategoryFormat
+    function category_format(category: int) returns Slice[char]
+    {
+        if category = 0
+            return "\u001b[93m"
+        if category = 1
+            return "\u001b[91m"
+        if category = 2
+            return "\u001b[90m"
+        "\u001b[94m"
+    }
+
+    ; WriteFlattenedDiagnosticMessage
+    procedure write_flattened_message(out: ref[StringBuilder], d: ref[DriverDiagnostic], new_line: Slice[char])
+    {
+        out.append(DiagnosticWriter.format_message(d.code, d.args))
+        if d.chain = null
+            return
+        let lines d.chain as ref[Array[ChainLine]]
+        var i 0
+        while i < (lines.get_length() as int)
+        {
+            let line lines[i as size_t]
+            set i: i + 1
+            out.append(new_line.data, new_line.length)
+            var k 0
+            while k < line.level
+            {
+                out.append("  ")
+                set k: k + 1
+            }
+            out.append(DiagnosticWriter.format_message(line.code, line.args))
+        }
+    }
+
+    ; the ECMA line of `pos` over `starts`
+    function line_of(starts: ref[Array[int]], pos: int) returns int
+    {
+        var lo 0
+        var hi (starts.get_length() as int) - 1
+        while lo < hi
+        {
+            let mid (lo + hi + 1) / 2
+            if starts[mid as size_t] <= pos
+                set lo: mid
+            else
+                set hi: mid - 1
+        }
+        lo
+    }
+
+    ; tspath.ConvertToRelativePath
+    function relative_file_name(host: ref[Page], file_name: Slice[char], cwd: Slice[char]) returns Slice[char]
+    {
+        if is_rooted_disk_path(file_name) = false
+            return file_name
+        get_relative_path_to_directory_or_url(host, cwd, file_name, false, cwd)
+    }
+
+    procedure write_with_style(out: ref[StringBuilder], text: Slice[char], style: Slice[char])
+    {
+        out.append(style.data, style.length)
+        out.append(text.data, text.length)
+        out.append("\u001b[0m")
+    }
+
+    ; WriteLocation
+    procedure write_location(host: ref[Page], out: ref[StringBuilder], d: ref[DriverDiagnostic], pos: int, cwd: Slice[char])
+    {
+        let starts Printer.compute_ecma_line_starts(host, d.text)
+        let line DiagnosticWriter.line_of(starts, pos)
+        let character TextWriter.utf16_len_of(d.text, starts[line as size_t], pos)
+        DiagnosticWriter.write_with_style(out, DiagnosticWriter.relative_file_name(host, d.file_name, cwd), "\u001b[96m")
+        out.append(":" as char)
+        var line_text StringBuilder()
+        line_text.append(line + 1)
+        let lt line_text.to_string()
+        DiagnosticWriter.write_with_style(out, Slice[char](lt.get_length(), lt.get_buffer() as pointer[char]), "\u001b[93m")
+        out.append(":" as char)
+        var char_text StringBuilder()
+        char_text.append(character + 1)
+        let ct char_text.to_string()
+        DiagnosticWriter.write_with_style(out, Slice[char](ct.get_length(), ct.get_buffer() as pointer[char]), "\u001b[93m")
+    }
+
+    procedure repeat_char(out: ref[StringBuilder], c: char, n: int)
+    {
+        var i 0
+        while i < n
+        {
+            out.append(c)
+            set i: i + 1
+        }
+    }
+
+    ; `%*d` and `%*s`: right-aligned in `width`
+    procedure write_padded(out: ref[StringBuilder], text: String, width: int)
+    {
+        DiagnosticWriter.repeat_char(out, " " as char, width - (text.get_length() as int))
+        out.append(text)
+    }
+
+    function digits_of(n: int) returns int
+    {
+        var sb StringBuilder()
+        sb.append(n)
+        sb.to_string().get_length() as int
+    }
+
+    function is_space_byte(c: int) returns bool
+        (c = 32) or (c = 9) or (c = 10) or (c = 13) or (c = 11) or (c = 12)
+
+    ; writeCodeSnippet
+    procedure write_code_snippet(host: ref[Page], out: ref[StringBuilder], d: ref[DriverDiagnostic], start: int, length: int, squiggle_color: Slice[char], indent: Slice[char], new_line: Slice[char])
+    {
+        let text d.text
+        let starts Printer.compute_ecma_line_starts(host, text)
+        let first_line DiagnosticWriter.line_of(starts, start)
+        let first_line_char TextWriter.utf16_len_of(text, starts[first_line as size_t], start)
+        let last_line DiagnosticWriter.line_of(starts, start + length)
+        var last_line_char TextWriter.utf16_len_of(text, starts[last_line as size_t], start + length)
+        if length = 0
+            set last_line_char: last_line_char + 1
+        let last_line_of_file DiagnosticWriter.line_of(starts, text.length as int)
+        let more_than_five (last_line - first_line) >= 4
+        var gutter_width DiagnosticWriter.digits_of(last_line + 1)
+        if more_than_five and (gutter_width < 3)
+            set gutter_width: 3
+        var i first_line
+        while i <= last_line
+        {
+            out.append(new_line.data, new_line.length)
+            if more_than_five and ((first_line + 1) < i) and (i < (last_line - 1))
+            {
+                out.append(indent.data, indent.length)
+                out.append("\u001b[7m")
+                DiagnosticWriter.write_padded(out, String("..."), gutter_width)
+                out.append("\u001b[0m")
+                out.append(" ")
+                out.append(new_line.data, new_line.length)
+                set i: last_line - 1
+            }
+            let line_start starts[i as size_t]
+            var line_end text.length as int
+            if i < last_line_of_file
+                set line_end: starts[(i + 1) as size_t]
+            var trimmed_end line_end
+            while (trimmed_end > line_start) and DiagnosticWriter.is_space_byte(DiagnosticWriter.byte_at(text, trimmed_end - 1))
+                set trimmed_end: trimmed_end - 1
+            var line_content StringBuilder()
+            var p line_start
+            while p < trimmed_end
+            {
+                let c DiagnosticWriter.byte_at(text, p)
+                if c = 9
+                    line_content.append(" " as char)
+                else
+                    line_content.append(c as char)
+                set p: p + 1
+            }
+            let content line_content.to_string()
+            out.append(indent.data, indent.length)
+            out.append("\u001b[7m")
+            var num StringBuilder()
+            num.append(i + 1)
+            DiagnosticWriter.write_padded(out, num.to_string(), gutter_width)
+            out.append("\u001b[0m")
+            out.append(" ")
+            out.append(content)
+            out.append(new_line.data, new_line.length)
+            out.append(indent.data, indent.length)
+            out.append("\u001b[7m")
+            DiagnosticWriter.write_padded(out, String(""), gutter_width)
+            out.append("\u001b[0m")
+            out.append(" ")
+            out.append(squiggle_color.data, squiggle_color.length)
+            let content_units TextWriter.utf16_len_of(Slice[char](content.get_length(), content.get_buffer() as pointer[char]), 0, content.get_length() as int)
+            if i = first_line
+            {
+                var last_char_for_line content_units
+                if i = last_line
+                    set last_char_for_line: last_line_char
+                DiagnosticWriter.repeat_char(out, " " as char, first_line_char)
+                DiagnosticWriter.repeat_char(out, "~" as char, last_char_for_line - first_line_char)
+            }
+            else
+            {
+                if i = last_line
+                    DiagnosticWriter.repeat_char(out, "~" as char, last_line_char)
+                else
+                    DiagnosticWriter.repeat_char(out, "~" as char, content_units)
+            }
+            out.append("\u001b[0m")
+            set i: i + 1
+        }
+    }
+
+    ; FormatDiagnosticWithColorAndContext
+    procedure format_with_color_and_context(host: ref[Page], out: ref[StringBuilder], d: ref[DriverDiagnostic], cwd: Slice[char], new_line: Slice[char])
+    {
+        if d.has_file()
+        {
+            DiagnosticWriter.write_location(host, out, d, d.pos, cwd)
+            out.append(" - ")
+        }
+        let category d.category()
+        DiagnosticWriter.write_with_style(out, DiagnosticWriter.category_name(category), DiagnosticWriter.category_format(category))
+        out.append("\u001b[90m TS")
+        out.append(d.code)
+        out.append(": \u001b[0m")
+        DiagnosticWriter.write_flattened_message(out, d, new_line)
+        ; File_appears_to_be_binary (1490) prints no snippet
+        if d.has_file() and (d.code <> 1490)
+        {
+            out.append(new_line.data, new_line.length)
+            DiagnosticWriter.write_code_snippet(host, out, d, d.pos, d.end - d.pos, DiagnosticWriter.category_format(category), "", new_line)
+            out.append(new_line.data, new_line.length)
+        }
+        if d.related <> null
+        {
+            let related d.related as ref[Array[ref[DriverDiagnostic]]]
+            var i 0
+            while i < (related.get_length() as int)
+            {
+                let r related[i as size_t]
+                set i: i + 1
+                if r.has_file()
+                {
+                    out.append(new_line.data, new_line.length)
+                    out.append("  ")
+                    DiagnosticWriter.write_location(host, out, r, r.pos, cwd)
+                    out.append(" - ")
+                    DiagnosticWriter.write_flattened_message(out, r, new_line)
+                    DiagnosticWriter.write_code_snippet(host, out, r, r.pos, r.end - r.pos, "\u001b[96m", "    ", new_line)
+                }
+                out.append(new_line.data, new_line.length)
+            }
+        }
+    }
+
+    ; WriteFormatDiagnostic
+    procedure write_format_diagnostic(host: ref[Page], out: ref[StringBuilder], d: ref[DriverDiagnostic], cwd: Slice[char], new_line: Slice[char])
+    {
+        if d.has_file()
+        {
+            let starts Printer.compute_ecma_line_starts(host, d.text)
+            let line DiagnosticWriter.line_of(starts, d.pos)
+            let character TextWriter.utf16_len_of(d.text, starts[line as size_t], d.pos)
+            let name DiagnosticWriter.relative_file_name(host, d.file_name, cwd)
+            out.append(name.data, name.length)
+            out.append("(" as char)
+            out.append(line + 1)
+            out.append("," as char)
+            out.append(character + 1)
+            out.append("): ")
+        }
+        let category_name DiagnosticWriter.category_name(d.category())
+        out.append(category_name.data, category_name.length)
+        out.append(" TS")
+        out.append(d.code)
+        out.append(": ")
+        DiagnosticWriter.write_flattened_message(out, d, new_line)
+        out.append(new_line.data, new_line.length)
+    }
+
+    ; prettyPathForFileError over the file's first error
+    procedure pretty_path_for_file_error(host: ref[Page], out: ref[StringBuilder], d: ref[DriverDiagnostic], cwd: Slice[char])
+    {
+        let starts Printer.compute_ecma_line_starts(host, d.text)
+        let line DiagnosticWriter.line_of(starts, d.pos)
+        var name d.file_name
+        if is_rooted_disk_path(name) and is_rooted_disk_path(cwd)
+            set name: DiagnosticWriter.relative_file_name(host, d.file_name, cwd)
+        out.append(name.data, name.length)
+        out.append("\u001b[90m:")
+        out.append(line + 1)
+        out.append("\u001b[0m")
+    }
+
+    ; WriteErrorSummaryText
+    procedure write_error_summary(host: ref[Page], out: ref[StringBuilder], diags: ref[Array[ref[DriverDiagnostic]]], cwd: Slice[char], new_line: Slice[char])
+    {
+        var total 0
+        var global_errors 0
+        ; the files with errors, each by its first error, sorted by name
+        let files &Array[ref[DriverDiagnostic]]^host()
+        let counts &Array[int]^host()
+        var i 0
+        while i < (diags.get_length() as int)
+        {
+            let d diags[i as size_t]
+            set i: i + 1
+            if d.category() <> 1
+                continue
+            set total: total + 1
+            if d.has_file() = false
+            {
+                set global_errors: global_errors + 1
+                continue
+            }
+            var found 0 - 1
+            var k 0
+            while k < (files.get_length() as int)
+            {
+                let f files[k as size_t]
+                if f.file_name.equals(d.file_name)
+                    set found: k
+                set k: k + 1
+            }
+            if found < 0
+            {
+                files.add(d)
+                counts.add(1)
+            }
+            else
+                counts.put(found as size_t, counts[found as size_t] + 1)
+        }
+        if total = 0
+            return
+        ; sort by file name (insertion sort, stable)
+        var a 1
+        while a < (files.get_length() as int)
+        {
+            var b a
+            while b > 0
+            {
+                let x files[(b - 1) as size_t]
+                let y files[b as size_t]
+                if DiagnosticWriter.compare_bytes(x.file_name, y.file_name) <= 0
+                    break
+                files.put((b - 1) as size_t, y)
+                files.put(b as size_t, x)
+                let cx counts[(b - 1) as size_t]
+                counts.put((b - 1) as size_t, counts[b as size_t])
+                counts.put(b as size_t, cx)
+                set b: b - 1
+            }
+            set a: a + 1
+        }
+        let erroring files.get_length() as int
+        var message StringBuilder()
+        if total = 1
+        {
+            if (global_errors > 0) or (erroring = 0)
+                message.append(DiagnosticWriter.format_message(6216, null))
+            else
+            {
+                var first StringBuilder()
+                DiagnosticWriter.pretty_path_for_file_error(host, &first, files[0], cwd)
+                let args &Array[String]^host()
+                let fa String^host(first.to_string())
+                args.add(fa)
+                message.append(DiagnosticWriter.format_message(6259, args))
+            }
+        }
+        else
+        {
+            let args &Array[String]^host()
+            var total_text StringBuilder()
+            total_text.append(total)
+            let ta String^host(total_text.to_string())
+            args.add(ta)
+            if erroring = 0
+                message.append(DiagnosticWriter.format_message(6217, args))
+            if erroring = 1
+            {
+                var first StringBuilder()
+                DiagnosticWriter.pretty_path_for_file_error(host, &first, files[0], cwd)
+                let fa String^host(first.to_string())
+                args.add(fa)
+                message.append(DiagnosticWriter.format_message(6260, args))
+            }
+            if erroring > 1
+            {
+                var count_text StringBuilder()
+                count_text.append(erroring)
+                let ca String^host(count_text.to_string())
+                args.add(ca)
+                message.append(DiagnosticWriter.format_message(6261, args))
+            }
+        }
+        out.append(new_line.data, new_line.length)
+        out.append(message.to_string())
+        out.append(new_line.data, new_line.length)
+        out.append(new_line.data, new_line.length)
+        if erroring > 1
+        {
+            DiagnosticWriter.write_tabular_errors(host, out, files, counts, cwd, new_line)
+            out.append(new_line.data, new_line.length)
+        }
+    }
+
+    ; writeTabularErrorsDisplay
+    procedure write_tabular_errors(host: ref[Page], out: ref[StringBuilder], files: ref[Array[ref[DriverDiagnostic]]], counts: ref[Array[int]], cwd: Slice[char], new_line: Slice[char])
+    {
+        var max_errors 0
+        var i 0
+        while i < (counts.get_length() as int)
+        {
+            if counts[i as size_t] > max_errors
+                set max_errors: counts[i as size_t]
+            set i: i + 1
+        }
+        let header DiagnosticMessages.text_of(6041)
+        var heading_length 0
+        while (heading_length < (header.length as int)) and (DiagnosticWriter.byte_at(header, heading_length) <> 32)
+            set heading_length: heading_length + 1
+        let biggest DiagnosticWriter.digits_of(max_errors)
+        var left_padding_goal heading_length
+        if biggest > left_padding_goal
+            set left_padding_goal: biggest
+        var header_padding biggest - heading_length
+        if header_padding < 0
+            set header_padding: 0
+        DiagnosticWriter.repeat_char(out, " " as char, header_padding)
+        out.append(header.data, header.length)
+        out.append(new_line.data, new_line.length)
+        set i: 0
+        while i < (files.get_length() as int)
+        {
+            var num StringBuilder()
+            num.append(counts[i as size_t])
+            DiagnosticWriter.write_padded(out, num.to_string(), left_padding_goal)
+            out.append("  ")
+            DiagnosticWriter.pretty_path_for_file_error(host, out, files[i as size_t], cwd)
+            out.append(new_line.data, new_line.length)
+            set i: i + 1
+        }
+    }
+
+    function compare_bytes(a: Slice[char], b: Slice[char]) returns int
+    {
+        let n a.length as int
+        let m b.length as int
+        var i 0
+        while (i < n) and (i < m)
+        {
+            let x DiagnosticWriter.byte_at(a, i)
+            let y DiagnosticWriter.byte_at(b, i)
+            if x < y
+                return 0 - 1
+            if x > y
+                return 1
+            set i: i + 1
+        }
+        if n < m
+            return 0 - 1
+        if n > m
+            return 1
+        0
+    }
+}

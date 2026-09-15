@@ -1,0 +1,812 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; buildinfojson — a JSON value tree as text (internal/json over go-json-experiment's
+; encoder: Marshal and MarshalIndent), and tsctests' readable build info
+; (readablebuildinfo.go), which the test system writes beside every .tsbuildinfo.
+;
+; ★ The build info is a JsonValue tree on both sides of the port: the incremental
+; program builds it in the field order of incremental.BuildInfo and writes it
+; compact, the harness parses the text and re-marshals it (testFs's version swap)
+; and converts it to the readable form. A struct in the reference, a tree here —
+; what is observable is the text, and a tree built in the struct's field order with
+; its `omitzero` members left out serializes to the same bytes.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use tscaly.program.JsonValue
+use tscaly.program.JsonParser
+
+define JsonText (reserved: int)
+{
+    ; ── construction ─────────────────────────────────────────────────────────
+
+    function new_object(host: ref[Page]) returns ref[JsonValue]
+        &JsonValue^host(JsonKindObject, Slice[char](), false, &Array[Slice[char]]^host(), &Array[ref[JsonValue]?]^host())
+
+    function new_array(host: ref[Page]) returns ref[JsonValue]
+        &JsonValue^host(JsonKindArray, Slice[char](), false, null, &Array[ref[JsonValue]?]^host())
+
+    function new_string(host: ref[Page], s: Slice[char]) returns ref[JsonValue]
+        &JsonValue^host(JsonKindString, s, false, null, null)
+
+    function new_bool(host: ref[Page], b: bool) returns ref[JsonValue]
+        &JsonValue^host(JsonKindBoolean, Slice[char](), b, null, null)
+
+    function new_number(host: ref[Page], n: int) returns ref[JsonValue]
+    {
+        var sb StringBuilder()
+        sb.append(n)
+        let s String^host(sb.to_string())
+        &JsonValue^host(JsonKindNumber, Slice[char](s.get_length(), s.get_buffer() as pointer[char]), false, null, null)
+    }
+
+    procedure put_member(obj: ref[JsonValue], key: Slice[char], value: ref[JsonValue])
+    {
+        let keys obj.keys as ref[Array[Slice[char]]]
+        let values obj.values as ref[Array[ref[JsonValue]?]]
+        keys.add(key)
+        values.add(value)
+    }
+
+    procedure push(arr: ref[JsonValue], value: ref[JsonValue])
+    {
+        let values arr.values as ref[Array[ref[JsonValue]?]]
+        values.add(value)
+    }
+
+    ; a number member's value, 0 when absent or not a number
+    function int_of(v: ref[JsonValue]?) returns int
+    {
+        if v = null
+            return 0
+        let jv v as ref[JsonValue]
+        if jv.kind <> JsonKindNumber
+            return 0
+        var n 0
+        var neg false
+        var i 0
+        while i < (jv.text.length as int)
+        {
+            let c *(jv.text.data + i) as int
+            if c = 45
+                set neg: true
+            if (c >= 48) and (c <= 57)
+                set n: n * 10 + (c - 48)
+            if (c = 46) or (c = 101) or (c = 69)
+                break
+            set i: i + 1
+        }
+        if neg
+            return 0 - n
+        n
+    }
+
+    function member_int(obj: ref[JsonValue], key: Slice[char]) returns int
+        JsonText.int_of(obj.get(key))
+
+    function member_bool(obj: ref[JsonValue], key: Slice[char]) returns bool
+    {
+        let v obj.get(key)
+        if v = null
+            return false
+        let jv v as ref[JsonValue]
+        (jv.kind = JsonKindBoolean) and jv.truth
+    }
+
+    ; ── the text ─────────────────────────────────────────────────────────────
+
+    function to_text(host: ref[Page], v: ref[JsonValue], indent: bool) returns Slice[char]
+    {
+        var sb StringBuilder()
+        JsonText.write(&sb, v, indent, 0)
+        let s String^host(sb.to_string())
+        Slice[char](s.get_length(), s.get_buffer() as pointer[char])
+    }
+
+    procedure newline_indent(sb: ref[StringBuilder], depth: int)
+    {
+        sb.append("\n" as char)
+        var i 0
+        while i < depth
+        {
+            sb.append("  ")
+            set i: i + 1
+        }
+    }
+
+    procedure write(sb: ref[StringBuilder], v_opt: ref[JsonValue]?, indent: bool, depth: int)
+    {
+        if v_opt = null
+        {
+            sb.append("null")
+            return
+        }
+        let v v_opt as ref[JsonValue]
+        if (v.kind = JsonKindNull) or (v.kind = JsonKindAbsent)
+        {
+            sb.append("null")
+            return
+        }
+        if v.kind = JsonKindBoolean
+        {
+            if v.truth
+                sb.append("true")
+            else
+                sb.append("false")
+            return
+        }
+        if v.kind = JsonKindNumber
+        {
+            sb.append(v.text.data, v.text.length)
+            return
+        }
+        if v.kind = JsonKindString
+        {
+            JsonText.quote(sb, v.text)
+            return
+        }
+        let n v.size()
+        if v.kind = JsonKindArray
+        {
+            if n = 0
+            {
+                sb.append("[]")
+                return
+            }
+            sb.append("[" as char)
+            var i 0
+            while i < n
+            {
+                if i > 0
+                    sb.append("," as char)
+                if indent
+                    JsonText.newline_indent(sb, depth + 1)
+                JsonText.write(sb, v.value_at(i), indent, depth + 1)
+                set i: i + 1
+            }
+            if indent
+                JsonText.newline_indent(sb, depth)
+            sb.append("]" as char)
+            return
+        }
+        if n = 0
+        {
+            sb.append("{}")
+            return
+        }
+        sb.append("{" as char)
+        var k 0
+        while k < n
+        {
+            if k > 0
+                sb.append("," as char)
+            if indent
+                JsonText.newline_indent(sb, depth + 1)
+            JsonText.quote(sb, v.key_at(k))
+            sb.append(":" as char)
+            if indent
+                sb.append(" " as char)
+            JsonText.write(sb, v.value_at(k), indent, depth + 1)
+            set k: k + 1
+        }
+        if indent
+            JsonText.newline_indent(sb, depth)
+        sb.append("}" as char)
+    }
+
+    ; the length of the valid UTF-8 sequence at `i`, 0 when the byte starts none
+    function utf8_length(s: Slice[char], i: int) returns int
+    {
+        let n s.length as int
+        let c *(s.data + i) as int
+        var need 0
+        var lo 128
+        var hi 191
+        if (c >= 194) and (c <= 223)
+            set need: 1
+        if (c >= 224) and (c <= 239)
+        {
+            set need: 2
+            if c = 224
+                set lo: 160
+            if c = 237
+                set hi: 159
+        }
+        if (c >= 240) and (c <= 244)
+        {
+            set need: 3
+            if c = 240
+                set lo: 144
+            if c = 244
+                set hi: 143
+        }
+        if need = 0
+            return 0
+        if (i + need) >= n
+            return 0
+        var k 1
+        while k <= need
+        {
+            let d *(s.data + i + k) as int
+            if k = 1
+            {
+                if (d < lo) or (d > hi)
+                    return 0
+            }
+            else
+            {
+                if (d < 128) or (d > 191)
+                    return 0
+            }
+            set k: k + 1
+        }
+        need + 1
+    }
+
+    ; jsonwire.AppendQuote without EscapeForHTML/EscapeForJS: `"`, `\` and the
+    ; control characters escaped, each invalid byte a U+FFFD
+    procedure quote(sb: ref[StringBuilder], s: Slice[char])
+    {
+        sb.append("\"" as char)
+        let n s.length as int
+        var i 0
+        while i < n
+        {
+            let c *(s.data + i) as int
+            if c < 128
+            {
+                if c = 34
+                    sb.append("\\\"")
+                else
+                {
+                    if c = 92
+                        sb.append("\\\\")
+                    else
+                    {
+                        if c < 32
+                            JsonText.escape_control(sb, c)
+                        else
+                            sb.append(c as char)
+                    }
+                }
+                set i: i + 1
+                continue
+            }
+            let len JsonText.utf8_length(s, i)
+            if len = 0
+            {
+                sb.append(239 as char)
+                sb.append(191 as char)
+                sb.append(189 as char)
+                set i: i + 1
+                continue
+            }
+            var k 0
+            while k < len
+            {
+                sb.append(*(s.data + i + k))
+                set k: k + 1
+            }
+            set i: i + len
+        }
+        sb.append("\"" as char)
+    }
+
+    procedure escape_control(sb: ref[StringBuilder], c: int)
+    {
+        if c = 8
+        {
+            sb.append("\\b")
+            return
+        }
+        if c = 12
+        {
+            sb.append("\\f")
+            return
+        }
+        if c = 10
+        {
+            sb.append("\\n")
+            return
+        }
+        if c = 13
+        {
+            sb.append("\\r")
+            return
+        }
+        if c = 9
+        {
+            sb.append("\\t")
+            return
+        }
+        sb.append("\\u00")
+        let digits: Slice[char] "0123456789abcdef"
+        sb.append(*(digits.data + (c / 16)))
+        sb.append(*(digits.data + (c % 16)))
+    }
+}
+
+; tsctests' readableBuildInfo over a parsed build info
+define ReadableBuildInfo
+(
+    host: ref[Page]
+    info: ref[JsonValue]
+    file_names: ref[JsonValue]?
+    file_ids_list: ref[JsonValue]?
+)
+{
+    function file_name(this, id: int) returns ref[JsonValue]
+    {
+        if file_names = null
+            return JsonText.new_string(host, "")
+        let names file_names as ref[JsonValue]
+        let v names.value_at(id - 1)
+        if v = null
+            return JsonText.new_string(host, "")
+        v as ref[JsonValue]
+    }
+
+    ; toReadableBuildInfo(buildInfo, buildInfoText)
+    function convert(host: ref[Page], info: ref[JsonValue], text: Slice[char]) returns Slice[char]
+    {
+        let r &ReadableBuildInfo^host(host, info, info.get("fileNames"), null)
+        let out JsonText.new_object(host)
+        r.copy_member(out, "version")
+        r.copy_member(out, "errors")
+        r.copy_member(out, "checkPending")
+        let root info.get("root")
+        if root <> null
+            JsonText.put_member(out, "root", r.roots(root as ref[JsonValue]))
+        r.copy_member(out, "packageJsons")
+        r.copy_member(out, "missingPackageJsons")
+        r.copy_member(out, "fileNames")
+        let infos info.get("fileInfos")
+        if infos <> null
+            JsonText.put_member(out, "fileInfos", r.file_infos(infos as ref[JsonValue]))
+        let lists info.get("fileIdsList")
+        if lists <> null
+        {
+            let named r.map_lists(lists as ref[JsonValue])
+            set r.file_ids_list: named
+            JsonText.put_member(out, "fileIdsList", named)
+        }
+        r.copy_member(out, "options")
+        let referenced info.get("referencedMap")
+        if referenced <> null
+            JsonText.put_member(out, "referencedMap", r.referenced_map(referenced as ref[JsonValue]))
+        let semantic info.get("semanticDiagnosticsPerFile")
+        if semantic <> null
+            JsonText.put_member(out, "semanticDiagnosticsPerFile", r.semantic_diagnostics(semantic as ref[JsonValue]))
+        let emit info.get("emitDiagnosticsPerFile")
+        if emit <> null
+        {
+            let ev emit as ref[JsonValue]
+            let arr JsonText.new_array(host)
+            var i 0
+            while i < ev.size()
+            {
+                JsonText.push(arr, r.diagnostics_of_file(ev.value_at(i) as ref[JsonValue]))
+                set i: i + 1
+            }
+            JsonText.put_member(out, "emitDiagnosticsPerFile", arr)
+        }
+        let changed info.get("changeFileSet")
+        if changed <> null
+            JsonText.put_member(out, "changeFileSet", r.map_ids(changed as ref[JsonValue]))
+        let pending info.get("affectedFilesPendingEmit")
+        if pending <> null
+            JsonText.put_member(out, "affectedFilesPendingEmit", r.pending_emit(pending as ref[JsonValue]))
+        r.copy_member(out, "latestChangedDtsFile")
+        let signatures info.get("emitSignatures")
+        if signatures <> null
+            JsonText.put_member(out, "emitSignatures", r.emit_signatures(signatures as ref[JsonValue]))
+        let resolved info.get("resolvedRoot")
+        if resolved <> null
+        {
+            let rv resolved as ref[JsonValue]
+            let arr JsonText.new_array(host)
+            var i 0
+            while i < rv.size()
+            {
+                let pair rv.value_at(i) as ref[JsonValue]
+                let named JsonText.new_array(host)
+                JsonText.push(named, r.file_name(JsonText.int_of(pair.value_at(0))))
+                JsonText.push(named, r.file_name(JsonText.int_of(pair.value_at(1))))
+                JsonText.push(arr, named)
+                set i: i + 1
+            }
+            JsonText.put_member(out, "resolvedRoot", arr)
+        }
+        let size ReadableBuildInfo.sanitized_length(text)
+        if size > 0
+            JsonText.put_member(out, "size", JsonText.new_number(host, size))
+        r.copy_member(out, "semanticErrors")
+        JsonText.to_text(host, out, true)
+    }
+
+    ; the length of fsbaselineutil.SanitizeInternalSymbolName(text): every
+    ; `\uFFFD@name@123` with its digits replaced by `<symbolId>`
+    function sanitized_length(text: Slice[char]) returns int
+    {
+        let n text.length as int
+        var length n
+        var i 0
+        while (i + 4) < n
+        {
+            var matched false
+            if ((*(text.data + i) as int) = 239) and ((*(text.data + i + 1) as int) = 191) and ((*(text.data + i + 2) as int) = 189) and ((*(text.data + i + 3) as int) = 64)
+            {
+                var j i + 4
+                while (j < n) and ((*(text.data + j) as int) <> 64)
+                    set j: j + 1
+                if (j > (i + 4)) and (j < n)
+                {
+                    var k j + 1
+                    while (k < n) and ((*(text.data + k) as int) >= 48) and ((*(text.data + k) as int) <= 57)
+                        set k: k + 1
+                    if k > (j + 1)
+                    {
+                        set length: length + 10 - (k - j - 1)
+                        set i: k
+                        set matched: true
+                    }
+                }
+            }
+            if matched = false
+                set i: i + 1
+        }
+        length
+    }
+
+    procedure copy_member(this, out: ref[JsonValue], key: Slice[char])
+    {
+        let v info.get(key)
+        if v <> null
+            JsonText.put_member(out, key, v as ref[JsonValue])
+    }
+
+    function map_ids(this, ids: ref[JsonValue]) returns ref[JsonValue]
+    {
+        let arr JsonText.new_array(host)
+        var i 0
+        while i < ids.size()
+        {
+            JsonText.push(arr, this.file_name(JsonText.int_of(ids.value_at(i))))
+            set i: i + 1
+        }
+        arr
+    }
+
+    function map_lists(this, lists: ref[JsonValue]) returns ref[JsonValue]
+    {
+        let arr JsonText.new_array(host)
+        var i 0
+        while i < lists.size()
+        {
+            JsonText.push(arr, this.map_ids(lists.value_at(i) as ref[JsonValue]))
+            set i: i + 1
+        }
+        arr
+    }
+
+    function roots(this, root: ref[JsonValue]) returns ref[JsonValue]
+    {
+        let arr JsonText.new_array(host)
+        var i 0
+        while i < root.size()
+        {
+            let original root.value_at(i) as ref[JsonValue]
+            let files JsonText.new_array(host)
+            if original.kind = JsonKindString
+                JsonText.push(files, original)
+            if original.kind = JsonKindNumber
+                JsonText.push(files, this.file_name(JsonText.int_of(original)))
+            if original.kind = JsonKindArray
+            {
+                let start JsonText.int_of(original.value_at(0))
+                let stop JsonText.int_of(original.value_at(1))
+                var id start
+                while id <= stop
+                {
+                    JsonText.push(files, this.file_name(id))
+                    set id: id + 1
+                }
+            }
+            let entry JsonText.new_object(host)
+            JsonText.put_member(entry, "files", files)
+            JsonText.put_member(entry, "original", original)
+            JsonText.push(arr, entry)
+            set i: i + 1
+        }
+        arr
+    }
+
+    ; ResolutionMode.String
+    function resolution_mode_name(mode: int) returns Slice[char]
+    {
+        if mode = 0
+            return "None"
+        if mode = 1
+            return "CommonJS"
+        if mode = 99
+            return "ESNext"
+        "ModuleKind(?)"
+    }
+
+    function file_infos(this, infos: ref[JsonValue]) returns ref[JsonValue]
+    {
+        let arr JsonText.new_array(host)
+        var i 0
+        while i < infos.size()
+        {
+            let original infos.value_at(i) as ref[JsonValue]
+            let entry JsonText.new_object(host)
+            JsonText.put_member(entry, "fileName", this.file_name(i + 1))
+            var version Slice[char]()
+            var signature Slice[char]()
+            var global false
+            var implied 1
+            if original.kind = JsonKindString
+            {
+                set version: original.text
+                set signature: original.text
+            }
+            else
+            {
+                set version: original.string_of("version")
+                set global: JsonText.member_bool(original, "affectsGlobalScope")
+                set implied: JsonText.member_int(original, "impliedNodeFormat")
+                if JsonText.member_bool(original, "noSignature") = false
+                {
+                    set signature: original.string_of("signature")
+                    if (signature.length as int) = 0
+                        set signature: version
+                }
+            }
+            if (version.length as int) > 0
+                JsonText.put_member(entry, "version", JsonText.new_string(host, version))
+            if (signature.length as int) > 0
+                JsonText.put_member(entry, "signature", JsonText.new_string(host, signature))
+            if global
+                JsonText.put_member(entry, "affectsGlobalScope", JsonText.new_bool(host, true))
+            JsonText.put_member(entry, "impliedNodeFormat", JsonText.new_string(host, ReadableBuildInfo.resolution_mode_name(implied)))
+            if original.kind <> JsonKindString
+                JsonText.put_member(entry, "original", original)
+            JsonText.push(arr, entry)
+            set i: i + 1
+        }
+        arr
+    }
+
+    function referenced_map(this, entries: ref[JsonValue]) returns ref[JsonValue]
+    {
+        let out JsonText.new_object(host)
+        var i 0
+        while i < entries.size()
+        {
+            let pair entries.value_at(i) as ref[JsonValue]
+            let name this.file_name(JsonText.int_of(pair.value_at(0)))
+            let list_id JsonText.int_of(pair.value_at(1))
+            var names JsonText.new_array(host)
+            if file_ids_list <> null
+            {
+                let lists file_ids_list as ref[JsonValue]
+                let l lists.value_at(list_id - 1)
+                if l <> null
+                    set names: l as ref[JsonValue]
+            }
+            JsonText.put_member(out, name.text, names)
+            set i: i + 1
+        }
+        out
+    }
+
+    function readable_diagnostics(this, list: ref[JsonValue]) returns ref[JsonValue]
+    {
+        let arr JsonText.new_array(host)
+        var i 0
+        while i < list.size()
+        {
+            let d list.value_at(i) as ref[JsonValue]
+            let entry JsonText.new_object(host)
+            let file JsonText.member_int(d, "file")
+            if file <> 0
+                JsonText.put_member(entry, "file", this.file_name(file))
+            var k 0
+            while k < d.size()
+            {
+                let key d.key_at(k)
+                let value d.value_at(k) as ref[JsonValue]
+                set k: k + 1
+                if key.equals("file") or key.equals("repopulateInfo")
+                    continue
+                if key.equals("messageChain") or key.equals("relatedInformation")
+                    JsonText.put_member(entry, key, this.readable_diagnostics(value))
+                else
+                    JsonText.put_member(entry, key, value)
+            }
+            JsonText.push(arr, entry)
+            set i: i + 1
+        }
+        arr
+    }
+
+    function diagnostics_of_file(this, pair: ref[JsonValue]) returns ref[JsonValue]
+    {
+        let arr JsonText.new_array(host)
+        JsonText.push(arr, this.file_name(JsonText.int_of(pair.value_at(0))))
+        let list pair.value_at(1)
+        if list = null
+            JsonText.push(arr, JsonText.new_array(host))
+        else
+            JsonText.push(arr, this.readable_diagnostics(list as ref[JsonValue]))
+        arr
+    }
+
+    function semantic_diagnostics(this, list: ref[JsonValue]) returns ref[JsonValue]
+    {
+        let arr JsonText.new_array(host)
+        var i 0
+        while i < list.size()
+        {
+            let v list.value_at(i) as ref[JsonValue]
+            if v.kind = JsonKindNumber
+                JsonText.push(arr, this.file_name(JsonText.int_of(v)))
+            else
+                JsonText.push(arr, this.diagnostics_of_file(v))
+            set i: i + 1
+        }
+        arr
+    }
+
+    ; GetFileEmitKind over the build info's own options
+    function full_emit_kind(this) returns int
+    {
+        var result 1
+        let options info.get("options")
+        if options = null
+            return result
+        let o options as ref[JsonValue]
+        if JsonText.member_bool(o, "sourceMap")
+            set result: result | 2
+        if JsonText.member_bool(o, "inlineSourceMap")
+            set result: result | 4
+        if JsonText.member_bool(o, "declaration") or JsonText.member_bool(o, "composite")
+            set result: result | 24
+        if JsonText.member_bool(o, "declarationMap")
+            set result: result | 32
+        if JsonText.member_bool(o, "emitDeclarationOnly")
+            set result: result & 56
+        result
+    }
+
+    ; toReadableFileEmitKind
+    function emit_kind_name(host: ref[Page], kind: int) returns ref[JsonValue]
+    {
+        var sb StringBuilder()
+        var first true
+        if (kind & 1) <> 0
+        {
+            sb.append("Js")
+            set first: false
+        }
+        if (kind & 2) <> 0
+        {
+            if first = false
+                sb.append("|" as char)
+            sb.append("JsMap")
+            set first: false
+        }
+        if (kind & 4) <> 0
+        {
+            if first = false
+                sb.append("|" as char)
+            sb.append("JsInlineMap")
+            set first: false
+        }
+        if (kind & 24) = 24
+        {
+            if first = false
+                sb.append("|" as char)
+            sb.append("Dts")
+            set first: false
+        }
+        else
+        {
+            if (kind & 16) <> 0
+            {
+                if first = false
+                    sb.append("|" as char)
+                sb.append("DtsEmit")
+                set first: false
+            }
+            if (kind & 8) <> 0
+            {
+                if first = false
+                    sb.append("|" as char)
+                sb.append("DtsErrors")
+                set first: false
+            }
+        }
+        if (kind & 32) <> 0
+        {
+            if first = false
+                sb.append("|" as char)
+            sb.append("DtsMap")
+            set first: false
+        }
+        if first
+            sb.append("None")
+        let s String^host(sb.to_string())
+        JsonText.new_string(host, Slice[char](s.get_length(), s.get_buffer() as pointer[char]))
+    }
+
+    function pending_emit(this, list: ref[JsonValue]) returns ref[JsonValue]
+    {
+        let arr JsonText.new_array(host)
+        let full this.full_emit_kind()
+        var i 0
+        while i < list.size()
+        {
+            let original list.value_at(i) as ref[JsonValue]
+            var id 0
+            var kind full
+            if original.kind = JsonKindNumber
+                set id: JsonText.int_of(original)
+            else
+            {
+                set id: JsonText.int_of(original.value_at(0))
+                if original.size() = 1
+                    set kind: 24
+                else
+                    set kind: JsonText.int_of(original.value_at(1))
+            }
+            let entry JsonText.new_array(host)
+            JsonText.push(entry, this.file_name(id))
+            JsonText.push(entry, ReadableBuildInfo.emit_kind_name(host, kind))
+            JsonText.push(entry, original)
+            JsonText.push(arr, entry)
+            set i: i + 1
+        }
+        arr
+    }
+
+    function emit_signatures(this, list: ref[JsonValue]) returns ref[JsonValue]
+    {
+        let arr JsonText.new_array(host)
+        var i 0
+        while i < list.size()
+        {
+            let original list.value_at(i) as ref[JsonValue]
+            let entry JsonText.new_object(host)
+            if original.kind = JsonKindNumber
+                JsonText.put_member(entry, "file", this.file_name(JsonText.int_of(original)))
+            else
+            {
+                JsonText.put_member(entry, "file", this.file_name(JsonText.int_of(original.value_at(0))))
+                let sig original.value_at(1) as ref[JsonValue]
+                if sig.kind = JsonKindString
+                {
+                    if (sig.text.length as int) > 0
+                        JsonText.put_member(entry, "signature", sig)
+                }
+                else
+                {
+                    if sig.size() = 0
+                        JsonText.put_member(entry, "differsOnlyInDtsMap", JsonText.new_bool(host, true))
+                    else
+                    {
+                        JsonText.put_member(entry, "signature", sig.value_at(0) as ref[JsonValue])
+                        JsonText.put_member(entry, "differsInOptions", JsonText.new_bool(host, true))
+                    }
+                }
+            }
+            JsonText.put_member(entry, "original", original)
+            JsonText.push(arr, entry)
+            set i: i + 1
+        }
+        arr
+    }
+}

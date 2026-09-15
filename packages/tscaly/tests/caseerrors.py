@@ -72,8 +72,51 @@ def format_message(code, args):
 
 
 class Args(tuple):
-    """a diagnostic's message arguments, carrying its message chain: [(level, code, args)]"""
+    """a diagnostic's message arguments, carrying its message chain: [(level, code, args)]
+    and its related information: [[path, pos, code, args]]"""
     chain = ()
+    related = ()
+
+
+RELATED_RE = re.compile(r"^!!! related TS(\d+)(?: ([^:]+:(?:\d+|--):(?:\d+|--)))?: (.*)$")
+
+
+def expected_related(path):
+    """the error baseline's `!!! related` lines → Counter of (code, location, first message
+    line); the harness's own pre/post-emit count report (TS-1) and its lines are left out"""
+    out = collections.Counter()
+    if not os.path.exists(path):
+        return out
+    with open(path, "rb") as fh:
+        text = fh.read().decode("utf-8", "replace").replace("\r\n", "\n")
+    harness = False
+    for line in text.split("\n"):
+        if line.startswith("!!! error TS"):
+            harness = line.startswith("!!! error TS-1:")
+            continue
+        m = RELATED_RE.match(line)
+        if m and not harness:
+            out[(int(m.group(1)), m.group(2) or "", m.group(3))] += 1
+    return out
+
+
+def related_location(plan, path, pos):
+    """formatLocation after removeTestPathPrefixes, a default lib's line and column hidden"""
+    if not path:
+        return ""
+    base = path.rsplit("/", 1)[-1]
+    if base.lower().startswith("lib.") and base.lower().endswith(".d.ts"):
+        return base + ":--:--"
+    text = plan["texts"].get(path)
+    if text is None and path.startswith("/.lib/"):
+        disk = os.path.join(PKG, "_submodules", "typescript-go", "_submodules", "TypeScript", "tests", "lib", path[len("/.lib/"):])
+        if os.path.exists(disk):
+            text = open(disk, "rb").read()
+            plan["texts"][path] = text
+    if text is None:
+        return casejs.remove_test_path_prefixes(path) + ":?:?"
+    line, col = line_col(text, pos)
+    return "%s:%d:%d" % (casejs.remove_test_path_prefixes(path), line, col)
 
 
 def full_message(code, margs):
@@ -196,6 +239,11 @@ def parse_answer(body):
             args = Args(unescape_args(argfield) if _ else ())
             cur[tag].append(tuple(int(x) for x in rest) + (args,))
             last = args
+        elif tag == "L" and len(head.split(" ", 3)) >= 3 and last is not None:
+            fields = head.split(" ", 3)
+            last.related = tuple(last.related) + ([fields[3] if len(fields) > 3 else "", int(fields[0]), int(fields[2]), unescape_args(argfield) if _ else ()],)
+        elif tag == "N" and len(rest) == 2 and last is not None and last.related:
+            pass
         elif tag == "M" and len(rest) == 2 and last is not None:
             # a chain line of the diagnostic before it: `M <level> <code>\targs`
             last.chain = tuple(last.chain) + ((int(rest[0]), int(rest[1]), unescape_args(argfield) if _ else ()),)
@@ -298,10 +346,12 @@ def main():
     ap.add_argument("--show", default="")
     ap.add_argument("--messages", default="")
     ap.add_argument("--chains", default="")
+    ap.add_argument("--related", default="")
     ap.add_argument("--scratch", default=os.path.join(PKG, "tests", "out", "caseerrors"))
     args = ap.parse_args()
     args.message_verdicts = [] if args.messages else None
     args.chain_verdicts = [] if args.chains else None
+    args.related_verdicts = [] if args.related else None
 
     db = sqlite3.connect(args.store)
     cases = db.execute("SELECT ci, name, case_file FROM cases WHERE name LIKE 'submodule_%' ORDER BY ci").fetchall()
@@ -408,6 +458,7 @@ def main():
             plans.append({"case": name, "config": cname, "cfg": cfg, "vpath": vpath, "texts": texts,
                           "expected": expected_errors(bstem + ".errors.txt", exp_messages, exp_chains),
                           "expected_messages": exp_messages, "expected_chains": exp_chains,
+                          "expected_related": expected_related(bstem + ".errors.txt"),
                           "pretty": cfg.get("pretty", "").lower() == "true"})
 
     binary = casejs.stack_wrapper(args)
@@ -419,6 +470,7 @@ def main():
     counts, stops, verdicts = collections.Counter(), collections.Counter(), []
     message_counts, message_codes = collections.Counter(), collections.Counter()
     chain_counts, chain_codes = collections.Counter(), collections.Counter()
+    related_counts, related_missing, related_extra = collections.Counter(), collections.Counter(), collections.Counter()
     missing_codes, extra_codes = collections.Counter(), collections.Counter()
     for plan in plans:
         rc, body, err = answers.get(plan["vpath"], (None, b"", b""))
@@ -440,13 +492,15 @@ def main():
         else:
             our_messages = collections.Counter()
             our_chains = collections.Counter()
-            ours = answer_counter(plan, body, our_messages, our_chains)
+            our_related = collections.Counter()
+            ours = answer_counter(plan, body, our_messages, our_chains, our_related)
             if post_body is not None:
                 post_messages = collections.Counter()
                 post_chains = collections.Counter()
-                post = answer_counter(plan, post_body, post_messages, post_chains)
+                post_related = collections.Counter()
+                post = answer_counter(plan, post_body, post_messages, post_chains, post_related)
                 if sum(post.values()) <= sum(ours.values()):
-                    ours, our_messages, our_chains = post, post_messages, post_chains
+                    ours, our_messages, our_chains, our_related = post, post_messages, post_chains, post_related
             exp = plan["expected"]
             # the port has no message text: a key counts once on each side
             if set(ours) != set(exp):
@@ -471,6 +525,17 @@ def main():
                             chain_codes[k[3]] += 1
                         if args.chain_verdicts is not None:
                             args.chain_verdicts.append((plan["case"], plan["config"], sorted(ec - oc), sorted(oc - ec)))
+                er = plan["expected_related"]
+                if er == our_related:
+                    related_counts["MATCH"] += 1
+                else:
+                    related_counts["FAIL"] += 1
+                    for k in (er - our_related):
+                        related_missing[k[0]] += 1
+                    for k in (our_related - er):
+                        related_extra[k[0]] += 1
+                    if args.related_verdicts is not None:
+                        args.related_verdicts.append((plan["case"], plan["config"], sorted(er - our_related), sorted(our_related - er)))
                 if em == om:
                     message_counts["MATCH"] += 1
                 else:
@@ -488,6 +553,8 @@ def main():
         verdicts.append((plan["case"], plan["config"], verdict, detail))
         if args.show and (plan["case"], plan["config"]) == tuple((args.show + ":").split(":")[:2]):
             print("==== %s %s" % (plan["case"], plan["config"]))
+            print(body.decode("utf-8", "replace"))
+            print(err.decode("utf-8", "replace"))
             print("  expected", sorted(plan["expected"]))
             print("  ours    ", sorted(ours))
     report(args, plans, counts, skips, stops, missing_codes, extra_codes, verdicts)
@@ -495,6 +562,13 @@ def main():
     print("  message codes differing (pairs):", message_codes.most_common(40))
     print("  chains of the code MATCHes (not pretty): MATCH %d FAIL %d" % (chain_counts["MATCH"], chain_counts["FAIL"]))
     print("  chain codes differing (pairs):", chain_codes.most_common(40))
+    print("  related information of the code MATCHes: MATCH %d FAIL %d" % (related_counts["MATCH"], related_counts["FAIL"]))
+    print("  related codes missing:", related_missing.most_common(30))
+    print("  related codes extra:  ", related_extra.most_common(30))
+    if args.related:
+        with open(args.related, "w") as fh:
+            for c, cfg, miss, extra in args.related_verdicts:
+                fh.write("%s\t%s\n  expected %r\n  ours     %r\n" % (c, cfg, miss, extra))
     if args.chains:
         with open(args.chains, "w") as fh:
             for c, cfg, miss, extra in args.chain_verdicts:
@@ -505,7 +579,7 @@ def main():
                 fh.write("%s\t%s\n  expected %r\n  ours     %r\n" % (c, cfg, miss, extra))
 
 
-def answer_counter(plan, body, messages=None, chains=None):
+def answer_counter(plan, body, messages=None, chains=None, related=None):
     """one program's answer → Counter of (file, line, col, code); with `messages` also the
     (key, formatted message) pairs, with `chains` the (key, message and chain) pairs"""
     ours = collections.Counter()
@@ -513,9 +587,17 @@ def answer_counter(plan, body, messages=None, chains=None):
         messages = collections.Counter()
     if chains is None:
         chains = collections.Counter()
+    if related is None:
+        related = collections.Counter()
+    # SortAndDeduplicateDiagnostics: diagnostics equal but for their related information
+    # are one, carrying the union of it
+    merged = collections.OrderedDict()
     def note(key, code, margs):
         messages[(key, format_message(code, margs))] += 1
         chains[(key, full_message(code, margs))] += 1
+        group = merged.setdefault((key, full_message(code, margs)), set())
+        for rpath, rpos, rcode, rargs in getattr(margs, "related", ()):
+            group.add((rcode, related_location(plan, rpath, rpos), format_message(rcode, rargs)))
     for path, entry in parse_answer(body).items():
         if path.startswith("TSCALY-DECL "):
             dpath = path[len("TSCALY-DECL "):]
@@ -546,6 +628,9 @@ def answer_counter(plan, body, messages=None, chains=None):
             line, col = line_col(text, pos)
             ours[(shown, line, col, code)] += 1
             note((shown, line, col, code), code, margs)
+    for group in merged.values():
+        for r in group:
+            related[r] += 1
     return ours
 
 

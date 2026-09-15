@@ -1,0 +1,3530 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; incremental — internal/execute/incremental: the incremental program over the
+; driver's program (program.go), its snapshot (snapshot.go, programtosnapshot.go),
+; the affected-files and emit-files handlers, and the build info in both
+; directions (buildInfo.go, snapshottobuildinfo.go, buildinfotosnapshot.go,
+; referencemap.go, incremental.go).
+;
+; ★ The reference's SyncMaps keyed by tspath.Path are PathMaps here: a key list,
+; a value list and a live bit, scanned linearly. The work groups run their tasks
+; one after another in the program's file order; where the reference's result is
+; independent of the order (a set, a sorted listing) nothing observable moves, and
+; where it is not — the order files are written in — the program's file order is
+; the deterministic choice a single-threaded run makes.
+;
+; ★ A diagnostic is a DriverDiagnostic (the checker's facts plus its file) or,
+; when it came from a build info, an IncBuildInfoDiagnostic that is converted on
+; first use, exactly as DiagnosticsOrBuildInfoDiagnosticsWithFileName converts.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use tscaly.ast.AstNode
+use tscaly.ast.Symbol
+use tscaly.ast.SymbolTable
+use tscaly.ast.SymbolTableEntry
+use tscaly.checker.Checker
+use tscaly.program.JsonValue
+use tscaly.program.ProgramFiles
+use tscaly.program.JsonParser
+use tscaly.buildinfojson.JsonText
+use tscaly.tsoptions.TsOptions
+use tscaly.TsOptionDecls.TsOptionDecls
+use tscaly.Diagnostics.ChainLine
+use tscaly.DiagnosticMessages.DiagnosticMessages
+use tscaly.diagnosticwriter.DriverDiagnostic
+use tscaly.diagnosticwriter.DiagnosticWriter
+use tscaly.system.ExecSystem
+use tscaly.programhost.DriverProgram
+use tscaly.programhost.FileEmitOutput
+use tscaly.xxh3.Xxh3
+
+define FileEmitKindJs: int 1
+define FileEmitKindJsMap: int 2
+define FileEmitKindJsInlineMap: int 4
+define FileEmitKindDtsErrors: int 8
+define FileEmitKindDtsEmit: int 16
+define FileEmitKindDtsMap: int 32
+define FileEmitKindDts: int 24
+define FileEmitKindAllJs: int 7
+define FileEmitKindAllDtsEmit: int 48
+define FileEmitKindAllDts: int 56
+
+define SignatureUpdateKindComputedDts: int 0
+define SignatureUpdateKindStoredAtEmit: int 1
+define SignatureUpdateKindUsedVersion: int 2
+
+; a map keyed by path: parallel key and value lists and a live bit per slot
+define PathMap[T] (keys: ref[Array[Slice[char]]]  values: ref[Array[T]]  live: ref[Array[bool]])
+{
+    function slot_of(this, key: Slice[char]) returns int
+    {
+        var i 0
+        while i < (keys.get_length() as int)
+        {
+            if live.get(i as size_t) <> null
+            {
+                let alive live[i as size_t]
+                if alive
+                {
+                    let k keys[i as size_t]
+                    if k.equals(key)
+                        return i
+                }
+            }
+            set i: i + 1
+        }
+        0 - 1
+    }
+
+    function has(this, key: Slice[char]) returns bool
+        this.slot_of(key) >= 0
+
+    function slot_count(this) returns int
+        keys.get_length() as int
+
+    function is_live(this, i: int) returns bool
+        live[i as size_t]
+
+    function key_at(this, i: int) returns Slice[char]
+        keys[i as size_t]
+
+    function value_at(this, i: int) returns T
+        values[i as size_t]
+
+    function size(this) returns int
+    {
+        var n 0
+        var i 0
+        while i < (keys.get_length() as int)
+        {
+            let alive live[i as size_t]
+            if alive
+                set n: n + 1
+            set i: i + 1
+        }
+        n
+    }
+
+    ; every key and value a caller stores lives on the program's host page (a
+    ; path of the file table, the build info's text, a host construction); the
+    ; entry is written one call down
+    procedure store(this, key: Slice[char], value: T)
+        this.store_entry(key, value)
+
+    procedure store_entry(this, key: Slice[char], value: T)
+    {
+        let i this.slot_of(key)
+        if i >= 0
+        {
+            values.put(i as size_t, value)
+            return
+        }
+        keys.add(key)
+        values.add(value)
+        live.add(true)
+    }
+
+    procedure remove(this, key: Slice[char])
+    {
+        let i this.slot_of(key)
+        if i >= 0
+            live.put(i as size_t, false)
+    }
+
+    procedure clear(this)
+    {
+        var i 0
+        while i < (live.get_length() as int)
+        {
+            live.put(i as size_t, false)
+            set i: i + 1
+        }
+    }
+
+    ; the live keys in byte order (slices.Sort over tspath.Path)
+    procedure sorted_keys(this, host: ref[Page]) returns ref[Array[Slice[char]]]
+    {
+        let out &Array[Slice[char]]^host()
+        var i 0
+        while i < (keys.get_length() as int)
+        {
+            let alive live[i as size_t]
+            if alive
+                IncSort.insert_sorted(out, keys[i as size_t])
+            set i: i + 1
+        }
+        out
+    }
+}
+
+define IncSort (reserved: int)
+{
+    procedure insert_sorted(list: ref[Array[Slice[char]]], item: Slice[char])
+    {
+        list.add(item)
+        var j (list.get_length() as int) - 1
+        while j > 0
+        {
+            let prev list[(j - 1) as size_t]
+            if DiagnosticWriter.compare_bytes(prev, item) <= 0
+                break
+            list.put(j as size_t, prev)
+            set j: j - 1
+        }
+        list.put(j as size_t, item)
+    }
+
+    procedure insert_sorted_int(list: ref[Array[int]], item: int)
+    {
+        list.add(item)
+        var j (list.get_length() as int) - 1
+        while j > 0
+        {
+            let prev list[(j - 1) as size_t]
+            if prev <= item
+                break
+            list.put(j as size_t, prev)
+            set j: j - 1
+        }
+        list.put(j as size_t, item)
+    }
+}
+
+define IncFileInfo (version: Slice[char]  signature: Slice[char]  affects_global_scope: bool  implied_node_format: int)
+
+; emitSignature: the signature, or the one-element list when the d.ts map options
+; differed
+define IncEmitSignature (signature: Slice[char]  different: bool  different_signature: Slice[char])
+
+; buildInfoDiagnosticWithFileName
+define IncBuildInfoDiagnostic
+(
+    file: Slice[char]
+    no_file: bool
+    pos: int
+    end: int
+    code: int
+    category: int
+    key: Slice[char]
+    args: ref[Array[String]]?
+    chain: ref[Array[ref[IncBuildInfoDiagnostic]]]?
+    related: ref[Array[ref[IncBuildInfoDiagnostic]]]?
+    reports_unnecessary: bool
+    reports_deprecated: bool
+    skipped_on_no_emit: bool
+)
+
+; DiagnosticsOrBuildInfoDiagnosticsWithFileName
+define IncDiagnostics (diagnostics: ref[Array[ref[DriverDiagnostic]]]?  build_info: ref[Array[ref[IncBuildInfoDiagnostic]]]?)
+{
+    function is_empty(this) returns bool
+    {
+        if diagnostics <> null
+        {
+            if (diagnostics as ref[Array[ref[DriverDiagnostic]]]).get_length() > 0
+                return false
+        }
+        if build_info <> null
+        {
+            if (build_info as ref[Array[ref[IncBuildInfoDiagnostic]]]).get_length() > 0
+                return false
+        }
+        true
+    }
+}
+
+define IncSnapshot
+(
+    file_infos: ref[PathMap[ref[IncFileInfo]]]
+    options: ref[TsOptions]
+    referenced_map: ref[PathMap[ref[Array[Slice[char]]]]]
+    semantic_diagnostics: ref[PathMap[ref[IncDiagnostics]]]
+    emit_diagnostics: ref[PathMap[ref[IncDiagnostics]]]
+    changed_files: ref[PathMap[bool]]
+    pending_emit: ref[PathMap[int]]
+    latest_changed_dts_file: Slice[char]
+    emit_signatures: ref[PathMap[ref[IncEmitSignature]]]
+    ; core.Tristate: -1 unknown
+    has_errors: int
+    has_semantic_errors: bool
+    check_pending: bool
+    package_jsons: ref[Array[Slice[char]]]?
+    missing_package_jsons: ref[Array[Slice[char]]]?
+    build_info_emit_pending: bool
+    has_errors_from_old_state: int
+    has_semantic_errors_from_old_state: bool
+    package_jsons_from_old_state: ref[Array[Slice[char]]]?
+    missing_package_jsons_from_old_state: ref[Array[Slice[char]]]?
+    all_files_excluding_default_lib: ref[Array[int]]?
+    has_changed_dts_file: bool
+    has_emit_diagnostics: bool
+    hash_with_text: bool
+)
+{
+    function create(host: ref[Page], options: ref[TsOptions], hash_with_text: bool) returns ref[IncSnapshot]
+    {
+        let none: Slice[char] ""
+        &IncSnapshot^host(IncSnapshot.file_info_map(host), options, IncSnapshot.references_map(host), IncSnapshot.diagnostics_map(host), IncSnapshot.diagnostics_map(host), IncSnapshot.bool_map(host), IncSnapshot.int_map(host), none, IncSnapshot.signature_map(host), 0 - 1, false, false, null, null, false, 0 - 1, false, null, null, null, false, false, hash_with_text)
+    }
+
+    function file_info_map(host: ref[Page]) returns ref[PathMap[ref[IncFileInfo]]]
+        &PathMap[ref[IncFileInfo]]^host(&Array[Slice[char]]^host(), &Array[ref[IncFileInfo]]^host(), &Array[bool]^host())
+
+    function references_map(host: ref[Page]) returns ref[PathMap[ref[Array[Slice[char]]]]]
+        &PathMap[ref[Array[Slice[char]]]]^host(&Array[Slice[char]]^host(), &Array[ref[Array[Slice[char]]]]^host(), &Array[bool]^host())
+
+    function diagnostics_map(host: ref[Page]) returns ref[PathMap[ref[IncDiagnostics]]]
+        &PathMap[ref[IncDiagnostics]]^host(&Array[Slice[char]]^host(), &Array[ref[IncDiagnostics]]^host(), &Array[bool]^host())
+
+    function bool_map(host: ref[Page]) returns ref[PathMap[bool]]
+        &PathMap[bool]^host(&Array[Slice[char]]^host(), &Array[bool]^host(), &Array[bool]^host())
+
+    function int_map(host: ref[Page]) returns ref[PathMap[int]]
+        &PathMap[int]^host(&Array[Slice[char]]^host(), &Array[int]^host(), &Array[bool]^host())
+
+    function signature_map(host: ref[Page]) returns ref[PathMap[ref[IncEmitSignature]]]
+        &PathMap[ref[IncEmitSignature]]^host(&Array[Slice[char]]^host(), &Array[ref[IncEmitSignature]]^host(), &Array[bool]^host())
+
+    procedure add_file_to_change_set(this, path: Slice[char])
+    {
+        changed_files.store(path, true)
+        set build_info_emit_pending: true
+    }
+
+    procedure add_file_to_affected_files_pending_emit(this, path: Slice[char], emit_kind: int)
+    {
+        var existing 0
+        let i pending_emit.slot_of(path)
+        if i >= 0
+            set existing: pending_emit.value_at(i)
+        pending_emit.store(path, existing | emit_kind)
+        if (emit_kind & FileEmitKindDtsErrors) <> 0
+            emit_diagnostics.remove(path)
+        set build_info_emit_pending: true
+    }
+
+    ; getAllFilesExcludingDefaultLibraryFile (once)
+    procedure all_files_excluding_default_library_file(this, host: ref[Page], program: ref[DriverProgram], first: int) returns ref[Array[int]]
+    {
+        if all_files_excluding_default_lib <> null
+            return all_files_excluding_default_lib as ref[Array[int]]
+        let out &Array[int]^host()
+        if (first >= 0) and (first >= program.lib_count())
+            out.add(first)
+        var i program.lib_count()
+        while i < program.source_file_count()
+        {
+            if i <> first
+                out.add(i)
+            set i: i + 1
+        }
+        set this.all_files_excluding_default_lib: out
+        out
+    }
+
+    function compute_hash(this, host: ref[Page], text: Slice[char]) returns Slice[char]
+        IncOptions.compute_hash(host, text, hash_with_text)
+
+    ; canUseIncrementalState
+    function can_use_incremental_state(this) returns bool
+    {
+        if (IncOptions.is_incremental(options) = false) and (options.tristate_of("build") = 1)
+            return false
+        true
+    }
+
+    ; referenceMap.getReferencedBy
+    procedure referenced_by(this, host: ref[Page], path: Slice[char]) returns ref[Array[Slice[char]]]
+    {
+        let out &Array[Slice[char]]^host()
+        var i 0
+        while i < referenced_map.slot_count()
+        {
+            if referenced_map.is_live(i)
+            {
+                let refs referenced_map.value_at(i)
+                if ExecSystem.contains(refs, path)
+                    out.add(referenced_map.key_at(i))
+            }
+            set i: i + 1
+        }
+        out
+    }
+}
+
+; the option questions the incremental program asks of core.CompilerOptions
+define IncOptions (reserved: int)
+{
+    function compute_hash(host: ref[Page], text: Slice[char], hash_with_text: bool) returns Slice[char]
+    {
+        let hash Xxh3.hex_of(host, text)
+        if hash_with_text = false
+            return hash
+        join_slices(host, join_slices(host, hash, "-"), text)
+    }
+
+    function is_incremental(o: ref[TsOptions]) returns bool
+        (o.tristate_of("incremental") = 1) or (o.tristate_of("composite") = 1)
+
+    function emit_declarations(o: ref[TsOptions]) returns bool
+        (o.tristate_of("declaration") = 1) or (o.tristate_of("composite") = 1)
+
+    ; GetFileEmitKind
+    function file_emit_kind(o: ref[TsOptions]) returns int
+    {
+        var result FileEmitKindJs
+        if o.tristate_of("sourceMap") = 1
+            set result: result | FileEmitKindJsMap
+        if o.tristate_of("inlineSourceMap") = 1
+            set result: result | FileEmitKindJsInlineMap
+        if IncOptions.emit_declarations(o)
+            set result: result | FileEmitKindDts
+        if o.tristate_of("declarationMap") = 1
+            set result: result | FileEmitKindDtsMap
+        if o.tristate_of("emitDeclarationOnly") = 1
+            set result: result & FileEmitKindAllDts
+        result
+    }
+
+    ; getPendingEmitKind
+    function pending_emit_kind(emit_kind: int, old_emit_kind: int) returns int
+    {
+        if old_emit_kind = emit_kind
+            return 0
+        if (old_emit_kind = 0) or (emit_kind = 0)
+            return emit_kind
+        let diff old_emit_kind xor emit_kind
+        var result 0
+        if (diff & FileEmitKindAllJs) <> 0
+            set result: result | (emit_kind & FileEmitKindAllJs)
+        if (diff & FileEmitKindDtsErrors) <> 0
+            set result: result | (emit_kind & FileEmitKindAllDts)
+        if (diff & FileEmitKindAllDtsEmit) <> 0
+            set result: result | (emit_kind & FileEmitKindAllDtsEmit)
+        result
+    }
+
+    function pending_emit_kind_with_options(options: ref[TsOptions], old_options: ref[TsOptions]) returns int
+        IncOptions.pending_emit_kind(IncOptions.file_emit_kind(options), IncOptions.file_emit_kind(old_options))
+
+    ; GetStrictOptionValue
+    function strict_value(o: ref[TsOptions], name: Slice[char]) returns bool
+    {
+        let t o.tristate_of(name)
+        if t >= 0
+            return t = 1
+        o.tristate_of("strict") <> 0
+    }
+
+    ; GetAllowJS
+    function allow_js(o: ref[TsOptions]) returns bool
+    {
+        let t o.tristate_of("allowJs")
+        if t >= 0
+            return t = 1
+        o.tristate_of("checkJs") = 1
+    }
+
+    ; a field's value as one comparable text (reflect.DeepEqual over the field)
+    function canonical(host: ref[Page], o: ref[TsOptions], i: int) returns Slice[char]
+    {
+        let name TsOptionDecls.name_of(i)
+        let v o.get(name)
+        if v = null
+            return ""
+        let jv v as ref[JsonValue]
+        if TsOptionDecls.kind_of(i) = TsOptionKindEnum
+        {
+            if jv.kind = JsonKindString
+            {
+                var sb StringBuilder()
+                sb.append(TsOptionDecls.enum_number(i, TsConfigLower.lower(host, jv.text)))
+                let s String^host(sb.to_string())
+                return Slice[char](s.get_length(), s.get_buffer() as pointer[char])
+            }
+        }
+        JsonText.to_text(host, jv, false)
+    }
+
+    ; optionsHaveChanges over the declarations whose affects bits meet `mask`
+    function have_changes(host: ref[Page], old_options: ref[TsOptions], new_options: ref[TsOptions], mask: int) returns bool
+    {
+        var f 0
+        while f < TsOptionDecls.compiler_field_count()
+        {
+            let i TsOptionDecls.compiler_field_option(f)
+            set f: f + 1
+            if i < 0
+                continue
+            let affects TsOptionDecls.affects_of(i)
+            if (affects & mask) = 0
+                continue
+            let name TsOptionDecls.name_of(i)
+            if (affects & 16) <> 0
+            {
+                if IncOptions.strict_value(old_options, name) <> IncOptions.strict_value(new_options, name)
+                    return true
+                continue
+            }
+            if (affects & 32) <> 0
+            {
+                if IncOptions.allow_js(old_options) <> IncOptions.allow_js(new_options)
+                    return true
+                continue
+            }
+            let a IncOptions.canonical(host, old_options, i)
+            let b IncOptions.canonical(host, new_options, i)
+            if a.equals(b) = false
+                return true
+        }
+        false
+    }
+}
+
+define TsConfigLower (reserved: int)
+{
+    function lower(host: ref[Page], s: Slice[char]) returns Slice[char]
+    {
+        var sb StringBuilder()
+        var i 0
+        while i < (s.length as int)
+        {
+            var c *(s.data + i) as int
+            if (c >= 65) and (c <= 90)
+                set c: c + 32
+            sb.append(c as char)
+            set i: i + 1
+        }
+        let t String^host(sb.to_string())
+        Slice[char](t.get_length(), t.get_buffer() as pointer[char])
+    }
+}
+
+; incremental.Program
+define IncProgram
+(
+    host: ref[Page]
+    snapshot: ref[IncSnapshot]
+    program: ref[DriverProgram]
+    ; TestingData
+    old_semantic: ref[PathMap[ref[IncDiagnostics]]]
+    updated_signature_kinds: ref[PathMap[int]]
+    ; a build task's program (tsc -b): the build info it wrote (onBuildInfoEmit's
+    ; entry: the info, the clock at the write, and whether a d.ts changed)
+    build_mode: bool
+    build_info_emitted: bool
+    build_info_time: int
+    build_info_json: ref[JsonValue]?
+    build_info_dts_changed: bool
+)
+{
+    function sys(this) returns ref[ExecSystem]
+        program.sys
+
+    function stopped(this) returns bool
+        (program.sys.stop_tag.length as int) > 0
+
+    ; NewProgram(program, oldProgram, host, testing); null after a stop
+    procedure create(host: ref[Page], program: ref[DriverProgram], old: ref[IncSnapshot]?) returns ref[IncProgram]?
+    {
+        let snapshot IncSnapshot.create(host, program.ts, true)
+        set snapshot.check_pending: program.flag("noCheck")
+        var old_semantic IncSnapshot.diagnostics_map(host)
+        if old <> null
+            set old_semantic: (old as ref[IncSnapshot]).semantic_diagnostics
+        let p &IncProgram^host(host, snapshot, program, old_semantic, IncSnapshot.int_map(host), false, false, 0, null, false)
+        if snapshot.can_use_incremental_state()
+        {
+            let to &ToProgramSnapshot^host(host, p, old, false)
+            to.reuse_from_old_program()
+            if to.compute_program_file_changes() = false
+                return null
+            to.handle_file_delete()
+            to.handle_pending_emit()
+            to.handle_pending_check()
+        }
+        p
+    }
+
+    ; ── diagnostics ──────────────────────────────────────────────────────────
+
+    ; GetSemanticDiagnostics(nil); false after a stop
+    procedure semantic_diagnostics(this, out: ref[Array[ref[DriverDiagnostic]]]) returns bool
+    {
+        if program.flag("noCheck")
+            return true
+        if this.collect_semantic_diagnostics_of_affected_files() = false
+            return false
+        var i 0
+        while i < program.source_file_count()
+        {
+            this.semantic_diagnostics_of_file(i, out)
+            set i: i + 1
+        }
+        true
+    }
+
+    procedure semantic_diagnostics_of_file(this, i: int, out: ref[Array[ref[DriverDiagnostic]]])
+    {
+        let path program.source_path(i)
+        let k snapshot.semantic_diagnostics.slot_of(path)
+        if k >= 0
+        {
+            let cached this.diagnostics_of(snapshot.semantic_diagnostics.value_at(k), i)
+            var d 0
+            while d < (cached.get_length() as int)
+            {
+                out.add(cached[d as size_t])
+                set d: d + 1
+            }
+        }
+        let index program.source_pf_index(i)
+        if index >= 0
+            program.include_processor(index, out)
+    }
+
+    ; getDiagnostics: the build info's converted on first use
+    procedure diagnostics_of(this, d: ref[IncDiagnostics], i: int) returns ref[Array[ref[DriverDiagnostic]]]
+    {
+        if d.diagnostics <> null
+            return d.diagnostics as ref[Array[ref[DriverDiagnostic]]]
+        let out &Array[ref[DriverDiagnostic]]^host()
+        if d.build_info <> null
+        {
+            let list d.build_info as ref[Array[ref[IncBuildInfoDiagnostic]]]
+            var k 0
+            while k < (list.get_length() as int)
+            {
+                out.add(this.to_driver_diagnostic(list[k as size_t], program.source_path(i)))
+                set k: k + 1
+            }
+        }
+        set d.diagnostics: out
+        out
+    }
+
+    procedure to_driver_diagnostic(this, b: ref[IncBuildInfoDiagnostic], own_path: Slice[char]) returns ref[DriverDiagnostic]
+    {
+        var name: Slice[char] ""
+        var text: Slice[char] ""
+        if (b.file.length as int) > 0
+        {
+            let si program.source_index_of_path(b.file)
+            if si >= 0
+            {
+                set name: program.source_path(si)
+                set text: program.source_text(si)
+            }
+        }
+        else
+        {
+            if b.no_file = false
+            {
+                let si program.source_index_of_path(own_path)
+                if si >= 0
+                {
+                    set name: program.source_path(si)
+                    set text: program.source_text(si)
+                }
+            }
+        }
+        var chain: ref[Array[ChainLine]]? null
+        if b.chain <> null
+        {
+            let lines &Array[ChainLine]^host()
+            IncProgram.flatten_chain(b.chain as ref[Array[ref[IncBuildInfoDiagnostic]]], 1, lines)
+            set chain: lines
+        }
+        var related: ref[Array[ref[DriverDiagnostic]]]? null
+        if b.related <> null
+        {
+            let rl b.related as ref[Array[ref[IncBuildInfoDiagnostic]]]
+            let list &Array[ref[DriverDiagnostic]]^host()
+            var k 0
+            while k < (rl.get_length() as int)
+            {
+                var file_path name
+                list.add(this.to_driver_diagnostic(rl[k as size_t], file_path))
+                set k: k + 1
+            }
+            set related: list
+        }
+        &DriverDiagnostic^host(name, text, b.pos, b.end, b.code, b.args, chain, related)
+    }
+
+    procedure flatten_chain(list: ref[Array[ref[IncBuildInfoDiagnostic]]], level: int, out: ref[Array[ChainLine]])
+    {
+        var k 0
+        while k < (list.get_length() as int)
+        {
+            let c list[k as size_t]
+            out.add(ChainLine(level, c.code, c.args))
+            if c.chain <> null
+                IncProgram.flatten_chain(c.chain as ref[Array[ref[IncBuildInfoDiagnostic]]], level + 1, out)
+            set k: k + 1
+        }
+    }
+
+    ; collectSemanticDiagnosticsOfAffectedFiles(nil); false after a stop
+    procedure collect_semantic_diagnostics_of_affected_files(this) returns bool
+    {
+        if snapshot.can_use_incremental_state()
+        {
+            if AffectedFilesHandler.collect_all_affected_files(host, this) = false
+                return false
+            if snapshot.semantic_diagnostics.size() = program.source_file_count()
+                return true
+        }
+        var i 0
+        while i < program.source_file_count()
+        {
+            let path program.source_path(i)
+            if snapshot.semantic_diagnostics.has(path) = false
+            {
+                let found &Array[ref[DriverDiagnostic]]^host()
+                let index program.source_pf_index(i)
+                if index >= 0
+                {
+                    if program.bind_and_check(index, found) = false
+                        return false
+                }
+                let sorted DriverProgram.sort_and_deduplicate(host, found)
+                snapshot.semantic_diagnostics.store(path, &IncDiagnostics^host(sorted, null))
+            }
+            set i: i + 1
+        }
+        if (snapshot.semantic_diagnostics.size() = program.source_file_count()) and snapshot.check_pending and (program.flag("noCheck") = false)
+            set snapshot.check_pending: false
+        set snapshot.build_info_emit_pending: true
+        true
+    }
+
+    ; GetDeclarationDiagnostics(nil); false after a stop
+    procedure declaration_diagnostics(this, out: ref[Array[ref[DriverDiagnostic]]]) returns bool
+    {
+        let handler EmitFilesHandler.create(host, this, true)
+        let result handler.emit_all_affected_files()
+        if result = null
+            return false
+        let r result as ref[IncEmitResult]
+        var i 0
+        while i < (r.diagnostics.get_length() as int)
+        {
+            out.add(r.diagnostics[i as size_t])
+            set i: i + 1
+        }
+        true
+    }
+
+    ; GetDiagnosticsOfAnyProgram(nil) over this program; the timed callbacks'
+    ; clock ticks when `timed`; false after a stop
+    procedure diagnostics_of_any_program(this, out: ref[Array[ref[DriverDiagnostic]]], skip_no_emit_check: bool, timed: bool) returns bool
+    {
+        let sys program.sys
+        var ci 0
+        while ci < (program.config_diagnostics.get_length() as int)
+        {
+            out.add(program.config_diagnostics[ci as size_t])
+            set ci: ci + 1
+        }
+        let config_count out.get_length()
+        var k program.lib_count()
+        while k < program.source_file_count()
+        {
+            program.syntactic(program.source_pf_index(k), out)
+            set k: k + 1
+        }
+        if out.get_length() <> config_count
+            return true
+        program.program_diagnostics(out)
+        if timed
+        {
+            sys.now()
+            sys.now()
+        }
+        if program.flag("listFilesOnly")
+            return true
+        program.global(out)
+        if out.get_length() = config_count
+        {
+            if timed
+                sys.now()
+            if this.semantic_diagnostics(out) = false
+                return false
+            if timed
+                sys.now()
+            program.global(out)
+        }
+        if (skip_no_emit_check or program.flag("noEmit")) and IncOptions.emit_declarations(program.ts) and (out.get_length() = config_count)
+        {
+            if this.declaration_diagnostics(out) = false
+                return false
+        }
+        true
+    }
+
+    ; ── emit ─────────────────────────────────────────────────────────────────
+
+    ; Program.Emit(nil); null after a stop
+    procedure emit(this) returns ref[IncEmitResult]?
+    {
+        var result: ref[IncEmitResult]? null
+        if program.flag("noEmit")
+            set result: IncEmitResult.create(host, true)
+        else
+        {
+            if program.flag("noEmitOnError")
+            {
+                let found &Array[ref[DriverDiagnostic]]^host()
+                if this.diagnostics_of_any_program(found, true, false) = false
+                    return null
+                if found.get_length() > 0
+                {
+                    let skipped IncEmitResult.create(host, true)
+                    set skipped.diagnostics: found
+                    set result: skipped
+                }
+            }
+        }
+        if result <> null
+        {
+            let r result as ref[IncEmitResult]
+            if this.emit_build_info(r) = false
+                return null
+            return r
+        }
+        let handler EmitFilesHandler.create(host, this, false)
+        handler.emit_all_affected_files()
+    }
+
+    ; emitBuildInfo, its result combined into `result`; false after a stop
+    procedure emit_build_info(this, result: ref[IncEmitResult]) returns bool
+    {
+        let file_name IncProgram.build_info_file_name(host, program)
+        if (file_name.length as int) = 0
+            return true
+        if program.is_blocked(file_name)
+            return true
+        if snapshot.has_errors < 0
+        {
+            if this.ensure_has_errors_for_state() = false
+                return false
+            if (snapshot.has_errors <> snapshot.has_errors_from_old_state) or (snapshot.has_semantic_errors <> snapshot.has_semantic_errors_from_old_state)
+                set snapshot.build_info_emit_pending: true
+        }
+        if snapshot.package_jsons = null
+        {
+            set snapshot.package_jsons: &Array[Slice[char]]^host()
+            set snapshot.missing_package_jsons: &Array[Slice[char]]^host()
+            this.ensure_package_jsons_for_state()
+            if (IncProgram.same_list(snapshot.package_jsons, snapshot.package_jsons_from_old_state) = false) or (IncProgram.same_list(snapshot.missing_package_jsons, snapshot.missing_package_jsons_from_old_state) = false)
+                set snapshot.build_info_emit_pending: true
+        }
+        if snapshot.build_info_emit_pending = false
+            return true
+        let info ToBuildInfo.convert(host, this, file_name)
+        let text JsonText.to_text(host, info, false)
+        program.sys.write_file(file_name, text)
+        if build_mode
+        {
+            set this.build_info_emitted: true
+            set this.build_info_time: program.sys.now()
+            set this.build_info_json: info
+            set this.build_info_dts_changed: snapshot.has_changed_dts_file
+        }
+        set snapshot.build_info_emit_pending: false
+        result.emitted_files.add(file_name)
+        true
+    }
+
+    ; ensurePackageJsonsForState: with a config file, every package.json the
+    ; resolver looked up — found ones, and missing ones inside node_modules —
+    ; sorted and deduplicated
+    procedure ensure_package_jsons_for_state(this)
+    {
+        if (program.config_path.length as int) = 0
+            return
+        let found snapshot.package_jsons as ref[Array[Slice[char]]]
+        let missing snapshot.missing_package_jsons as ref[Array[Slice[char]]]
+        let pfiles program.pf
+        var i 0
+        while i < (pfiles.package_json_lookups.get_length() as int)
+        {
+            let path pfiles.package_json_lookups[i as size_t]
+            let exists pfiles.package_json_found[i as size_t]
+            set i: i + 1
+            var real path
+            if exists or pfiles.directory_exists(get_directory_path(host, path))
+                set real: pfiles.real_path(path)
+            if exists
+            {
+                if ExecSystem.contains(found, real) = false
+                    IncSort.insert_sorted(found, real)
+            }
+            else
+            {
+                if slice_contains_node_modules(real) and (ExecSystem.contains(missing, real) = false)
+                    IncSort.insert_sorted(missing, real)
+            }
+        }
+    }
+
+    function same_list(a: ref[Array[Slice[char]]]?, b: ref[Array[Slice[char]]]?) returns bool
+    {
+        var na 0
+        var nb 0
+        if a <> null
+            set na: (a as ref[Array[Slice[char]]]).get_length() as int
+        if b <> null
+            set nb: (b as ref[Array[Slice[char]]]).get_length() as int
+        if na <> nb
+            return false
+        var i 0
+        while i < na
+        {
+            let la a as ref[Array[Slice[char]]]
+            let lb b as ref[Array[Slice[char]]]
+            let x la[i as size_t]
+            let y lb[i as size_t]
+            if x.equals(y) = false
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    ; outputpaths.GetBuildInfoFileName, absolute
+    function build_info_file_name(host: ref[Page], program: ref[DriverProgram]) returns Slice[char]
+        IncProgram.build_info_file_name_of(host, program.ts, program.config_path, program.sys.cwd)
+
+    function build_info_file_name_of(host: ref[Page], o: ref[TsOptions], config: Slice[char], cwd: Slice[char]) returns Slice[char]
+    {
+        if (IncOptions.is_incremental(o) = false) and (o.tristate_of("build") <> 1)
+            return ""
+        let explicit o.text_of("tsBuildInfoFile")
+        if (explicit.length as int) > 0
+            return get_normalized_absolute_path(host, explicit, cwd)
+        if (config.length as int) = 0
+            return ""
+        let ext_len remove_file_extension(config)
+        let extension_less config.subslice(0, ext_len as size_t)
+        var result extension_less
+        let out_dir o.text_of("outDir")
+        if (out_dir.length as int) > 0
+        {
+            let root_dir o.text_of("rootDir")
+            if (root_dir.length as int) > 0
+                set result: get_normalized_absolute_path(host, get_relative_path_to_directory_or_url(host, get_normalized_absolute_path(host, root_dir, cwd), extension_less, false, cwd), get_normalized_absolute_path(host, out_dir, cwd))
+            else
+                set result: combine_paths(host, get_normalized_absolute_path(host, out_dir, cwd), get_base_file_name(host, extension_less))
+        }
+        join_slices(host, result, ".tsbuildinfo")
+    }
+
+    ; ensureHasErrorsForState; false after a stop
+    procedure ensure_has_errors_for_state(this) returns bool
+    {
+        var has_emit_diagnostics false
+        var has_include false
+        if snapshot.can_use_incremental_state()
+        {
+            var i 0
+            while i < program.source_file_count()
+            {
+                let path program.source_path(i)
+                if snapshot.emit_diagnostics.has(path)
+                {
+                    set has_emit_diagnostics: true
+                    break
+                }
+                if has_include = false
+                    set has_include: this.has_include_diagnostics(i)
+                set i: i + 1
+            }
+        }
+        else
+        {
+            set has_emit_diagnostics: snapshot.has_emit_diagnostics
+            var i 0
+            while i < program.source_file_count()
+            {
+                if this.has_include_diagnostics(i)
+                    set has_include: true
+                set i: i + 1
+            }
+        }
+        if has_emit_diagnostics
+        {
+            if IncOptions.is_incremental(program.ts)
+                set snapshot.has_errors: 0
+            else
+                set snapshot.has_errors: 1
+            set snapshot.has_semantic_errors: false
+            return true
+        }
+        let found &Array[ref[DriverDiagnostic]]^host()
+        var k program.lib_count()
+        while k < program.source_file_count()
+        {
+            program.syntactic(program.source_pf_index(k), found)
+            set k: k + 1
+        }
+        program.program_diagnostics(found)
+        program.global(found)
+        if has_include or (program.config_diagnostics.get_length() > 0) or (found.get_length() > 0)
+        {
+            set snapshot.has_errors: 1
+            set snapshot.has_semantic_errors: false
+            return true
+        }
+        set snapshot.has_errors: 0
+        var i 0
+        while i < program.source_file_count()
+        {
+            let path program.source_path(i)
+            let si snapshot.semantic_diagnostics.slot_of(path)
+            var encoded false
+            if si < 0
+                set encoded: IncOptions.is_incremental(program.ts)
+            else
+                set encoded: snapshot.semantic_diagnostics.value_at(si).is_empty() = false
+            if encoded
+            {
+                set snapshot.has_semantic_errors: IncOptions.is_incremental(program.ts) = false
+                break
+            }
+            set i: i + 1
+        }
+        true
+    }
+
+    procedure has_include_diagnostics(this, i: int) returns bool
+    {
+        let index program.source_pf_index(i)
+        if index < 0
+            return false
+        let found &Array[ref[DriverDiagnostic]]^host()
+        program.include_processor(index, found)
+        found.get_length() > 0
+    }
+
+    ; ── the harness's program baseline (TestSys.OnProgram) ────────────────────
+
+    procedure baseline(this, builder: ref[StringBuilder])
+    {
+        if builder.get_length() <> 0
+            builder.append("\n")
+        let config program.config_path
+        let sys program.sys
+        if (config.length as int) > 0
+        {
+            let relative get_relative_path_to_directory_or_url(host, sys.cwd, config, false, sys.cwd)
+            builder.append(relative.data, relative.length)
+            builder.append("::\n")
+        }
+        builder.append("SemanticDiagnostics::\n")
+        var i 0
+        while i < program.source_file_count()
+        {
+            let path program.source_path(i)
+            set i: i + 1
+            let k snapshot.semantic_diagnostics.slot_of(path)
+            if k >= 0
+            {
+                let current snapshot.semantic_diagnostics.value_at(k)
+                let ok old_semantic.slot_of(path)
+                var refreshed true
+                if ok >= 0
+                {
+                    let previous old_semantic.value_at(ok)
+                    if previous = current
+                        set refreshed: false
+                }
+                if refreshed
+                {
+                    builder.append("*refresh*    ")
+                    builder.append(path.data, path.length)
+                    builder.append("\n")
+                }
+            }
+            else
+            {
+                builder.append("*not cached* ")
+                builder.append(path.data, path.length)
+                builder.append("\n")
+            }
+        }
+        builder.append("Signatures::\n")
+        var j 0
+        while j < program.source_file_count()
+        {
+            let path program.source_path(j)
+            set j: j + 1
+            let k updated_signature_kinds.slot_of(path)
+            if k < 0
+                continue
+            let kind updated_signature_kinds.value_at(k)
+            if kind = SignatureUpdateKindComputedDts
+                builder.append("(computed .d.ts) ")
+            if kind = SignatureUpdateKindStoredAtEmit
+                builder.append("(stored at emit) ")
+            if kind = SignatureUpdateKindUsedVersion
+                builder.append("(used version)   ")
+            builder.append(path.data, path.length)
+            builder.append("\n")
+        }
+    }
+}
+
+; compiler.EmitResult
+define IncEmitResult (emit_skipped: bool  diagnostics: ref[Array[ref[DriverDiagnostic]]]  emitted_files: ref[Array[Slice[char]]])
+{
+    function create(host: ref[Page], skipped: bool) returns ref[IncEmitResult]
+        &IncEmitResult^host(skipped, &Array[ref[DriverDiagnostic]]^host(), &Array[Slice[char]]^host())
+
+    ; CombineEmitResults, one at a time
+    procedure combine(this, other: ref[IncEmitResult])
+    {
+        if other.emit_skipped
+            set emit_skipped: true
+        var i 0
+        while i < (other.diagnostics.get_length() as int)
+        {
+            diagnostics.add(other.diagnostics[i as size_t])
+            set i: i + 1
+        }
+        var k 0
+        while k < (other.emitted_files.get_length() as int)
+        {
+            emitted_files.add(other.emitted_files[k as size_t])
+            set k: k + 1
+        }
+    }
+}
+
+; toProgramSnapshot
+define ToProgramSnapshot (host: ref[Page]  p: ref[IncProgram]  old: ref[IncSnapshot]?  global_file_removed: bool)
+{
+    procedure reuse_from_old_program(this)
+    {
+        let s p.snapshot
+        if old = null
+        {
+            set s.build_info_emit_pending: IncOptions.is_incremental(s.options)
+            return
+        }
+        let o old as ref[IncSnapshot]
+        if s.options.tristate_of("composite") = 1
+            set s.latest_changed_dts_file: o.latest_changed_dts_file
+        var i 0
+        while i < o.changed_files.slot_count()
+        {
+            if o.changed_files.is_live(i)
+                s.changed_files.store(o.changed_files.key_at(i), true)
+            set i: i + 1
+        }
+        var k 0
+        while k < o.pending_emit.slot_count()
+        {
+            if o.pending_emit.is_live(k)
+                s.pending_emit.store(o.pending_emit.key_at(k), o.pending_emit.value_at(k))
+            set k: k + 1
+        }
+        set s.build_info_emit_pending: o.build_info_emit_pending
+        set s.has_errors_from_old_state: o.has_errors
+        set s.has_semantic_errors_from_old_state: o.has_semantic_errors
+        set s.package_jsons_from_old_state: o.package_jsons
+        set s.missing_package_jsons_from_old_state: o.missing_package_jsons
+    }
+
+    function same_set(a: ref[Array[Slice[char]]]?, b: ref[Array[Slice[char]]]?) returns bool
+    {
+        var na 0
+        var nb 0
+        if a <> null
+            set na: (a as ref[Array[Slice[char]]]).get_length() as int
+        if b <> null
+            set nb: (b as ref[Array[Slice[char]]]).get_length() as int
+        if na <> nb
+            return false
+        if na = 0
+            return true
+        let la a as ref[Array[Slice[char]]]
+        let lb b as ref[Array[Slice[char]]]
+        var i 0
+        while i < na
+        {
+            if ExecSystem.contains(lb, la[i as size_t]) = false
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    ; computeProgramFileChanges; false after a stop
+    procedure compute_program_file_changes(this) returns bool
+    {
+        let s p.snapshot
+        let program p.program
+        var can_copy_semantic false
+        var can_copy_signatures false
+        var copy_declaration false
+        var copy_lib false
+        if old <> null
+        {
+            let o old as ref[IncSnapshot]
+            set can_copy_semantic: IncOptions.have_changes(host, o.options, s.options, 2) = false
+            set can_copy_signatures: (s.options.tristate_of("composite") = 1) and (IncOptions.have_changes(host, o.options, s.options, 8) = false)
+            set copy_declaration: can_copy_semantic and ((s.options.tristate_of("skipLibCheck") = 1) = (o.options.tristate_of("skipLibCheck") = 1))
+            set copy_lib: copy_declaration and ((s.options.tristate_of("skipDefaultLibCheck") = 1) = (o.options.tristate_of("skipDefaultLibCheck") = 1))
+        }
+        var i 0
+        while i < program.source_file_count()
+        {
+            let path program.source_path(i)
+            let version s.compute_hash(host, program.source_text(i))
+            let implied program.source_implied_node_format(i)
+            let affects program.source_affects_global_scope(i)
+            var signature Slice[char]()
+            let refs program.referenced_files(i)
+            if refs = null
+                return false
+            let new_references refs as ref[Array[Slice[char]]]
+            if new_references.get_length() > 0
+                s.referenced_map.store(path, new_references)
+            if old <> null
+            {
+                let o old as ref[IncSnapshot]
+                let oi o.file_infos.slot_of(path)
+                if oi >= 0
+                {
+                    let old_info o.file_infos.value_at(oi)
+                    set signature: old_info.signature
+                    let old_refs_index o.referenced_map.slot_of(path)
+                    var old_refs: ref[Array[Slice[char]]]? null
+                    if old_refs_index >= 0
+                        set old_refs: o.referenced_map.value_at(old_refs_index)
+                    if (old_info.version.equals(version) = false) or (old_info.affects_global_scope <> affects) or (old_info.implied_node_format <> implied)
+                        s.add_file_to_change_set(path)
+                    else
+                    {
+                        if ToProgramSnapshot.same_set(new_references, old_refs) = false
+                            s.add_file_to_change_set(path)
+                        else
+                        {
+                            var r 0
+                            while r < (new_references.get_length() as int)
+                            {
+                                let ref_path new_references[r as size_t]
+                                set r: r + 1
+                                if program.source_index_of_path(ref_path) < 0
+                                {
+                                    if o.file_infos.has(ref_path)
+                                    {
+                                        s.add_file_to_change_set(path)
+                                        break
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                    s.add_file_to_change_set(path)
+                if s.changed_files.has(path) = false
+                {
+                    let ei o.emit_diagnostics.slot_of(path)
+                    if ei >= 0
+                        s.emit_diagnostics.store(path, o.emit_diagnostics.value_at(ei))
+                    if can_copy_semantic
+                    {
+                        var copy true
+                        if program.source_is_declaration_file(i) and (copy_declaration = false)
+                            set copy: false
+                        if (i < program.lib_count()) and (copy_lib = false)
+                            set copy: false
+                        if copy
+                        {
+                            let si o.semantic_diagnostics.slot_of(path)
+                            if si >= 0
+                                s.semantic_diagnostics.store(path, o.semantic_diagnostics.value_at(si))
+                        }
+                    }
+                }
+                if can_copy_signatures
+                {
+                    let gi o.emit_signatures.slot_of(path)
+                    if gi >= 0
+                        s.emit_signatures.store(path, ToProgramSnapshot.new_emit_signature(host, o.emit_signatures.value_at(gi), o.options, s.options))
+                }
+            }
+            else
+            {
+                s.add_file_to_affected_files_pending_emit(path, IncOptions.file_emit_kind(s.options))
+                set signature: version
+            }
+            s.file_infos.store(path, &IncFileInfo^host(version, signature, affects, implied))
+            set i: i + 1
+        }
+        true
+    }
+
+    ; emitSignature.getNewEmitSignature
+    function new_emit_signature(host: ref[Page], e: ref[IncEmitSignature], old_options: ref[TsOptions], new_options: ref[TsOptions]) returns ref[IncEmitSignature]
+    {
+        if (old_options.tristate_of("declarationMap") = 1) = (new_options.tristate_of("declarationMap") = 1)
+            return e
+        let none: Slice[char] ""
+        if e.different = false
+            return &IncEmitSignature^host(none, true, e.signature)
+        &IncEmitSignature^host(e.different_signature, false, none)
+    }
+
+    procedure handle_file_delete(this)
+    {
+        if old = null
+            return
+        let s p.snapshot
+        let o old as ref[IncSnapshot]
+        var i 0
+        while i < o.file_infos.slot_count()
+        {
+            if o.file_infos.is_live(i)
+            {
+                let path o.file_infos.key_at(i)
+                if s.file_infos.has(path) = false
+                {
+                    let info o.file_infos.value_at(i)
+                    if info.affects_global_scope
+                    {
+                        let all s.all_files_excluding_default_library_file(host, p.program, 0 - 1)
+                        var k 0
+                        while k < (all.get_length() as int)
+                        {
+                            s.add_file_to_change_set(p.program.source_path(all[k as size_t]))
+                            set k: k + 1
+                        }
+                        set this.global_file_removed: true
+                    }
+                    else
+                        set s.build_info_emit_pending: true
+                    return
+                }
+            }
+            set i: i + 1
+        }
+    }
+
+    procedure handle_pending_emit(this)
+    {
+        if (old = null) or global_file_removed
+            return
+        let s p.snapshot
+        let o old as ref[IncSnapshot]
+        var kind 0
+        if IncOptions.have_changes(host, o.options, s.options, 4)
+            set kind: IncOptions.file_emit_kind(s.options)
+        else
+            set kind: IncOptions.pending_emit_kind_with_options(s.options, o.options)
+        if kind = 0
+            return
+        var i 0
+        while i < p.program.source_file_count()
+        {
+            let path p.program.source_path(i)
+            if s.changed_files.has(path) = false
+                s.add_file_to_affected_files_pending_emit(path, kind)
+            set i: i + 1
+        }
+        set s.build_info_emit_pending: true
+    }
+
+    procedure handle_pending_check(this)
+    {
+        if old = null
+            return
+        let s p.snapshot
+        let o old as ref[IncSnapshot]
+        if (s.semantic_diagnostics.size() <> p.program.source_file_count()) and (o.check_pending <> s.check_pending)
+            set s.build_info_emit_pending: true
+    }
+}
+
+; affectedFilesHandler
+define AffectedFilesHandler
+(
+    host: ref[Page]
+    p: ref[IncProgram]
+    has_all_files_excluding_default_library_file: bool
+    updated_signature_keys: ref[Array[Slice[char]]]
+    updated_signature_values: ref[Array[Slice[char]]]
+    updated_signature_kinds: ref[Array[int]]
+    ; dtsMayChange: one map per affected file, flattened (path, kind) pairs in order
+    dts_may_change_paths: ref[Array[Slice[char]]]
+    dts_may_change_kinds: ref[Array[int]]
+    files_to_remove_diagnostics: ref[Array[Slice[char]]]
+    cleaned_diagnostics_of_lib_files: bool
+    seen_file_and_references: ref[PathMap[bool]]
+)
+{
+    ; collectAllAffectedFiles; false after a stop
+    procedure collect_all_affected_files(host: ref[Page], p: ref[IncProgram]) returns bool
+    {
+        let s p.snapshot
+        if s.changed_files.size() = 0
+            return true
+        let h &AffectedFilesHandler^host(host, p, false, &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), false, IncSnapshot.bool_map(host))
+        let affected &Array[int]^host()
+        var i 0
+        while i < s.changed_files.slot_count()
+        {
+            if s.changed_files.is_live(i)
+            {
+                let files h.files_affected_by(s.changed_files.key_at(i))
+                if files = null
+                    return false
+                let fl files as ref[Array[int]]
+                var k 0
+                while k < (fl.get_length() as int)
+                {
+                    let f fl[k as size_t]
+                    var seen false
+                    var q 0
+                    while q < (affected.get_length() as int)
+                    {
+                        if affected[q as size_t] = f
+                            set seen: true
+                        set q: q + 1
+                    }
+                    if seen = false
+                        affected.add(f)
+                    set k: k + 1
+                }
+            }
+            set i: i + 1
+        }
+        let emit_kind IncOptions.file_emit_kind(s.options)
+        var a 0
+        while a < (affected.get_length() as int)
+        {
+            let file affected[a as size_t]
+            set a: a + 1
+            let marker (h.dts_may_change_paths.get_length() as int)
+            h.dts_may_change_paths.add(p.program.source_path(file))
+            h.dts_may_change_kinds.add(emit_kind)
+            if h.handle_dts_may_change_of_affected_file(file) = false
+                return false
+        }
+        h.update_snapshot()
+        true
+    }
+
+    function find_updated(this, path: Slice[char]) returns int
+    {
+        var i 0
+        while i < (updated_signature_keys.get_length() as int)
+        {
+            let k updated_signature_keys[i as size_t]
+            if k.equals(path)
+                return i
+            set i: i + 1
+        }
+        0 - 1
+    }
+
+    function is_changed_signature(this, path: Slice[char]) returns bool
+    {
+        let i this.find_updated(path)
+        let info_index p.snapshot.file_infos.slot_of(path)
+        let info p.snapshot.file_infos.value_at(info_index)
+        let sig updated_signature_values[i as size_t]
+        sig.equals(info.signature) = false
+    }
+
+    procedure remove_semantic_diagnostics_of(this, path: Slice[char])
+    {
+        if ExecSystem.contains(files_to_remove_diagnostics, path) = false
+            files_to_remove_diagnostics.add(path)
+    }
+
+    procedure remove_diagnostics_of_library_files(this)
+    {
+        if cleaned_diagnostics_of_lib_files
+            return
+        set this.cleaned_diagnostics_of_lib_files: true
+        var i 0
+        while i < p.program.lib_count()
+        {
+            if p.program.source_skip_type_checking(i, true) = false
+                this.remove_semantic_diagnostics_of(p.program.source_path(i))
+            set i: i + 1
+        }
+    }
+
+    ; computeDtsSignature into the cell; false after a stop
+    procedure compute_dts_signature(this, i: int, out_signature: ref[Slice[char]]) returns bool
+    {
+        let index p.program.source_pf_index(i)
+        let result p.program.emit_one(index, EmitOnlyForcedDts)
+        if result = null
+            return false
+        let r result as ref[FileEmitOutput]
+        if r.has_dts = false
+            return true
+        let signature EmitFilesHandler.signature_with_diagnostics(host, p, i, r.dts_text, r.diagnostics)
+        set out_signature.data: signature.data
+        set out_signature.length: signature.length
+        true
+    }
+
+    ; updateShapeSignature; the answer through `out_changed`, false after a stop
+    procedure update_shape_signature(this, i: int, use_file_version_as_signature: bool, out_changed: ref[bool]) returns bool
+    {
+        let path p.program.source_path(i)
+        set out_changed: false
+        if this.find_updated(path) >= 0
+            return true
+        let info_index p.snapshot.file_infos.slot_of(path)
+        let info p.snapshot.file_infos.value_at(info_index)
+        let previous info.signature
+        var signature Slice[char]()
+        var kind SignatureUpdateKindComputedDts
+        if (p.program.source_is_declaration_file(i) = false) and (use_file_version_as_signature = false)
+        {
+            if this.compute_dts_signature(i, &signature) = false
+                return false
+        }
+        if (signature.length as int) = 0
+        {
+            set signature: info.version
+            set kind: SignatureUpdateKindUsedVersion
+        }
+        updated_signature_keys.add(path)
+        updated_signature_values.add(signature)
+        updated_signature_kinds.add(kind)
+        set out_changed: signature.equals(previous) = false
+        true
+    }
+
+    ; getFilesAffectedBy; null after a stop
+    procedure files_affected_by(this, path: Slice[char]) returns ref[Array[int]]?
+    {
+        let out &Array[int]^host()
+        let file p.program.source_index_of_path(path)
+        if file < 0
+            return out
+        var changed false
+        if this.update_shape_signature(file, false, &changed) = false
+            return null
+        if changed = false
+        {
+            out.add(file)
+            return out
+        }
+        let info_index p.snapshot.file_infos.slot_of(path)
+        let info p.snapshot.file_infos.value_at(info_index)
+        if info.affects_global_scope
+        {
+            set this.has_all_files_excluding_default_library_file: true
+            p.snapshot.all_files_excluding_default_library_file(host, p.program, file)
+        }
+        if p.program.flag("isolatedModules")
+        {
+            out.add(file)
+            return out
+        }
+        let seen &Array[Slice[char]]^host()
+        seen.add(path)
+        let queue p.snapshot.referenced_by(host, path)
+        while queue.get_length() > 0
+        {
+            let current queue[(queue.get_length() - 1) as size_t]
+            AffectedFilesHandler.pop(host, queue)
+            if ExecSystem.contains(seen, current)
+                continue
+            seen.add(current)
+            let current_file p.program.source_index_of_path(current)
+            if current_file >= 0
+            {
+                var shape_changed false
+                if this.update_shape_signature(current_file, false, &shape_changed) = false
+                    return null
+                if shape_changed
+                {
+                    let more p.snapshot.referenced_by(host, current)
+                    var m 0
+                    while m < (more.get_length() as int)
+                    {
+                        queue.add(more[m as size_t])
+                        set m: m + 1
+                    }
+                }
+            }
+        }
+        var k 0
+        while k < (seen.get_length() as int)
+        {
+            let f p.program.source_index_of_path(seen[k as size_t])
+            if f >= 0
+                out.add(f)
+            set k: k + 1
+        }
+        out
+    }
+
+    ; the list without its last element
+    procedure pop(host: ref[Page], list: ref[Array[Slice[char]]])
+    {
+        let n list.get_length() as int
+        let copy &Array[Slice[char]]^host()
+        var i 0
+        while i < (n - 1)
+        {
+            copy.add(list[i as size_t])
+            set i: i + 1
+        }
+        list.clear()
+        var k 0
+        while k < (copy.get_length() as int)
+        {
+            list.add(copy[k as size_t])
+            set k: k + 1
+        }
+    }
+
+    ; the current dtsMayChange map's entry (a later add of the same path replaces)
+    procedure add_dts_may_change(this, path: Slice[char], kind: int)
+    {
+        dts_may_change_paths.add(path)
+        dts_may_change_kinds.add(kind)
+    }
+
+    ; handleDtsMayChangeOfAffectedFile; false after a stop
+    procedure handle_dts_may_change_of_affected_file(this, file: int) returns bool
+    {
+        let s p.snapshot
+        let path p.program.source_path(file)
+        this.remove_semantic_diagnostics_of(path)
+        if has_all_files_excluding_default_library_file
+        {
+            this.remove_diagnostics_of_library_files()
+            var ignored false
+            return this.update_shape_signature(file, false, &ignored)
+        }
+        if p.program.flag("assumeChangesOnlyAffectDirectDependencies")
+            return true
+        if s.changed_files.has(path) = false
+            return true
+        if this.is_changed_signature(path) = false
+            return true
+        if p.program.flag("isolatedModules")
+        {
+            let seen &Array[Slice[char]]^host()
+            seen.add(path)
+            let queue s.referenced_by(host, path)
+            while queue.get_length() > 0
+            {
+                let current queue[(queue.get_length() - 1) as size_t]
+                AffectedFilesHandler.pop(host, queue)
+                if ExecSystem.contains(seen, current)
+                    continue
+                seen.add(current)
+                var global false
+                if this.handle_dts_may_change_of_global_scope(current, false, &global) = false
+                    return false
+                if global
+                    break
+                if this.handle_dts_may_change_of(current, false) = false
+                    return false
+                if this.find_updated(current) >= 0
+                {
+                    if this.is_changed_signature(current)
+                    {
+                        let more s.referenced_by(host, current)
+                        var m 0
+                        while m < (more.get_length() as int)
+                        {
+                            queue.add(more[m as size_t])
+                            set m: m + 1
+                        }
+                    }
+                }
+            }
+        }
+        var invalidate_js false
+        let node p.program.source_node(file)
+        if node <> null
+        {
+            let symbol AstNode.symbol_of(node as ref[AstNode])
+            if symbol <> null
+            {
+                let sym symbol as ref[Symbol]
+                if sym.exports <> null
+                {
+                    let table sym.exports as ref[SymbolTable]
+                    let entries table.entries
+                    var e 0
+                    while e < (entries.get_length() as int)
+                    {
+                        let entry entries[e as size_t]
+                        set e: e + 1
+                        if entry.symbol = null
+                            continue
+                        let exported entry.symbol as ref[Symbol]
+                        if (exported.flags & SymbolFlagsConstEnum) <> 0
+                        {
+                            set invalidate_js: true
+                            break
+                        }
+                        if (exported.flags & SymbolFlagsAlias) = 0
+                            continue
+                        let cd p.program.checker as ref[Checker]
+                        let index p.program.source_pf_index(file)
+                        let pfiles p.program.pf
+                        cd.select_program_file(index, pfiles.format_at(index))
+                        let aliased cd.resolve_alias(exported)
+                        if (aliased = null) or (aliased = exported)
+                            continue
+                        let al aliased as ref[Symbol]
+                        if (al.flags & SymbolFlagsConstEnum) <> 0
+                        {
+                            if al.declarations <> null
+                            {
+                                let decls al.declarations as ref[Array[ref[AstNode]?]]
+                                var d 0
+                                while d < (decls.get_length() as int)
+                                {
+                                    if Checker.source_file_of_node(decls[d as size_t]) = node
+                                        set invalidate_js: true
+                                    set d: d + 1
+                                }
+                            }
+                            if invalidate_js
+                                break
+                        }
+                    }
+                }
+            }
+        }
+        let referencing s.referenced_by(host, path)
+        var r 0
+        while r < (referencing.get_length() as int)
+        {
+            let changed_ref referencing[r as size_t]
+            set r: r + 1
+            var global false
+            if this.handle_dts_may_change_of_global_scope(changed_ref, invalidate_js, &global) = false
+                return false
+            if global
+                return true
+            let second s.referenced_by(host, changed_ref)
+            var q 0
+            while q < (second.get_length() as int)
+            {
+                var stop false
+                if this.handle_dts_may_change_of_file_and_references(second[q as size_t], invalidate_js, &stop) = false
+                    return false
+                if stop
+                    return true
+                set q: q + 1
+            }
+        }
+        true
+    }
+
+    procedure handle_dts_may_change_of_file_and_references(this, path: Slice[char], invalidate_js: bool, out_stop: ref[bool]) returns bool
+    {
+        set out_stop: false
+        let si seen_file_and_references.slot_of(path)
+        if si >= 0
+        {
+            let existing seen_file_and_references.value_at(si)
+            if existing or (invalidate_js = false)
+                return true
+            seen_file_and_references.store(path, true)
+        }
+        else
+            seen_file_and_references.store(path, invalidate_js)
+        var global false
+        if this.handle_dts_may_change_of_global_scope(path, invalidate_js, &global) = false
+            return false
+        if global
+        {
+            set out_stop: true
+            return true
+        }
+        if this.handle_dts_may_change_of(path, invalidate_js) = false
+            return false
+        let referencing p.snapshot.referenced_by(host, path)
+        var r 0
+        while r < (referencing.get_length() as int)
+        {
+            var stop false
+            if this.handle_dts_may_change_of_file_and_references(referencing[r as size_t], invalidate_js, &stop) = false
+                return false
+            if stop
+            {
+                set out_stop: true
+                return true
+            }
+            set r: r + 1
+        }
+        true
+    }
+
+    procedure handle_dts_may_change_of_global_scope(this, path: Slice[char], invalidate_js: bool, out_global: ref[bool]) returns bool
+    {
+        set out_global: false
+        let ii p.snapshot.file_infos.slot_of(path)
+        if ii < 0
+            return true
+        let info p.snapshot.file_infos.value_at(ii)
+        if info.affects_global_scope = false
+            return true
+        let all p.snapshot.all_files_excluding_default_library_file(host, p.program, 0 - 1)
+        var k 0
+        while k < (all.get_length() as int)
+        {
+            if this.handle_dts_may_change_of(p.program.source_path(all[k as size_t]), invalidate_js) = false
+                return false
+            set k: k + 1
+        }
+        this.remove_diagnostics_of_library_files()
+        set out_global: true
+        true
+    }
+
+    procedure handle_dts_may_change_of(this, path: Slice[char], invalidate_js: bool) returns bool
+    {
+        let s p.snapshot
+        if s.changed_files.has(path)
+            return true
+        let file p.program.source_index_of_path(path)
+        if file < 0
+            return true
+        this.remove_semantic_diagnostics_of(path)
+        var ignored false
+        if this.update_shape_signature(file, true, &ignored) = false
+            return false
+        if invalidate_js
+            this.add_dts_may_change(path, IncOptions.file_emit_kind(s.options))
+        else
+        {
+            if IncOptions.emit_declarations(s.options)
+            {
+                if s.options.tristate_of("declarationMap") = 1
+                    this.add_dts_may_change(path, FileEmitKindAllDts)
+                else
+                    this.add_dts_may_change(path, FileEmitKindDts)
+            }
+        }
+        true
+    }
+
+    procedure update_snapshot(this)
+    {
+        let s p.snapshot
+        var i 0
+        while i < (updated_signature_keys.get_length() as int)
+        {
+            let path updated_signature_keys[i as size_t]
+            let ii s.file_infos.slot_of(path)
+            if ii >= 0
+            {
+                let info s.file_infos.value_at(ii)
+                set info.signature: updated_signature_values[i as size_t]
+                p.updated_signature_kinds.store(path, updated_signature_kinds[i as size_t])
+            }
+            set i: i + 1
+        }
+        var r 0
+        while r < (files_to_remove_diagnostics.get_length() as int)
+        {
+            s.semantic_diagnostics.remove(files_to_remove_diagnostics[r as size_t])
+            set r: r + 1
+        }
+        var d 0
+        while d < (dts_may_change_paths.get_length() as int)
+        {
+            s.add_file_to_affected_files_pending_emit(dts_may_change_paths[d as size_t], dts_may_change_kinds[d as size_t])
+            set d: d + 1
+        }
+        s.changed_files.clear()
+        set s.build_info_emit_pending: true
+    }
+}
+
+; emitFilesHandler
+define EmitFilesHandler
+(
+    host: ref[Page]
+    p: ref[IncProgram]
+    is_for_dts_errors: bool
+    signatures: ref[PathMap[Slice[char]]]
+    emit_signatures: ref[PathMap[ref[IncEmitSignature]]]
+    latest_changed_dts_files: ref[PathMap[Slice[char]]]
+    deleted_pending_kinds: ref[Array[Slice[char]]]
+    update_paths: ref[Array[Slice[char]]]
+    update_kinds: ref[Array[int]]
+    update_results: ref[Array[ref[IncEmitResult]]]
+    update_from_cache: ref[Array[bool]]
+    has_emit_diagnostics: bool
+)
+{
+    function create(host: ref[Page], p: ref[IncProgram], is_for_dts_errors: bool) returns ref[EmitFilesHandler]
+        &EmitFilesHandler^host(host, p, is_for_dts_errors, &PathMap[Slice[char]]^host(&Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[bool]^host()), IncSnapshot.signature_map(host), &PathMap[Slice[char]]^host(&Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[bool]^host()), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[ref[IncEmitResult]]^host(), &Array[bool]^host(), false)
+
+    procedure update_has_emit_diagnostics(this, result: ref[IncEmitResult])
+    {
+        if result.diagnostics.get_length() > 0
+            set this.has_emit_diagnostics: true
+    }
+
+    ; emitAllAffectedFiles(nil); null after a stop
+    procedure emit_all_affected_files(this) returns ref[IncEmitResult]?
+    {
+        let s p.snapshot
+        if s.can_use_incremental_state()
+        {
+            let results this.emit_files_incremental()
+            if results = null
+                return null
+            let list results as ref[Array[ref[IncEmitResult]]]
+            let combined IncEmitResult.create(host, false)
+            var i 0
+            while i < (list.get_length() as int)
+            {
+                combined.combine(list[i as size_t])
+                set i: i + 1
+            }
+            this.update_has_emit_diagnostics(combined)
+            if is_for_dts_errors = false
+            {
+                if p.emit_build_info(combined) = false
+                    return null
+            }
+            return combined
+        }
+        if is_for_dts_errors = false
+        {
+            if p.program.emit() = false
+                return null
+            let result IncEmitResult.create(host, p.program.emit_skipped)
+            var d 0
+            while d < (p.program.emit_diagnostics.get_length() as int)
+            {
+                result.diagnostics.add(p.program.emit_diagnostics[d as size_t])
+                set d: d + 1
+            }
+            var f 0
+            while f < (p.program.emitted_files.get_length() as int)
+            {
+                result.emitted_files.add(p.program.emitted_files[f as size_t])
+                set f: f + 1
+            }
+            this.update_has_emit_diagnostics(result)
+            if has_emit_diagnostics
+                set s.has_emit_diagnostics: true
+            if p.emit_build_info(result) = false
+                return null
+            return result
+        }
+        let result IncEmitResult.create(host, true)
+        var k p.program.lib_count()
+        while k < p.program.source_file_count()
+        {
+            if p.program.declaration(p.program.source_pf_index(k), result.diagnostics) = false
+                return null
+            set k: k + 1
+        }
+        if result.diagnostics.get_length() > 0
+        {
+            this.update_has_emit_diagnostics(result)
+            set s.has_emit_diagnostics: true
+        }
+        result
+    }
+
+    ; getPendingEmitKindForEmitOptions
+    function pending_kind_for(this, emit_kind: int) returns int
+    {
+        var kind IncOptions.pending_emit_kind(emit_kind, 0)
+        if is_for_dts_errors
+            set kind: kind & FileEmitKindDtsErrors
+        kind
+    }
+
+    ; emitFilesIncremental; null after a stop
+    procedure emit_files_incremental(this) returns ref[Array[ref[IncEmitResult]]]?
+    {
+        let s p.snapshot
+        if AffectedFilesHandler.collect_all_affected_files(host, p) = false
+            return null
+        var i 0
+        while i < p.program.source_file_count()
+        {
+            let path p.program.source_path(i)
+            set i: i + 1
+            let pi s.pending_emit.slot_of(path)
+            if pi < 0
+                continue
+            let emit_kind s.pending_emit.value_at(pi)
+            let file i - 1
+            if p.program.source_may_be_emitted(file) = false
+            {
+                deleted_pending_kinds.add(path)
+                continue
+            }
+            let pending this.pending_kind_for(emit_kind)
+            if pending = 0
+                continue
+            var emit_only EmitOnlyDts
+            if (pending & FileEmitKindAllJs) <> 0
+                set emit_only: EmitOnlyJs
+            if (pending & FileEmitKindAllDts) <> 0
+            {
+                if emit_only = EmitOnlyJs
+                    set emit_only: EmitOnlyAll
+                else
+                    set emit_only: EmitOnlyDts
+            }
+            var result: ref[IncEmitResult]? null
+            if is_for_dts_errors = false
+            {
+                let emitted this.program_emit(file, emit_only)
+                if emitted = null
+                    return null
+                set result: emitted
+            }
+            else
+            {
+                let r IncEmitResult.create(host, true)
+                if p.program.declaration(p.program.source_pf_index(file), r.diagnostics) = false
+                    return null
+                set result: r
+            }
+            let rr result as ref[IncEmitResult]
+            this.update_has_emit_diagnostics(rr)
+            update_paths.add(path)
+            update_kinds.add(IncOptions.pending_emit_kind(emit_kind, pending))
+            update_results.add(rr)
+            update_from_cache.add(false)
+        }
+        ; the cached emit diagnostics of files not emitted above
+        var k 0
+        while k < s.emit_diagnostics.slot_count()
+        {
+            if s.emit_diagnostics.is_live(k)
+            {
+                let path s.emit_diagnostics.key_at(k)
+                if ExecSystem.contains(update_paths, path) = false
+                {
+                    let file p.program.source_index_of_path(path)
+                    var deleted file < 0
+                    if deleted = false
+                        set deleted: p.program.source_may_be_emitted(file) = false
+                    if deleted
+                        deleted_pending_kinds.add(path)
+                    else
+                    {
+                        var kind 0
+                        let pi s.pending_emit.slot_of(path)
+                        if pi >= 0
+                            set kind: s.pending_emit.value_at(pi)
+                        let r IncEmitResult.create(host, true)
+                        let cached p.diagnostics_of(s.emit_diagnostics.value_at(k), file)
+                        var d 0
+                        while d < (cached.get_length() as int)
+                        {
+                            r.diagnostics.add(cached[d as size_t])
+                            set d: d + 1
+                        }
+                        update_paths.add(path)
+                        update_kinds.add(kind)
+                        update_results.add(r)
+                        update_from_cache.add(true)
+                    }
+                }
+            }
+            set k: k + 1
+        }
+        this.update_snapshot()
+    }
+
+    ; program.Emit(TargetSourceFile, EmitOnly, WriteFile: getEmitOptions); null
+    ; after a stop
+    procedure program_emit(this, file: int, emit_only: int) returns ref[IncEmitResult]?
+    {
+        let program p.program
+        let index program.source_pf_index(file)
+        let result IncEmitResult.create(host, false)
+        if program.flag("noEmitOnError")
+        {
+            let found &Array[ref[DriverDiagnostic]]^host()
+            if this.file_diagnostics_of_any_program(file, found) = false
+                return null
+            if found.get_length() > 0
+            {
+                set result.emit_skipped: true
+                set result.diagnostics: found
+                return result
+            }
+        }
+        let output program.emit_one(index, emit_only)
+        if output = null
+            return null
+        let o output as ref[FileEmitOutput]
+        set result.emit_skipped: o.skipped
+        var d 0
+        while d < (o.diagnostics.get_length() as int)
+        {
+            result.diagnostics.add(o.diagnostics[d as size_t])
+            set d: d + 1
+        }
+        if o.has_js
+        {
+            program.sys.write_file(o.js_path, o.js_text)
+            result.emitted_files.add(o.js_path)
+        }
+        if o.has_dts
+        {
+            if this.write_declaration(file, o) = false
+                result.emitted_files.add(o.dts_path)
+        }
+        result
+    }
+
+    ; GetDiagnosticsOfAnyProgram(file) over the driver's program (HandleNoEmitOnError
+    ; inside Program.Emit); false after a stop
+    procedure file_diagnostics_of_any_program(this, file: int, out: ref[Array[ref[DriverDiagnostic]]]) returns bool
+    {
+        let program p.program
+        let index program.source_pf_index(file)
+        var ci 0
+        while ci < (program.config_diagnostics.get_length() as int)
+        {
+            out.add(program.config_diagnostics[ci as size_t])
+            set ci: ci + 1
+        }
+        let config_count out.get_length()
+        program.syntactic(index, out)
+        if out.get_length() <> config_count
+            return true
+        program.program_diagnostics(out)
+        program.global(out)
+        if out.get_length() = config_count
+        {
+            let found &Array[ref[DriverDiagnostic]]^host()
+            if program.semantic(index, found) = false
+                return false
+            var k 0
+            while k < (found.get_length() as int)
+            {
+                out.add(found[k as size_t])
+                set k: k + 1
+            }
+            program.global(out)
+        }
+        if IncOptions.emit_declarations(program.ts) and (out.get_length() = config_count)
+        {
+            if program.declaration(index, out) = false
+                return false
+        }
+        true
+    }
+
+    ; getEmitOptions' WriteFile for a declaration file: the signature bookkeeping,
+    ; then the write unless the composite d.ts did not change; true when skipped
+    procedure write_declaration(this, file: int, o: ref[FileEmitOutput]) returns bool
+    {
+        let s p.snapshot
+        let path p.program.source_path(file)
+        if IncOptions.emit_declarations(s.options) and s.can_use_incremental_state()
+        {
+            var emit_signature Slice[char]()
+            let ii s.file_infos.slot_of(path)
+            let info s.file_infos.value_at(ii)
+            if info.signature.equals(info.version)
+            {
+                let signature EmitFilesHandler.signature_with_diagnostics(host, p, file, o.dts_text, o.diagnostics)
+                if o.diagnostics.get_length() = 0
+                    set emit_signature: signature
+                if signature.equals(info.version) = false
+                    signatures.store(path, signature)
+            }
+            if this.skip_dts_output_of_composite(path, o, emit_signature)
+                return true
+        }
+        p.program.sys.write_file(o.dts_path, o.dts_text)
+        false
+    }
+
+    ; skipDtsOutputOfComposite
+    procedure skip_dts_output_of_composite(this, path: Slice[char], o: ref[FileEmitOutput], signature_in: Slice[char]) returns bool
+    {
+        let s p.snapshot
+        if s.options.tristate_of("composite") <> 1
+            return false
+        var old_signature Slice[char]()
+        let oi s.emit_signatures.slot_of(path)
+        var old_format: ref[IncEmitSignature]? null
+        if oi >= 0
+        {
+            let f s.emit_signatures.value_at(oi)
+            set old_format: f
+            if f.different
+                set old_signature: f.different_signature
+            else
+                set old_signature: f.signature
+        }
+        var new_signature signature_in
+        if (new_signature.length as int) = 0
+            set new_signature: s.compute_hash(host, o.dts_text)
+        if (oi >= 0) and new_signature.equals(old_signature)
+        {
+            let f old_format as ref[IncEmitSignature]
+            if f.different = false
+                return true
+        }
+        else
+            latest_changed_dts_files.store(path, o.dts_path)
+        let none: Slice[char] ""
+        emit_signatures.store(path, &IncEmitSignature^host(new_signature, false, none))
+        false
+    }
+
+    ; computeSignatureWithDiagnostics
+    function signature_with_diagnostics(host: ref[Page], p: ref[IncProgram], file: int, text: Slice[char], diagnostics: ref[Array[ref[DriverDiagnostic]]]) returns Slice[char]
+    {
+        var sb StringBuilder()
+        sb.append(text.data, text.length)
+        let own p.program.source_path(file)
+        var i 0
+        while i < (diagnostics.get_length() as int)
+        {
+            EmitFilesHandler.diagnostic_to_string(host, &sb, diagnostics[i as size_t], own, 0 - 1, 0 - 1)
+            set i: i + 1
+        }
+        let all String^host(sb.to_string())
+        p.snapshot.compute_hash(host, Slice[char](all.get_length(), all.get_buffer() as pointer[char]))
+    }
+
+    ; diagnosticToStringBuilder; a chain line carries its head's file and range
+    procedure diagnostic_to_string(host: ref[Page], sb: ref[StringBuilder], d: ref[DriverDiagnostic], own: Slice[char], head_pos: int, head_end: int)
+    {
+        sb.append("\n")
+        if d.file_name.equals(own) = false
+        {
+            if d.has_file()
+            {
+                let relative IncPaths.non_module_name(host, get_relative_path_to_directory_or_url(host, get_directory_path(host, own), d.file_name, false, Slice[char]()))
+                sb.append(relative.data, relative.length)
+            }
+        }
+        if d.has_file()
+        {
+            sb.append("(")
+            sb.append(d.pos)
+            sb.append(",")
+            sb.append(d.end - d.pos)
+            sb.append("): ")
+        }
+        EmitFilesHandler.append_category_name(sb, DiagnosticMessages.category_of(d.code))
+        sb.append(d.code)
+        sb.append(": ")
+        let key DiagnosticMessages.key_of(d.code)
+        sb.append(key.data, key.length)
+        sb.append("\n")
+        if d.args <> null
+        {
+            let args d.args as ref[Array[String]]
+            var a 0
+            while a < (args.get_length() as int)
+            {
+                sb.append(args[a as size_t])
+                sb.append("\n")
+                set a: a + 1
+            }
+        }
+        if d.related <> null
+        {
+            let related d.related as ref[Array[ref[DriverDiagnostic]]]
+            var r 0
+            while r < (related.get_length() as int)
+            {
+                EmitFilesHandler.diagnostic_to_string(host, sb, related[r as size_t], own, 0 - 1, 0 - 1)
+                set r: r + 1
+            }
+        }
+    }
+
+    procedure append_category_name(sb: ref[StringBuilder], category: int)
+    {
+        if category = 0
+            sb.append("warning")
+        if category = 1
+            sb.append("error")
+        if category = 2
+            sb.append("suggestion")
+        if category = 3
+            sb.append("message")
+    }
+
+    ; updateSnapshot; the emit results in the program's file order
+    procedure update_snapshot(this) returns ref[Array[ref[IncEmitResult]]]
+    {
+        let s p.snapshot
+        let results &Array[ref[IncEmitResult]]^host()
+        if s.can_use_incremental_state() = false
+        {
+            if has_emit_diagnostics
+                set s.has_emit_diagnostics: true
+            return results
+        }
+        var i 0
+        while i < signatures.slot_count()
+        {
+            if signatures.is_live(i)
+            {
+                let path signatures.key_at(i)
+                let ii s.file_infos.slot_of(path)
+                let info s.file_infos.value_at(ii)
+                set info.signature: signatures.value_at(i)
+                p.updated_signature_kinds.store(path, SignatureUpdateKindStoredAtEmit)
+                set s.build_info_emit_pending: true
+            }
+            set i: i + 1
+        }
+        var e 0
+        while e < emit_signatures.slot_count()
+        {
+            if emit_signatures.is_live(e)
+            {
+                s.emit_signatures.store(emit_signatures.key_at(e), emit_signatures.value_at(e))
+                set s.build_info_emit_pending: true
+            }
+            set e: e + 1
+        }
+        var d 0
+        while d < (deleted_pending_kinds.get_length() as int)
+        {
+            s.pending_emit.remove(deleted_pending_kinds[d as size_t])
+            set s.build_info_emit_pending: true
+            set d: d + 1
+        }
+        var f 0
+        while f < p.program.source_file_count()
+        {
+            let path p.program.source_path(f)
+            set f: f + 1
+            let li latest_changed_dts_files.slot_of(path)
+            if li >= 0
+            {
+                set s.latest_changed_dts_file: latest_changed_dts_files.value_at(li)
+                set s.build_info_emit_pending: true
+                set s.has_changed_dts_file: true
+            }
+            var u 0 - 1
+            var q 0
+            while q < (update_paths.get_length() as int)
+            {
+                let up update_paths[q as size_t]
+                if up.equals(path)
+                    set u: q
+                set q: q + 1
+            }
+            if u < 0
+                continue
+            let from_cache update_from_cache[u as size_t]
+            if from_cache = false
+            {
+                let kind update_kinds[u as size_t]
+                if kind = 0
+                    s.pending_emit.remove(path)
+                else
+                    s.pending_emit.store(path, kind)
+                set s.build_info_emit_pending: true
+            }
+            let result update_results[u as size_t]
+            results.add(result)
+            if result.diagnostics.get_length() > 0
+                s.emit_diagnostics.store(path, &IncDiagnostics^host(result.diagnostics, null))
+        }
+        results
+    }
+}
+
+define IncPaths (reserved: int)
+{
+    ; tspath.EnsurePathIsNonModuleName
+    function non_module_name(host: ref[Page], path: Slice[char]) returns Slice[char]
+    {
+        if (get_root_length(path) = 0) and (path_is_relative(path) = false)
+            return join_slices(host, "./", path)
+        path
+    }
+
+    ; relativeToBuildInfo
+    function relative_to(host: ref[Page], directory: Slice[char], path: Slice[char], cwd: Slice[char]) returns Slice[char]
+        IncPaths.non_module_name(host, get_relative_path_to_directory_or_url(host, directory, path, false, cwd))
+}
+
+; toBuildInfo (snapshotToBuildInfo)
+define ToBuildInfo
+(
+    host: ref[Page]
+    p: ref[IncProgram]
+    directory: Slice[char]
+    cwd: Slice[char]
+    file_names: ref[JsonValue]
+    file_ids: ref[PathMap[int]]
+    file_id_lists: ref[JsonValue]
+    file_id_list_keys: ref[Array[Slice[char]]]
+    root_files: ref[Array[int]]
+    root_paths: ref[Array[Slice[char]]]
+    emit_signatures_list: ref[JsonValue]?
+    resolved_roots: ref[JsonValue]?
+)
+{
+    function convert(host: ref[Page], p: ref[IncProgram], build_info_file_name: Slice[char]) returns ref[JsonValue]
+    {
+        let s p.snapshot
+        let to &ToBuildInfo^host(host, p, get_directory_path(host, build_info_file_name), p.program.sys.cwd, JsonText.new_array(host), IncSnapshot.int_map(host), JsonText.new_array(host), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), null, null)
+        let info JsonText.new_object(host)
+        JsonText.put_member(info, "version", JsonText.new_string(host, "7.0.0-dev"))
+        ; the struct's field order, members filled below
+        var file_infos: ref[JsonValue]? null
+        var options: ref[JsonValue]? null
+        var referenced: ref[JsonValue]? null
+        var semantic: ref[JsonValue]? null
+        var emit_diagnostics: ref[JsonValue]? null
+        var changed: ref[JsonValue]? null
+        var pending: ref[JsonValue]? null
+        var signatures: ref[JsonValue]? null
+        var resolved_root: ref[JsonValue]? null
+        var root: ref[JsonValue]? null
+        var latest Slice[char]()
+        if IncOptions.is_incremental(s.options)
+        {
+            to.collect_root_files()
+            let fi_sig to.file_infos_and_emit_signatures()
+            set file_infos: fi_sig
+            set signatures: to.emit_signatures_list
+            let roots_pair to.root_of_incremental_program()
+            set root: roots_pair
+            set resolved_root: to.resolved_roots
+            set options: to.compiler_options()
+            set referenced: to.referenced_map()
+            set changed: to.change_file_set()
+            set semantic: to.semantic_diagnostics()
+            set emit_diagnostics: to.emit_diagnostics()
+            set pending: to.affected_files_pending_emit()
+            if (s.latest_changed_dts_file.length as int) > 0
+                set latest: IncPaths.relative_to(host, to.directory, s.latest_changed_dts_file, to.cwd)
+        }
+        else
+            set root: to.root_of_non_incremental_program()
+        if s.has_errors = 1
+            JsonText.put_member(info, "errors", JsonText.new_bool(host, true))
+        if s.check_pending
+            JsonText.put_member(info, "checkPending", JsonText.new_bool(host, true))
+        ToBuildInfo.put_nonempty(info, "root", root)
+        ToBuildInfo.put_nonempty(info, "packageJsons", to.relative_list(s.package_jsons))
+        ToBuildInfo.put_nonempty(info, "missingPackageJsons", to.relative_list(s.missing_package_jsons))
+        ToBuildInfo.put_nonempty(info, "fileNames", to.file_names)
+        ; core.Map over GetSourceFiles: an empty list, not a nil one
+        if file_infos <> null
+            JsonText.put_member(info, "fileInfos", file_infos as ref[JsonValue])
+        ToBuildInfo.put_nonempty(info, "fileIdsList", to.file_id_lists)
+        if options <> null
+            JsonText.put_member(info, "options", options as ref[JsonValue])
+        ToBuildInfo.put_nonempty(info, "referencedMap", referenced)
+        ToBuildInfo.put_nonempty(info, "semanticDiagnosticsPerFile", semantic)
+        ToBuildInfo.put_nonempty(info, "emitDiagnosticsPerFile", emit_diagnostics)
+        ToBuildInfo.put_nonempty(info, "changeFileSet", changed)
+        ToBuildInfo.put_nonempty(info, "affectedFilesPendingEmit", pending)
+        if (latest.length as int) > 0
+            JsonText.put_member(info, "latestChangedDtsFile", JsonText.new_string(host, latest))
+        ToBuildInfo.put_nonempty(info, "emitSignatures", signatures)
+        ToBuildInfo.put_nonempty(info, "resolvedRoot", resolved_root)
+        if s.has_semantic_errors
+            JsonText.put_member(info, "semanticErrors", JsonText.new_bool(host, true))
+        info
+    }
+
+    ; a list member, left out when it is empty (omitzero over a nil slice)
+    procedure put_nonempty(info: ref[JsonValue], key: Slice[char], value: ref[JsonValue]?)
+    {
+        if value = null
+            return
+        let v value as ref[JsonValue]
+        if v.size() = 0
+            return
+        JsonText.put_member(info, key, v)
+    }
+
+    function relative(this, path: Slice[char]) returns Slice[char]
+        IncPaths.relative_to(host, directory, path, cwd)
+
+    function relative_list(this, list: ref[Array[Slice[char]]]?) returns ref[JsonValue]?
+    {
+        if list = null
+            return null
+        let l list as ref[Array[Slice[char]]]
+        let arr JsonText.new_array(host)
+        var i 0
+        while i < (l.get_length() as int)
+        {
+            JsonText.push(arr, JsonText.new_string(host, this.relative(l[i as size_t])))
+            set i: i + 1
+        }
+        arr
+    }
+
+    ; toFileId
+    procedure file_id(this, path: Slice[char]) returns int
+    {
+        let k file_ids.slot_of(path)
+        if k >= 0
+            return file_ids.value_at(k)
+        let program p.program
+        let si program.source_index_of_path(path)
+        if (si >= 0) and (si < program.lib_count())
+            JsonText.push(file_names, JsonText.new_string(host, get_base_file_name(host, path)))
+        else
+            JsonText.push(file_names, JsonText.new_string(host, this.relative(path)))
+        let id file_names.size()
+        file_ids.store(path, id)
+        id
+    }
+
+    ; toFileIdListId
+    procedure file_id_list_id(this, set_paths: ref[Array[Slice[char]]]) returns int
+    {
+        let ids &Array[int]^host()
+        var i 0
+        while i < (set_paths.get_length() as int)
+        {
+            IncSort.insert_sorted_int(ids, this.file_id(set_paths[i as size_t]))
+            set i: i + 1
+        }
+        var sb StringBuilder()
+        var k 0
+        while k < (ids.get_length() as int)
+        {
+            if k > 0
+                sb.append(",")
+            sb.append(ids[k as size_t])
+            set k: k + 1
+        }
+        let key_s String^host(sb.to_string())
+        let key Slice[char](key_s.get_length(), key_s.get_buffer() as pointer[char])
+        var q 0
+        while q < (file_id_list_keys.get_length() as int)
+        {
+            let existing file_id_list_keys[q as size_t]
+            if existing.equals(key)
+                return q + 1
+            set q: q + 1
+        }
+        let arr JsonText.new_array(host)
+        var a 0
+        while a < (ids.get_length() as int)
+        {
+            JsonText.push(arr, JsonText.new_number(host, ids[a as size_t]))
+            set a: a + 1
+        }
+        JsonText.push(file_id_lists, arr)
+        file_id_list_keys.add(key)
+        file_id_list_keys.get_length() as int
+    }
+
+    ; collectRootFiles
+    procedure collect_root_files(this)
+    {
+        let program p.program
+        var i 0
+        while i < (program.root_names.get_length() as int)
+        {
+            let name program.root_names[i as size_t]
+            set i: i + 1
+            let absolute get_normalized_absolute_path(host, name, cwd)
+            let si program.source_index_of_path(absolute)
+            if si >= 0
+            {
+                var known false
+                var k 0
+                while k < (root_files.get_length() as int)
+                {
+                    if root_files[k as size_t] = si
+                    {
+                        set known: true
+                        root_paths.put(k as size_t, absolute)
+                    }
+                    set k: k + 1
+                }
+                if known = false
+                {
+                    root_files.add(si)
+                    root_paths.add(absolute)
+                }
+            }
+        }
+    }
+
+    ; newBuildInfoFileInfo's encoding
+    function file_info_json(host: ref[Page], info: ref[IncFileInfo]) returns ref[JsonValue]
+    {
+        if info.version.equals(info.signature)
+        {
+            if (info.affects_global_scope = false) and (info.implied_node_format = 1)
+                return JsonText.new_string(host, info.signature)
+        }
+        else
+        {
+            if (info.signature.length as int) = 0
+            {
+                let o JsonText.new_object(host)
+                if (info.version.length as int) > 0
+                    JsonText.put_member(o, "version", JsonText.new_string(host, info.version))
+                JsonText.put_member(o, "noSignature", JsonText.new_bool(host, true))
+                if info.affects_global_scope
+                    JsonText.put_member(o, "affectsGlobalScope", JsonText.new_bool(host, true))
+                if info.implied_node_format <> 0
+                    JsonText.put_member(o, "impliedNodeFormat", JsonText.new_number(host, info.implied_node_format))
+                return o
+            }
+        }
+        let o JsonText.new_object(host)
+        if (info.version.length as int) > 0
+            JsonText.put_member(o, "version", JsonText.new_string(host, info.version))
+        if info.signature.equals(info.version) = false
+        {
+            if (info.signature.length as int) > 0
+                JsonText.put_member(o, "signature", JsonText.new_string(host, info.signature))
+        }
+        if info.affects_global_scope
+            JsonText.put_member(o, "affectsGlobalScope", JsonText.new_bool(host, true))
+        if info.implied_node_format <> 0
+            JsonText.put_member(o, "impliedNodeFormat", JsonText.new_number(host, info.implied_node_format))
+        o
+    }
+
+    ; setFileInfoAndEmitSignatures; the emit signatures into `emit_signatures_list`
+    procedure file_infos_and_emit_signatures(this) returns ref[JsonValue]
+    {
+        let s p.snapshot
+        let program p.program
+        let arr JsonText.new_array(host)
+        let sigs JsonText.new_array(host)
+        var i 0
+        while i < program.source_file_count()
+        {
+            let path program.source_path(i)
+            set i: i + 1
+            let ii s.file_infos.slot_of(path)
+            let info s.file_infos.value_at(ii)
+            let id this.file_id(path)
+            if s.options.tristate_of("composite") = 1
+            {
+                if (path.ends_with(".json") = false) and program.source_may_be_emitted(i - 1)
+                {
+                    let ei s.emit_signatures.slot_of(path)
+                    if ei < 0
+                        JsonText.push(sigs, JsonText.new_number(host, id))
+                    else
+                    {
+                        let e s.emit_signatures.value_at(ei)
+                        var differs true
+                        if (e.different = false) and e.signature.equals(info.signature)
+                            set differs: false
+                        if differs
+                        {
+                            let pair JsonText.new_array(host)
+                            JsonText.push(pair, JsonText.new_number(host, id))
+                            if e.different = false
+                                JsonText.push(pair, JsonText.new_string(host, e.signature))
+                            else
+                            {
+                                let list JsonText.new_array(host)
+                                if e.different_signature.equals(info.signature) = false
+                                    JsonText.push(list, JsonText.new_string(host, e.different_signature))
+                                JsonText.push(pair, list)
+                            }
+                            JsonText.push(sigs, pair)
+                        }
+                    }
+                }
+            }
+            JsonText.push(arr, ToBuildInfo.file_info_json(host, info))
+        }
+        set this.emit_signatures_list: sigs
+        arr
+    }
+
+    ; setRootOfIncrementalProgram; the resolved roots into `resolved_roots`
+    procedure root_of_incremental_program(this) returns ref[JsonValue]
+    {
+        let program p.program
+        let order &Array[int]^host()
+        let ids &Array[int]^host()
+        var i 0
+        while i < (root_files.get_length() as int)
+        {
+            let id this.file_id(program.source_path(root_files[i as size_t]))
+            ; sorted by file id
+            order.add(i)
+            ids.add(id)
+            var j (order.get_length() as int) - 1
+            while j > 0
+            {
+                let prev ids[(j - 1) as size_t]
+                if prev <= id
+                    break
+                ids.put(j as size_t, prev)
+                order.put(j as size_t, order[(j - 1) as size_t])
+                set j: j - 1
+            }
+            ids.put(j as size_t, id)
+            order.put(j as size_t, i)
+            set i: i + 1
+        }
+        let starts &Array[int]^host()
+        let ends &Array[int]^host()
+        let resolved JsonText.new_array(host)
+        var k 0
+        while k < (order.get_length() as int)
+        {
+            let index order[k as size_t]
+            set k: k + 1
+            let root_id this.file_id(root_paths[index as size_t])
+            let resolved_id this.file_id(program.source_path(root_files[index as size_t]))
+            let n starts.get_length() as int
+            if n = 0
+            {
+                starts.add(resolved_id)
+                ends.add(0)
+            }
+            else
+            {
+                let last_end ends[(n - 1) as size_t]
+                let last_start starts[(n - 1) as size_t]
+                if last_end = (resolved_id - 1)
+                    ends.put((n - 1) as size_t, resolved_id)
+                else
+                {
+                    if (last_end = 0) and (last_start = (resolved_id - 1))
+                        ends.put((n - 1) as size_t, resolved_id)
+                    else
+                    {
+                        starts.add(resolved_id)
+                        ends.add(0)
+                    }
+                }
+            }
+            if root_id <> resolved_id
+            {
+                let pair JsonText.new_array(host)
+                JsonText.push(pair, JsonText.new_number(host, resolved_id))
+                JsonText.push(pair, JsonText.new_number(host, root_id))
+                JsonText.push(resolved, pair)
+            }
+        }
+        set this.resolved_roots: resolved
+        let arr JsonText.new_array(host)
+        var r 0
+        while r < (starts.get_length() as int)
+        {
+            let e ends[r as size_t]
+            if e = 0
+                JsonText.push(arr, JsonText.new_number(host, starts[r as size_t]))
+            else
+            {
+                let pair JsonText.new_array(host)
+                JsonText.push(pair, JsonText.new_number(host, starts[r as size_t]))
+                JsonText.push(pair, JsonText.new_number(host, e))
+                JsonText.push(arr, pair)
+            }
+            set r: r + 1
+        }
+        arr
+    }
+
+    ; setRootOfNonIncrementalProgram
+    procedure root_of_non_incremental_program(this) returns ref[JsonValue]
+    {
+        let program p.program
+        let arr JsonText.new_array(host)
+        var i 0
+        while i < (program.root_names.get_length() as int)
+        {
+            let absolute get_normalized_absolute_path(host, program.root_names[i as size_t], cwd)
+            JsonText.push(arr, JsonText.new_string(host, this.relative(absolute)))
+            set i: i + 1
+        }
+        arr
+    }
+
+    ; setCompilerOptions: the AffectsBuildInfo fields that are set, in the struct's order
+    procedure compiler_options(this) returns ref[JsonValue]?
+    {
+        let o p.snapshot.options
+        var result: ref[JsonValue]? null
+        var f 0
+        while f < TsOptionDecls.compiler_field_count()
+        {
+            let i TsOptionDecls.compiler_field_option(f)
+            set f: f + 1
+            if i < 0
+                continue
+            if (TsOptionDecls.affects_of(i) & 1) = 0
+                continue
+            let name TsOptionDecls.name_of(i)
+            let v o.get(name)
+            if v = null
+                continue
+            let jv v as ref[JsonValue]
+            if TsOptions.is_zero(jv)
+                continue
+            if result = null
+                set result: JsonText.new_object(host)
+            JsonText.put_member(result as ref[JsonValue], name, this.option_value(i, jv))
+        }
+        result
+    }
+
+    ; toRelativeToBuildInfoCompilerOptionValue over the field's value
+    procedure option_value(this, i: int, v: ref[JsonValue]) returns ref[JsonValue]
+    {
+        let kind TsOptionDecls.kind_of(i)
+        if (kind = TsOptionKindEnum) and (v.kind = JsonKindString)
+        {
+            let n TsOptionDecls.enum_number(i, TsConfigLower.lower(host, v.text))
+            if n >= 0
+                return JsonText.new_number(host, n)
+        }
+        if (v.kind = JsonKindString) and TsOptionDecls.is_file_path(i) and ((v.text.length as int) > 0)
+            return JsonText.new_string(host, this.relative(get_normalized_absolute_path(host, v.text, cwd)))
+        if (v.kind = JsonKindArray) and TsOptionDecls.element_is_file_path(i)
+        {
+            let arr JsonText.new_array(host)
+            var k 0
+            while k < v.size()
+            {
+                let e v.value_at(k)
+                set k: k + 1
+                if e = null
+                    continue
+                let ev e as ref[JsonValue]
+                if ev.kind = JsonKindString
+                    JsonText.push(arr, JsonText.new_string(host, this.relative(get_normalized_absolute_path(host, ev.text, cwd))))
+                else
+                    JsonText.push(arr, ev)
+            }
+            return arr
+        }
+        v
+    }
+
+    ; setReferencedMap
+    procedure referenced_map(this) returns ref[JsonValue]
+    {
+        let s p.snapshot
+        let arr JsonText.new_array(host)
+        let keys s.referenced_map.sorted_keys(host)
+        var i 0
+        while i < (keys.get_length() as int)
+        {
+            let path keys[i as size_t]
+            set i: i + 1
+            let refs s.referenced_map.value_at(s.referenced_map.slot_of(path))
+            let id this.file_id(path)
+            let list_id this.file_id_list_id(refs)
+            let pair JsonText.new_array(host)
+            JsonText.push(pair, JsonText.new_number(host, id))
+            JsonText.push(pair, JsonText.new_number(host, list_id))
+            JsonText.push(arr, pair)
+        }
+        arr
+    }
+
+    ; setChangeFileSet
+    procedure change_file_set(this) returns ref[JsonValue]
+    {
+        let arr JsonText.new_array(host)
+        let keys p.snapshot.changed_files.sorted_keys(host)
+        var i 0
+        while i < (keys.get_length() as int)
+        {
+            JsonText.push(arr, JsonText.new_number(host, this.file_id(keys[i as size_t])))
+            set i: i + 1
+        }
+        arr
+    }
+
+    ; setSemanticDiagnostics
+    procedure semantic_diagnostics(this) returns ref[JsonValue]
+    {
+        let s p.snapshot
+        let program p.program
+        let arr JsonText.new_array(host)
+        var i 0
+        while i < program.source_file_count()
+        {
+            let path program.source_path(i)
+            set i: i + 1
+            let k s.semantic_diagnostics.slot_of(path)
+            if k < 0
+            {
+                if s.changed_files.has(path) = false
+                    JsonText.push(arr, JsonText.new_number(host, this.file_id(path)))
+            }
+            else
+            {
+                let d this.diagnostics_of_file(path, s.semantic_diagnostics.value_at(k))
+                if d <> null
+                    JsonText.push(arr, d as ref[JsonValue])
+            }
+        }
+        arr
+    }
+
+    ; setEmitDiagnostics
+    procedure emit_diagnostics(this) returns ref[JsonValue]
+    {
+        let s p.snapshot
+        let arr JsonText.new_array(host)
+        let keys s.emit_diagnostics.sorted_keys(host)
+        var i 0
+        while i < (keys.get_length() as int)
+        {
+            let path keys[i as size_t]
+            set i: i + 1
+            let d this.diagnostics_of_file(path, s.emit_diagnostics.value_at(s.emit_diagnostics.slot_of(path)))
+            if d <> null
+                JsonText.push(arr, d as ref[JsonValue])
+        }
+        arr
+    }
+
+    ; setAffectedFilesPendingEmit
+    procedure affected_files_pending_emit(this) returns ref[JsonValue]
+    {
+        let s p.snapshot
+        let program p.program
+        let arr JsonText.new_array(host)
+        let full IncOptions.file_emit_kind(s.options)
+        let keys s.pending_emit.sorted_keys(host)
+        var i 0
+        while i < (keys.get_length() as int)
+        {
+            let path keys[i as size_t]
+            set i: i + 1
+            let si program.source_index_of_path(path)
+            if si < 0
+                continue
+            if program.source_may_be_emitted(si) = false
+                continue
+            let kind s.pending_emit.value_at(s.pending_emit.slot_of(path))
+            let id this.file_id(path)
+            if kind = full
+                JsonText.push(arr, JsonText.new_number(host, id))
+            else
+            {
+                let pair JsonText.new_array(host)
+                JsonText.push(pair, JsonText.new_number(host, id))
+                if kind <> FileEmitKindDts
+                    JsonText.push(pair, JsonText.new_number(host, kind))
+                JsonText.push(arr, pair)
+            }
+        }
+        arr
+    }
+
+    ; toBuildInfoDiagnosticsOfFile, null when there are none
+    procedure diagnostics_of_file(this, path: Slice[char], d: ref[IncDiagnostics]) returns ref[JsonValue]?
+    {
+        var list: ref[JsonValue]? null
+        if d.diagnostics <> null
+        {
+            let dl d.diagnostics as ref[Array[ref[DriverDiagnostic]]]
+            if dl.get_length() > 0
+            {
+                let arr JsonText.new_array(host)
+                var i 0
+                while i < (dl.get_length() as int)
+                {
+                    JsonText.push(arr, this.diagnostic_json(path, dl[i as size_t]))
+                    set i: i + 1
+                }
+                set list: arr
+            }
+        }
+        else
+        {
+            if d.build_info <> null
+            {
+                let bl d.build_info as ref[Array[ref[IncBuildInfoDiagnostic]]]
+                if bl.get_length() > 0
+                {
+                    let arr JsonText.new_array(host)
+                    var i 0
+                    while i < (bl.get_length() as int)
+                    {
+                        JsonText.push(arr, this.build_info_diagnostic_json(bl[i as size_t]))
+                        set i: i + 1
+                    }
+                    set list: arr
+                }
+            }
+        }
+        if list = null
+            return null
+        let pair JsonText.new_array(host)
+        JsonText.push(pair, JsonText.new_number(host, this.file_id(path)))
+        JsonText.push(pair, list as ref[JsonValue])
+        pair
+    }
+
+    procedure put_common(this, o: ref[JsonValue], pos: int, end: int, code: int, args: ref[Array[String]]?)
+    {
+        if pos <> 0
+            JsonText.put_member(o, "pos", JsonText.new_number(host, pos))
+        if end <> 0
+            JsonText.put_member(o, "end", JsonText.new_number(host, end))
+        if code <> 0
+            JsonText.put_member(o, "code", JsonText.new_number(host, code))
+        let category DiagnosticMessages.category_of(code)
+        if category <> 0
+            JsonText.put_member(o, "category", JsonText.new_number(host, category))
+        let key DiagnosticMessages.key_of(code)
+        if (key.length as int) > 0
+            JsonText.put_member(o, "messageKey", JsonText.new_string(host, key))
+        if args <> null
+        {
+            let al args as ref[Array[String]]
+            if al.get_length() > 0
+            {
+                let arr JsonText.new_array(host)
+                var i 0
+                while i < (al.get_length() as int)
+                {
+                    let a al[i as size_t]
+                    let copy String^host(a)
+                    JsonText.push(arr, JsonText.new_string(host, Slice[char](copy.get_length(), copy.get_buffer() as pointer[char])))
+                    set i: i + 1
+                }
+                JsonText.put_member(o, "messageArgs", arr)
+            }
+        }
+    }
+
+    procedure put_flags(this, o: ref[JsonValue], code: int)
+    {
+        if DiagnosticMessages.reports_unnecessary(code)
+            JsonText.put_member(o, "reportsUnnecessary", JsonText.new_bool(host, true))
+        if DiagnosticMessages.reports_deprecated(code)
+            JsonText.put_member(o, "reportsDeprecated", JsonText.new_bool(host, true))
+    }
+
+    ; toBuildInfoDiagnosticsFromDiagnostics: one diagnostic of `own`
+    procedure diagnostic_json(this, own: Slice[char], d: ref[DriverDiagnostic]) returns ref[JsonValue]
+    {
+        let o JsonText.new_object(host)
+        if d.has_file() = false
+            JsonText.put_member(o, "noFile", JsonText.new_bool(host, true))
+        else
+        {
+            if d.file_name.equals(own) = false
+                JsonText.put_member(o, "file", JsonText.new_number(host, this.file_id(d.file_name)))
+        }
+        this.put_common(o, d.pos, d.end, d.code, d.args)
+        if d.chain <> null
+        {
+            let lines d.chain as ref[Array[ChainLine]]
+            if lines.get_length() > 0
+            {
+                var cursor 0
+                JsonText.put_member(o, "messageChain", this.chain_json(d, lines, 1, &cursor))
+            }
+        }
+        if d.related <> null
+        {
+            let related d.related as ref[Array[ref[DriverDiagnostic]]]
+            if related.get_length() > 0
+            {
+                let arr JsonText.new_array(host)
+                var i 0
+                while i < (related.get_length() as int)
+                {
+                    JsonText.push(arr, this.diagnostic_json(own, related[i as size_t]))
+                    set i: i + 1
+                }
+                JsonText.put_member(o, "relatedInformation", arr)
+            }
+        }
+        this.put_flags(o, d.code)
+        o
+    }
+
+    ; the chain lines of `level` from `cursor` as a message chain tree; each line
+    ; carries its head's file and range
+    procedure chain_json(this, head: ref[DriverDiagnostic], lines: ref[Array[ChainLine]], level: int, cursor: ref[int]) returns ref[JsonValue]
+    {
+        let arr JsonText.new_array(host)
+        repeat
+        {
+            let at: int cursor
+            if at >= (lines.get_length() as int)
+                break
+            let line lines[at as size_t]
+            if line.level < level
+                break
+            set cursor: at + 1
+            let o JsonText.new_object(host)
+            if head.has_file() = false
+                JsonText.put_member(o, "noFile", JsonText.new_bool(host, true))
+            this.put_common(o, head.pos, head.end, line.code, line.args)
+            if (at + 1) < (lines.get_length() as int)
+            {
+                let next lines[(at + 1) as size_t]
+                if next.level > line.level
+                    JsonText.put_member(o, "messageChain", this.chain_json(head, lines, line.level + 1, cursor))
+            }
+            this.put_flags(o, line.code)
+            JsonText.push(arr, o)
+        }
+        arr
+    }
+
+    ; toBuildInfoDiagnosticsFromFileNameDiagnostics
+    procedure build_info_diagnostic_json(this, d: ref[IncBuildInfoDiagnostic]) returns ref[JsonValue]
+    {
+        let o JsonText.new_object(host)
+        if (d.file.length as int) > 0
+            JsonText.put_member(o, "file", JsonText.new_number(host, this.file_id(d.file)))
+        if d.no_file
+            JsonText.put_member(o, "noFile", JsonText.new_bool(host, true))
+        if d.pos <> 0
+            JsonText.put_member(o, "pos", JsonText.new_number(host, d.pos))
+        if d.end <> 0
+            JsonText.put_member(o, "end", JsonText.new_number(host, d.end))
+        if d.code <> 0
+            JsonText.put_member(o, "code", JsonText.new_number(host, d.code))
+        if d.category <> 0
+            JsonText.put_member(o, "category", JsonText.new_number(host, d.category))
+        if (d.key.length as int) > 0
+            JsonText.put_member(o, "messageKey", JsonText.new_string(host, d.key))
+        if d.args <> null
+        {
+            let al d.args as ref[Array[String]]
+            if al.get_length() > 0
+            {
+                let arr JsonText.new_array(host)
+                var i 0
+                while i < (al.get_length() as int)
+                {
+                    let a al[i as size_t]
+                    let copy String^host(a)
+                    JsonText.push(arr, JsonText.new_string(host, Slice[char](copy.get_length(), copy.get_buffer() as pointer[char])))
+                    set i: i + 1
+                }
+                JsonText.put_member(o, "messageArgs", arr)
+            }
+        }
+        if d.chain <> null
+        {
+            let cl d.chain as ref[Array[ref[IncBuildInfoDiagnostic]]]
+            if cl.get_length() > 0
+            {
+                let arr JsonText.new_array(host)
+                var i 0
+                while i < (cl.get_length() as int)
+                {
+                    JsonText.push(arr, this.build_info_diagnostic_json(cl[i as size_t]))
+                    set i: i + 1
+                }
+                JsonText.put_member(o, "messageChain", arr)
+            }
+        }
+        if d.related <> null
+        {
+            let rl d.related as ref[Array[ref[IncBuildInfoDiagnostic]]]
+            if rl.get_length() > 0
+            {
+                let arr JsonText.new_array(host)
+                var i 0
+                while i < (rl.get_length() as int)
+                {
+                    JsonText.push(arr, this.build_info_diagnostic_json(rl[i as size_t]))
+                    set i: i + 1
+                }
+                JsonText.put_member(o, "relatedInformation", arr)
+            }
+        }
+        if d.reports_unnecessary
+            JsonText.put_member(o, "reportsUnnecessary", JsonText.new_bool(host, true))
+        if d.reports_deprecated
+            JsonText.put_member(o, "reportsDeprecated", JsonText.new_bool(host, true))
+        if d.skipped_on_no_emit
+            JsonText.put_member(o, "skippedOnNoEmit", JsonText.new_bool(host, true))
+        o
+    }
+}
+
+; ReadBuildInfoProgram and buildInfoToSnapshot
+define ToSnapshot
+(
+    host: ref[Page]
+    info: ref[JsonValue]
+    directory: Slice[char]
+    file_paths: ref[Array[Slice[char]]]
+    file_path_sets: ref[Array[ref[Array[Slice[char]]]]]
+    snapshot: ref[IncSnapshot]
+)
+{
+    ; the old program's snapshot, null when there is no usable build info
+    procedure read(host: ref[Page], program: ref[DriverProgram]) returns ref[IncSnapshot]?
+    {
+        let file_name IncProgram.build_info_file_name(host, program)
+        if (file_name.length as int) = 0
+            return null
+        var text Slice[char]()
+        if program.sys.read_file(file_name, &text) = false
+            return null
+        let parsed JsonParser.parse(host, text)
+        if parsed = null
+            return null
+        let info parsed as ref[JsonValue]
+        let version info.string_of("version")
+        if version.equals("7.0.0-dev") = false
+            return null
+        let names info.get("fileNames")
+        if names = null
+            return null
+        if (names as ref[JsonValue]).size() = 0
+            return null
+        let to &ToSnapshot^host(host, info, get_directory_path(host, file_name), &Array[Slice[char]]^host(), &Array[ref[Array[Slice[char]]]]^host(), IncSnapshot.create(host, TsOptions.create(host), false))
+        to.convert(program)
+        to.snapshot
+    }
+
+    function file_path(this, id: int) returns Slice[char]
+        file_paths[(id - 1) as size_t]
+
+    procedure convert(this, program: ref[DriverProgram])
+    {
+        let cwd program.sys.cwd
+        let names info.get("fileNames") as ref[JsonValue]
+        var i 0
+        while i < names.size()
+        {
+            let name (names.value_at(i) as ref[JsonValue]).text
+            set i: i + 1
+            if (get_root_length(name) = 0) and (path_is_relative(name) = false)
+                file_paths.add(combine_paths(host, program.sys.default_library_path, name))
+            else
+                file_paths.add(get_normalized_absolute_path(host, name, directory))
+        }
+        let lists info.get("fileIdsList")
+        if lists <> null
+        {
+            let lv lists as ref[JsonValue]
+            var l 0
+            while l < lv.size()
+            {
+                let ids lv.value_at(l) as ref[JsonValue]
+                let set_paths &Array[Slice[char]]^host()
+                var k 0
+                while k < ids.size()
+                {
+                    set_paths.add(this.file_path(JsonText.int_of(ids.value_at(k))))
+                    set k: k + 1
+                }
+                file_path_sets.add(set_paths)
+                set l: l + 1
+            }
+        }
+        this.set_compiler_options(cwd)
+        this.set_file_info_and_emit_signatures()
+        let referenced info.get("referencedMap")
+        if referenced <> null
+        {
+            let rv referenced as ref[JsonValue]
+            var r 0
+            while r < rv.size()
+            {
+                let pair rv.value_at(r) as ref[JsonValue]
+                snapshot.referenced_map.store(this.file_path(JsonText.int_of(pair.value_at(0))), file_path_sets[(JsonText.int_of(pair.value_at(1)) - 1) as size_t])
+                set r: r + 1
+            }
+        }
+        let changed info.get("changeFileSet")
+        if changed <> null
+        {
+            let cv changed as ref[JsonValue]
+            var c 0
+            while c < cv.size()
+            {
+                snapshot.changed_files.store(this.file_path(JsonText.int_of(cv.value_at(c))), true)
+                set c: c + 1
+            }
+        }
+        this.set_semantic_diagnostics()
+        let emit info.get("emitDiagnosticsPerFile")
+        if emit <> null
+        {
+            let ev emit as ref[JsonValue]
+            var e 0
+            while e < ev.size()
+            {
+                let pair ev.value_at(e) as ref[JsonValue]
+                snapshot.emit_diagnostics.store(this.file_path(JsonText.int_of(pair.value_at(0))), this.diagnostics_list(pair.value_at(1)))
+                set e: e + 1
+            }
+        }
+        let pending info.get("affectedFilesPendingEmit")
+        if pending <> null
+        {
+            let pv pending as ref[JsonValue]
+            let own IncOptions.file_emit_kind(snapshot.options)
+            var q 0
+            while q < pv.size()
+            {
+                let entry pv.value_at(q) as ref[JsonValue]
+                set q: q + 1
+                if entry.kind = JsonKindNumber
+                    snapshot.pending_emit.store(this.file_path(JsonText.int_of(entry)), own)
+                else
+                {
+                    var kind FileEmitKindDts
+                    if entry.size() > 1
+                        set kind: JsonText.int_of(entry.value_at(1))
+                    if kind = 0
+                        set kind: own
+                    snapshot.pending_emit.store(this.file_path(JsonText.int_of(entry.value_at(0))), kind)
+                }
+            }
+        }
+        let latest info.string_of("latestChangedDtsFile")
+        if (latest.length as int) > 0
+            set snapshot.latest_changed_dts_file: get_normalized_absolute_path(host, latest, directory)
+        if JsonText.member_bool(info, "errors")
+            set snapshot.has_errors: 1
+        else
+            set snapshot.has_errors: 0
+        set snapshot.has_semantic_errors: JsonText.member_bool(info, "semanticErrors")
+        set snapshot.check_pending: JsonText.member_bool(info, "checkPending")
+        set snapshot.package_jsons: this.absolute_list(info.get("packageJsons"))
+        set snapshot.missing_package_jsons: this.absolute_list(info.get("missingPackageJsons"))
+    }
+
+    procedure absolute_list(this, v: ref[JsonValue]?) returns ref[Array[Slice[char]]]
+    {
+        let out &Array[Slice[char]]^host()
+        if v = null
+            return out
+        let jv v as ref[JsonValue]
+        var i 0
+        while i < jv.size()
+        {
+            let e jv.value_at(i) as ref[JsonValue]
+            out.add(get_normalized_absolute_path(host, e.text, directory))
+            set i: i + 1
+        }
+        out
+    }
+
+    ; GetCompilerOptions(buildInfoDirectory): file paths made absolute
+    procedure set_compiler_options(this, cwd: Slice[char])
+    {
+        let options info.get("options")
+        if options = null
+            return
+        let ov options as ref[JsonValue]
+        var k 0
+        while k < ov.size()
+        {
+            let name ov.key_at(k)
+            let value ov.value_at(k) as ref[JsonValue]
+            set k: k + 1
+            let i TsOptionDecls.index_of(name)
+            var v value
+            if (i >= 0) and (value.kind = JsonKindString) and TsOptionDecls.is_file_path(i)
+                set v: JsonText.new_string(host, get_normalized_absolute_path(host, value.text, directory))
+            if (i >= 0) and (value.kind = JsonKindArray) and TsOptionDecls.element_is_file_path(i)
+            {
+                let arr JsonText.new_array(host)
+                var e 0
+                while e < value.size()
+                {
+                    let ev value.value_at(e) as ref[JsonValue]
+                    JsonText.push(arr, JsonText.new_string(host, get_normalized_absolute_path(host, ev.text, directory)))
+                    set e: e + 1
+                }
+                set v: arr
+            }
+            TsOptions.put(host, snapshot.options, name, v)
+        }
+    }
+
+    procedure set_file_info_and_emit_signatures(this)
+    {
+        let infos info.get("fileInfos")
+        if infos = null
+            return
+        let composite snapshot.options.tristate_of("composite") = 1
+        let iv infos as ref[JsonValue]
+        let none: Slice[char] ""
+        var i 0
+        while i < iv.size()
+        {
+            let entry iv.value_at(i) as ref[JsonValue]
+            let path this.file_path(i + 1)
+            set i: i + 1
+            var version Slice[char]()
+            var signature Slice[char]()
+            var global false
+            var implied 1
+            if entry.kind = JsonKindString
+            {
+                set version: entry.text
+                set signature: entry.text
+            }
+            else
+            {
+                set version: entry.string_of("version")
+                set global: JsonText.member_bool(entry, "affectsGlobalScope")
+                set implied: JsonText.member_int(entry, "impliedNodeFormat")
+                if JsonText.member_bool(entry, "noSignature") = false
+                {
+                    set signature: entry.string_of("signature")
+                    if (signature.length as int) = 0
+                        set signature: version
+                }
+            }
+            snapshot.file_infos.store(path, &IncFileInfo^host(version, signature, global, implied))
+            if ((signature.length as int) > 0) and composite
+                snapshot.emit_signatures.store(path, &IncEmitSignature^host(signature, false, none))
+        }
+        let signatures info.get("emitSignatures")
+        if signatures = null
+            return
+        let sv signatures as ref[JsonValue]
+        var s 0
+        while s < sv.size()
+        {
+            let entry sv.value_at(s) as ref[JsonValue]
+            set s: s + 1
+            if entry.kind = JsonKindNumber
+            {
+                snapshot.emit_signatures.remove(this.file_path(JsonText.int_of(entry)))
+                continue
+            }
+            let path this.file_path(JsonText.int_of(entry.value_at(0)))
+            let sig entry.value_at(1) as ref[JsonValue]
+            if sig.kind = JsonKindString
+                snapshot.emit_signatures.store(path, &IncEmitSignature^host(sig.text, false, none))
+            else
+            {
+                if sig.size() = 0
+                {
+                    var previous Slice[char]()
+                    let pi snapshot.emit_signatures.slot_of(path)
+                    if pi >= 0
+                        set previous: snapshot.emit_signatures.value_at(pi).signature
+                    snapshot.emit_signatures.store(path, &IncEmitSignature^host(none, true, previous))
+                }
+                else
+                    snapshot.emit_signatures.store(path, &IncEmitSignature^host(none, true, (sig.value_at(0) as ref[JsonValue]).text))
+            }
+        }
+    }
+
+    procedure set_semantic_diagnostics(this)
+    {
+        var i 0
+        while i < snapshot.file_infos.slot_count()
+        {
+            if snapshot.file_infos.is_live(i)
+            {
+                let path snapshot.file_infos.key_at(i)
+                if snapshot.changed_files.has(path) = false
+                    snapshot.semantic_diagnostics.store(path, &IncDiagnostics^host(null, null))
+            }
+            set i: i + 1
+        }
+        let list info.get("semanticDiagnosticsPerFile")
+        if list = null
+            return
+        let lv list as ref[JsonValue]
+        var k 0
+        while k < lv.size()
+        {
+            let entry lv.value_at(k) as ref[JsonValue]
+            set k: k + 1
+            if entry.kind = JsonKindNumber
+                snapshot.semantic_diagnostics.remove(this.file_path(JsonText.int_of(entry)))
+            else
+                snapshot.semantic_diagnostics.store(this.file_path(JsonText.int_of(entry.value_at(0))), this.diagnostics_list(entry.value_at(1)))
+        }
+    }
+
+    procedure diagnostics_list(this, v: ref[JsonValue]?) returns ref[IncDiagnostics]
+    {
+        let out &Array[ref[IncBuildInfoDiagnostic]]^host()
+        if v <> null
+        {
+            let jv v as ref[JsonValue]
+            var i 0
+            while i < jv.size()
+            {
+                out.add(this.diagnostic(jv.value_at(i) as ref[JsonValue]))
+                set i: i + 1
+            }
+        }
+        &IncDiagnostics^host(null, out)
+    }
+
+    procedure diagnostic_list_of(this, v: ref[JsonValue]?) returns ref[Array[ref[IncBuildInfoDiagnostic]]]?
+    {
+        if v = null
+            return null
+        let jv v as ref[JsonValue]
+        let out &Array[ref[IncBuildInfoDiagnostic]]^host()
+        var i 0
+        while i < jv.size()
+        {
+            out.add(this.diagnostic(jv.value_at(i) as ref[JsonValue]))
+            set i: i + 1
+        }
+        out
+    }
+
+    procedure diagnostic(this, d: ref[JsonValue]) returns ref[IncBuildInfoDiagnostic]
+    {
+        var file Slice[char]()
+        let id JsonText.member_int(d, "file")
+        if id <> 0
+            set file: this.file_path(id)
+        var args: ref[Array[String]]? null
+        let av d.get("messageArgs")
+        if av <> null
+        {
+            let a av as ref[JsonValue]
+            let list &Array[String]^host()
+            var i 0
+            while i < a.size()
+            {
+                let e a.value_at(i) as ref[JsonValue]
+                list.add(String^host(e.text.data as pointer[const_char], e.text.length))
+                set i: i + 1
+            }
+            set args: list
+        }
+        &IncBuildInfoDiagnostic^host(file, JsonText.member_bool(d, "noFile"), JsonText.member_int(d, "pos"), JsonText.member_int(d, "end"), JsonText.member_int(d, "code"), JsonText.member_int(d, "category"), d.string_of("messageKey"), args, this.diagnostic_list_of(d.get("messageChain")), this.diagnostic_list_of(d.get("relatedInformation")), JsonText.member_bool(d, "reportsUnnecessary"), JsonText.member_bool(d, "reportsDeprecated"), JsonText.member_bool(d, "skippedOnNoEmit"))
+    }
+}

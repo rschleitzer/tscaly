@@ -1,0 +1,301 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; system — the System internal/execute runs against (tsc.System), as tsctests'
+; TestSys implements it (phase (b)2).
+;
+; ★★★ THE SYSTEM IS THE TEST HARNESS'S, AND THAT IS WHAT THE DRIVER BASELINES MEASURE.
+; tsctests' TestSys is a virtual file system over a map with a CLOCK that advances one
+; second on every `Now()` — every file write, every `sys.Now()` a compile-time
+; measurement takes, every emitted file's touched timestamp. Modification times are
+; observable twice in a baseline (`*mTime changed*`, and tsbuild's up-to-date checks
+; that compare them), so the port keeps the clock as a tick count and asks it at
+; exactly the reference's call sites. The default libraries are written at startup
+; (ensureLibPathExists) and a file stays a "default lib" until something reads or
+; writes it, which is what the harness's `*Lib*` entry reports.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use tscaly.tsoptions.TsGlobPattern
+use tscaly.program.JsonValue
+use tscaly.program.JsonParser
+use tscaly.buildinfojson.JsonText
+use tscaly.buildinfojson.ReadableBuildInfo
+
+; one entry of the map file system: a regular file, or a symlink to `link_target`
+define VfsFile (path: Slice[char]  text: Slice[char]  mtime: int  is_link: bool  link_target: Slice[char])
+
+define ExecSystem
+(
+    host: ref[Page]
+    cwd: Slice[char]
+    case_sensitive: bool
+    files: ref[Array[ref[VfsFile]?]]
+    ; TestClock: seconds since the start, advanced by every now()
+    clock: int
+    ; testFs.writtenFiles since the last baseline
+    written: ref[Array[Slice[char]]]
+    ; testFs.defaultLibs: written at startup and not read or rewritten since
+    default_libs: ref[Array[Slice[char]]]
+    default_library_path: Slice[char]
+    env_names: ref[Array[Slice[char]]]
+    env_values: ref[Array[Slice[char]]]
+    ; the writer (TestSys.currentWrite)
+    output: ref[StringBuilder]
+    ; the first construct the port does not implement
+    stop_tag: Slice[char]
+    ; TestSys.programBaselines
+    programs: ref[StringBuilder]
+)
+{
+    function create(host: ref[Page], cwd: Slice[char], case_sensitive: bool) returns ref[ExecSystem]
+    {
+        let lib_path: Slice[char] "/home/src/tslibs/TS/Lib"
+        let none: Slice[char] ""
+        &ExecSystem^host(host, ExecSystem.copy(host, cwd), case_sensitive, &Array[ref[VfsFile]?]^host(), 0, &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), lib_path, &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &StringBuilder^host(), none, &StringBuilder^host())
+    }
+
+    function copy(host: ref[Page], s: Slice[char]) returns Slice[char]
+    {
+        let text String^host(s.data as pointer[const_char], s.length)
+        Slice[char](text.get_length(), text.get_buffer() as pointer[char])
+    }
+
+    procedure stop(this, tag: Slice[char])
+    {
+        if (stop_tag.length as int) = 0
+            set stop_tag: tag
+    }
+
+    ; TestClock.Now
+    procedure now(this) returns int
+    {
+        set clock: clock + 1
+        clock
+    }
+
+    function same_path(this, a: Slice[char], b: Slice[char]) returns bool
+    {
+        if case_sensitive
+            return a.equals(b)
+        TsGlobPattern.equal_fold(a, b)
+    }
+
+    function find_index(this, path: Slice[char]) returns int
+    {
+        var i 0
+        while i < (files.get_length() as int)
+        {
+            let f files[i as size_t]
+            if f <> null
+            {
+                if this.same_path((f as ref[VfsFile]).path, path)
+                    return i
+            }
+            set i: i + 1
+        }
+        0 - 1
+    }
+
+    function file_at(this, i: int) returns ref[VfsFile]?
+        files[i as size_t]
+
+    procedure remove_from(list: ref[Array[Slice[char]]], path: Slice[char])
+    {
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            let item list[i as size_t]
+            if item.equals(path)
+            {
+                let none: Slice[char] ""
+                list.put(i as size_t, none)
+            }
+            set i: i + 1
+        }
+    }
+
+    function contains(list: ref[Array[Slice[char]]], path: Slice[char]) returns bool
+    {
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            let item list[i as size_t]
+            if item.equals(path)
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    ; the map file system's write (vfstest): the modification time is the clock's
+    procedure put_file(this, path: Slice[char], text: Slice[char])
+    {
+        let mtime this.now()
+        let none: Slice[char] ""
+        let entry &VfsFile^host(ExecSystem.copy(host, path), ExecSystem.copy(host, text), mtime, false, none)
+        let i this.find_index(path)
+        if i >= 0
+            files.put(i as size_t, entry)
+        else
+            files.add(entry)
+    }
+
+    procedure put_link(this, path: Slice[char], target: Slice[char])
+    {
+        let none: Slice[char] ""
+        let entry &VfsFile^host(ExecSystem.copy(host, path), none, 0, true, ExecSystem.copy(host, target))
+        let i this.find_index(path)
+        if i >= 0
+            files.put(i as size_t, entry)
+        else
+            files.add(entry)
+    }
+
+    procedure remove_file(this, path: Slice[char])
+    {
+        let i this.find_index(path)
+        if i >= 0
+            files.put(i as size_t, null)
+    }
+
+    procedure touch(this, path: Slice[char])
+    {
+        let i this.find_index(path)
+        if i < 0
+            return
+        let f files[i as size_t] as ref[VfsFile]
+        set f.mtime: this.now()
+    }
+
+    ; testFs.ReadFile: a read ends a file's default-lib status; a build info written
+    ; with the harness's fake version reads back with the real one
+    procedure read_file(this, path: Slice[char], out_text: ref[Slice[char]]) returns bool
+    {
+        ExecSystem.remove_from(default_libs, path)
+        let i this.find_index(path)
+        if i < 0
+            return false
+        let f files[i as size_t] as ref[VfsFile]
+        if f.is_link
+            return false
+        var text f.text
+        if path.ends_with(".tsbuildinfo")
+        {
+            let parsed JsonParser.parse(host, text)
+            if parsed <> null
+            {
+                let info parsed as ref[JsonValue]
+                let version info.string_of("version")
+                if version.equals("FakeTSVersion")
+                {
+                    ExecSystem.set_version(host, info, "7.0.0-dev")
+                    set text: JsonText.to_text(host, info, false)
+                }
+            }
+        }
+        set out_text.data: text.data
+        set out_text.length: text.length
+        true
+    }
+
+    procedure set_version(host: ref[Page], info: ref[JsonValue], version: Slice[char])
+    {
+        var k 0
+        while k < info.size()
+        {
+            let key info.key_at(k)
+            if key.equals("version")
+            {
+                let values info.values as ref[Array[ref[JsonValue]?]]
+                values.put(k as size_t, JsonText.new_string(host, version))
+            }
+            set k: k + 1
+        }
+    }
+
+    ; testFs.WriteFile: a build info is written with the fake version, its readable
+    ; form first
+    procedure write_file(this, path: Slice[char], text_in: Slice[char])
+    {
+        ExecSystem.remove_from(default_libs, path)
+        if ExecSystem.contains(written, path) = false
+            written.add(ExecSystem.copy(host, path))
+        var text text_in
+        if path.ends_with(".tsbuildinfo")
+        {
+            let parsed JsonParser.parse(host, text)
+            if parsed = null
+            {
+                this.stop("buildinfo-unmarshal")
+                return
+            }
+            let info parsed as ref[JsonValue]
+            let version info.string_of("version")
+            if version.equals("7.0.0-dev")
+            {
+                ExecSystem.set_version(host, info, "FakeTSVersion")
+                set text: JsonText.to_text(host, info, false)
+            }
+            let readable ReadableBuildInfo.convert(host, info, text)
+            let readable_path join_slices(host, path, ".readable.baseline.txt")
+            this.write_file(readable_path, readable)
+        }
+        this.put_file(path, text)
+    }
+
+    function file_exists(this, path: Slice[char]) returns bool
+    {
+        let i this.find_index(path)
+        if i < 0
+            return false
+        let f files[i as size_t] as ref[VfsFile]
+        f.is_link = false
+    }
+
+    ; a directory exists when some entry lies below it
+    function directory_exists(this, path_in: Slice[char]) returns bool
+    {
+        var path path_in
+        if (path.length as int) > 1
+        {
+            if (*(path.data + ((path.length as int) - 1)) as int) = ("/" as char) as int
+                set path: path.subslice(0, path.length - 1)
+        }
+        var i 0
+        while i < (files.get_length() as int)
+        {
+            let f files[i as size_t]
+            set i: i + 1
+            if f = null
+                continue
+            let p (f as ref[VfsFile]).path
+            if (path.length as int) = 1
+                return true
+            if (p.length > path.length) and ((*(p.data + path.length) as int) = ("/" as char) as int)
+            {
+                if this.same_path(p.subslice(0, path.length), path)
+                    return true
+            }
+        }
+        false
+    }
+
+    function get_environment_variable(this, name: Slice[char]) returns Slice[char]
+    {
+        var i 0
+        while i < (env_names.get_length() as int)
+        {
+            let env_name env_names[i as size_t]
+            if env_name.equals(name)
+                return env_values[i as size_t]
+            set i: i + 1
+        }
+        ""
+    }
+
+    procedure write(this, text: Slice[char])
+        output.append(text.data, text.length)
+}
+

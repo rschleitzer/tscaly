@@ -1,0 +1,445 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; xxh3 — the 128-bit XXH3 hash incremental.ComputeHash asks for
+; (xxh3.HashString128), ported from the reference's dependency
+; github.com/zeebo/xxh3 v1.1.0 (hash128.go, utils.go, consts.go and the scalar
+; accumulator of accum_generic.go), which carries this notice:
+;
+;   BSD 2-Clause License
+;
+;   Copyright (c) 2012-2014, Yann Collet
+;   Copyright (c) 2019, Jeff Wendling
+;   All rights reserved.
+;
+;   Redistribution and use in source and binary forms, with or without
+;   modification, are permitted provided that the following conditions are met:
+;
+;   * Redistributions of source code must retain the above copyright notice, this
+;     list of conditions and the following disclaimer.
+;
+;   * Redistributions in binary form must reproduce the above copyright notice,
+;     this list of conditions and the following disclaimer in the documentation
+;     and/or other materials provided with the distribution.
+;
+;   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+;   AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+;   IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+;   DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+;   FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+;   DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+;   SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+;   CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+;   OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+;   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;
+; ★ The unseeded hash only: the secret is the default key, so every key64_NNN
+; constant is a little-endian read of the key table at NNN. The SIMD paths of the
+; dependency compute the scalar accumulator's result; the scalar one is ported.
+
+use scaly.memory.Page
+use scaly.containers.String
+use scaly.containers.StringBuilder
+
+define Xxh3Key: u8[] [
+    0xb8, 0xfe, 0x6c, 0x39, 0x23, 0xa4, 0x4b, 0xbe, 0x7c, 0x01, 0x81, 0x2c, 0xf7, 0x21, 0xad, 0x1c,
+    0xde, 0xd4, 0x6d, 0xe9, 0x83, 0x90, 0x97, 0xdb, 0x72, 0x40, 0xa4, 0xa4, 0xb7, 0xb3, 0x67, 0x1f,
+    0xcb, 0x79, 0xe6, 0x4e, 0xcc, 0xc0, 0xe5, 0x78, 0x82, 0x5a, 0xd0, 0x7d, 0xcc, 0xff, 0x72, 0x21,
+    0xb8, 0x08, 0x46, 0x74, 0xf7, 0x43, 0x24, 0x8e, 0xe0, 0x35, 0x90, 0xe6, 0x81, 0x3a, 0x26, 0x4c,
+    0x3c, 0x28, 0x52, 0xbb, 0x91, 0xc3, 0x00, 0xcb, 0x88, 0xd0, 0x65, 0x8b, 0x1b, 0x53, 0x2e, 0xa3,
+    0x71, 0x64, 0x48, 0x97, 0xa2, 0x0d, 0xf9, 0x4e, 0x38, 0x19, 0xef, 0x46, 0xa9, 0xde, 0xac, 0xd8,
+    0xa8, 0xfa, 0x76, 0x3f, 0xe3, 0x9c, 0x34, 0x3f, 0xf9, 0xdc, 0xbb, 0xc7, 0xc7, 0x0b, 0x4f, 0x1d,
+    0x8a, 0x51, 0xe0, 0x4b, 0xcd, 0xb4, 0x59, 0x31, 0xc8, 0x9f, 0x7e, 0xc9, 0xd9, 0x78, 0x73, 0x64,
+    0xea, 0xc5, 0xac, 0x83, 0x34, 0xd3, 0xeb, 0xc3, 0xc5, 0x81, 0xa0, 0xff, 0xfa, 0x13, 0x63, 0xeb,
+    0x17, 0x0d, 0xdd, 0x51, 0xb7, 0xf0, 0xda, 0x49, 0xd3, 0x16, 0x55, 0x26, 0x29, 0xd4, 0x68, 0x9e,
+    0x2b, 0x16, 0xbe, 0x58, 0x7d, 0x47, 0xa1, 0xfc, 0x8f, 0xf8, 0xb8, 0xd1, 0x7a, 0xd0, 0x31, 0xce,
+    0x45, 0xcb, 0x3a, 0x8f, 0x95, 0x16, 0x04, 0x28, 0xaf, 0xd7, 0xfb, 0xca, 0xbb, 0x4b, 0x40, 0x7e,
+]
+
+define Xxh3Prime32_1: u64 0x9e3779b1
+define Xxh3Prime32_2: u64 0x85ebca77
+define Xxh3Prime32_3: u64 0xc2b2ae3d
+define Xxh3Prime64_1: u64 0x9e3779b185ebca87
+define Xxh3Prime64_2: u64 0xc2b2ae3d27d4eb4f
+define Xxh3Prime64_3: u64 0x165667b19e3779f9
+define Xxh3Prime64_4: u64 0x85ebca77c2b2ae63
+define Xxh3Prime64_5: u64 0x27d4eb2f165667c5
+
+define Xxh3 (hi: u64  lo: u64)
+{
+    ; the text's hash as its canonical bytes in lower-case hex (hex.EncodeToString
+    ; of Uint128.Bytes: Hi big-endian, then Lo)
+    function hex_of(host: ref[Page], text: Slice[char]) returns Slice[char]
+    {
+        let h Xxh3.hash128(text)
+        var sb StringBuilder()
+        Xxh3.append_hex(&sb, h.hi)
+        Xxh3.append_hex(&sb, h.lo)
+        let s String^host(sb.to_string())
+        Slice[char](s.get_length(), s.get_buffer() as pointer[char])
+    }
+
+    procedure append_hex(sb: ref[StringBuilder], v: u64)
+    {
+        var shift 60
+        while shift >= 0
+        {
+            let nibble ((v >> (shift as u64)) & (15 as u64)) as int
+            if nibble < 10
+                sb.append((48 + nibble) as char)
+            else
+                sb.append((87 + nibble) as char)
+            set shift: shift - 4
+        }
+    }
+
+    function byte_at(p: Slice[char], o: size_t) returns u64
+        (*(p.data + o) as u8) as u64
+
+    function read_u64(p: Slice[char], o: size_t) returns u64
+    {
+        var v: u64 0
+        var i 7
+        while i >= 0
+        {
+            set v: (v << (8 as u64)) | Xxh3.byte_at(p, o + (i as size_t))
+            set i: i - 1
+        }
+        v
+    }
+
+    function read_u32(p: Slice[char], o: size_t) returns u64
+    {
+        var v: u64 0
+        var i 3
+        while i >= 0
+        {
+            set v: (v << (8 as u64)) | Xxh3.byte_at(p, o + (i as size_t))
+            set i: i - 1
+        }
+        v
+    }
+
+    function key_u64(o: int) returns u64
+    {
+        var v: u64 0
+        var i 7
+        while i >= 0
+        {
+            set v: (v << (8 as u64)) | (Xxh3Key[o + i] as u64)
+            set i: i - 1
+        }
+        v
+    }
+
+    function key_u32(o: int) returns u64
+    {
+        var v: u64 0
+        var i 3
+        while i >= 0
+        {
+            set v: (v << (8 as u64)) | (Xxh3Key[o + i] as u64)
+            set i: i - 1
+        }
+        v
+    }
+
+    ; bits.Mul64: the low half answered, the high half through the cell
+    function mul128(x: u64, y: u64, out_hi: ref[u64]) returns u64
+    {
+        let mask: u64 0xffffffff
+        let x0 x & mask
+        let x1 x >> (32 as u64)
+        let y0 y & mask
+        let y1 y >> (32 as u64)
+        let w0 x0 * y0
+        let t (x1 * y0) + (w0 >> (32 as u64))
+        var w1 t & mask
+        let w2 t >> (32 as u64)
+        set w1: w1 + (x0 * y1)
+        set out_hi: ((x1 * y1) + w2) + (w1 >> (32 as u64))
+        x * y
+    }
+
+    function mul_fold64(x: u64, y: u64) returns u64
+    {
+        var hi: u64 0
+        let lo Xxh3.mul128(x, y, &hi)
+        hi xor lo
+    }
+
+    function rotl64(x: u64, r: u64) returns u64
+        (x << r) | (x >> ((64 as u64) - r))
+
+    function rotl32(x: u64, r: u64) returns u64
+    {
+        let v x & (0xffffffff as u64)
+        ((v << r) | (v >> ((32 as u64) - r))) & (0xffffffff as u64)
+    }
+
+    function bswap64(x: u64) returns u64
+    {
+        var v: u64 0
+        var i 0
+        while i < 8
+        {
+            set v: (v << (8 as u64)) | ((x >> ((8 * i) as u64)) & (0xff as u64))
+            set i: i + 1
+        }
+        v
+    }
+
+    function bswap32(x: u64) returns u64
+    {
+        var v: u64 0
+        var i 0
+        while i < 4
+        {
+            set v: (v << (8 as u64)) | ((x >> ((8 * i) as u64)) & (0xff as u64))
+            set i: i + 1
+        }
+        v
+    }
+
+    function avalanche(x_in: u64) returns u64
+    {
+        var x x_in
+        set x: x xor (x >> (37 as u64))
+        set x: x * (0x165667919e3779f9 as u64)
+        set x: x xor (x >> (32 as u64))
+        x
+    }
+
+    function avalanche_small(x_in: u64) returns u64
+    {
+        var x x_in
+        set x: x * Xxh3Prime64_2
+        set x: x xor (x >> (29 as u64))
+        set x: x * Xxh3Prime64_3
+        set x: x xor (x >> (32 as u64))
+        x
+    }
+
+    ; one 128-bit round over four input words (hash128.go's repeated block)
+    procedure round(acc: ref[Xxh3], i0: u64, i1: u64, i2: u64, i3: u64, k0: u64, k1: u64, k2: u64, k3: u64)
+    {
+        set acc.hi: (acc.hi + Xxh3.mul_fold64(i2 xor k2, i3 xor k3)) xor (i0 + i1)
+        set acc.lo: (acc.lo + Xxh3.mul_fold64(i0 xor k0, i1 xor k1)) xor (i2 + i3)
+    }
+
+    function hash128(p: Slice[char]) returns Xxh3
+    {
+        let l p.length
+        let lu l as u64
+        var acc Xxh3(0 as u64, 0 as u64)
+        if l <= 16
+        {
+            if l > 8
+            {
+                let bitflipl Xxh3.key_u64(32) xor Xxh3.key_u64(40)
+                let bitfliph Xxh3.key_u64(48) xor Xxh3.key_u64(56)
+                let input_lo Xxh3.read_u64(p, 0)
+                var input_hi Xxh3.read_u64(p, l - 8)
+                var m128_h: u64 0
+                var m128_l Xxh3.mul128((input_lo xor input_hi) xor bitflipl, Xxh3Prime64_1, &m128_h)
+                set m128_l: m128_l + ((lu - (1 as u64)) << (54 as u64))
+                set input_hi: input_hi xor bitfliph
+                set m128_h: (m128_h + input_hi) + ((input_hi & (0xffffffff as u64)) * (Xxh3Prime32_2 - (1 as u64)))
+                set m128_l: m128_l xor Xxh3.bswap64(m128_h)
+                var hi: u64 0
+                let lo Xxh3.mul128(m128_l, Xxh3Prime64_2, &hi)
+                set hi: hi + (m128_h * Xxh3Prime64_2)
+                return Xxh3(Xxh3.avalanche(hi), Xxh3.avalanche(lo))
+            }
+            if l > 3
+            {
+                let bitflip Xxh3.key_u64(16) xor Xxh3.key_u64(24)
+                let input_lo Xxh3.read_u32(p, 0)
+                let input_hi Xxh3.read_u32(p, l - 4)
+                let input_64 input_lo + (input_hi << (32 as u64))
+                let keyed input_64 xor bitflip
+                var hi: u64 0
+                var lo Xxh3.mul128(keyed, Xxh3Prime64_1 + (lu << (2 as u64)), &hi)
+                set hi: hi + (lo << (1 as u64))
+                set lo: lo xor (hi >> (3 as u64))
+                set lo: lo xor (lo >> (35 as u64))
+                set lo: lo * (0x9fb21c651e98df25 as u64)
+                set lo: lo xor (lo >> (28 as u64))
+                return Xxh3(Xxh3.avalanche(hi), lo)
+            }
+            var lo: u64 0
+            if l = 3
+            {
+                let c12 Xxh3.byte_at(p, 0) | (Xxh3.byte_at(p, 1) << (8 as u64))
+                let c3 Xxh3.byte_at(p, 2)
+                set lo: ((c12 << (16 as u64)) + c3) + (0x300 as u64)
+            }
+            if l = 2
+            {
+                let c12 Xxh3.byte_at(p, 0) | (Xxh3.byte_at(p, 1) << (8 as u64))
+                set lo: ((c12 * (0x1000001 as u64)) >> (8 as u64)) + (0x200 as u64)
+            }
+            if l = 1
+            {
+                let c1 Xxh3.byte_at(p, 0)
+                set lo: (c1 * (0x1010001 as u64)) + (0x100 as u64)
+            }
+            if l = 0
+                return Xxh3(0x99aa06d3014798d8 as u64, 0x6001c324468d497f as u64)
+            var hi Xxh3.rotl32(Xxh3.bswap32(lo), 13 as u64)
+            set lo: lo xor (Xxh3.key_u32(0) xor Xxh3.key_u32(4))
+            set hi: hi xor (Xxh3.key_u32(8) xor Xxh3.key_u32(12))
+            return Xxh3(Xxh3.avalanche_small(hi), Xxh3.avalanche_small(lo))
+        }
+        if l <= 128
+        {
+            set acc.lo: lu * Xxh3Prime64_1
+            if l > 32
+            {
+                if l > 64
+                {
+                    if l > 96
+                        Xxh3.round(&acc, Xxh3.read_u64(p, 48), Xxh3.read_u64(p, 56), Xxh3.read_u64(p, l - 64), Xxh3.read_u64(p, l - 56), Xxh3.key_u64(96), Xxh3.key_u64(104), Xxh3.key_u64(112), Xxh3.key_u64(120))
+                    Xxh3.round(&acc, Xxh3.read_u64(p, 32), Xxh3.read_u64(p, 40), Xxh3.read_u64(p, l - 48), Xxh3.read_u64(p, l - 40), Xxh3.key_u64(64), Xxh3.key_u64(72), Xxh3.key_u64(80), Xxh3.key_u64(88))
+                }
+                Xxh3.round(&acc, Xxh3.read_u64(p, 16), Xxh3.read_u64(p, 24), Xxh3.read_u64(p, l - 32), Xxh3.read_u64(p, l - 24), Xxh3.key_u64(32), Xxh3.key_u64(40), Xxh3.key_u64(48), Xxh3.key_u64(56))
+            }
+            Xxh3.round(&acc, Xxh3.read_u64(p, 0), Xxh3.read_u64(p, 8), Xxh3.read_u64(p, l - 16), Xxh3.read_u64(p, l - 8), Xxh3.key_u64(0), Xxh3.key_u64(8), Xxh3.key_u64(16), Xxh3.key_u64(24))
+            return Xxh3.finish_mid(acc, lu)
+        }
+        if l <= 240
+        {
+            set acc.lo: lu * Xxh3Prime64_1
+            var g 0
+            while g < 4
+            {
+                let b (g * 32) as size_t
+                Xxh3.round(&acc, Xxh3.read_u64(p, b), Xxh3.read_u64(p, b + 8), Xxh3.read_u64(p, b + 16), Xxh3.read_u64(p, b + 24), Xxh3.key_u64(g * 32), Xxh3.key_u64(g * 32 + 8), Xxh3.key_u64(g * 32 + 16), Xxh3.key_u64(g * 32 + 24))
+                set g: g + 1
+            }
+            set acc.hi: Xxh3.avalanche(acc.hi)
+            set acc.lo: Xxh3.avalanche(acc.lo)
+            let top (l as int) & (0 - 32)
+            var i 128
+            while i < top
+            {
+                let b i as size_t
+                Xxh3.round(&acc, Xxh3.read_u64(p, b), Xxh3.read_u64(p, b + 8), Xxh3.read_u64(p, b + 16), Xxh3.read_u64(p, b + 24), Xxh3.key_u64(i - 125), Xxh3.key_u64(i - 117), Xxh3.key_u64(i - 109), Xxh3.key_u64(i - 101))
+                set i: i + 32
+            }
+            ; the last 32 bytes, their halves crossed
+            let e0 Xxh3.read_u64(p, l - 32)
+            let e1 Xxh3.read_u64(p, l - 24)
+            let e2 Xxh3.read_u64(p, l - 16)
+            let e3 Xxh3.read_u64(p, l - 8)
+            set acc.hi: (acc.hi + Xxh3.mul_fold64(e0 xor Xxh3.key_u64(119), e1 xor Xxh3.key_u64(127))) xor (e2 + e3)
+            set acc.lo: (acc.lo + Xxh3.mul_fold64(e2 xor Xxh3.key_u64(103), e3 xor Xxh3.key_u64(111))) xor (e0 + e1)
+            return Xxh3.finish_mid(acc, lu)
+        }
+        set acc.lo: lu * Xxh3Prime64_1
+        set acc.hi: (lu * Xxh3Prime64_2) xor (0xffffffffffffffff as u64)
+        var accs u64[8]
+        set accs[0]: Xxh3Prime32_3
+        set accs[1]: Xxh3Prime64_1
+        set accs[2]: Xxh3Prime64_2
+        set accs[3]: Xxh3Prime64_3
+        set accs[4]: Xxh3Prime64_4
+        set accs[5]: Xxh3Prime32_2
+        set accs[6]: Xxh3Prime64_5
+        set accs[7]: Xxh3Prime32_1
+        Xxh3.accumulate(&accs[0], p)
+        set acc.lo: acc.lo + Xxh3.mul_fold64(accs[0] xor Xxh3.key_u64(11), accs[1] xor Xxh3.key_u64(19))
+        set acc.hi: acc.hi + Xxh3.mul_fold64(accs[0] xor Xxh3.key_u64(117), accs[1] xor Xxh3.key_u64(125))
+        set acc.lo: acc.lo + Xxh3.mul_fold64(accs[2] xor Xxh3.key_u64(27), accs[3] xor Xxh3.key_u64(35))
+        set acc.hi: acc.hi + Xxh3.mul_fold64(accs[2] xor Xxh3.key_u64(133), accs[3] xor Xxh3.key_u64(141))
+        set acc.lo: acc.lo + Xxh3.mul_fold64(accs[4] xor Xxh3.key_u64(43), accs[5] xor Xxh3.key_u64(51))
+        set acc.hi: acc.hi + Xxh3.mul_fold64(accs[4] xor Xxh3.key_u64(149), accs[5] xor Xxh3.key_u64(157))
+        set acc.lo: acc.lo + Xxh3.mul_fold64(accs[6] xor Xxh3.key_u64(59), accs[7] xor Xxh3.key_u64(67))
+        set acc.hi: acc.hi + Xxh3.mul_fold64(accs[6] xor Xxh3.key_u64(165), accs[7] xor Xxh3.key_u64(173))
+        Xxh3(Xxh3.avalanche(acc.hi), Xxh3.avalanche(acc.lo))
+    }
+
+    ; the 17..240 tail: hi and lo recombined, then avalanched (hi negated)
+    function finish_mid(acc: Xxh3, lu: u64) returns Xxh3
+    {
+        let hi ((acc.lo * Xxh3Prime64_1) + (acc.hi * Xxh3Prime64_4)) + (lu * Xxh3Prime64_2)
+        let lo acc.hi + acc.lo
+        Xxh3((0 as u64) - Xxh3.avalanche(hi), Xxh3.avalanche(lo))
+    }
+
+    ; one stripe's eight lanes, at `p`+`po` against the key at `ko`
+    procedure stripe(accs: pointer[u64], p: Slice[char], po: size_t, ko: int)
+    {
+        var lane 0
+        while lane < 8
+        {
+            let dv0 Xxh3.read_u64(p, po + ((8 * lane) as size_t))
+            let dk0 dv0 xor Xxh3.key_u64(ko + 8 * lane)
+            let dv1 Xxh3.read_u64(p, po + ((8 * lane + 8) as size_t))
+            let dk1 dv1 xor Xxh3.key_u64(ko + 8 * lane + 8)
+            let ac0 ((dk0 & (0xffffffff as u64)) * (dk0 >> (32 as u64))) + dv1
+            let ac1 dv0 + ((dk1 & (0xffffffff as u64)) * (dk1 >> (32 as u64)))
+            set *(accs + lane): *(accs + lane) + ac0
+            set *(accs + lane + 1): *(accs + lane + 1) + ac1
+            set lane: lane + 2
+        }
+    }
+
+    ; accumScalar over the default key
+    procedure accumulate(accs: pointer[u64], p: Slice[char])
+    {
+        var l p.length as u64
+        var po: size_t 0
+        while l > (1024 as u64)
+        {
+            var i 0
+            while i < 16
+            {
+                Xxh3.stripe(accs, p, po, 8 * i)
+                set l: l - (64 as u64)
+                if l > (0 as u64)
+                    set po: po + 64
+                set i: i + 1
+            }
+            var a 0
+            while a < 8
+            {
+                var v *(accs + a)
+                set v: v xor (v >> (47 as u64))
+                set v: v xor Xxh3.key_u64(128 + 8 * a)
+                set v: v * Xxh3Prime32_1
+                set *(accs + a): v
+                set a: a + 1
+            }
+        }
+        if l > (0 as u64)
+        {
+            let t ((l - (1 as u64)) / (64 as u64)) as int
+            var i 0
+            while i < t
+            {
+                Xxh3.stripe(accs, p, po, 8 * i)
+                set l: l - (64 as u64)
+                if l > (0 as u64)
+                    set po: po + 64
+                set i: i + 1
+            }
+            if l > (0 as u64)
+            {
+                set po: po - (((64 as u64) - l) as size_t)
+                var lane 0
+                while lane < 8
+                {
+                    let dv0 Xxh3.read_u64(p, po + ((8 * lane) as size_t))
+                    let dk0 dv0 xor Xxh3.key_u64(121 + 8 * lane)
+                    let dv1 Xxh3.read_u64(p, po + ((8 * lane + 8) as size_t))
+                    let dk1 dv1 xor Xxh3.key_u64(129 + 8 * lane)
+                    set *(accs + lane + 1): *(accs + lane + 1) + dv0
+                    set *(accs + lane): *(accs + lane) + ((dk0 & (0xffffffff as u64)) * (dk0 >> (32 as u64)))
+                    set *(accs + lane): *(accs + lane) + dv1
+                    set *(accs + lane + 1): *(accs + lane + 1) + ((dk1 & (0xffffffff as u64)) * (dk1 >> (32 as u64)))
+                    set lane: lane + 2
+                }
+            }
+        }
+    }
+}

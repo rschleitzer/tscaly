@@ -1,0 +1,541 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; execute — internal/execute's command line (tsc.go and execute/tsc) (phase (b)2).
+;
+; ★ The reporters are closures upstream (CreateDiagnosticReporter,
+; CreateReportErrorSummary); here they are the two booleans they close over —
+; quiet and pretty — decided at the same call sites.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use tscaly.program.JsonValue
+use tscaly.program.ProgramFiles
+use tscaly.tsoptions.TsOptions
+use tscaly.tsoptions.TsConfigParser
+use tscaly.tsoptions.TsParsedCommandLine
+use tscaly.system.ExecSystem
+use tscaly.system.VfsFile
+use tscaly.commandline.CommandLine
+use tscaly.commandline.ParsedCommandLine
+use tscaly.diagnosticwriter.DriverDiagnostic
+use tscaly.diagnosticwriter.DiagnosticWriter
+use tscaly.programhost.DriverProgram
+use tscaly.incremental.IncProgram
+use tscaly.incremental.IncEmitResult
+use tscaly.incremental.ToSnapshot
+use tscaly.incremental.PathMap
+use tscaly.help.Help
+use tscaly.build.Orchestrator
+use tscaly.help.Init
+
+; tsc.ExitStatus
+define ExitStatusSuccess: int 0
+define ExitStatusDiagnosticsPresent_OutputsSkipped: int 1
+define ExitStatusDiagnosticsPresent_OutputsGenerated: int 2
+define ExitStatusInvalidProject_OutputsSkipped: int 3
+define ExitStatusProjectReferenceCycle_OutputsSkipped: int 4
+define ExitStatusNotImplemented: int 5
+
+; a reporter's two decisions
+define Reporter (quiet: bool  pretty: bool)
+
+; EmitAndReportStatistics' answer
+define CompileOutcome (status: int  diagnostics: ref[Array[ref[DriverDiagnostic]]]  emitted_files: ref[Array[Slice[char]]]  emit_skipped: bool)
+
+; a concept with a field, so its statics mangle with its name (§3.38)
+define Execute (reserved: int)
+{
+    ; execute.CommandLine
+    procedure command_line(sys: ref[ExecSystem], args: ref[Array[Slice[char]]]) returns int
+    {
+        let host sys.host
+        if args.get_length() > 0
+        {
+            let first TsConfigParser.to_lower(host, args[0])
+            if first.equals("-b") or first.equals("--b") or first.equals("-build") or first.equals("--build")
+            {
+                let build_cl CommandLine.parse_build(host, sys, args)
+                if (sys.stop_tag.length as int) > 0
+                    return ExitStatusNotImplemented
+                return Orchestrator.compile(sys, build_cl)
+            }
+        }
+        let cl CommandLine.parse(host, sys, args)
+        if (sys.stop_tag.length as int) > 0
+            return ExitStatusNotImplemented
+        Execute.tsc_compilation(sys, cl)
+    }
+
+    ; defaultIsPretty
+    function default_is_pretty(sys: ref[ExecSystem]) returns bool
+    {
+        if (sys.get_environment_variable("NO_COLOR").length as int) > 0
+            return false
+        if (sys.get_environment_variable("FORCE_COLOR").length as int) > 0
+            return true
+        true
+    }
+
+    ; shouldBePretty
+    function should_be_pretty(sys: ref[ExecSystem], options: ref[TsOptions]) returns bool
+    {
+        let pretty options.tristate_of("pretty")
+        if pretty < 0
+            return Execute.default_is_pretty(sys)
+        pretty = 1
+    }
+
+    ; CreateDiagnosticReporter
+    function reporter(sys: ref[ExecSystem], options: ref[TsOptions]) returns Reporter
+        Reporter(options.tristate_of("quiet") = 1, Execute.should_be_pretty(sys, options))
+
+    procedure report(sys: ref[ExecSystem], r: Reporter, d: ref[DriverDiagnostic])
+    {
+        if r.quiet
+            return
+        let out sys.output
+        if r.pretty
+        {
+            DiagnosticWriter.format_with_color_and_context(sys.host, out, d, sys.cwd, "\n")
+            out.append("\n")
+            return
+        }
+        DiagnosticWriter.write_format_diagnostic(sys.host, out, d, sys.cwd, "\n")
+    }
+
+    procedure report_all(sys: ref[ExecSystem], r: Reporter, list: ref[Array[ref[DriverDiagnostic]]])
+    {
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            Execute.report(sys, r, list[i as size_t])
+            set i: i + 1
+        }
+    }
+
+    ; ast.NewCompilerDiagnostic, reported
+    procedure report_compiler(sys: ref[ExecSystem], r: Reporter, code: int, args: ref[Array[String]]?)
+    {
+        let none: Slice[char] ""
+        let h sys.host
+        Execute.report(sys, r, &DriverDiagnostic^h(none, none, 0, 0, code, args, null, null))
+    }
+
+    function arg1(host: ref[Page], a0: Slice[char]) returns ref[Array[String]]
+        CommandLine.args1(host, a0)
+
+    ; findConfigFile over the ancestors of the search path
+    procedure find_config_file(sys: ref[ExecSystem], search_path: Slice[char]) returns Slice[char]
+    {
+        let host sys.host
+        var dir search_path
+        repeat
+        {
+            let candidate combine_paths(host, dir, "tsconfig.json")
+            if sys.file_exists(candidate)
+                return candidate
+            let parent get_directory_path(host, dir)
+            if parent.equals(dir)
+                return Slice[char]()
+            set dir: parent
+        }
+    }
+
+    ; tscCompilation
+    procedure tsc_compilation(sys: ref[ExecSystem], cl: ref[ParsedCommandLine]) returns int
+    {
+        let host sys.host
+        let options cl.options
+        var report_diagnostic Execute.reporter(sys, options)
+        if cl.errors.get_length() > 0
+        {
+            Execute.report_all(sys, report_diagnostic, cl.errors)
+            return ExitStatusDiagnosticsPresent_OutputsSkipped
+        }
+        if options.tristate_of("init") = 1
+        {
+            if Init.write_config_file(sys, Execute.default_is_pretty(sys), cl.raw)
+            {
+                let file get_normalized_absolute_path(host, combine_paths(host, sys.cwd, "tsconfig.json"), Slice[char]())
+                Execute.report_compiler(sys, report_diagnostic, DiagA_tsconfig_json_file_is_already_defined_at_Colon_0, Execute.arg1(host, file))
+            }
+            return ExitStatusSuccess
+        }
+        if options.tristate_of("version") = 1
+        {
+            Help.print_version(sys)
+            return ExitStatusSuccess
+        }
+        if (options.tristate_of("help") = 1) or (options.tristate_of("all") = 1)
+        {
+            Help.print_help(sys, Execute.default_is_pretty(sys), options.tristate_of("all") = 1)
+            return ExitStatusSuccess
+        }
+        if (options.tristate_of("watch") = 1) and (options.tristate_of("listFilesOnly") = 1)
+        {
+            Execute.report_compiler(sys, report_diagnostic, DiagOptions_0_and_1_cannot_be_combined, CommandLine.args2(host, "watch", String("listFilesOnly")))
+            return ExitStatusDiagnosticsPresent_OutputsSkipped
+        }
+        var config_file_name Slice[char]()
+        let project options.text_of("project")
+        let file_count cl.file_names.get_length() as int
+        if (project.length as int) > 0
+        {
+            if file_count <> 0
+            {
+                Execute.report_compiler(sys, report_diagnostic, DiagOption_project_cannot_be_mixed_with_source_files_on_a_command_line, null)
+                return ExitStatusDiagnosticsPresent_OutputsSkipped
+            }
+            let file_or_directory get_normalized_absolute_path(host, project, sys.cwd)
+            if sys.directory_exists(file_or_directory)
+            {
+                set config_file_name: combine_paths(host, file_or_directory, "tsconfig.json")
+                if sys.file_exists(config_file_name) = false
+                {
+                    Execute.report_compiler(sys, report_diagnostic, DiagCannot_find_a_tsconfig_json_file_at_the_current_directory_Colon_0, Execute.arg1(host, config_file_name))
+                    return ExitStatusDiagnosticsPresent_OutputsSkipped
+                }
+            }
+            else
+            {
+                set config_file_name: file_or_directory
+                if sys.file_exists(config_file_name) = false
+                {
+                    Execute.report_compiler(sys, report_diagnostic, DiagThe_specified_path_does_not_exist_Colon_0, Execute.arg1(host, file_or_directory))
+                    return ExitStatusDiagnosticsPresent_OutputsSkipped
+                }
+            }
+        }
+        else
+        {
+            if (options.tristate_of("ignoreConfig") <> 1) or (file_count = 0)
+            {
+                let search_path get_normalized_absolute_path(host, sys.cwd, Slice[char]())
+                set config_file_name: Execute.find_config_file(sys, search_path)
+                if file_count <> 0
+                {
+                    if (config_file_name.length as int) > 0
+                    {
+                        Execute.report_compiler(sys, report_diagnostic, DiagX_tsconfig_json_is_present_but_will_not_be_loaded_if_files_are_specified_on_commandline_Use_ignoreConfig_to_skip_this_error, null)
+                        return ExitStatusDiagnosticsPresent_OutputsSkipped
+                    }
+                }
+                else
+                {
+                    if (config_file_name.length as int) = 0
+                    {
+                        if options.tristate_of("showConfig") = 1
+                        {
+                            Execute.report_compiler(sys, report_diagnostic, DiagCannot_find_a_tsconfig_json_file_at_the_current_directory_Colon_0, Execute.arg1(host, search_path))
+                            return ExitStatusDiagnosticsPresent_OutputsSkipped
+                        }
+                        Help.print_version(sys)
+                        Help.print_help(sys, Execute.default_is_pretty(sys), options.tristate_of("all") = 1)
+                        return ExitStatusDiagnosticsPresent_OutputsSkipped
+                    }
+                }
+            }
+        }
+        var compile_options options
+        var root_names cl.file_names
+        var config_text Slice[char]()
+        let config_diagnostics &Array[ref[DriverDiagnostic]]^host()
+        if (config_file_name.length as int) > 0
+        {
+            sys.now()
+            let absolute get_normalized_absolute_path(host, config_file_name, sys.cwd)
+            set config_file_name: absolute
+            var text Slice[char]()
+            if sys.read_file(absolute, &text) = false
+            {
+                sys.now()
+                Execute.report_compiler(sys, report_diagnostic, DiagCannot_read_file_0, Execute.arg1(host, absolute))
+                return ExitStatusDiagnosticsPresent_OutputsGenerated
+            }
+            set config_text: text
+            let parsed Execute.parse_config(sys, cl, absolute, text, config_diagnostics)
+            sys.now()
+            if parsed = null
+                return ExitStatusNotImplemented
+            let p parsed as ref[TsParsedCommandLine]
+            set compile_options: p.options
+            set root_names: p.file_names
+            set report_diagnostic: Execute.reporter(sys, options)
+        }
+        else
+        {
+            let absolute_names &Array[Slice[char]]^host()
+            var ni 0
+            while ni < file_count
+            {
+                absolute_names.add(get_normalized_absolute_path(host, cl.file_names[ni as size_t], sys.cwd))
+                set ni: ni + 1
+            }
+            set root_names: absolute_names
+        }
+        let summary_pretty Execute.should_be_pretty(sys, compile_options)
+        if options.tristate_of("showConfig") = 1
+        {
+            sys.stop("show-config")
+            return ExitStatusNotImplemented
+        }
+        if compile_options.tristate_of("watch") = 1
+        {
+            sys.stop("watch")
+            return ExitStatusNotImplemented
+        }
+        if (compile_options.tristate_of("incremental") = 1) or (compile_options.tristate_of("composite") = 1)
+            return Execute.perform_incremental_compilation(sys, compile_options, root_names, config_file_name, config_text, config_diagnostics, report_diagnostic, summary_pretty)
+        Execute.perform_compilation(sys, compile_options, root_names, config_file_name, config_text, config_diagnostics, report_diagnostic, summary_pretty)
+    }
+
+    ; GetParsedCommandLineOfConfigFile: the config's parse diagnostics into
+    ; `diagnostics`; null after a stop
+    procedure parse_config(sys: ref[ExecSystem], cl: ref[ParsedCommandLine], config_file_name: Slice[char], text: Slice[char], diagnostics: ref[Array[ref[DriverDiagnostic]]]) returns ref[TsParsedCommandLine]?
+    {
+        let host sys.host
+        let pf ProgramFiles.create(host)
+        var fi 0
+        while fi < (sys.files.get_length() as int)
+        {
+            let entry sys.files[fi as size_t]
+            set fi: fi + 1
+            if entry = null
+                continue
+            let f entry as ref[VfsFile]
+            if f.is_link
+                pf.add_link(f.path, f.link_target)
+            else
+                pf.add(f.path, f.text, null, null, null, false, 0)
+        }
+        let tp TsConfigParser.create(host, pf, sys.cwd)
+        set tp.existing_options: cl.options
+        set tp.extended_reporting: true
+        let none: Slice[char] ""
+        let wrapper_keys &Array[Slice[char]]^host()
+        wrapper_keys.add("compilerOptions")
+        let wrapper_values &Array[ref[JsonValue]?]^host()
+        wrapper_values.add(&JsonValue^host(JsonKindObject, none, false, cl.raw.names, cl.raw.values))
+        set tp.existing_raw: &JsonValue^host(JsonKindObject, none, false, wrapper_keys, wrapper_values)
+        let found tp.config_file_diagnostics(config_file_name, text)
+        if (found = null) or (tp.last_parsed = null)
+        {
+            sys.stop(tp.stop_tag)
+            if (sys.stop_tag.length as int) = 0
+                sys.stop("tsconfig")
+            return null
+        }
+        let references tp.root_property_initializer("references")
+        if TsConfigParser.element_node_at(references, 0) <> null
+        {
+            sys.stop("project-references")
+            return null
+        }
+        let fl found as ref[Array[int]]
+        var i 0
+        while i < ((fl.get_length() as int) / 3)
+        {
+            let pos fl[(3 * i) as size_t]
+            if pos < 0
+                diagnostics.add(&DriverDiagnostic^host(none, none, 0, 0, fl[(3 * i + 2) as size_t], tp.diagnostic_args_at(i), null, null))
+            else
+            {
+                let source tp.diagnostic_source_at(i)
+                if (source.length as int) > 0
+                    diagnostics.add(&DriverDiagnostic^host(source, pf.text_of_path(source), pos, fl[(3 * i + 1) as size_t], fl[(3 * i + 2) as size_t], tp.diagnostic_args_at(i), null, null))
+                else
+                    diagnostics.add(&DriverDiagnostic^host(config_file_name, text, pos, fl[(3 * i + 1) as size_t], fl[(3 * i + 2) as size_t], tp.diagnostic_args_at(i), null, null))
+            }
+            set i: i + 1
+        }
+        tp.last_parsed
+    }
+
+    ; the compile options this port does not implement, as a stop; true when one stopped
+    procedure unported_compile_options(sys: ref[ExecSystem], options: ref[TsOptions]) returns bool
+    {
+        if (options.tristate_of("diagnostics") = 1) or (options.tristate_of("extendedDiagnostics") = 1)
+        {
+            sys.stop("statistics")
+            return true
+        }
+        if (options.text_of("generateTrace").length as int) > 0
+        {
+            sys.stop("generate-trace")
+            return true
+        }
+        if (options.tristate_of("listFiles") = 1) or (options.tristate_of("explainFiles") = 1) or (options.tristate_of("listFilesOnly") = 1) or (options.tristate_of("listEmittedFiles") = 1)
+        {
+            sys.stop("list-files")
+            return true
+        }
+        if (options.text_of("locale").length as int) > 0
+        {
+            sys.stop("locale")
+            return true
+        }
+        if options.tristate_of("traceResolution") = 1
+        {
+            sys.stop("trace-resolution")
+            return true
+        }
+        false
+    }
+
+    ; performIncrementalCompilation, then EmitAndReportStatistics and the harness's
+    ; OnProgram
+    procedure perform_incremental_compilation(sys: ref[ExecSystem], options: ref[TsOptions], root_names: ref[Array[Slice[char]]], config_file_name: Slice[char], config_text: Slice[char], config_diagnostics: ref[Array[ref[DriverDiagnostic]]], r: Reporter, summary_pretty: bool) returns int
+    {
+        let host sys.host
+        if Execute.unported_compile_options(sys, options)
+            return ExitStatusNotImplemented
+        let program DriverProgram.create(host, sys, options, root_names, config_file_name, config_text, config_diagnostics)
+        sys.now()
+        let old ToSnapshot.read(host, program)
+        sys.now()
+        sys.now()
+        if program.load() = false
+            return ExitStatusNotImplemented
+        sys.now()
+        sys.now()
+        let created IncProgram.create(host, program, old)
+        if created = null
+            return ExitStatusNotImplemented
+        let ip created as ref[IncProgram]
+        sys.now()
+        let outcome Execute.emit_and_report_incremental(sys, ip, r, summary_pretty, null, null)
+        if outcome = null
+            return ExitStatusNotImplemented
+        ip.baseline(sys.programs)
+        (outcome as ref[CompileOutcome]).status
+    }
+
+    ; EmitAndReportStatistics over an incremental program: the diagnostics reported
+    ; (and collected into `collected`, a build task's errors), the emitted files
+    ; touched (their times into a build's cache when it holds them); null after a stop
+    procedure emit_and_report_incremental(sys: ref[ExecSystem], ip: ref[IncProgram], r: Reporter, summary_pretty: bool, collected: ref[Array[ref[DriverDiagnostic]]]?, mtimes: ref[PathMap[int]]?) returns ref[CompileOutcome]?
+    {
+        let host sys.host
+        let all &Array[ref[DriverDiagnostic]]^host()
+        if ip.diagnostics_of_any_program(all, false, true) = false
+            return null
+        sys.now()
+        let emitted ip.emit()
+        if emitted = null
+            return null
+        let result emitted as ref[IncEmitResult]
+        sys.now()
+        var ei 0
+        while ei < (result.diagnostics.get_length() as int)
+        {
+            all.add(result.diagnostics[ei as size_t])
+            set ei: ei + 1
+        }
+        var ti 0
+        while ti < (result.emitted_files.get_length() as int)
+        {
+            let file result.emitted_files[ti as size_t]
+            set ti: ti + 1
+            sys.touch(file)
+            if mtimes <> null
+            {
+                let cache mtimes as ref[PathMap[int]]
+                if cache.has(file)
+                    cache.store(file, sys.clock)
+            }
+        }
+        let sorted DriverProgram.sort_and_deduplicate(host, all)
+        Execute.report_all(sys, r, sorted)
+        if collected <> null
+        {
+            let list collected as ref[Array[ref[DriverDiagnostic]]]
+            var ci 0
+            while ci < (sorted.get_length() as int)
+            {
+                list.add(sorted[ci as size_t])
+                set ci: ci + 1
+            }
+        }
+        if summary_pretty
+            DiagnosticWriter.write_error_summary(host, sys.output, sorted, sys.cwd, "\n")
+        var status ExitStatusSuccess
+        ; SinceStart
+        sys.now()
+        if sorted.get_length() > 0
+        {
+            if result.emit_skipped
+                set status: ExitStatusDiagnosticsPresent_OutputsSkipped
+            else
+                set status: ExitStatusDiagnosticsPresent_OutputsGenerated
+        }
+        &CompileOutcome^host(status, sorted, result.emitted_files, result.emit_skipped)
+    }
+
+    ; performCompilation, then EmitAndReportStatistics
+    procedure perform_compilation(sys: ref[ExecSystem], options: ref[TsOptions], root_names: ref[Array[Slice[char]]], config_file_name: Slice[char], config_text: Slice[char], config_diagnostics: ref[Array[ref[DriverDiagnostic]]], r: Reporter, summary_pretty: bool) returns int
+    {
+        let host sys.host
+        if options.tristate_of("traceResolution") = 1
+        {
+            sys.stop("trace-resolution")
+            return ExitStatusNotImplemented
+        }
+        if (options.tristate_of("diagnostics") = 1) or (options.tristate_of("extendedDiagnostics") = 1)
+        {
+            sys.stop("statistics")
+            return ExitStatusNotImplemented
+        }
+        if (options.text_of("generateTrace").length as int) > 0
+        {
+            sys.stop("generate-trace")
+            return ExitStatusNotImplemented
+        }
+        if (options.tristate_of("listFiles") = 1) or (options.tristate_of("explainFiles") = 1) or (options.tristate_of("listFilesOnly") = 1) or (options.tristate_of("listEmittedFiles") = 1)
+        {
+            sys.stop("list-files")
+            return ExitStatusNotImplemented
+        }
+        if (options.text_of("locale").length as int) > 0
+        {
+            sys.stop("locale")
+            return ExitStatusNotImplemented
+        }
+        sys.now()
+        let program DriverProgram.create(host, sys, options, root_names, config_file_name, config_text, config_diagnostics)
+        if program.load() = false
+            return ExitStatusNotImplemented
+        sys.now()
+        ; EmitFilesAndReportErrors
+        let all &Array[ref[DriverDiagnostic]]^host()
+        if program.diagnostics_of_any_program(all, false, true) = false
+            return ExitStatusNotImplemented
+        sys.now()
+        if program.emit() = false
+            return ExitStatusNotImplemented
+        sys.now()
+        var ei 0
+        while ei < (program.emit_diagnostics.get_length() as int)
+        {
+            all.add(program.emit_diagnostics[ei as size_t])
+            set ei: ei + 1
+        }
+        ; OnEmittedFiles
+        var ti 0
+        while ti < (program.emitted_files.get_length() as int)
+        {
+            sys.touch(program.emitted_files[ti as size_t])
+            set ti: ti + 1
+        }
+        let sorted DriverProgram.sort_and_deduplicate(host, all)
+        Execute.report_all(sys, r, sorted)
+        if summary_pretty
+            DiagnosticWriter.write_error_summary(host, sys.output, sorted, sys.cwd, "\n")
+        if sorted.get_length() = 0
+            return ExitStatusSuccess
+        if program.emit_skipped
+            return ExitStatusDiagnosticsPresent_OutputsSkipped
+        ExitStatusDiagnosticsPresent_OutputsGenerated
+    }
+}

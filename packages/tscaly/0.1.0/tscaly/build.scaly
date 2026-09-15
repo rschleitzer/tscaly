@@ -1,0 +1,1064 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; build — internal/execute/build: the `tsc -b` orchestrator (orchestrator.go), its
+; build tasks and their up-to-date status (buildtask.go, uptodatestatus.go), the
+; build host's modification-time cache (host.go), and tscBuildCompilation.
+;
+; ★ The reference builds tasks on a work group and reports them in order through
+; channels; with one builder the order is the graph's and every report follows its
+; build, which is what a single-threaded run prints and what the port does.
+;
+; ★ Project references are not here yet: a config with `references` is the
+; `project-references` stop, as it is for tsc, and a task therefore has no upstream
+; tasks; watch mode is the `watch` stop.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use tscaly.program.JsonValue
+use tscaly.program.JsonParser
+use tscaly.buildinfojson.JsonText
+use tscaly.tsoptions.TsOptions
+use tscaly.tsoptions.TsConfigParser
+use tscaly.tsoptions.TsParsedCommandLine
+use tscaly.system.ExecSystem
+use tscaly.system.VfsFile
+use tscaly.commandline.CommandLine
+use tscaly.commandline.ParsedCommandLine
+use tscaly.diagnosticwriter.DriverDiagnostic
+use tscaly.diagnosticwriter.DiagnosticWriter
+use tscaly.programhost.DriverProgram
+use tscaly.incremental.IncProgram
+use tscaly.incremental.IncOptions
+use tscaly.incremental.PathMap
+use tscaly.incremental.IncSnapshot
+use tscaly.incremental.ToSnapshot
+use tscaly.help.Help
+use tscaly.emitter.Emitter
+use tscaly.execute.Execute
+use tscaly.execute.Reporter
+use tscaly.execute.CompileOutcome
+
+; upToDateStatusType, in the reference's order
+define UpToDateConfigFileNotFound: int 0
+define UpToDateBuildErrors: int 1
+define UpToDateUpstreamErrors: int 2
+define UpToDateUpToDate: int 3
+define UpToDateWithUpstreamTypes: int 4
+define UpToDateWithInputFileText: int 5
+define UpToDateInputFileMissing: int 6
+define UpToDateOutputMissing: int 7
+define UpToDateInputFileNewer: int 8
+define UpToDateOutOfDateBuildInfoWithPendingEmit: int 9
+define UpToDateOutOfDateBuildInfoWithErrors: int 10
+define UpToDateOutOfDateOptions: int 11
+define UpToDateOutOfDateRoots: int 12
+define UpToDateTsVersionOutputOfDate: int 13
+define UpToDateForceBuild: int 14
+define UpToDateSolution: int 15
+
+define BuildKindNone: int 0
+define BuildKindPseudo: int 1
+define BuildKindProgram: int 2
+
+; upToDateStatus: the kind and its data — a file name (`name`), an input and an
+; output name (`input`, `output`), or the newest input and oldest output with
+; their times (`has_times`)
+define BuildStatus
+(
+    kind: int
+    name: Slice[char]
+    input: Slice[char]
+    output: Slice[char]
+    has_names: bool
+    input_time: int
+    output_time: int
+    has_times: bool
+)
+{
+    function simple(host: ref[Page], kind: int) returns ref[BuildStatus]
+        &BuildStatus^host(kind, Slice[char](), Slice[char](), Slice[char](), false, 0, 0, false)
+
+    function named(host: ref[Page], kind: int, name: Slice[char]) returns ref[BuildStatus]
+        &BuildStatus^host(kind, name, Slice[char](), Slice[char](), false, 0, 0, false)
+
+    function input_output(host: ref[Page], kind: int, input: Slice[char], output: Slice[char]) returns ref[BuildStatus]
+        &BuildStatus^host(kind, Slice[char](), input, output, true, 0, 0, false)
+
+    function is_pseudo_build(this) returns bool
+        (kind = UpToDateWithUpstreamTypes) or (kind = UpToDateWithInputFileText)
+
+    function is_error(this) returns bool
+        (kind = UpToDateConfigFileNotFound) or (kind = UpToDateBuildErrors) or (kind = UpToDateUpstreamErrors)
+}
+
+; buildInfoEntry
+define BuildInfoEntry (info: ref[JsonValue]?  path: Slice[char]  mtime: int  dts_time: int  has_dts_time: bool)
+
+; BuildTask with its taskResult
+define BuildTask
+(
+    config: Slice[char]
+    ; the resolved project (null: the config file was not found)
+    resolved: ref[TsParsedCommandLine]?
+    config_text: Slice[char]
+    config_diagnostics: ref[Array[ref[DriverDiagnostic]]]
+    status: ref[BuildStatus]?
+    build_info_entry: ref[BuildInfoEntry]?
+    errors: ref[Array[ref[DriverDiagnostic]]]
+    builder: ref[StringBuilder]
+    exit_status: int
+    program: ref[IncProgram]?
+    build_kind: int
+    files_to_delete: ref[Array[Slice[char]]]
+)
+
+define Orchestrator
+(
+    host: ref[Page]
+    sys: ref[ExecSystem]
+    cl: ref[ParsedCommandLine]
+    tasks: ref[Array[ref[BuildTask]]]
+    mtimes: ref[PathMap[int]]
+    verbose: bool
+    dry: bool
+    force: bool
+    clean: bool
+)
+{
+    ; tscBuildCompilation
+    procedure compile(sys: ref[ExecSystem], cl: ref[ParsedCommandLine]) returns int
+    {
+        let host sys.host
+        let r Execute.reporter(sys, cl.options)
+        if cl.errors.get_length() > 0
+        {
+            Execute.report_all(sys, r, cl.errors)
+            return ExitStatusDiagnosticsPresent_OutputsSkipped
+        }
+        if cl.options.tristate_of("help") = 1
+        {
+            Help.print_version(sys)
+            Help.print_build_help(sys, Execute.default_is_pretty(sys))
+            return ExitStatusSuccess
+        }
+        if cl.options.tristate_of("watch") = 1
+        {
+            sys.stop("watch")
+            return ExitStatusNotImplemented
+        }
+        let o &Orchestrator^host(host, sys, cl, &Array[ref[BuildTask]]^host(), IncSnapshot.int_map(host), CommandLine.raw_true(cl.raw, "verbose"), CommandLine.raw_true(cl.raw, "dry"), CommandLine.raw_true(cl.raw, "force"), CommandLine.raw_true(cl.raw, "clean"))
+        o.start()
+    }
+
+    function relative_file_name(this, file_name: Slice[char]) returns Slice[char]
+    {
+        if is_rooted_disk_path(file_name) = false
+            return file_name
+        let relative get_relative_path_to_directory_or_url(host, sys.cwd, file_name, false, sys.cwd)
+        if is_rooted_disk_path(relative)
+            return file_name
+        relative
+    }
+
+    ; Orchestrator.Start without watch; ExitStatusNotImplemented after a stop
+    procedure start(this) returns int
+    {
+        ; GenerateGraph: ResolvedProjectPaths, a task per project
+        var i 0
+        while i < (cl.file_names.get_length() as int)
+        {
+            let project cl.file_names[i as size_t]
+            set i: i + 1
+            var resolved get_normalized_absolute_path(host, project, sys.cwd)
+            if resolved.ends_with(".json") = false
+                set resolved: combine_paths(host, resolved, "tsconfig.json")
+            var known false
+            var k 0
+            while k < (tasks.get_length() as int)
+            {
+                let existing tasks[k as size_t]
+                if existing.config.equals(resolved)
+                    set known: true
+                set k: k + 1
+            }
+            if known
+                continue
+            let task &BuildTask^host(resolved, null, Slice[char](), &Array[ref[DriverDiagnostic]]^host(), null, null, &Array[ref[DriverDiagnostic]]^host(), &StringBuilder^host(), ExitStatusSuccess, null, BuildKindNone, &Array[Slice[char]]^host())
+            if this.resolve_project(task) = false
+                return ExitStatusNotImplemented
+            tasks.add(task)
+        }
+        this.build_or_clean()
+    }
+
+    ; host.GetResolvedProjectReference: the config parsed, null when unreadable;
+    ; false after a stop
+    procedure resolve_project(this, task: ref[BuildTask]) returns bool
+    {
+        sys.now()
+        var text Slice[char]()
+        if sys.read_file(task.config, &text)
+        {
+            set task.config_text: text
+            let parsed Execute.parse_config(sys, cl, task.config, text, task.config_diagnostics)
+            if parsed = null
+                return false
+            set task.resolved: parsed
+        }
+        sys.now()
+        true
+    }
+
+    ; buildOrClean; the exit status
+    procedure build_or_clean(this) returns int
+    {
+        if (clean = false) and verbose
+        {
+            var sb StringBuilder()
+            var i 0
+            while i < (tasks.get_length() as int)
+            {
+                let task tasks[i as size_t]
+                let name this.relative_file_name(task.config)
+                sb.append("\r\n    * ")
+                sb.append(name.data, name.length)
+                set i: i + 1
+            }
+            let joined String^host(sb.to_string())
+            this.report_status(sys.output, DiagProjects_in_this_build_Colon_0, CommandLine.args1(host, Slice[char](joined.get_length(), joined.get_buffer() as pointer[char])))
+        }
+        var status ExitStatusSuccess
+        let errors &Array[ref[DriverDiagnostic]]^host()
+        let files_to_delete &Array[Slice[char]]^host()
+        var k 0
+        while k < (tasks.get_length() as int)
+        {
+            let task tasks[k as size_t]
+            set k: k + 1
+            if clean
+                this.clean_project(task)
+            else
+            {
+                if this.build_project(task) = false
+                    return ExitStatusNotImplemented
+            }
+            ; BuildTask.report
+            var e 0
+            while e < (task.errors.get_length() as int)
+            {
+                errors.add(task.errors[e as size_t])
+                set e: e + 1
+            }
+            let text task.builder.to_string()
+            sys.output.append(text)
+            if task.exit_status > status
+                set status: task.exit_status
+            if task.build_kind = BuildKindProgram
+                (task.program as ref[IncProgram]).baseline(sys.programs)
+            var d 0
+            while d < (task.files_to_delete.get_length() as int)
+            {
+                files_to_delete.add(task.files_to_delete[d as size_t])
+                set d: d + 1
+            }
+        }
+        ; orchestratorResult.report
+        if Execute.should_be_pretty(sys, cl.options)
+            DiagnosticWriter.write_error_summary(host, sys.output, errors, sys.cwd, "\n")
+        if files_to_delete.get_length() > 0
+        {
+            var sb StringBuilder()
+            var f 0
+            while f < (files_to_delete.get_length() as int)
+            {
+                let file files_to_delete[f as size_t]
+                sb.append("\r\n * ")
+                sb.append(file.data, file.length)
+                set f: f + 1
+            }
+            let joined String^host(sb.to_string())
+            this.report_status(sys.output, DiagA_non_dry_build_would_delete_the_following_files_Colon_0, CommandLine.args1(host, Slice[char](joined.get_length(), joined.get_buffer() as pointer[char])))
+        }
+        status
+    }
+
+    ; CreateBuilderStatusReporter: the harness's markers around the time and the
+    ; flattened message, then two newlines
+    procedure report_status(this, out: ref[StringBuilder], code: int, args: ref[Array[String]]?)
+    {
+        if cl.options.tristate_of("quiet") = 1
+            return
+        out.append("!!! Build Status Report Start\n")
+        sys.now()
+        let none: Slice[char] ""
+        let d &DriverDiagnostic^host(none, none, 0, 0, code, args, null, null)
+        if Execute.should_be_pretty(sys, cl.options)
+        {
+            out.append("[")
+            out.append("[90m")
+            out.append("12:00:00 AM")
+            out.append("[0m")
+            out.append("] ")
+        }
+        else
+            out.append("12:00:00 AM - ")
+        DiagnosticWriter.write_flattened_message(out, d, "\n")
+        out.append("\n\n")
+        out.append("!!! Build Status Report End\n")
+    }
+
+    procedure report_task_diagnostic(this, task: ref[BuildTask], d: ref[DriverDiagnostic])
+    {
+        task.errors.add(d)
+        let saved sys.output
+        set sys.output: task.builder
+        Execute.report(sys, Execute.reporter(sys, cl.options), d)
+        set sys.output: saved
+    }
+
+    ; host.GetMTime through the cache: 0 for a missing file
+    procedure mtime_of(this, file: Slice[char]) returns int
+    {
+        let k mtimes.slot_of(file)
+        if k >= 0
+            return mtimes.value_at(k)
+        var t 0
+        let i sys.find_index(file)
+        if i >= 0
+        {
+            let entry sys.files[i as size_t]
+            if entry <> null
+                set t: (entry as ref[VfsFile]).mtime
+        }
+        mtimes.store(slice_copy_on(host, file), t)
+        t
+    }
+
+    ; host.SetMTime (Chtimes)
+    procedure set_mtime(this, file: Slice[char], t: int)
+    {
+        let i sys.find_index(file)
+        if i < 0
+            return
+        let entry sys.files[i as size_t]
+        if entry = null
+            return
+        let file_entry entry as ref[VfsFile]
+        set file_entry.mtime: t
+    }
+
+    ; ── BuildTask.buildProject ───────────────────────────────────────────────
+
+    procedure build_project(this, task: ref[BuildTask]) returns bool
+    {
+        set task.status: this.up_to_date_status(task)
+        if (sys.stop_tag.length as int) > 0
+            return false
+        this.report_up_to_date_status(task)
+        if this.handle_status_that_doesnt_require_build(task) = false
+        {
+            if this.compile_and_emit(task) = false
+                return false
+        }
+        else
+        {
+            if task.resolved <> null
+            {
+                var i 0
+                while i < (task.config_diagnostics.get_length() as int)
+                {
+                    this.report_task_diagnostic(task, task.config_diagnostics[i as size_t])
+                    set i: i + 1
+                }
+            }
+            if task.errors.get_length() > 0
+                set task.exit_status: ExitStatusDiagnosticsPresent_OutputsSkipped
+        }
+        true
+    }
+
+    procedure task_status(this, task: ref[BuildTask], code: int, args: ref[Array[String]]?)
+        this.report_status(task.builder, code, args)
+
+    function args1(this, a: Slice[char]) returns ref[Array[String]]
+        CommandLine.args1(host, a)
+
+    function args2(this, a: Slice[char], b: Slice[char]) returns ref[Array[String]]
+        CommandLine.args2(host, a, String(b.data as pointer[const_char], b.length))
+
+    function args3(this, a: Slice[char], b: Slice[char], c: Slice[char]) returns ref[Array[String]]
+    {
+        let list CommandLine.args2(host, a, String(b.data as pointer[const_char], b.length))
+        list.add(String^host(c.data as pointer[const_char], c.length))
+        list
+    }
+
+    ; handleStatusThatDoesntRequireBuild
+    procedure handle_status_that_doesnt_require_build(this, task: ref[BuildTask]) returns bool
+    {
+        let status task.status as ref[BuildStatus]
+        let kind status.kind
+        if kind = UpToDateUpToDate
+        {
+            if dry
+                this.task_status(task, DiagProject_0_is_up_to_date, this.args1(task.config))
+            return true
+        }
+        if (kind = UpToDateUpstreamErrors) or (kind = UpToDateSolution)
+            return true
+        if kind = UpToDateConfigFileNotFound
+        {
+            let none: Slice[char] ""
+            this.report_task_diagnostic(task, &DriverDiagnostic^host(none, none, 0, 0, DiagFile_0_not_found, this.args1(task.config), null, null))
+            return true
+        }
+        if status.is_pseudo_build()
+        {
+            if dry
+            {
+                this.task_status(task, DiagA_non_dry_build_would_update_timestamps_for_output_of_project_0, this.args1(task.config))
+                set task.status: BuildStatus.simple(host, UpToDateUpToDate)
+                return true
+            }
+            this.update_time_stamps(task, null, DiagUpdating_output_timestamps_of_project_0)
+            set task.status: &BuildStatus^host(UpToDateUpToDate, status.name, status.input, status.output, status.has_names, status.input_time, status.output_time, status.has_times)
+            set task.build_kind: BuildKindPseudo
+            return true
+        }
+        if dry
+        {
+            this.task_status(task, DiagA_non_dry_build_would_build_project_0, this.args1(task.config))
+            set task.status: BuildStatus.simple(host, UpToDateUpToDate)
+            return true
+        }
+        false
+    }
+
+    ; compileAndEmit; false after a stop
+    procedure compile_and_emit(this, task: ref[BuildTask]) returns bool
+    {
+        let resolved task.resolved as ref[TsParsedCommandLine]
+        set task.errors: &Array[ref[DriverDiagnostic]]^host()
+        if verbose
+            this.task_status(task, DiagBuilding_project_0, this.args1(this.relative_file_name(task.config)))
+        let options resolved.options
+        if Execute.unported_compile_options(sys, options)
+            return false
+        let program DriverProgram.create(host, sys, options, resolved.file_names, task.config, task.config_text, task.config_diagnostics)
+        sys.now()
+        var old: ref[IncSnapshot]? null
+        if force = false
+            set old: ToSnapshot.read(host, program)
+        sys.now()
+        sys.now()
+        if program.load() = false
+            return false
+        sys.now()
+        sys.now()
+        let created IncProgram.create(host, program, old)
+        if created = null
+            return false
+        let ip created as ref[IncProgram]
+        set ip.build_mode: true
+        set task.program: ip
+        sys.now()
+        let saved sys.output
+        set sys.output: task.builder
+        let outcome_opt Execute.emit_and_report_incremental(sys, ip, Execute.reporter(sys, cl.options), false, task.errors, mtimes)
+        set sys.output: saved
+        if outcome_opt = null
+            return false
+        let outcome outcome_opt as ref[CompileOutcome]
+        if ip.build_info_emitted
+            this.on_build_info_emit(task, ip)
+        set task.exit_status: outcome.status
+        let no_emit_on_error options.tristate_of("noEmitOnError") = 1
+        let status_kind (task.status as ref[BuildStatus]).kind
+        if ((no_emit_on_error = false) or (outcome.diagnostics.get_length() = 0)) and ((outcome.emitted_files.get_length() > 0) or (status_kind <> UpToDateOutOfDateBuildInfoWithErrors))
+            this.update_time_stamps(task, outcome.emitted_files, DiagUpdating_unchanged_output_timestamps_of_project_0)
+        set task.build_kind: BuildKindProgram
+        if (outcome.status = ExitStatusDiagnosticsPresent_OutputsSkipped) or (outcome.status = ExitStatusDiagnosticsPresent_OutputsGenerated)
+            set task.status: BuildStatus.simple(host, UpToDateBuildErrors)
+        else
+        {
+            var oldest Slice[char]()
+            if outcome.emitted_files.get_length() > 0
+                set oldest: outcome.emitted_files[0]
+            else
+            {
+                let outputs this.output_file_names(task)
+                if outputs.get_length() > 0
+                    set oldest: outputs[0]
+            }
+            set task.status: BuildStatus.named(host, UpToDateUpToDate, oldest)
+        }
+        true
+    }
+
+    ; onBuildInfoEmit: the entry the task keeps
+    procedure on_build_info_emit(this, task: ref[BuildTask], ip: ref[IncProgram])
+    {
+        var dts_time 0
+        var has_dts_time false
+        if ip.build_info_dts_changed
+        {
+            set dts_time: ip.build_info_time
+            set has_dts_time: true
+        }
+        else
+        {
+            if task.build_info_entry <> null
+            {
+                let old task.build_info_entry as ref[BuildInfoEntry]
+                set dts_time: old.dts_time
+                set has_dts_time: old.has_dts_time
+            }
+        }
+        let file_name IncProgram.build_info_file_name(host, ip.program)
+        set task.build_info_entry: &BuildInfoEntry^host(ip.build_info_json, file_name, ip.build_info_time, dts_time, has_dts_time)
+    }
+
+    function can_update_js_dts_output_timestamps(this, task: ref[BuildTask]) returns bool
+    {
+        let options (task.resolved as ref[TsParsedCommandLine]).options
+        (options.tristate_of("noEmit") <> 1) and (IncOptions.is_incremental(options) = false)
+    }
+
+    ; updateTimeStamps
+    procedure update_time_stamps(this, task: ref[BuildTask], emitted: ref[Array[Slice[char]]]?, verbose_message: int)
+    {
+        let resolved task.resolved as ref[TsParsedCommandLine]
+        let build_info_name IncProgram.build_info_file_name_of(host, resolved.options, task.config, sys.cwd)
+        let now sys.now()
+        var reported false
+        let files &Array[Slice[char]]^host()
+        if this.can_update_js_dts_output_timestamps(task)
+        {
+            let outputs this.output_file_names(task)
+            var i 0
+            while i < (outputs.get_length() as int)
+            {
+                files.add(outputs[i as size_t])
+                set i: i + 1
+            }
+        }
+        files.add(build_info_name)
+        var k 0
+        while k < (files.get_length() as int)
+        {
+            let file files[k as size_t]
+            set k: k + 1
+            if emitted <> null
+            {
+                if ExecSystem.contains(emitted as ref[Array[Slice[char]]], file)
+                    continue
+            }
+            if (reported = false) and verbose
+            {
+                this.task_status(task, verbose_message, this.args1(this.relative_file_name(task.config)))
+                set reported: true
+            }
+            if sys.find_index(file) >= 0
+            {
+                this.set_mtime(file, now)
+                if file.equals(build_info_name)
+                {
+                    if task.build_info_entry <> null
+                    {
+                        let entry task.build_info_entry as ref[BuildInfoEntry]
+                        set entry.mtime: now
+                    }
+                }
+            }
+        }
+    }
+
+    ; ParsedCommandLine.GetOutputFileNames
+    procedure output_file_names(this, task: ref[BuildTask]) returns ref[Array[Slice[char]]]
+    {
+        let out &Array[Slice[char]]^host()
+        let resolved task.resolved as ref[TsParsedCommandLine]
+        let options resolved.options
+        var i 0
+        while i < (resolved.file_names.get_length() as int)
+        {
+            let file get_normalized_absolute_path(host, resolved.file_names[i as size_t], sys.cwd)
+            set i: i + 1
+            if is_declaration_file_name_of(file)
+                continue
+            let is_json file.ends_with(".json")
+            if options.tristate_of("emitDeclarationOnly") <> 1
+            {
+                let js this.output_path(task, file, this.js_extension(options, file), options.text_of("outDir"))
+                if (is_json = false) or (js.equals(file) = false)
+                {
+                    out.add(js)
+                    if (is_json = false) and (options.tristate_of("sourceMap") = 1)
+                        out.add(join_slices(host, js, ".map"))
+                }
+            }
+            if is_json
+                continue
+            if IncOptions.emit_declarations(options)
+            {
+                var dir options.text_of("declarationDir")
+                if (dir.length as int) = 0
+                    set dir: options.text_of("outDir")
+                let dts this.output_path(task, file, this.dts_extension(file), dir)
+                out.add(dts)
+                if options.tristate_of("declarationMap") = 1
+                    out.add(join_slices(host, dts, ".map"))
+            }
+        }
+        out
+    }
+
+    function js_extension(this, options: ref[TsOptions], file: Slice[char]) returns Slice[char]
+    {
+        if file.ends_with(".json")
+            return ".json"
+        if file.ends_with(".tsx") or file.ends_with(".jsx")
+        {
+            let jsx options.text_of("jsx")
+            if jsx.equals("preserve")
+                return ".jsx"
+        }
+        if file.ends_with(".mts") or file.ends_with(".mjs")
+            return ".mjs"
+        if file.ends_with(".cts") or file.ends_with(".cjs")
+            return ".cjs"
+        ".js"
+    }
+
+    function dts_extension(this, file: Slice[char]) returns Slice[char]
+    {
+        if file.ends_with(".mts") or file.ends_with(".mjs")
+            return ".d.mts"
+        if file.ends_with(".cts") or file.ends_with(".cjs")
+            return ".d.cts"
+        ".d.ts"
+    }
+
+    ; getOutputPathWithoutChangingExtension + ChangeExtension: under the output
+    ; directory relative to the common source directory (rootDir, else the config's
+    ; directory)
+    procedure output_path(this, task: ref[BuildTask], file: Slice[char], ext: Slice[char], out_dir: Slice[char]) returns Slice[char]
+    {
+        let options (task.resolved as ref[TsParsedCommandLine]).options
+        var path file
+        if (out_dir.length as int) > 0
+        {
+            var common options.text_of("rootDir")
+            if (common.length as int) = 0
+                set common: get_directory_path(host, task.config)
+            else
+                set common: get_normalized_absolute_path(host, common, sys.cwd)
+            let new_dir get_normalized_absolute_path(host, out_dir, sys.cwd)
+            set path: Emitter.source_file_path_in_new_dir(host, file, new_dir, sys.cwd, common)
+        }
+        let without path.subslice(0, remove_file_extension(path) as size_t)
+        join_slices(host, without, ext)
+    }
+
+    ; loadOrStoreBuildInfo
+    procedure load_build_info(this, task: ref[BuildTask], build_info_path: Slice[char]) returns ref[BuildInfoEntry]
+    {
+        if task.build_info_entry <> null
+        {
+            let existing task.build_info_entry as ref[BuildInfoEntry]
+            if existing.path.equals(build_info_path)
+                return existing
+        }
+        var info: ref[JsonValue]? null
+        var text Slice[char]()
+        if sys.read_file(build_info_path, &text)
+            set info: JsonParser.parse(host, text)
+        var mtime 0
+        if info <> null
+            set mtime: this.mtime_of(build_info_path)
+        let entry &BuildInfoEntry^host(info, build_info_path, mtime, 0, false)
+        set task.build_info_entry: entry
+        entry
+    }
+
+    ; getUpToDateStatus
+    procedure up_to_date_status(this, task: ref[BuildTask]) returns ref[BuildStatus]
+    {
+        if task.status <> null
+            return task.status as ref[BuildStatus]
+        if task.resolved = null
+            return BuildStatus.simple(host, UpToDateConfigFileNotFound)
+        let resolved task.resolved as ref[TsParsedCommandLine]
+        let options resolved.options
+        if force
+            return BuildStatus.simple(host, UpToDateForceBuild)
+        let build_info_path IncProgram.build_info_file_name_of(host, options, task.config, sys.cwd)
+        let build_info_directory get_directory_path(host, build_info_path)
+        let entry this.load_build_info(task, build_info_path)
+        if entry.info = null
+            return BuildStatus.named(host, UpToDateOutputMissing, build_info_path)
+        let info entry.info as ref[JsonValue]
+        let version info.string_of("version")
+        if version.equals("7.0.0-dev") = false
+            return BuildStatus.named(host, UpToDateTsVersionOutputOfDate, version)
+        let no_check options.tristate_of("noCheck") = 1
+        if JsonText.member_bool(info, "errors") or ((no_check = false) and (JsonText.member_bool(info, "semanticErrors") or JsonText.member_bool(info, "checkPending")))
+            return BuildStatus.named(host, UpToDateOutOfDateBuildInfoWithErrors, build_info_path)
+        let file_names info.get("fileNames")
+        var is_incremental_info false
+        if file_names <> null
+            set is_incremental_info: (file_names as ref[JsonValue]).size() > 0
+        if IncOptions.is_incremental(options)
+        {
+            if is_incremental_info = false
+                return BuildStatus.named(host, UpToDateOutOfDateOptions, build_info_path)
+            if (IncOptions.emit_declarations(options) and (info.get("emitDiagnosticsPerFile") <> null)) or ((no_check = false) and ((info.get("changeFileSet") <> null) or (info.get("semanticDiagnosticsPerFile") <> null)))
+                return BuildStatus.named(host, UpToDateOutOfDateBuildInfoWithErrors, build_info_path)
+            if (options.tristate_of("noEmit") <> 1) and ((info.get("changeFileSet") <> null) or (info.get("affectedFilesPendingEmit") <> null))
+                return BuildStatus.named(host, UpToDateOutOfDateBuildInfoWithPendingEmit, build_info_path)
+            if this.is_emit_pending(options, info)
+                return BuildStatus.named(host, UpToDateOutOfDateOptions, build_info_path)
+        }
+        var input_text_unchanged false
+        var oldest_output_file build_info_path
+        var oldest_output_time entry.mtime
+        var newest_input_file Slice[char]()
+        var newest_input_time 0
+        let seen_roots &Array[Slice[char]]^host()
+        let roots this.build_info_roots(info, build_info_directory)
+        var i 0
+        while i < (resolved.file_names.get_length() as int)
+        {
+            let input_file resolved.file_names[i as size_t]
+            set i: i + 1
+            let input_path get_normalized_absolute_path(host, input_file, sys.cwd)
+            let input_time this.mtime_of(input_path)
+            if input_time = 0
+                return BuildStatus.named(host, UpToDateInputFileMissing, input_file)
+            if input_time > oldest_output_time
+            {
+                var matched false
+                if is_incremental_info
+                {
+                    let version_text this.root_file_version(info, roots, input_path, build_info_directory)
+                    if (version_text.length as int) > 0
+                    {
+                        var text Slice[char]()
+                        if sys.read_file(input_path, &text)
+                        {
+                            let current IncOptions.compute_hash(host, text, true)
+                            if current.equals(version_text)
+                            {
+                                set matched: true
+                                set input_text_unchanged: true
+                            }
+                        }
+                    }
+                }
+                if matched = false
+                    return BuildStatus.input_output(host, UpToDateInputFileNewer, input_file, build_info_path)
+            }
+            if input_time > newest_input_time
+            {
+                set newest_input_file: input_file
+                set newest_input_time: input_time
+            }
+            seen_roots.add(input_path)
+        }
+        var r 0
+        while r < (roots.get_length() as int)
+        {
+            let root roots[r as size_t]
+            if ExecSystem.contains(seen_roots, root) = false
+                return BuildStatus.input_output(host, UpToDateOutOfDateRoots, root, build_info_path)
+            set r: r + 1
+        }
+        if is_incremental_info
+        {
+            let infos info.get("fileInfos")
+            let names file_names as ref[JsonValue]
+            if infos <> null
+            {
+                let iv infos as ref[JsonValue]
+                var f 0
+                while f < iv.size()
+                {
+                    let name (names.value_at(f) as ref[JsonValue]).text
+                    let file_info iv.value_at(f) as ref[JsonValue]
+                    set f: f + 1
+                    if (get_root_length(name) = 0) and (path_is_relative(name) = false)
+                        continue
+                    let input_file get_normalized_absolute_path(host, name, build_info_directory)
+                    if ExecSystem.contains(seen_roots, input_file)
+                        continue
+                    let input_time this.mtime_of(input_file)
+                    if input_time = 0
+                        return BuildStatus.named(host, UpToDateInputFileMissing, input_file)
+                    if input_time > oldest_output_time
+                    {
+                        var version_text Slice[char]()
+                        if file_info.kind = JsonKindString
+                            set version_text: file_info.text
+                        else
+                            set version_text: file_info.string_of("version")
+                        var current Slice[char]()
+                        if (version_text.length as int) > 0
+                        {
+                            var text Slice[char]()
+                            if sys.read_file(input_file, &text)
+                                set current: IncOptions.compute_hash(host, text, true)
+                        }
+                        if ((version_text.length as int) = 0) or (version_text.equals(current) = false)
+                            return BuildStatus.input_output(host, UpToDateInputFileNewer, input_file, build_info_path)
+                        set input_text_unchanged: true
+                    }
+                }
+            }
+        }
+        if IncOptions.is_incremental(options) = false
+        {
+            let outputs this.output_file_names(task)
+            var o 0
+            while o < (outputs.get_length() as int)
+            {
+                let output_file outputs[o as size_t]
+                set o: o + 1
+                let output_time this.mtime_of(output_file)
+                if output_time = 0
+                    return BuildStatus.named(host, UpToDateOutputMissing, output_file)
+                if output_time < newest_input_time
+                    return BuildStatus.input_output(host, UpToDateInputFileNewer, newest_input_file, output_file)
+                if output_time < oldest_output_time
+                {
+                    set oldest_output_file: output_file
+                    set oldest_output_time: output_time
+                }
+            }
+        }
+        let config_time this.mtime_of(task.config)
+        if config_time > oldest_output_time
+            return BuildStatus.input_output(host, UpToDateInputFileNewer, task.config, oldest_output_file)
+        let package_jsons info.get("packageJsons")
+        if package_jsons <> null
+        {
+            let pv package_jsons as ref[JsonValue]
+            var p 0
+            while p < pv.size()
+            {
+                let package_json get_normalized_absolute_path(host, (pv.value_at(p) as ref[JsonValue]).text, build_info_directory)
+                set p: p + 1
+                let t this.mtime_of(package_json)
+                if t = 0
+                    return BuildStatus.named(host, UpToDateInputFileMissing, package_json)
+                if t > oldest_output_time
+                    return BuildStatus.input_output(host, UpToDateInputFileNewer, package_json, oldest_output_file)
+            }
+        }
+        let missing info.get("missingPackageJsons")
+        if missing <> null
+        {
+            let mv missing as ref[JsonValue]
+            var m 0
+            while m < mv.size()
+            {
+                let package_json get_normalized_absolute_path(host, (mv.value_at(m) as ref[JsonValue]).text, build_info_directory)
+                set m: m + 1
+                if this.mtime_of(package_json) <> 0
+                    return BuildStatus.input_output(host, UpToDateInputFileNewer, package_json, oldest_output_file)
+            }
+        }
+        var kind UpToDateUpToDate
+        if input_text_unchanged
+            set kind: UpToDateWithInputFileText
+        &BuildStatus^host(kind, Slice[char](), newest_input_file, oldest_output_file, false, newest_input_time, oldest_output_time, true)
+    }
+
+    ; BuildInfo.IsEmitPending
+    function is_emit_pending(this, options: ref[TsOptions], info: ref[JsonValue]) returns bool
+    {
+        let no_emit options.tristate_of("noEmit") = 1
+        if (no_emit = false) or IncOptions.emit_declarations(options)
+        {
+            var old_kind 1
+            let old_options info.get("options")
+            if old_options <> null
+            {
+                let o old_options as ref[JsonValue]
+                if JsonText.member_bool(o, "sourceMap")
+                    set old_kind: old_kind | 2
+                if JsonText.member_bool(o, "inlineSourceMap")
+                    set old_kind: old_kind | 4
+                if JsonText.member_bool(o, "declaration") or JsonText.member_bool(o, "composite")
+                    set old_kind: old_kind | 24
+                if JsonText.member_bool(o, "declarationMap")
+                    set old_kind: old_kind | 32
+                if JsonText.member_bool(o, "emitDeclarationOnly")
+                    set old_kind: old_kind & 56
+            }
+            var pending IncOptions.pending_emit_kind(IncOptions.file_emit_kind(options), old_kind)
+            if no_emit
+                set pending: pending & 8
+            return pending <> 0
+        }
+        false
+    }
+
+    ; GetBuildInfoRootInfoReader's roots, as absolute paths in the build info's order
+    procedure build_info_roots(this, info: ref[JsonValue], directory: Slice[char]) returns ref[Array[Slice[char]]]
+    {
+        let out &Array[Slice[char]]^host()
+        let root info.get("root")
+        if root = null
+            return out
+        let names info.get("fileNames")
+        let rv root as ref[JsonValue]
+        var i 0
+        while i < rv.size()
+        {
+            let entry rv.value_at(i) as ref[JsonValue]
+            set i: i + 1
+            if entry.kind = JsonKindString
+            {
+                out.add(get_normalized_absolute_path(host, entry.text, directory))
+                continue
+            }
+            if names = null
+                continue
+            let nv names as ref[JsonValue]
+            var start 0
+            var stop 0
+            if entry.kind = JsonKindNumber
+            {
+                set start: JsonText.int_of(entry)
+                set stop: start
+            }
+            else
+            {
+                set start: JsonText.int_of(entry.value_at(0))
+                set stop: JsonText.int_of(entry.value_at(1))
+            }
+            var id start
+            while id <= stop
+            {
+                let name (nv.value_at(id - 1) as ref[JsonValue]).text
+                out.add(get_normalized_absolute_path(host, name, directory))
+                set id: id + 1
+            }
+        }
+        out
+    }
+
+    ; BuildInfoRootInfoReader.GetBuildInfoFileInfo's version for a root file,
+    ; empty when the build info records none
+    function root_file_version(this, info: ref[JsonValue], roots: ref[Array[Slice[char]]], input_path: Slice[char], directory: Slice[char]) returns Slice[char]
+    {
+        let names info.get("fileNames")
+        let infos info.get("fileInfos")
+        if (names = null) or (infos = null)
+            return ""
+        if ExecSystem.contains(roots, input_path) = false
+            return ""
+        let nv names as ref[JsonValue]
+        let iv infos as ref[JsonValue]
+        var f 0
+        while (f < nv.size()) and (f < iv.size())
+        {
+            let name (nv.value_at(f) as ref[JsonValue]).text
+            let absolute get_normalized_absolute_path(host, name, directory)
+            if absolute.equals(input_path)
+            {
+                let file_info iv.value_at(f) as ref[JsonValue]
+                if file_info.kind = JsonKindString
+                    return file_info.text
+                return file_info.string_of("version")
+            }
+            set f: f + 1
+        }
+        ""
+    }
+
+    ; reportUpToDateStatus
+    procedure report_up_to_date_status(this, task: ref[BuildTask])
+    {
+        if verbose = false
+            return
+        let status task.status as ref[BuildStatus]
+        let config this.relative_file_name(task.config)
+        let kind status.kind
+        if kind = UpToDateConfigFileNotFound
+            this.task_status(task, DiagProject_0_is_out_of_date_because_config_file_does_not_exist, this.args1(config))
+        if kind = UpToDateBuildErrors
+            this.task_status(task, DiagProject_0_is_out_of_date_because_it_has_errors, this.args1(config))
+        if kind = UpToDateUpToDate
+        {
+            if status.has_times
+                this.task_status(task, DiagProject_0_is_up_to_date_because_newest_input_1_is_older_than_output_2, this.args3(config, this.relative_file_name(status.input), this.relative_file_name(status.output)))
+        }
+        if kind = UpToDateWithUpstreamTypes
+            this.task_status(task, DiagProject_0_is_up_to_date_with_d_ts_files_from_its_dependencies, this.args1(config))
+        if kind = UpToDateWithInputFileText
+            this.task_status(task, DiagProject_0_is_up_to_date_but_needs_to_update_timestamps_of_output_files_that_are_older_than_input_files, this.args1(config))
+        if kind = UpToDateInputFileMissing
+            this.task_status(task, DiagProject_0_is_out_of_date_because_input_1_does_not_exist, this.args2(config, this.relative_file_name(status.name)))
+        if kind = UpToDateOutputMissing
+            this.task_status(task, DiagProject_0_is_out_of_date_because_output_file_1_does_not_exist, this.args2(config, this.relative_file_name(status.name)))
+        if kind = UpToDateInputFileNewer
+            this.task_status(task, DiagProject_0_is_out_of_date_because_output_1_is_older_than_input_2, this.args3(config, this.relative_file_name(status.output), this.relative_file_name(status.input)))
+        if kind = UpToDateOutOfDateBuildInfoWithPendingEmit
+            this.task_status(task, DiagProject_0_is_out_of_date_because_buildinfo_file_1_indicates_that_some_of_the_changes_were_not_emitted, this.args2(config, this.relative_file_name(status.name)))
+        if kind = UpToDateOutOfDateBuildInfoWithErrors
+            this.task_status(task, DiagProject_0_is_out_of_date_because_buildinfo_file_1_indicates_that_program_needs_to_report_errors, this.args2(config, this.relative_file_name(status.name)))
+        if kind = UpToDateOutOfDateOptions
+            this.task_status(task, DiagProject_0_is_out_of_date_because_buildinfo_file_1_indicates_there_is_change_in_compilerOptions, this.args2(config, this.relative_file_name(status.name)))
+        if kind = UpToDateOutOfDateRoots
+            this.task_status(task, DiagProject_0_is_out_of_date_because_buildinfo_file_1_indicates_that_file_2_was_root_file_of_compilation_but_not_any_more, this.args3(config, this.relative_file_name(status.output), this.relative_file_name(status.input)))
+        if kind = UpToDateTsVersionOutputOfDate
+            this.task_status(task, DiagProject_0_is_out_of_date_because_output_for_it_was_generated_with_version_1_that_differs_with_current_version_2, this.args3(config, this.relative_file_name(status.name), "7.0.0-dev"))
+        if kind = UpToDateForceBuild
+            this.task_status(task, DiagProject_0_is_being_forcibly_rebuilt, this.args1(config))
+    }
+
+    ; ── BuildTask.cleanProject ───────────────────────────────────────────────
+
+    procedure clean_project(this, task: ref[BuildTask])
+    {
+        if task.resolved = null
+        {
+            let none: Slice[char] ""
+            this.report_task_diagnostic(task, &DriverDiagnostic^host(none, none, 0, 0, DiagFile_0_not_found, this.args1(task.config), null, null))
+            set task.exit_status: ExitStatusDiagnosticsPresent_OutputsSkipped
+            return
+        }
+        let resolved task.resolved as ref[TsParsedCommandLine]
+        let inputs &Array[Slice[char]]^host()
+        var i 0
+        while i < (resolved.file_names.get_length() as int)
+        {
+            inputs.add(get_normalized_absolute_path(host, resolved.file_names[i as size_t], sys.cwd))
+            set i: i + 1
+        }
+        let outputs this.output_file_names(task)
+        var o 0
+        while o < (outputs.get_length() as int)
+        {
+            this.clean_project_output(task, outputs[o as size_t], inputs)
+            set o: o + 1
+        }
+        this.clean_project_output(task, IncProgram.build_info_file_name_of(host, resolved.options, task.config, sys.cwd), inputs)
+    }
+
+    procedure clean_project_output(this, task: ref[BuildTask], output_file: Slice[char], inputs: ref[Array[Slice[char]]])
+    {
+        if ExecSystem.contains(inputs, output_file)
+            return
+        if sys.file_exists(output_file)
+        {
+            if dry = false
+                sys.remove_file(output_file)
+            else
+                task.files_to_delete.add(output_file)
+        }
+    }
+}

@@ -123,6 +123,7 @@ use tscaly.binder.Binder
 use tscaly.program.ProgramFiles
 use tscaly.program.ModuleResolver
 use tscaly.Diagnostics.DiagnosticList
+use tscaly.Diagnostics.RelatedInfo
 use tscaly.modulespecifiers.SpecifierHost
 use tscaly.emitter.NodeBuilder
 ; ★ Slice 113: the Checker is this port's PROGRAM stub (see create's header), and
@@ -5868,7 +5869,14 @@ define ErrorChain
     depth: int
     ; the reference's `args ...any`, stringified
     args: ref[Array[String]]?
+    ; Relater.relatedInfo as it stood when this entry became the head (the
+    ; reference saves and restores the two together; newest first)
+    related: ref[RelatedNode]?
 )
+
+; one entry of Relater.relatedInfo: createDiagnosticForNode's file, span, code and
+; arguments, the list newest first
+define RelatedNode (next: ref[RelatedNode]?  file: ref[AstNode]?  pos: int  end: int  code: int  args: ref[Array[String]]?)
 
 ; printer.SymbolAccessibilityResult (slice 250, the declaration emitter): how a
 ; symbol may be named from an enclosing declaration, and which unexported
@@ -7538,6 +7546,9 @@ define Checker
     ; `rel_reported_mark` / `rel_unmatched_*`, the latch that kept the INNERMOST
     ; message.
     rel_error_chain: ref[ErrorChain]?
+    ; getTypeOfDottedName's `diagnostic` (the index it adds related information to,
+    ; -1 for none), a cell rather than a parameter threaded through the recursion
+    explicit_type_diagnostic: int
 
     ; ★★★ `NodeBuilderContext.mapper`, SLICE 187 — and the note that said this
     ; port has none was an ARGUMENT ABOUT THE WRONG FIELD. It read *`ctx.mapper`
@@ -8399,6 +8410,7 @@ define Checker
         let prms &Array[ref[Symbol]?]^host()
         set c.printer_reverse_mapped_stack: prms as ref[Array[ref[Symbol]?]]
         set c.rel_error_chain: null
+        set c.explicit_type_diagnostic: 0 - 1
         set c.relation_capture_on: false
         set c.serialization_level: 0
         set c.printer_emitted: 0
@@ -25523,10 +25535,21 @@ define Checker
             }
             set i: i + 1
         }
+        let local_mark this.diagnostic_mark()
         if found <> null
             this.error_on_node(name, DiagModule_0_declares_1_locally_but_it_is_exported_as_2, module_name, declaration_name, this.symbol_arg(found))
         else
             this.error_on_node(name, DiagModule_0_declares_1_locally_but_it_is_not_exported, module_name, declaration_name)
+        var di 0
+        while di < Symbol.declaration_count(ls)
+        {
+            let decl Symbol.declaration_at(ls, di)
+            if di = 0
+                this.related_info_since(local_mark, decl, DiagX_0_is_declared_here, declaration_name)
+            else
+                this.related_info_since(local_mark, decl, DiagX_and_here, declaration_name)
+            set di: di + 1
+        }
     }
 
     ; errorNoModuleMemberSymbol. ★★★ THE SUGGESTION FORK DECIDES THE CODE, so it is
@@ -25561,7 +25584,10 @@ define Checker
                     ; the suggestion has a value declaration is not written: the
                     ; yardstick dumps `C pos end code` and carries none, which is
                     ; error_on_node's own note.
-                    this.error_on_node(nm, DiagX_0_has_no_exported_member_named_1_Did_you_mean_2, module_name, declaration_name, this.symbol_arg(suggestion))
+                    let suggestion_name this.symbol_arg(suggestion)
+                    let member_mark this.diagnostic_mark()
+                    this.error_on_node(nm, DiagX_0_has_no_exported_member_named_1_Did_you_mean_2, module_name, declaration_name, suggestion_name)
+                    this.related_info_since(member_mark, Symbol.value_declaration_of(suggestion as ref[Symbol]), DiagX_0_is_declared_here, suggestion_name)
                     return
                 }
             }
@@ -25595,6 +25621,7 @@ define Checker
                 return
             }
         }
+        let default_mark this.diagnostic_mark()
         this.error_on_node(AstNode.name_of(node), DiagModule_0_has_no_default_export, this.symbol_arg(module_symbol))
         var sd Slice[char]()
         set sd: Binder.internal_name(host, "export")
@@ -25611,7 +25638,19 @@ define Checker
             {
                 let spec AstNode.module_specifier_of(decl)
                 if spec <> null
-                    this.resolve_external_module_name(decl, spec, false)
+                {
+                    let resolved this.resolve_external_module_name(decl, spec, false)
+                    if resolved <> null
+                    {
+                        var dd Slice[char]()
+                        set dd: Binder.internal_name_unprefixed(host, "default")
+                        if SymbolTable.get(Symbol.exports_of(resolved as ref[Symbol]), dd) <> null
+                        {
+                            this.related_info_since(default_mark, decl, DiagX_export_Asterisk_does_not_re_export_a_default)
+                            return
+                        }
+                    }
+                }
             }
             set i: i + 1
         }
@@ -26184,10 +26223,18 @@ define Checker
                     set is_export: true
                 if tk = KindExportDeclaration
                     set is_export: true
+                let alias_mark this.diagnostic_mark()
                 if is_export
                     this.error_on_node(AstNode.module_reference_of(node), DiagAn_import_alias_cannot_reference_a_declaration_that_was_exported_using_export_type)
                 else
                     this.error_on_node(AstNode.module_reference_of(node), DiagAn_import_alias_cannot_reference_a_declaration_that_was_imported_using_import_type)
+                var related_code DiagX_0_was_imported_here
+                if is_export
+                    set related_code: DiagX_0_was_exported_here
+                var type_only_name String("*")
+                if tk <> KindExportDeclaration
+                    set type_only_name: Checker.arg_text(AstNode.identifier_text_of(AstNode.name_of(type_only as ref[AstNode])))
+                this.related_info_since(alias_mark, type_only, related_code, type_only_name)
                 break
             }
             if AstNode.kind_of(name as ref[AstNode]) = KindIdentifier
@@ -29433,7 +29480,32 @@ define Checker
                     if error_node = null
                         set error_node: node
                     if AstNode.kind_of(node) = KindExportSpecifier
+                    {
+                        let js_export_mark this.diagnostic_mark()
                         this.error_on_node(error_node, DiagTypes_cannot_appear_in_export_declarations_in_JavaScript_files)
+                        ; the alias already exported under that name: its JS type alias declaration
+                        let source_symbol AstNode.symbol_of(Checker.source_file_of_node(node))
+                        if source_symbol <> null
+                        {
+                            let exported_name AstNode.identifier_text_of(Checker.property_name_or_name_of(node))
+                            let already SymbolTable.get(Symbol.exports_of(source_symbol as ref[Symbol]), exported_name)
+                            if (already <> null) and (already = target)
+                            {
+                                let already_symbol already as ref[Symbol]
+                                var ai 0
+                                while ai < Symbol.declaration_count(already_symbol)
+                                {
+                                    let ad Symbol.declaration_at(already_symbol, ai)
+                                    set ai: ai + 1
+                                    if Checker.kind_or_unknown(ad) = KindJSTypeAliasDeclaration
+                                    {
+                                        this.related_info_since(js_export_mark, ad, DiagX_0_is_automatically_exported_here, Checker.arg_text(Symbol.name_of(already_symbol)))
+                                        break
+                                    }
+                                }
+                            }
+                        }
+                    }
                     else
                     {
                         var identifier_text Checker.arg_text(Symbol.name_of(symbol))
@@ -29522,10 +29594,14 @@ define Checker
                         else
                         {
                             let import_name Checker.arg_text(AstNode.identifier_text_of(Checker.property_name_or_name_of(node)))
+                            let import_mark this.diagnostic_mark()
                             if is_type
                                 this.error_on_node(node, DiagX_0_is_a_type_and_must_be_imported_using_a_type_only_import_when_verbatimModuleSyntax_is_enabled, import_name)
                             else
+                            {
                                 this.error_on_node(node, DiagX_0_resolves_to_a_type_only_declaration_and_must_be_imported_using_a_type_only_import_when_verbatimModuleSyntax_is_enabled, import_name)
+                                this.add_type_only_declaration_related_info(import_mark, type_only_alias, import_name)
+                            }
                         }
                     }
                     if is_type and (nk = KindImportEqualsDeclaration) and b.has_syntactic_modifier(node, ModifierFlagsExport)
@@ -29544,7 +29620,12 @@ define Checker
                         if is_type
                             this.error_on_node(node, DiagRe_exporting_a_type_when_0_is_enabled_requires_using_export_type, this.isolated_modules_like_flag_name())
                         else
-                            this.error_on_node(node, DiagX_0_resolves_to_a_type_only_declaration_and_must_be_re_exported_using_a_type_only_re_export_when_1_is_enabled, Checker.arg_text(AstNode.identifier_text_of(Checker.property_name_or_name_of(node))), this.isolated_modules_like_flag_name())
+                        {
+                            let export_name Checker.arg_text(AstNode.identifier_text_of(Checker.property_name_or_name_of(node)))
+                            let export_mark this.diagnostic_mark()
+                            this.error_on_node(node, DiagX_0_resolves_to_a_type_only_declaration_and_must_be_re_exported_using_a_type_only_re_export_when_1_is_enabled, export_name, this.isolated_modules_like_flag_name())
+                            this.add_type_only_declaration_related_info(export_mark, type_only_alias, export_name)
+                        }
                     }
                 }
             }
@@ -32229,6 +32310,9 @@ define Checker
             ; first construct signature's RETURN type is resolved there, and the
             ; name is then walked — see name_type_for_message.
             let base_name this.type_arg(bt)
+            var constrained_declaration: ref[AstNode]? null
+            var constrained_symbol_name String("")
+            var constrained_return_name String("")
             if (bt.flags & TypeFlagsTypeParameter) <> 0
             {
                 let constraint this.get_constraint_from_type_parameter(bt)
@@ -32250,10 +32334,17 @@ define Checker
                 if bt.symbol <> null
                 {
                     if Symbol.declaration_count(bt.symbol as ref[Symbol]) <> 0
-                        this.name_type_for_message(ctor_return)
+                    {
+                        set constrained_declaration: Symbol.declaration_at(bt.symbol as ref[Symbol], 0)
+                        set constrained_symbol_name: this.symbol_arg(bt.symbol as ref[Symbol])
+                        set constrained_return_name: this.type_arg(ctor_return)
+                    }
                 }
             }
+            let base_mark this.diagnostic_mark()
             this.error_on_node(base_expr, DiagType_0_is_not_a_constructor_function_type, base_name)
+            if constrained_declaration <> null
+                this.related_info_since(base_mark, constrained_declaration, DiagDid_you_mean_for_0_to_be_constrained_to_type_new_args_Colon_any_1, constrained_symbol_name, constrained_return_name)
             if Checker.resolved_base_constructor_type_of(t) = null
                 Checker.set_resolved_base_constructor_type(t, error_type)
             return Checker.resolved_base_constructor_type_of(t)
@@ -33049,7 +33140,13 @@ define Checker
                 if error_node <> null
                 {
                     let circular_name this.type_arg(t)
+                    let circular_mark this.diagnostic_mark()
                     this.error_on_node_or_null(error_node, DiagType_parameter_0_has_a_circular_constraint, circular_name)
+                    if current_node <> null
+                    {
+                        if (Checker.is_node_descendant_of(error_node, current_node) = false) and (Checker.is_node_descendant_of(current_node, error_node) = false)
+                            this.related_info_since(circular_mark, current_node, DiagCircularity_originates_in_type_at_this_location)
+                    }
                 }
             }
             set constraint: circular_constraint_type
@@ -65204,13 +65301,15 @@ define Checker
         let declaration decl as ref[AstNode]
         if this.is_declaration_with_explicit_type_annotation(declaration)
             return this.get_type_of_symbol(symbol)
-        if AstNode.kind_of(declaration) <> KindVariableDeclaration
+        var grand: ref[AstNode]? null
+        if AstNode.kind_of(declaration) = KindVariableDeclaration
+            set grand: AstNode.parent_node_of(AstNode.parent_node_of(declaration))
+        if Checker.kind_or_unknown(grand) <> KindForOfStatement
+        {
+            if explicit_type_diagnostic >= 0
+                this.related_info_at(explicit_type_diagnostic, declaration, DiagX_0_needs_an_explicit_type_annotation, this.message_args1(this.symbol_arg(symbol)))
             return null
-        let grand AstNode.parent_node_of(AstNode.parent_node_of(declaration))
-        if grand = null
-            return null
-        if AstNode.kind_of(grand as ref[AstNode]) <> KindForOfStatement
-            return null
+        }
         let statement grand as ref[AstNode]
         let e AstNode.expression_of(statement)
         if e = null
@@ -69658,10 +69757,29 @@ define Checker
             set any_na_n: true
         if any_na_n
         {
+            let nan_mark this.diagnostic_mark()
             if (op_kind = KindEqualsEqualsEqualsToken) or (op_kind = KindEqualsEqualsToken)
                 this.error_on_node_or_null(error_node, DiagThis_condition_will_always_return_0, "false")
             else
                 this.error_on_node_or_null(error_node, DiagThis_condition_will_always_return_0, "true")
+            if is_left and is_right
+                return
+            ; the `Number.isNaN` suggestion on the other operand
+            var suggestion StringBuilder()
+            if (op_kind = KindExclamationEqualsEqualsToken) or (op_kind = KindExclamationEqualsToken)
+                suggestion.append("!")
+            suggestion.append("Number.isNaN(")
+            var location left
+            if is_left
+                set location: right
+            let expression Checker.skip_parentheses(location)
+            var entity StringBuilder()
+            if Checker.is_entity_name_expression(expression) and this.write_entity_name(expression, &entity)
+                suggestion.append(entity.to_string())
+            else
+                suggestion.append("...")
+            suggestion.append(")")
+            this.related_info_since(nan_mark, location, DiagDid_you_mean_0, suggestion.to_string())
         }
     }
 
@@ -70757,14 +70875,18 @@ define Checker
                         return null
                     if effects = null
                     {
+                        let assertion_mark this.diagnostic_mark()
                         this.error_on_node(callee, DiagAssertions_require_every_name_in_the_call_target_to_be_declared_with_an_explicit_type_annotation)
                         ; `c.getTypeOfDottedName(node.Expression(), diagnostic)`
-                        ; attaches RELATED INFORMATION to the diagnostic just
-                        ; reported, and this port carries none (error_on_node takes
-                        ; a code and a span) — so the call is named rather than
-                        ; written, on §3.5be's rule about a value with no reader.
-                        ; The diagnostic itself is above it and is what the
-                        ; yardstick compares.
+                        if this.diagnostic_mark() > assertion_mark
+                        {
+                            let saved_diagnostic explicit_type_diagnostic
+                            set this.explicit_type_diagnostic: assertion_mark
+                            let ignored this.get_type_of_dotted_name(callee as ref[AstNode])
+                            set this.explicit_type_diagnostic: saved_diagnostic
+                            if this.unported_mark() <> mark
+                                return null
+                        }
                     }
                 }
             }
@@ -73777,18 +73899,19 @@ define Checker
     ; this implementation* as related information. The information is invisible here;
     ; the RE-CHECK of the arguments is not — it reports its own side effects (TS2454 on
     ; an unassigned variable) one more time (slice 210; `incompatibleTypes`).
-    procedure add_implementation_success_elaboration(this, s: ref[CallState], failed: ref[Signature])
+    ; the implementation whose success is the related information, null for none
+    procedure add_implementation_success_elaboration(this, s: ref[CallState], failed: ref[Signature]) returns ref[AstNode]?
     {
         if failed.declaration = null
-            return
+            return null
         let decl failed.declaration as ref[AstNode]
         let sym this.symbol_of_declaration(decl)
         if sym = null
-            return
+            return null
         let symbol sym as ref[Symbol]
         let n Symbol.declaration_count(symbol)
         if n <= 1
-            return
+            return null
         var implementation: ref[AstNode]? null
         var i 0
         while i < n
@@ -73809,20 +73932,23 @@ define Checker
             }
         }
         if implementation = null
-            return
+            return null
         let mark this.unported_mark()
         let candidate this.get_signature_from_declaration(implementation as ref[AstNode])
         if this.unported_mark() <> mark
-            return
+            return null
         if candidate = null
-            return
+            return null
         let one this.new_signature_list()
         one.add(candidate)
         var single_non_generic false
         if Checker.type_parameter_count_of_signature(candidate as ref[Signature]) = 0
             set single_non_generic: true
         let local &CallState^host(s.node, s.args, one, s.type_arguments, s.arg_check_mode, single_non_generic, null, null, null)
-        let ignored this.choose_overload(local, RelationAssignable)
+        let chosen this.choose_overload(local, RelationAssignable)
+        if chosen = null
+            return null
+        implementation
     }
 
     procedure report_call_resolution_errors(this, node: ref[AstNode], s: ref[CallState], signatures: ref[Array[ref[Signature]?]], head_code: int)
@@ -73849,6 +73975,7 @@ define Checker
             set this.relation_capture_on: false
             if this.unported_mark() <> mark
                 return
+            let implementation this.add_implementation_success_elaboration(s, last)
             var ci 0
             while ci < (relation_capture.get_length() as int)
             {
@@ -73860,9 +73987,12 @@ define Checker
                 }
                 if head_code <> 0
                     diagnostics.recode_at(at, head_code)
+                if (last.declaration <> null) and (arg_error_count > 1)
+                    this.related_info_at(at, last.declaration, DiagThe_last_overload_is_declared_here, null)
+                if implementation <> null
+                    this.related_info_at(at, implementation, DiagThe_call_would_have_succeeded_against_this_implementation_but_implementation_signatures_of_overloads_are_not_externally_visible, null)
                 set ci: ci + 1
             }
-            this.add_implementation_success_elaboration(s, last)
             return
         }
         if s.candidate_for_argument_arity_error <> null
@@ -73997,6 +74127,7 @@ define Checker
             return
         var min_count 0
         var max_count 0
+        var closest_signature: ref[Signature]? null
         ; "longest parameter count *shorter than the call*" / "shortest parameter
         ; count *longer than the call*" — both stay UNSET when no candidate is on
         ; that side, and both are read only by the arm that guarantees one is.
@@ -74020,11 +74151,15 @@ define Checker
             {
                 set min_count: min_parameter
                 set max_count: max_parameter
+                set closest_signature: sig
             }
             else
             {
                 if min_parameter < min_count
+                {
                     set min_count: min_parameter
+                    set closest_signature: sig
+                }
                 if max_parameter > max_count
                     set max_count: max_parameter
             }
@@ -74126,12 +74261,37 @@ define Checker
         ; related information and are dropped.
         if arg_count < min_count
         {
+            let related_mark this.diagnostic_mark()
             if head_code = 0
-            {
                 this.error_on_node(error_node, code2, range_text, arg_count_text)
-                return
+            else
+                this.error_on_node(error_node, code2)
+            if closest_signature <> null
+            {
+                let cs closest_signature as ref[Signature]
+                if cs.declaration <> null
+                {
+                    var parameter_index arg_count
+                    if cs.this_parameter <> null
+                        set parameter_index: parameter_index + 1
+                    let parameter AstNode.child_in_list(AstNode.parameters_of(cs.declaration as ref[AstNode]), parameter_index)
+                    if parameter <> null
+                    {
+                        let pn parameter as ref[AstNode]
+                        let parameter_name AstNode.name_of(pn)
+                        if AstNode.is_binding_pattern(parameter_name)
+                            this.related_info_since(related_mark, pn, DiagAn_argument_matching_this_binding_pattern_was_not_provided)
+                        else
+                        {
+                            let name_text Checker.arg_text(AstNode.identifier_text_of(parameter_name))
+                            if Checker.is_rest_parameter(pn)
+                                this.related_info_since(related_mark, pn, DiagArguments_for_the_rest_parameter_0_were_not_provided, name_text)
+                            else
+                                this.related_info_since(related_mark, pn, DiagAn_argument_for_0_was_not_provided, name_text)
+                        }
+                    }
+                }
             }
-            this.error_on_node(error_node, code2)
             return
         }
         ; "Guard against out-of-bounds access when maxCount >= len(args)."
@@ -75109,10 +75269,7 @@ define Checker
                     return false
                 if ok = false
                 {
-                    ; maybeAddMissingAwaitInfo adds RELATED INFORMATION to a
-                    ; diagnostic this call site never produced, and its own first
-                    ; guard is `diagnosticOutput != nil` — so there is nothing here
-                    ; for it to attach to.
+                    this.maybe_add_missing_await_info(a, check_arg_type, param_type, relation, report_errors)
                     return false
                 }
             }
@@ -75159,9 +75316,33 @@ define Checker
                     set error_node: synth
                 }
             }
-            return this.check_type_related_to_ex(spread_type as ref[Type], rest_type as ref[Type], relation, error_node, DiagArgument_of_type_0_is_not_assignable_to_parameter_of_type_1)
+            if this.check_type_related_to_ex(spread_type as ref[Type], rest_type as ref[Type], relation, error_node, DiagArgument_of_type_0_is_not_assignable_to_parameter_of_type_1) = false
+            {
+                this.maybe_add_missing_await_info(error_node, spread_type as ref[Type], rest_type as ref[Type], relation, report_errors)
+                return false
+            }
+            return true
         }
         true
+    }
+
+    ; maybeAddMissingAwaitInfo: the report pass's captured diagnostics are its
+    ; diagnosticOutput
+    procedure maybe_add_missing_await_info(this, error_node: ref[AstNode]?, source: ref[Type], target: ref[Type], relation: int, report_errors: bool)
+    {
+        if (error_node = null) or (report_errors = false) or (relation_capture_on = false) or (relation_capture.get_length() = 0)
+            return
+        let mark this.unported_mark()
+        let target_awaited this.get_awaited_type_of_promise(target)
+        if (this.unported_mark() <> mark) or (target_awaited <> null)
+            return
+        let awaited this.get_awaited_type_of_promise(source)
+        if (this.unported_mark() <> mark) or (awaited = null)
+            return
+        let related this.is_type_related_to(awaited as ref[Type], target, relation)
+        if (this.unported_mark() <> mark) or (related = false)
+            return
+        this.related_info_at(relation_capture[0], error_node, DiagDid_you_forget_to_use_await, null)
     }
 
     ; isCallChain, whole.
@@ -76355,7 +76536,10 @@ define Checker
                 {
                     let diag_name this.declaration_name_to_string(right)
                     let left_name this.type_arg(left_type)
+                    let shadow_mark this.diagnostic_mark()
                     this.error_on_node(right, DiagThe_property_0_cannot_be_accessed_on_type_1_within_this_class_because_it_is_shadowed_by_another_private_identifier_with_the_same_spelling, diag_name, left_name)
+                    this.related_info_since(shadow_mark, lexical_value_decl, DiagThe_shadowing_declaration_of_0_is_defined_here, diag_name)
+                    this.related_info_since(shadow_mark, type_value_decl, DiagThe_declaration_of_0_that_you_probably_intended_to_use_is_defined_here, diag_name)
                     return true
                 }
             }
@@ -76867,7 +77051,9 @@ define Checker
                 let promised_container this.type_arg(containing_type)
                 if this.unported_mark() <> mark
                     return
+                let await_mark this.diagnostic_mark()
                 this.error_on_node(prop_node, DiagProperty_0_does_not_exist_on_type_1, promised_prop_name, promised_container)
+                this.related_info_since(await_mark, prop_node, DiagDid_you_forget_to_use_await)
                 return
             }
         }
@@ -76899,7 +77085,10 @@ define Checker
                 set suggestion_count: suggestion_count + 1
                 return
             }
-            this.error_on_node(prop_node, DiagProperty_0_does_not_exist_on_type_1_Did_you_mean_2, missing_property, container, Checker.arg_text(Symbol.name_of(suggestion as ref[Symbol])))
+            let suggested_name Checker.arg_text(Symbol.name_of(suggestion as ref[Symbol]))
+            let suggestion_mark this.diagnostic_mark()
+            this.error_on_node(prop_node, DiagProperty_0_does_not_exist_on_type_1_Did_you_mean_2, missing_property, container, suggested_name)
+            this.related_info_since(suggestion_mark, Symbol.value_declaration_of(suggestion as ref[Symbol]), DiagX_0_is_declared_here, suggested_name)
             return
         }
         if this.container_seems_to_be_empty_dom_element(containing_type)
@@ -77144,7 +77333,9 @@ define Checker
                             }
                             if report_it
                             {
+                                let used_mark this.diagnostic_mark()
                                 this.error_on_node(right, DiagProperty_0_is_used_before_its_initialization, Checker.arg_text(AstNode.identifier_text_of(right)))
+                                this.related_info_since(used_mark, value_declaration, DiagX_0_is_declared_here, Checker.arg_text(AstNode.identifier_text_of(right)))
                                 set reported: true
                             }
                         }
@@ -77165,7 +77356,11 @@ define Checker
         if this.unported_mark() <> class_mark
             return
         if class_before = false
+        {
+            let class_used_mark this.diagnostic_mark()
             this.error_on_node(right, DiagClass_0_used_before_its_declaration, Checker.arg_text(AstNode.identifier_text_of(right)))
+            this.related_info_since(class_used_mark, value_declaration, DiagX_0_is_declared_here, Checker.arg_text(AstNode.identifier_text_of(right)))
+        }
     }
 
     ; isOptionalPropertyDeclaration.
@@ -81827,7 +82022,25 @@ define Checker
             if is_global_this = false
             {
                 if t = null
+                {
+                    let this_mark this.diagnostic_mark()
                     this.error_on_node(node, DiagX_this_implicitly_has_type_any_because_it_does_not_have_a_type_annotation)
+                    if AstNode.kind_of(container) <> KindSourceFile
+                    {
+                        var outside_arm 0
+                        let outside_this this.try_get_this_type_at_ex(container, true, null, &outside_arm)
+                        if this.unported_mark() <> mark
+                            return null
+                        if outside_this <> null
+                        {
+                            var same_as_global false
+                            if global_this_type <> null
+                                set same_as_global: (outside_this as ref[Type]) = (global_this_type as ref[Type])
+                            if same_as_global = false
+                                this.related_info_since(this_mark, container, DiagAn_outer_value_of_this_is_shadowed_by_this_container)
+                        }
+                    }
+                }
             }
         }
         ; The THISPIN's entry — see ThisEvent's header. It is written at BOTH
@@ -83825,7 +84038,9 @@ define Checker
                 this.record_unported("spread-override-value-declaration", 0)
                 continue
             }
+            let spread_mark this.diagnostic_mark()
             this.error_on_node(lvd as ref[AstNode], DiagX_0_is_specified_more_than_once_so_this_usage_will_be_overwritten, Checker.arg_text(Symbol.name_of(left as ref[Symbol])))
+            this.related_info_since(spread_mark, spread, DiagThis_spread_always_overwrites_this_property)
         }
     }
 
@@ -86127,7 +86342,14 @@ define Checker
                         ; is not built — see the section header.
                         if this.has_parse_diagnostics() = false
                         {
+                            let await_mark this.diagnostic_mark()
                             this.error_on_node(await_modifier, DiagX_for_await_loops_are_only_allowed_within_async_functions_and_at_the_top_levels_of_modules)
+                            let containing_func Checker.get_containing_function(node)
+                            if containing_func <> null
+                            {
+                                if AstNode.kind_of(containing_func) <> KindConstructor
+                                    this.related_info_since(await_mark, containing_func, DiagDid_you_mean_to_mark_this_function_as_async)
+                            }
                             return true
                         }
                     }
@@ -87474,7 +87696,7 @@ define Checker
                         }
                     }
                     if report_mismatch
-                        this.error_next_variable_or_property_declaration_must_have_same_type(node, symbol_type, declaration_type)
+                        this.error_next_variable_or_property_declaration_must_have_same_type(Symbol.value_declaration_of(symbol as ref[Symbol]), node, symbol_type, declaration_type)
                     if initializer <> null
                     {
                         let it this.check_expression_cached(initializer as ref[AstNode])
@@ -87587,7 +87809,7 @@ define Checker
     ;
     ; ★ The CODE is a fork and it is transcribed: a property redeclaration is TS2717
     ; and a variable one TS2403, chosen off the NEXT declaration's kind.
-    procedure error_next_variable_or_property_declaration_must_have_same_type(this, next_declaration: ref[AstNode], first_type: ref[Type]?, next_type: ref[Type]?)
+    procedure error_next_variable_or_property_declaration_must_have_same_type(this, first_declaration: ref[AstNode]?, next_declaration: ref[AstNode], first_type: ref[Type]?, next_type: ref[Type]?)
     {
         let nk AstNode.kind_of(next_declaration)
         var code DiagSubsequent_variable_declarations_must_have_the_same_type_Variable_0_must_be_of_type_1_but_here_has_type_2
@@ -87599,7 +87821,9 @@ define Checker
         let decl_name this.declaration_name_to_string(next_name)
         let first_name this.type_arg(first_type)
         let next_type_name this.type_arg(next_type)
+        let related_mark this.diagnostic_mark()
         this.error_on_node(next_name, code, decl_name, first_name, next_type_name)
+        this.related_info_since(related_mark, first_declaration, DiagX_0_was_also_declared_here, decl_name)
     }
 
     ; ── slice 76: checkVarDeclaredNamesNotShadowed, up to its one resolveName ──
@@ -90859,7 +91083,12 @@ define Checker
                 if unchecked_js
                     set suggestion_count: suggestion_count + 1
                 else
+                {
+                    let related_mark this.diagnostic_mark()
                     this.error_on_node_or_null(error_location, code, declaration_name, suggestion_name)
+                    if vd <> null
+                        this.related_info_since(related_mark, vd, DiagX_0_is_declared_here, suggestion_name)
+                }
                 return
             }
         }
@@ -91597,23 +91826,25 @@ define Checker
         if before
             return
         let declaration_name this.declaration_name_to_string(b.get_name_of_declaration(decl))
+        let related_mark this.diagnostic_mark()
         if (f & SymbolFlagsBlockScopedVariable) <> 0
-        {
             this.error_on_node(error_location, DiagBlock_scoped_variable_0_used_before_its_declaration, declaration_name)
-            return
-        }
-        if (f & SymbolFlagsClass) <> 0
+        else
         {
-            this.error_on_node(error_location, DiagClass_0_used_before_its_declaration, declaration_name)
-            return
+            if (f & SymbolFlagsClass) <> 0
+                this.error_on_node(error_location, DiagClass_0_used_before_its_declaration, declaration_name)
+            else
+            {
+                if (f & SymbolFlagsRegularEnum) <> 0
+                    this.error_on_node(error_location, DiagEnum_0_used_before_its_declaration, declaration_name)
+                else
+                {
+                    if this.get_isolated_modules()
+                        this.error_on_node(error_location, DiagEnum_0_used_before_its_declaration, declaration_name)
+                }
+            }
         }
-        if (f & SymbolFlagsRegularEnum) <> 0
-        {
-            this.error_on_node(error_location, DiagEnum_0_used_before_its_declaration, declaration_name)
-            return
-        }
-        if this.get_isolated_modules()
-            this.error_on_node(error_location, DiagEnum_0_used_before_its_declaration, declaration_name)
+        this.related_info_since(related_mark, decl, DiagX_0_is_declared_here, declaration_name)
     }
 
     ; onSuccessfullyResolvedSymbol — the third message-gated callback, five blocks
@@ -91817,7 +92048,9 @@ define Checker
                                     set code: DiagX_0_cannot_be_used_as_a_value_because_it_was_exported_using_export_type
                                 if tk = KindNamespaceExport
                                     set code: DiagX_0_cannot_be_used_as_a_value_because_it_was_exported_using_export_type
+                                let type_only_mark this.diagnostic_mark()
                                 this.error_on_node(el, code, Checker.arg_text(Symbol.name_of(result)))
+                                this.add_type_only_declaration_related_info(type_only_mark, tod, Checker.arg_text(Symbol.name_of(result)))
                             }
                         }
                     }
@@ -95434,10 +95667,12 @@ define Checker
                     {
                         if (type_only_declaration <> null) and (same_file = false)
                         {
+                            let reexport_mark this.diagnostic_mark()
                             if is_export_equals
                                 this.error_on_node(id, DiagX_0_resolves_to_a_type_only_declaration_and_must_be_marked_type_only_in_this_file_before_re_exporting_when_1_is_enabled_Consider_using_import_type_where_0_is_imported, Checker.arg_text(AstNode.identifier_text_of(id)), this.isolated_modules_like_flag_name())
                             else
                                 this.error_on_node(id, DiagX_0_resolves_to_a_type_only_declaration_and_must_be_marked_type_only_in_this_file_before_re_exporting_when_1_is_enabled_Consider_using_export_type_0_as_default, Checker.arg_text(AstNode.identifier_text_of(id)), this.isolated_modules_like_flag_name())
+                            this.add_type_only_declaration_related_info(reexport_mark, type_only_declaration, Checker.arg_text(AstNode.identifier_text_of(id)))
                         }
                     }
                 }
@@ -97262,6 +97497,7 @@ define Checker
             return false
         var can_have_call_expression true
         var has_error false
+        var error_node: ref[AstNode]? null
         repeat
         {
             let k AstNode.kind_of(node)
@@ -97284,9 +97520,15 @@ define Checker
             if k = KindCallExpression
             {
                 if can_have_call_expression = false
+                {
                     set has_error: true
+                    set error_node: node
+                }
                 if AstNode.question_dot_token_of(node) <> null
+                {
                     set has_error: true
+                    set error_node: AstNode.question_dot_token_of(node)
+                }
                 let callee AstNode.expression_of(node)
                 if callee = null
                     return false
@@ -97300,7 +97542,10 @@ define Checker
             if k = KindPropertyAccessExpression
             {
                 if AstNode.question_dot_token_of(node) <> null
+                {
                     set has_error: true
+                    set error_node: AstNode.question_dot_token_of(node)
+                }
                 let receiver AstNode.expression_of(node)
                 if receiver = null
                     return false
@@ -97309,12 +97554,18 @@ define Checker
                 continue
             }
             if k <> KindIdentifier
+            {
                 set has_error: true
+                set error_node: node
+            }
             break
         }
         if has_error = false
             return false
-        this.grammar_error_on_node(expression, DiagExpression_must_be_enclosed_in_parentheses_to_be_used_as_a_decorator)
+        let decorator_mark this.diagnostic_mark()
+        this.error_on_node(expression, DiagExpression_must_be_enclosed_in_parentheses_to_be_used_as_a_decorator)
+        this.related_info_since(decorator_mark, error_node, DiagInvalid_syntax_in_decorator)
+        true
     }
 
     ; markDecoratorAliasReferenced — markLinkedReferences' DECORATOR arm.
@@ -97646,7 +97897,23 @@ define Checker
             if take = false
             {
                 if for_decorator_metadata and this.get_isolated_modules() and (module_kind >= ModuleKindES2015) and (this.symbol_is_value(rs) = false) and (Checker.some_declaration_is_type_only_import_or_export(rs) = false)
+                {
+                    let metadata_mark this.diagnostic_mark()
                     this.error_on_node(type_name, DiagA_type_referenced_in_a_decorated_signature_must_be_imported_with_import_type_or_a_namespace_import_when_isolatedModules_and_emitDecoratorMetadata_are_enabled)
+                    var di 0
+                    while di < Symbol.declaration_count(rs)
+                    {
+                        let decl Symbol.declaration_at(rs, di)
+                        set di: di + 1
+                        if decl = null
+                            continue
+                        if this.is_alias_symbol_declaration(decl as ref[AstNode])
+                        {
+                            this.related_info_since(metadata_mark, decl, DiagX_0_was_imported_here, Checker.arg_text(AstNode.identifier_text_of(root_name)))
+                            break
+                        }
+                    }
+                }
             }
     }
 
@@ -108839,17 +109106,18 @@ define Checker
         this.lookup_or_issue_error_with(node, code, args)
     }
 
-    ; lookupOrIssueError — DiagnosticsCollection.Lookup compares the MESSAGE too
-    procedure lookup_or_issue_error_with(this, node: ref[AstNode], code: int, args: ref[Array[String]]?)
+    ; lookupOrIssueError — DiagnosticsCollection.Lookup compares the MESSAGE too;
+    ; the index of the diagnostic found or added, -1 for none
+    procedure lookup_or_issue_error_with(this, node: ref[AstNode], code: int, args: ref[Array[String]]?) returns int
     {
         if this.node_is_in_lib(node)
-            return
+            return 0 - 1
         var start 0
         var stop 0
         if this.error_range_in_own_file(node, &start, &stop) = false
         {
             this.record_unported("error-range", AstNode.kind_of(node))
-            return
+            return 0 - 1
         }
         let tag this.program_index_of_node(node)
         let n diagnostics.length()
@@ -108865,33 +109133,76 @@ define Checker
                 {
                     if e = stop
                     {
-                        if c = code
+                        ; CompareDiagnostics also compares the chain and the related
+                        ; information, and this report has neither
+                        if (c = code) and (diagnostics.chain_length_at(i) = 0) and (diagnostics.related_count_at(i) = 0)
                         {
                             if diagnostics.args_equal_at(i, args)
-                                return
+                                return i
                         }
                     }
                 }
             }
             set i: i + 1
         }
+        let before this.diagnostic_mark()
         this.add_diagnostic_at_node_with(start, stop, code, node, args)
+        if this.diagnostic_mark() > before
+            return before
+        0 - 1
     }
 
     ; addDuplicateDeclarationErrorsForSymbols + addDuplicateDeclarationError, whose
     ; related-information half is a DROP here (§3.24's rule, one chapter over): the
     ; `0 was also declared here` / `and here` chain is related information on the
     ; diagnostic this port does not carry.
-    procedure add_duplicate_declaration_errors_for_symbols(this, target: ref[Symbol], code: int, symbol_name: String)
+    procedure add_duplicate_declaration_errors_for_symbols(this, target: ref[Symbol], code: int, symbol_name: String, source: ref[Symbol]?)
     {
         let n Symbol.declaration_count(target)
         var i 0
         while i < n
         {
             let d Symbol.declaration_at(target, i)
-            if d <> null
-                this.lookup_or_issue_error(this.get_adjusted_node_for_error(d as ref[AstNode]), code, symbol_name)
             set i: i + 1
+            if d = null
+                continue
+            let error_node this.get_adjusted_node_for_error(d as ref[AstNode])
+            let args this.message_args()
+            args.add(symbol_name)
+            let index this.lookup_or_issue_error_with(error_node, code, args)
+            if (index < 0) or (source = null)
+                continue
+            ; addDuplicateDeclarationError's related nodes: the other symbol's
+            ; declarations, the first as `was also declared here`, the rest `and here`,
+            ; five at most and none twice
+            let src source as ref[Symbol]
+            let m Symbol.declaration_count(src)
+            var k 0
+            while k < m
+            {
+                let rd Symbol.declaration_at(src, k)
+                set k: k + 1
+                if rd = null
+                    continue
+                let adjusted this.get_adjusted_node_for_error(rd as ref[AstNode])
+                if adjusted = error_node
+                    continue
+                var start 0
+                var stop 0
+                if this.related_range_of(adjusted, &start, &stop) = false
+                    continue
+                let list diagnostics as ref[DiagnosticList]
+                let count list.related_count_at(index)
+                let file Checker.source_file_of_node(adjusted)
+                if count >= 5
+                    continue
+                if list.related_contains_at(index, file, start, stop, DiagX_and_here, null) or list.related_contains_at(index, file, start, stop, DiagX_0_was_also_declared_here, args)
+                    continue
+                if count = 0
+                    list.add_related_at(index, file, start, stop, DiagX_0_was_also_declared_here, args)
+                else
+                    list.add_related_at(index, file, start, stop, DiagX_and_here, null)
+            }
         }
     }
 
@@ -108921,9 +109232,9 @@ define Checker
         }
         let symbol_name this.symbol_arg(source)
         if this.symbol_is_in_plain_js_file(source) = false
-            this.add_duplicate_declaration_errors_for_symbols(source, code, symbol_name)
+            this.add_duplicate_declaration_errors_for_symbols(source, code, symbol_name, target)
         if this.symbol_is_in_plain_js_file(target) = false
-            this.add_duplicate_declaration_errors_for_symbols(target, code, symbol_name)
+            this.add_duplicate_declaration_errors_for_symbols(target, code, symbol_name, source)
     }
 
     ; ast.IsPlainJSFile(GetSourceFileOfNode(getFirstDeclaration(symbol)), c.CheckJs)
@@ -109302,8 +109613,8 @@ define Checker
             if (ty.flags & TypeFlagsUniqueESSymbol) <> 0
                 set duplicate_name: this.declaration_name_to_string(dn)
             if early_symbol <> null
-                this.add_duplicate_declaration_errors_for_symbols(early_symbol as ref[Symbol], DiagDuplicate_identifier_0, duplicate_name)
-            this.add_duplicate_declaration_errors_for_symbols(ls, DiagDuplicate_identifier_0, duplicate_name)
+                this.add_duplicate_declaration_errors_for_symbols(early_symbol as ref[Symbol], DiagDuplicate_identifier_0, duplicate_name, ls)
+            this.add_duplicate_declaration_errors_for_symbols(ls, DiagDuplicate_identifier_0, duplicate_name, early_symbol)
             this.lookup_or_issue_error(dn, DiagDuplicate_identifier_0, duplicate_name)
             if (Symbol.flags_of(ls) & SymbolFlagsAccessor) <> 0
             {
@@ -118114,7 +118425,10 @@ define Checker
                             let prop_type_name this.type_arg(prop_type)
                             let key_name this.type_arg(info.key_type)
                             let value_name this.type_arg(info.value_type)
+                            let related_mark this.diagnostic_mark()
                             this.error_on_node(error_node, DiagProperty_0_of_type_1_is_not_assignable_to_2_index_type_3, prop_name, prop_type_name, key_name, value_name)
+                            if (prop_declaration <> null) and (error_node <> prop_declaration)
+                                this.related_info_since(related_mark, prop_declaration, DiagX_0_is_declared_here, prop_name)
                         }
                     }
                 }
@@ -119037,7 +119351,19 @@ define Checker
                             var target this.name_of_declaration(declaration)
                             if target = null
                                 set target: declaration
+                            let related_mark this.diagnostic_mark()
                             this.error_on_node_or_null(target, code, Checker.arg_text(Symbol.name_of(symbol)))
+                            ; SetRelatedInfo(relatedDiagnostics): every class declaration
+                            var rj 0
+                            while rj < count
+                            {
+                                let rd Symbol.declaration_at(symbol, rj)
+                                set rj: rj + 1
+                                if rd = null
+                                    continue
+                                if AstNode.kind_of(rd) = KindClassDeclaration
+                                    this.related_info_since(related_mark, rd, DiagConsider_adding_a_declare_modifier_to_this_class)
+                            }
                         }
                     }
                 }
@@ -119102,7 +119428,9 @@ define Checker
                 return
             if compatible
                 continue
+            let related_mark this.diagnostic_mark()
             this.error_on_node(signature.declaration, DiagThis_overload_signature_is_not_compatible_with_its_implementation_signature)
+            this.related_info_since(related_mark, bd, DiagThe_implementation_signature_is_declared_here)
             return
         }
     }
@@ -120904,9 +121232,21 @@ define Checker
                 continue
             if Symbol.reference_kinds_of(symbol as ref[Symbol]) <> 0
                 continue
-            if Checker.walk_up_binding_elements_and_patterns(nd) = null
+            let wrapping Checker.walk_up_binding_elements_and_patterns(nd)
+            if wrapping = null
                 continue
-            this.error_on_node(AstNode.name_of(nd), DiagX_0_is_an_unused_renaming_of_1_Did_you_intend_to_use_it_as_a_type_annotation, this.declaration_name_to_string(AstNode.name_of(nd)), this.declaration_name_to_string(AstNode.property_name_of(nd)))
+            let property_name_text this.declaration_name_to_string(AstNode.property_name_of(nd))
+            let renaming_mark this.diagnostic_mark()
+            this.error_on_node(AstNode.name_of(nd), DiagX_0_is_an_unused_renaming_of_1_Did_you_intend_to_use_it_as_a_type_annotation, this.declaration_name_to_string(AstNode.name_of(nd)), property_name_text)
+            let wd wrapping as ref[AstNode]
+            if (AstNode.type_of(wd) = null) and (this.diagnostic_mark() > renaming_mark)
+            {
+                ; the entire parameter has no annotation: an empty span at its end
+                let args this.message_args()
+                args.add(property_name_text)
+                let dl diagnostics as ref[DiagnosticList]
+                dl.add_related_at(renaming_mark, Checker.source_file_of_node(wd), AstNode.end_of(wd), AstNode.end_of(wd), DiagWe_can_only_write_a_type_for_0_by_adding_a_type_for_the_entire_parameter_here, args)
+            }
         }
     }
 
@@ -122461,15 +122801,44 @@ define Checker
                 set is_non_simple: true
             if AstNode.dot_dot_dot_token_of(parameter) <> null
                 set is_non_simple: true
+            if Checker.is_rest_parameter(parameter as ref[AstNode])
+                set is_non_simple: true
             if is_non_simple
             {
                 set non_simple: non_simple + 1
+                let parameter_mark this.diagnostic_mark()
                 this.error_on_node(parameter, DiagThis_parameter_is_not_allowed_with_use_strict_directive)
+                this.related_info_since(parameter_mark, use_strict_directive, DiagX_use_strict_directive_used_here)
             }
         }
         if non_simple = 0
             return false
+        let directive_mark this.diagnostic_mark()
         this.error_on_node(use_strict_directive, DiagX_use_strict_directive_cannot_be_used_with_non_simple_parameter_list)
+        var index 0
+        var j 0
+        while j < n
+        {
+            let parameter AstNode.child_in_list(parameters, j)
+            set j: j + 1
+            var is_non_simple false
+            if AstNode.initializer_of(parameter) <> null
+                set is_non_simple: true
+            if AstNode.is_binding_pattern(AstNode.name_of(parameter))
+                set is_non_simple: true
+            if AstNode.dot_dot_dot_token_of(parameter) <> null
+                set is_non_simple: true
+            if Checker.is_rest_parameter(parameter as ref[AstNode])
+                set is_non_simple: true
+            if is_non_simple
+            {
+                if index = 0
+                    this.related_info_since(directive_mark, parameter, DiagNon_simple_parameter_declared_here)
+                else
+                    this.related_info_since(directive_mark, parameter, DiagX_and_here)
+                set index: index + 1
+            }
+        }
         true
     }
 
@@ -123783,7 +124152,12 @@ define Checker
                         ; to the diagnostic, which ast.NewDiagnostic keeps on the
                         ; diagnostic rather than in the list, so it never reaches
                         ; a dump. What is left is grammarErrorOnNode exactly.
-                        return this.grammar_error_on_node(modifier, DiagDecorators_may_not_appear_after_export_or_export_default_if_they_also_appear_before_export)
+                        if this.has_parse_diagnostics()
+                            return false
+                        let decorator_mark this.diagnostic_mark()
+                        this.error_on_node(modifier, DiagDecorators_may_not_appear_after_export_or_export_default_if_they_also_appear_before_export)
+                        this.related_info_since(decorator_mark, first_decorator, DiagDecorator_used_before_export_here)
+                        return true
                     }
                 }
 
@@ -131507,6 +131881,14 @@ define Checker
             }
             let prop_name this.symbol_arg(unmatched)
             this.report_error(DiagProperty_0_is_missing_in_type_1_but_required_in_type_2, source, target, prop_name, source_type, target_type)
+            let unmatched_symbol unmatched as ref[Symbol]
+            let first_declaration Symbol.declaration_at(unmatched_symbol, 0)
+            if first_declaration <> null
+            {
+                let related_args this.message_args()
+                related_args.add(prop_name)
+                this.relater_related_info(first_declaration, DiagX_0_is_declared_here, related_args)
+            }
             return
         }
         if this.try_elaborate_array_like_errors(source, target) = false
@@ -134716,10 +135098,28 @@ define Checker
             }
         }
         this.report_relation_error(rep_source, rep_target, relation)
-        ; The `might need an extends` related info: a TYPE PARAMETER source with a
-        ; declaration and no constraint. It is RELATED INFO, attached to the
-        ; diagnostic rather than appended to the list, so it never reaches a
-        ; `D <pos> <end> <code>` line — named here rather than silently skipped.
+        ; the `might need an extends` related info: a TYPE PARAMETER source with a
+        ; declaration and no constraint
+        if ((rep_source.flags & TypeFlagsTypeParameter) = 0) or (rep_source.symbol = null)
+            return
+        let first_declaration Symbol.declaration_at(rep_source.symbol as ref[Symbol], 0)
+        if first_declaration = null
+            return
+        let extends_mark this.unported_mark()
+        let constraint this.get_constraint_of_type(rep_source)
+        if (this.unported_mark() <> extends_mark) or (constraint <> null)
+            return
+        let synthetic this.clone_type_parameter(rep_source)
+        let instantiated this.instantiate_type(rep_target, this.new_simple_type_mapper(rep_source, synthetic))
+        if (this.unported_mark() <> extends_mark) or (instantiated = null)
+            return
+        Checker.set_type_parameter_constraint(synthetic, instantiated as ref[Type])
+        let non_circular this.has_non_circular_base_constraint(synthetic)
+        if (this.unported_mark() <> extends_mark) or (non_circular = false)
+            return
+        let related_args this.message_args()
+        related_args.add(this.type_arg(rep_target))
+        this.relater_related_info(first_declaration, DiagThis_type_parameter_might_need_an_extends_0_constraint, related_args)
     }
 
     ; tryElaborateArrayLikeErrors' report half — the two `if reportErrors` blocks
@@ -134919,7 +135319,10 @@ define Checker
         var d 1
         if rel_error_chain <> null
             set d: (rel_error_chain as ref[ErrorChain]).depth + 1
-        let e &ErrorChain^host(rel_error_chain, code, arg_source, arg_target, d, args)
+        var inherited: ref[RelatedNode]? null
+        if rel_error_chain <> null
+            set inherited: (rel_error_chain as ref[ErrorChain]).related
+        let e &ErrorChain^host(rel_error_chain, code, arg_source, arg_target, d, args, inherited)
         set rel_error_chain: e
     }
 
@@ -135003,6 +135406,45 @@ define Checker
     ; day one of them is written the elision is not a line anybody would think to
     ; add, and a head that must not be printed is a WRONG CODE rather than a missing
     ; one.
+    ; `r.relatedInfo = append(r.relatedInfo, createDiagnosticForNode(n, code, args))`
+    procedure relater_related_info(this, n: ref[AstNode]?, code: int, args: ref[Array[String]]?)
+    {
+        if (n = null) or (rel_error_chain = null)
+            return
+        var start 0
+        var stop 0
+        if this.related_range_of(n as ref[AstNode], &start, &stop) = false
+            return
+        let head rel_error_chain as ref[ErrorChain]
+        let h host
+        let copied DiagnosticList.copy_args(h, args)
+        set head.related: &RelatedNode^h(head.related, Checker.source_file_of_node(n), start, stop, code, copied)
+    }
+
+    ; the relatedInfo list onto the diagnostic at `index`, oldest first
+    procedure attach_related_nodes(this, index: int, list: ref[RelatedNode]?)
+    {
+        if list = null
+            return
+        let h host
+        let ordered &Array[ref[RelatedNode]]^h()
+        var e list
+        while e <> null
+        {
+            let n e as ref[RelatedNode]
+            ordered.add(n)
+            set e: n.next
+        }
+        let dl diagnostics as ref[DiagnosticList]
+        var i (ordered.get_length() as int) - 1
+        while i >= 0
+        {
+            let n ordered[i as size_t]
+            dl.add_related_at(index, n.file, n.pos, n.end, n.code, n.args)
+            set i: i - 1
+        }
+    }
+
     procedure emit_error_chain(this)
     {
         var e rel_error_chain
@@ -135018,6 +135460,7 @@ define Checker
                 this.error_on_node_with(rel_error_node, n.code, n.args)
                 if dl.length() > before
                 {
+                    this.attach_related_nodes(before, (rel_error_chain as ref[ErrorChain]).related)
                     var level 1
                     var rest n.next
                     while rest <> null
@@ -135830,8 +136273,15 @@ define Checker
         ; the reference passes `headMessage` here too and then keeps the resulting
         ; diagnostic: `reportDiagnostic(diags[0].AddRelatedInfo(…))`. Only the
         ; related info is dropped. `false` here means it reported.
+        let call_mark this.diagnostic_mark()
         if this.check_type_related_to_ex(source, target, relation, node, head_code) = false
+        {
+            var call_code DiagDid_you_mean_to_call_this_expression
+            if kind = SignatureKindConstruct
+                set call_code: DiagDid_you_mean_to_use_new_with_this_expression
+            this.related_info_at(call_mark, node, call_code, null)
             return true
+        }
         false
     }
 
@@ -136093,12 +136543,14 @@ define Checker
                 return false
             set specific_source: checked as ref[Type]
         }
+        let element_mark this.diagnostic_mark()
         ; "Use the custom diagnostic factory if provided (e.g., for JSX text
         ; children with dynamic error messages)" — and it comes FIRST, ahead of the
         ; exactOptional fork and of the general report below.
         if text_child_code <> 0
         {
             this.error_on_node_with(prop, text_child_code, text_child_args)
+            this.elaborate_element_related_info(element_mark, source, target, name_type)
             return true
         }
         ; The exactOptionalPropertyTypes fork — its own message, and the option is
@@ -136108,6 +136560,7 @@ define Checker
             if this.is_exact_optional_property_mismatch(specific_source, tpt)
             {
                 this.error_on_node(prop, DiagType_0_is_not_assignable_to_type_1_with_exactOptionalPropertyTypes_Colon_true_Consider_adding_undefined_to_the_type_of_the_target)
+                this.elaborate_element_related_info(element_mark, source, target, name_type)
                 return true
             }
             if this.unported_mark() <> mark
@@ -136170,7 +136623,74 @@ define Checker
                     set reported: true
             }
         }
+        if reported
+            this.elaborate_element_related_info(element_mark, source, target, name_type)
         reported
+    }
+
+    ; elaborateElement's related information on the diagnostic it reported: the
+    ; index signature, else the property (or the type) the expected type comes from,
+    ; neither from a default library file
+    procedure elaborate_element_related_info(this, element_mark: int, source: ref[Type], target: ref[Type], name_type: ref[Type])
+    {
+        let dl diagnostics as ref[DiagnosticList]
+        if dl.length() <= element_mark
+            return
+        let index element_mark
+        let mark this.unported_mark()
+        var property_name: Slice[char] ""
+        var target_prop: ref[Symbol]? null
+        if Checker.is_type_usable_as_property_name(name_type)
+        {
+            var name_buf u8[64]
+            let name_data this.get_property_name_from_index(name_type, null, Slice[char](64 as size_t, &name_buf[0] as pointer[char]))
+            if this.unported_mark() <> mark
+                return
+            if name_data.data <> null
+            {
+                set property_name: this.copy_name_to_page(name_data)
+                set target_prop: this.get_property_of_type(target, property_name)
+                if this.unported_mark() <> mark
+                    return
+            }
+        }
+        var issued false
+        if target_prop = null
+        {
+            let info this.get_applicable_index_info(target, name_type)
+            if this.unported_mark() <> mark
+                return
+            if info <> null
+            {
+                let decl (info as ref[IndexInfo]).declaration
+                if decl <> null
+                {
+                    if this.node_is_in_lib(decl as ref[AstNode]) = false
+                    {
+                        set issued: true
+                        this.related_info_at(index, decl, DiagThe_expected_type_comes_from_this_index_signature, null)
+                    }
+                }
+            }
+        }
+        if issued
+            return
+        var target_node: ref[AstNode]? null
+        if target_prop <> null
+            set target_node: Symbol.declaration_at(target_prop as ref[Symbol], 0)
+        if (target_node = null) and (target.symbol <> null)
+            set target_node: Symbol.declaration_at(target.symbol as ref[Symbol], 0)
+        if target_node = null
+            return
+        var name_arg Checker.arg_text(property_name)
+        if ((property_name.length as int) = 0) or ((name_type.flags & TypeFlagsUniqueESSymbol) <> 0)
+            set name_arg: this.type_arg(name_type)
+        if this.node_is_in_lib(target_node as ref[AstNode])
+            return
+        let args this.message_args()
+        args.add(name_arg)
+        args.add(this.type_arg(target))
+        this.related_info_at(index, target_node, DiagThe_expected_type_comes_from_property_0_which_is_declared_here_on_type_1, args)
     }
 
     ; getBestMatchIndexedAccessTypeOrUndefined — the target property's type, and
@@ -136316,7 +136836,26 @@ define Checker
         if this.unported_mark() <> mark
             return false
         ; The tail: report on the return expression itself.
-        this.check_type_related_to(sr, tr, relation, body) = false
+        let arrow_mark this.diagnostic_mark()
+        let failed this.check_type_related_to(sr, tr, relation, body) = false
+        if (failed = false) or (this.diagnostic_mark() <= arrow_mark)
+            return failed
+        if target.symbol <> null
+            this.related_info_at(arrow_mark, Symbol.declaration_at(target.symbol as ref[Symbol], 0), DiagThe_expected_type_comes_from_the_return_type_of_this_signature, null)
+        if (b.get_function_flags(node) & FunctionFlagsAsync) = 0
+        {
+            let then_type this.get_type_of_property_of_type(sr, "then")
+            if (this.unported_mark() = mark) and (then_type = null)
+            {
+                let promise this.create_promise_type(sr)
+                if (this.unported_mark() = mark) and (promise <> null)
+                {
+                    if this.check_type_related_to(promise as ref[Type], tr, relation, null)
+                        this.related_info_at(arrow_mark, node, DiagDid_you_mean_to_mark_this_function_as_async, null)
+                }
+            }
+        }
+        failed
     }
 
     ; elaborateError, whole.
@@ -140424,7 +140963,15 @@ define Checker
         if absolute_min_arg_count <= max_param_count
             return true
         if report_errors
+        {
+            let tag_mark this.diagnostic_mark()
             this.error_on_node(tn, DiagTag_0_expects_at_least_1_arguments_but_the_JSX_factory_2_provides_at_most_3, this.entity_name_arg(tn), Checker.arg_int(absolute_min_arg_count), this.synthesized_entity_name_arg(factory as ref[AstNode]), Checker.arg_int(max_param_count))
+            let tag_name_symbol this.get_symbol_at_location(tn, false)
+            if this.unported_mark() <> mark
+                return true
+            if tag_name_symbol <> null
+                this.related_info_since(tag_mark, Symbol.value_declaration_of(tag_name_symbol as ref[Symbol]), DiagX_0_is_declared_here, this.entity_name_arg(tn))
+        }
         false
     }
 
@@ -149392,10 +149939,20 @@ define Checker
     ; parameter is taken, named and not read, because dropping it would make the
     ; two callers look as though they had asked a simpler question.
     procedure error_and_maybe_suggest_await(this, location: ref[AstNode]?, maybe_missing_await: bool, code: int)
+    {
+        let await_mark this.diagnostic_mark()
         this.error_on_node(location, code)
+        if maybe_missing_await
+            this.related_info_since(await_mark, location, DiagDid_you_forget_to_use_await)
+    }
 
     procedure error_and_maybe_suggest_await(this, location: ref[AstNode]?, maybe_missing_await: bool, code: int, a0: String)
+    {
+        let await_mark this.diagnostic_mark()
         this.error_on_node(location, code, a0)
+        if maybe_missing_await
+            this.related_info_since(await_mark, location, DiagDid_you_forget_to_use_await)
+    }
 
     ; reportTypeNotIterableError, whole.
     ;
@@ -151294,7 +151851,14 @@ define Checker
                         var async_msg DiagX_await_using_statements_are_only_allowed_within_async_functions_and_at_the_top_levels_of_modules
                         if is_await_expression
                             set async_msg: DiagX_await_expressions_are_only_allowed_within_async_functions_and_at_the_top_levels_of_modules
+                        let async_mark this.diagnostic_mark()
                         this.grammar_error_on_first_token(node, async_msg)
+                        if container <> null
+                        {
+                            let ct container as ref[AstNode]
+                            if (AstNode.kind_of(ct) <> KindConstructor) and (b.has_syntactic_modifier(ct, ModifierFlagsAsync) = false)
+                                this.related_info_since(async_mark, ct, DiagDid_you_mean_to_mark_this_function_as_async)
+                        }
                         set has_error: true
                     }
                 }
@@ -151643,4 +152207,121 @@ define Checker
 
     procedure append_global_diagnostic_chain_at(c: ref[Checker], i: int, out: ref[StringBuilder])
         c.global_diagnostic_list.append_chain_lines_at(i, out)
+
+    ; the i-th diagnostic's related information, one `L` line each (its file's name)
+    procedure append_diagnostic_related_at(c: ref[Checker], i: int, out: ref[StringBuilder])
+        c.append_related_lines(c.diagnostics as ref[DiagnosticList], i, out)
+
+    procedure append_global_diagnostic_related_at(c: ref[Checker], i: int, out: ref[StringBuilder])
+        c.append_related_lines(c.global_diagnostic_list, i, out)
+
+    procedure append_related_lines(this, list: ref[DiagnosticList], i: int, out: ref[StringBuilder])
+    {
+        let r list.related_at(i)
+        if r = null
+            return
+        let infos r as ref[Array[RelatedInfo]]
+        var k 0
+        while k < (infos.get_length() as int)
+        {
+            let info infos[k as size_t]
+            set k: k + 1
+            var path: Slice[char] ""
+            if info.file <> null
+            {
+                ; the program's own name for its file (a program unit's binder keeps a
+                ; name its loader does not pin); a lib's binder name otherwise
+                var index 0 - 1
+                if program <> null
+                    set index: (program as ref[ProgramFiles]).index_of_file(info.file)
+                if index >= 0
+                    set path: (program as ref[ProgramFiles]).path_at(index)
+                else
+                {
+                    let fb this.binder_of_node(info.file)
+                    set path: fb.file_name
+                }
+            }
+            DiagnosticList.append_related_line(info, path, out)
+        }
+    }
+
+    ; createDiagnosticForNode's range in the node's own file, a lib file's included
+    function related_range_of(this, n: ref[AstNode], out_start: ref[int], out_end: ref[int]) returns bool
+    {
+        if this.program_index_of_node(n) < 0
+        {
+            if this.node_is_in_lib(n)
+                return this.binder_of_node(n).error_range_for_node(null, n, out_start, out_end)
+        }
+        this.error_range_in_own_file(n, out_start, out_end)
+    }
+
+    ; AddRelatedInfo(createDiagnosticForNode(node, code, args)) on the entry at `index`
+    procedure related_info_at(this, index: int, n: ref[AstNode]?, code: int, args: ref[Array[String]]?)
+    {
+        let list diagnostics as ref[DiagnosticList]
+        if (n = null) or (index < 0) or (index >= list.length())
+            return
+        var start 0
+        var stop 0
+        if this.related_range_of(n as ref[AstNode], &start, &stop) = false
+            return
+        list.add_related_at(index, Checker.source_file_of_node(n), start, stop, code, args)
+    }
+
+    ; addTypeOnlyDeclarationRelatedInfo on the diagnostic reported since `mark`
+    procedure add_type_only_declaration_related_info(this, mark: int, type_only_declaration: ref[AstNode]?, name: String)
+    {
+        if type_only_declaration = null
+            return
+        let k AstNode.kind_of(type_only_declaration)
+        var code DiagX_0_was_imported_here
+        if (k = KindExportSpecifier) or (k = KindExportDeclaration) or (k = KindNamespaceExport)
+            set code: DiagX_0_was_exported_here
+        this.related_info_since(mark, type_only_declaration, code, name)
+    }
+
+    function message_args1(this, a0: String) returns ref[Array[String]]
+    {
+        let args this.message_args()
+        args.add(a0)
+        args
+    }
+
+    ; the diagnostic count before a report, for related_info_since
+    function diagnostic_mark(this) returns int
+        (diagnostics as ref[DiagnosticList]).length()
+
+    ; AddRelatedInfo(createDiagnosticForNode(node, code, args)) on the diagnostic the
+    ; report since `mark` added (nothing when it added none)
+    procedure related_info_since(this, mark: int, n: ref[AstNode]?, code: int, args: ref[Array[String]]?)
+    {
+        let list diagnostics as ref[DiagnosticList]
+        if (n = null) or (list.length() <= mark)
+            return
+        var start 0
+        var stop 0
+        if this.related_range_of(n as ref[AstNode], &start, &stop) = false
+            return
+        list.add_related_at(list.length() - 1, Checker.source_file_of_node(n), start, stop, code, args)
+    }
+
+    procedure related_info_since(this, mark: int, n: ref[AstNode]?, code: int)
+        this.related_info_since(mark, n, code, null)
+
+    procedure related_info_since(this, mark: int, n: ref[AstNode]?, code: int, a0: String)
+    {
+        let args this.message_args()
+        args.add(a0)
+        this.related_info_since(mark, n, code, args)
+    }
+
+    procedure related_info_since(this, mark: int, n: ref[AstNode]?, code: int, a0: String, a1: String)
+    {
+        let args this.message_args()
+        args.add(a0)
+        args.add(a1)
+        this.related_info_since(mark, n, code, args)
+    }
 }

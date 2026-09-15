@@ -149,6 +149,22 @@ SOURCES = [
     os.path.join(SUB, "internal/transformers/declarations/transform.go"),
     os.path.join(SUB, "internal/transformers/declarations/tracker.go"),
     os.path.join(SUB, "internal/transformers/declarations/diagnostics.go"),
+    # Phase (b)2, the driver: the command line (its parser, the did-you-mean tables,
+    # the option declarations' help texts), internal/execute's compilation and build
+    # paths, and the diagnostic writer's summary.
+    os.path.join(SUB, "internal/tsoptions/commandlineparser.go"),
+    os.path.join(SUB, "internal/tsoptions/diagnostics.go"),
+    os.path.join(SUB, "internal/tsoptions/parsedcommandline.go"),
+    os.path.join(SUB, "internal/execute/tsc.go"),
+    os.path.join(SUB, "internal/execute/tsc/help.go"),
+    os.path.join(SUB, "internal/execute/tsc/init.go"),
+    os.path.join(SUB, "internal/execute/tsc/emit.go"),
+    os.path.join(SUB, "internal/execute/tsc/statistics.go"),
+    os.path.join(SUB, "internal/execute/watcher.go"),
+    os.path.join(SUB, "internal/execute/build/orchestrator.go"),
+    os.path.join(SUB, "internal/execute/build/buildtask.go"),
+    os.path.join(SUB, "internal/execute/incremental/program.go"),
+    os.path.join(SUB, "internal/diagnosticwriter/diagnosticwriter.go"),
 ]
 DST = os.path.join(REPO, "packages/tscaly/0.1.0/tscaly/DiagnosticCodes.scaly")
 
@@ -189,6 +205,8 @@ def main():
     # suggestion it reports), which is the same class as `Message` above: a name in
     # this package that is not a message. The set is narrow and named rather than a
     # pattern that could swallow a real miss.
+    # the driver's help and writer name the TYPE `diagnostics.Category` as well
+    used.discard("Category")
     for category in ("CategoryError", "CategoryWarning", "CategorySuggestion",
                      "CategoryMessage"):
         used.discard(category)

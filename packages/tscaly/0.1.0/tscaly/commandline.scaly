@@ -1,0 +1,618 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; commandline — tsoptions/commandlineparser.go: ParseCommandLine and
+; ParseBuildCommandLine (phase (b)2).
+;
+; ★ The parser's option map (`parser.options`, an ordered map of name to a Go value)
+; is a TsOptions of JsonValues here, in insertion order and WITHOUT the zero-unsetting
+; `TsOptions.put` does for a converted CompilerOptions: the raw map keeps an explicit
+; `null` and an empty list, and showConfig and `--init` print it as it stands. The
+; converted options go through convertToOptionsWithAbsolutePaths and
+; ParseCompilerOptions (`TsConfigParser.parse_compiler_option`), the tsconfig path's
+; own conversion.
+;
+; ★ A declaration is (table, index): the compiler options (TsOptionDecls, the last
+; declaration of a name winning as the reference's name map does), the watch options
+; and the build options.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use tscaly.program.JsonValue
+use tscaly.tsoptions.TsOptions
+use tscaly.tsoptions.TsConfigParser
+use tscaly.tsoptions.TsGlobPattern
+use tscaly.TsOptionDecls.TsOptionDecls
+use tscaly.diagnosticwriter.DriverDiagnostic
+use tscaly.system.ExecSystem
+
+define OptionTableCompiler: int 0
+define OptionTableWatch: int 1
+define OptionTableBuild: int 2
+
+; the parser's diagnostics sets (ParseCommandLineWorkerDiagnostics)
+define ParseModeCompiler: int 0
+define ParseModeBuild: int 1
+
+define ParsedCommandLine
+(
+    ; parser.options, as parsed
+    raw: ref[TsOptions]
+    ; the CompilerOptions (tsc) or the build command's compiler options
+    options: ref[TsOptions]
+    ; the file names (tsc) or the projects (-b)
+    file_names: ref[Array[Slice[char]]]
+    errors: ref[Array[ref[DriverDiagnostic]]]
+)
+
+define CommandLine (reserved: int)
+{
+    ; ── the declarations ─────────────────────────────────────────────────────
+
+    function table_count(table: int) returns int
+    {
+        if table = OptionTableWatch
+            return TsOptionDecls.watch_count()
+        if table = OptionTableBuild
+            return TsOptionDecls.build_count()
+        var n 0
+        while (TsOptionDecls.name_of(n).length as int) > 0
+            set n: n + 1
+        n
+    }
+
+    function decl_name(table: int, i: int) returns Slice[char]
+    {
+        if table = OptionTableWatch
+            return TsOptionDecls.watch_name_of(i)
+        if table = OptionTableBuild
+            return TsOptionDecls.build_name_of(i)
+        TsOptionDecls.name_of(i)
+    }
+
+    function decl_short(table: int, i: int) returns Slice[char]
+    {
+        if table = OptionTableWatch
+            return TsOptionDecls.watch_short_name_of(i)
+        if table = OptionTableBuild
+            return TsOptionDecls.build_short_name_of(i)
+        TsOptionDecls.short_name_of(i)
+    }
+
+    function decl_kind(table: int, i: int) returns int
+    {
+        if table = OptionTableWatch
+            return TsOptionDecls.watch_kind_of(i)
+        if table = OptionTableBuild
+            return TsOptionDecls.build_kind_of(i)
+        TsOptionDecls.kind_of(i)
+    }
+
+    ; CommandLineOption.Elements().Kind: the watch lists are lists of strings
+    function decl_element_kind(table: int, i: int) returns int
+    {
+        if table = OptionTableCompiler
+            return TsOptionDecls.element_kind_of(i)
+        TsOptionKindString
+    }
+
+    function decl_tsconfig_only(table: int, i: int) returns bool
+    {
+        if table = OptionTableWatch
+            return TsOptionDecls.watch_is_tsconfig_only(i)
+        if table = OptionTableBuild
+            return TsOptionDecls.build_is_tsconfig_only(i)
+        TsOptionDecls.is_tsconfig_only(i)
+    }
+
+    function decl_min_value(table: int, i: int) returns int
+    {
+        if table = OptionTableWatch
+            return TsOptionDecls.watch_min_value_of(i)
+        if table = OptionTableBuild
+            return TsOptionDecls.build_min_value_of(i)
+        TsOptionDecls.min_value_of(i)
+    }
+
+    ; NameMap.GetOptionDeclarationFromName: the short name first, then the name
+    ; without regard to case, the LAST declaration of a name winning
+    function find_decl(table: int, name: Slice[char], allow_short: bool) returns int
+    {
+        let n CommandLine.table_count(table)
+        var lookup name
+        if allow_short
+        {
+            var i 0
+            while i < n
+            {
+                let short CommandLine.decl_short(table, i)
+                if ((short.length as int) > 0) and TsGlobPattern.equal_fold(short, name)
+                    set lookup: CommandLine.decl_name(table, i)
+                set i: i + 1
+            }
+        }
+        var found 0 - 1
+        var k 0
+        while k < n
+        {
+            if TsGlobPattern.equal_fold(CommandLine.decl_name(table, k), lookup)
+                set found: k
+            set k: k + 1
+        }
+        found
+    }
+
+    ; ── values ───────────────────────────────────────────────────────────────
+
+    function value(host: ref[Page], kind: int, text: Slice[char], truth: bool) returns ref[JsonValue]
+        &JsonValue^host(kind, ExecSystem.copy(host, text), truth, null, null)
+
+    function list_value(host: ref[Page]) returns ref[JsonValue]
+        &JsonValue^host(JsonKindArray, null, false, null, &Array[ref[JsonValue]?]^host())
+
+    ; `p.options.Set(name, value)` on the ordered map: replaced in place, else appended
+    procedure raw_set(host: ref[Page], raw: ref[TsOptions], name: Slice[char], v: ref[JsonValue])
+    {
+        let i raw.index_of_name(name)
+        let vals raw.values
+        if i >= 0
+        {
+            vals.put(i as size_t, v)
+            return
+        }
+        let names raw.names
+        names.add(ExecSystem.copy(host, name))
+        vals.add(v)
+    }
+
+    function args1(host: ref[Page], a0: Slice[char]) returns ref[Array[String]]
+    {
+        let a &Array[String]^host()
+        let c0 String^host(a0.data as pointer[const_char], a0.length)
+        a.add(c0)
+        a
+    }
+
+    function args2(host: ref[Page], a0: Slice[char], a1: String) returns ref[Array[String]]
+    {
+        let a &Array[String]^host()
+        let c0 String^host(a0.data as pointer[const_char], a0.length)
+        a.add(c0)
+        let c1 String^host(a1)
+        a.add(c1)
+        a
+    }
+
+    ; ast.NewCompilerDiagnostic
+    procedure error(host: ref[Page], errors: ref[Array[ref[DriverDiagnostic]]], code: int, args: ref[Array[String]]?)
+    {
+        let none: Slice[char] ""
+        errors.add(&DriverDiagnostic^host(none, none, 0, 0, code, args, null, null))
+    }
+
+    ; createDiagnosticForInvalidEnumType
+    procedure invalid_enum(host: ref[Page], errors: ref[Array[ref[DriverDiagnostic]]], i: int)
+    {
+        var name StringBuilder()
+        name.append("--")
+        let n TsOptionDecls.name_of(i)
+        name.append(n.data, n.length)
+        let name_text name.to_string()
+        let keys TsOptionDecls.enum_keys_text(i)
+        let a &Array[String]^host()
+        let c0 String^host(name_text)
+        a.add(c0)
+        let c1 String^host(keys.data as pointer[const_char], keys.length)
+        a.add(c1)
+        CommandLine.error(host, errors, DiagArgument_for_0_option_must_be_Colon_1, a)
+    }
+
+    ; convertJsonOptionOfEnumType: the value of a known key, null for an empty text
+    ; or an option without a map, an error for an unknown key
+    procedure enum_value(host: ref[Page], table: int, i: int, text: Slice[char], errors: ref[Array[ref[DriverDiagnostic]]]) returns ref[JsonValue]
+    {
+        let trimmed CommandLine.trim(text)
+        if (trimmed.length as int) = 0
+            return CommandLine.value(host, JsonKindNull, "", false)
+        if table <> OptionTableCompiler
+            return CommandLine.value(host, JsonKindNull, "", false)
+        let v TsOptionDecls.enum_value(i, TsConfigParser.to_lower(host, trimmed))
+        if (v.length as int) = 0
+        {
+            CommandLine.invalid_enum(host, errors, i)
+            return CommandLine.value(host, JsonKindNull, "", false)
+        }
+        CommandLine.value(host, JsonKindString, v, false)
+    }
+
+    function byte_at(s: Slice[char], i: int) returns int
+        (*(s.data + i) as int) & 255
+
+    ; strings.TrimSpace over ASCII white space
+    function trim(s: Slice[char]) returns Slice[char]
+    {
+        var start 0
+        var stop s.length as int
+        while (start < stop) and CommandLine.is_space(CommandLine.byte_at(s, start))
+            set start: start + 1
+        while (stop > start) and CommandLine.is_space(CommandLine.byte_at(s, stop - 1))
+            set stop: stop - 1
+        s.subslice(start as size_t, stop as size_t)
+    }
+
+    function is_space(c: int) returns bool
+        (c = 32) or (c = 9) or (c = 10) or (c = 13) or (c = 11) or (c = 12)
+
+    ; ParseListTypeOption → the list; the errors go to `errors`
+    procedure parse_list(host: ref[Page], table: int, i: int, text: Slice[char], errors: ref[Array[ref[DriverDiagnostic]]]) returns ref[JsonValue]
+    {
+        let out CommandLine.list_value(host)
+        let vals out.values as ref[Array[ref[JsonValue]?]]
+        let value CommandLine.trim(text)
+        if value.starts_with("-")
+            return out
+        if (value.length as int) = 0
+            return out
+        let element_kind CommandLine.decl_element_kind(table, i)
+        var start 0
+        var p 0
+        let n value.length as int
+        while p <= n
+        {
+            var at_end p = n
+            var comma false
+            if at_end = false
+                set comma: CommandLine.byte_at(value, p) = 44
+            if at_end or comma
+            {
+                let piece value.subslice(start as size_t, p as size_t)
+                if element_kind = TsOptionKindString
+                {
+                    if (piece.length as int) > 0
+                        vals.add(CommandLine.value(host, JsonKindString, piece, false))
+                }
+                else
+                {
+                    let converted CommandLine.enum_value(host, table, i, piece, errors)
+                    if (converted.kind = JsonKindString) and ((converted.text.length as int) > 0)
+                        vals.add(converted)
+                }
+                set start: p + 1
+            }
+            set p: p + 1
+        }
+        out
+    }
+
+    ; getCompilerOptionValueTypeString
+    function type_string(table: int, i: int) returns String
+        TsConfigParser.option_type_text(CommandLine.decl_kind(table, i), CommandLine.decl_element_kind(table, i))
+
+    ; parseOptionValue → the index past the value
+    procedure parse_option_value(host: ref[Page], sys: ref[ExecSystem], args: ref[Array[Slice[char]]], i_in: int, table: int, d: int, mismatch_code: int, raw: ref[TsOptions], errors: ref[Array[ref[DriverDiagnostic]]]) returns int
+    {
+        var i i_in
+        let n args.get_length() as int
+        let name CommandLine.decl_name(table, d)
+        let kind CommandLine.decl_kind(table, d)
+        if CommandLine.decl_tsconfig_only(table, d) and (i <= n)
+        {
+            var opt_value: Slice[char] ""
+            if i < n
+                set opt_value: args[i as size_t]
+            if opt_value.equals("null")
+            {
+                CommandLine.raw_set(host, raw, name, CommandLine.value(host, JsonKindNull, "", false))
+                return i + 1
+            }
+            if kind = TsOptionKindBoolean
+            {
+                if opt_value.equals("false")
+                {
+                    CommandLine.raw_set(host, raw, name, CommandLine.value(host, JsonKindBoolean, "", false))
+                    return i + 1
+                }
+                if opt_value.equals("true")
+                    set i: i + 1
+                CommandLine.error(host, errors, DiagOption_0_can_only_be_specified_in_tsconfig_json_file_or_set_to_false_or_null_on_command_line, CommandLine.args1(host, name))
+                return i
+            }
+            CommandLine.error(host, errors, DiagOption_0_can_only_be_specified_in_tsconfig_json_file_or_set_to_null_on_command_line, CommandLine.args1(host, name))
+            if ((opt_value.length as int) <> 0) and (opt_value.starts_with("-") = false)
+                set i: i + 1
+            return i
+        }
+        if i >= n
+        {
+            if kind <> TsOptionKindBoolean
+            {
+                CommandLine.error(host, errors, mismatch_code, CommandLine.args2(host, name, CommandLine.type_string(table, d)))
+                if kind = TsOptionKindList
+                    CommandLine.raw_set(host, raw, name, CommandLine.list_value(host))
+                else
+                {
+                    if kind = TsOptionKindEnum
+                        CommandLine.invalid_enum(host, errors, d)
+                }
+            }
+            else
+                CommandLine.raw_set(host, raw, name, CommandLine.value(host, JsonKindBoolean, "", true))
+            return i
+        }
+        let arg args[i as size_t]
+        if arg.equals("null")
+        {
+            CommandLine.raw_set(host, raw, name, CommandLine.value(host, JsonKindNull, "", false))
+            return i + 1
+        }
+        if kind = TsOptionKindNumber
+        {
+            var ok (arg.length as int) > 0
+            var num 0
+            var p 0
+            var negative false
+            if ok and (CommandLine.byte_at(arg, 0) = 45)
+            {
+                set negative: true
+                set p: 1
+                set ok: (arg.length as int) > 1
+            }
+            if ok and (CommandLine.byte_at(arg, 0) = 43)
+            {
+                set p: 1
+                set ok: (arg.length as int) > 1
+            }
+            while ok and (p < (arg.length as int))
+            {
+                let c CommandLine.byte_at(arg, p)
+                if (c < 48) or (c > 57)
+                    set ok: false
+                else
+                    set num: num * 10 + (c - 48)
+                set p: p + 1
+            }
+            if negative
+                set num: 0 - num
+            if ok
+            {
+                let min CommandLine.decl_min_value(table, d)
+                if num >= min
+                {
+                    var text StringBuilder()
+                    text.append(num)
+                    let t text.to_string()
+                    CommandLine.raw_set(host, raw, name, CommandLine.value(host, JsonKindNumber, Slice[char](t.get_length(), t.get_buffer() as pointer[char]), false))
+                }
+                else
+                {
+                    var min_text StringBuilder()
+                    min_text.append(min)
+                    CommandLine.error(host, errors, DiagOption_0_requires_value_to_be_greater_than_1, CommandLine.args2(host, name, min_text.to_string()))
+                }
+            }
+            else
+                CommandLine.error(host, errors, mismatch_code, CommandLine.args2(host, name, String("number")))
+            return i + 1
+        }
+        if kind = TsOptionKindBoolean
+        {
+            CommandLine.raw_set(host, raw, name, CommandLine.value(host, JsonKindBoolean, "", arg.equals("false") = false))
+            if arg.equals("false") or arg.equals("true")
+                return i + 1
+            return i
+        }
+        if kind = TsOptionKindString
+        {
+            if (table = OptionTableCompiler) and TsOptionDecls.validates_locale(d)
+            {
+                sys.stop("command-line-locale")
+                return i + 1
+            }
+            CommandLine.raw_set(host, raw, name, CommandLine.value(host, JsonKindString, arg, false))
+            return i + 1
+        }
+        if kind = TsOptionKindList
+        {
+            let before errors.get_length()
+            let list CommandLine.parse_list(host, table, d, arg, errors)
+            CommandLine.raw_set(host, raw, name, list)
+            if (list.size() > 0) or (errors.get_length() > before)
+                return i + 1
+            return i
+        }
+        if kind = TsOptionKindListOrElement
+        {
+            sys.stop("command-line-list-or-element")
+            return i + 1
+        }
+        CommandLine.raw_set(host, raw, name, CommandLine.enum_value(host, table, d, arg, errors))
+        i + 1
+    }
+
+    ; createUnknownOptionError, with the mode's alternate map
+    procedure unknown_option(host: ref[Page], mode: int, input_name: Slice[char], text: Slice[char], errors: ref[Array[ref[DriverDiagnostic]]])
+    {
+        var other_table OptionTableBuild
+        if mode = ParseModeBuild
+            set other_table: OptionTableCompiler
+        let other CommandLine.find_decl(other_table, TsConfigParser.to_lower(host, input_name), false)
+        if other >= 0
+        {
+            var code DiagCompiler_option_0_may_only_be_used_with_build
+            if mode = ParseModeBuild
+                set code: DiagCompiler_option_0_may_not_be_used_with_build
+            let other_name CommandLine.decl_name(other_table, other)
+            if other_name.equals("build")
+                set code: DiagOption_build_must_be_the_first_command_line_argument
+            CommandLine.error(host, errors, code, CommandLine.args1(host, input_name))
+            return
+        }
+        var code DiagUnknown_compiler_option_0
+        if mode = ParseModeBuild
+            set code: DiagUnknown_build_option_0
+        CommandLine.error(host, errors, code, CommandLine.args1(host, text))
+    }
+
+    ; commandLineParser.parseStrings
+    procedure parse_strings(host: ref[Page], sys: ref[ExecSystem], mode: int, args: ref[Array[Slice[char]]], raw: ref[TsOptions], file_names: ref[Array[Slice[char]]], errors: ref[Array[ref[DriverDiagnostic]]])
+    {
+        var i 0
+        let n args.get_length() as int
+        while i < n
+        {
+            let s args[i as size_t]
+            set i: i + 1
+            if (s.length as int) = 0
+                continue
+            let first CommandLine.byte_at(s, 0)
+            if first = 64
+            {
+                sys.stop("command-line-response-file")
+                return
+            }
+            if first <> 45
+            {
+                file_names.add(s)
+                continue
+            }
+            var input_name s.slice_from(1)
+            if input_name.starts_with("-")
+                set input_name: input_name.slice_from(1)
+            var table OptionTableCompiler
+            var mismatch DiagCompiler_option_0_expects_an_argument
+            if mode = ParseModeBuild
+            {
+                set table: OptionTableBuild
+                set mismatch: DiagBuild_option_0_requires_a_value_of_type_1
+            }
+            var d CommandLine.find_decl(table, input_name, true)
+            ; the build command's declarations are commonOptionsWithBuild then the
+            ; build options; the common ones are the compiler table's
+            if (d < 0) and (mode = ParseModeBuild)
+            {
+                let common CommandLine.find_decl(OptionTableCompiler, input_name, true)
+                if (common >= 0) and TsOptionDecls.is_common_with_build(common)
+                {
+                    set table: OptionTableCompiler
+                    set d: common
+                }
+            }
+            if d >= 0
+            {
+                set i: CommandLine.parse_option_value(host, sys, args, i, table, d, mismatch, raw, errors)
+                continue
+            }
+            let w CommandLine.find_decl(OptionTableWatch, input_name, true)
+            if w >= 0
+            {
+                set i: CommandLine.parse_option_value(host, sys, args, i, OptionTableWatch, w, DiagWatch_option_0_requires_a_value_of_type_1, raw, errors)
+                continue
+            }
+            CommandLine.unknown_option(host, mode, input_name, s, errors)
+        }
+    }
+
+    ; convertToOptionsWithAbsolutePaths + convertMapToOptions(compilerOptionsParser)
+    procedure convert_compiler_options(host: ref[Page], raw: ref[TsOptions], cwd: Slice[char]) returns ref[TsOptions]
+    {
+        let options TsOptions.create(host)
+        var k 0
+        while k < raw.count()
+        {
+            let name raw.name_at(k)
+            let v_opt raw.value_at(k)
+            set k: k + 1
+            let i TsOptionDecls.index_of(name)
+            if (i < 0) or (v_opt = null)
+                continue
+            var v v_opt as ref[JsonValue]
+            let kind TsOptionDecls.kind_of(i)
+            if (kind = TsOptionKindList) and TsOptionDecls.element_is_file_path(i) and (v.kind = JsonKindArray)
+            {
+                let out CommandLine.list_value(host)
+                let out_vals out.values as ref[Array[ref[JsonValue]?]]
+                var j 0
+                while j < v.size()
+                {
+                    let e v.value_at(j)
+                    set j: j + 1
+                    if e = null
+                        continue
+                    let ev e as ref[JsonValue]
+                    if ev.kind = JsonKindString
+                        out_vals.add(CommandLine.value(host, JsonKindString, get_normalized_absolute_path(host, ev.text, cwd), false))
+                    else
+                        out_vals.add(ev)
+                }
+                set v: out
+            }
+            else
+            {
+                if (kind <> TsOptionKindList) and TsOptionDecls.is_file_path(i) and (v.kind = JsonKindString)
+                    set v: CommandLine.value(host, JsonKindString, get_normalized_absolute_path(host, v.text, cwd), false)
+            }
+            TsConfigParser.parse_compiler_option(host, options, i, v)
+        }
+        options
+    }
+
+    ; tsoptions.ParseCommandLine
+    procedure parse(host: ref[Page], sys: ref[ExecSystem], args: ref[Array[Slice[char]]]) returns ref[ParsedCommandLine]
+    {
+        let raw TsOptions.create(host)
+        let file_names &Array[Slice[char]]^host()
+        let errors &Array[ref[DriverDiagnostic]]^host()
+        CommandLine.parse_strings(host, sys, ParseModeCompiler, args, raw, file_names, errors)
+        let options CommandLine.convert_compiler_options(host, raw, sys.cwd)
+        &ParsedCommandLine^host(raw, options, file_names, errors)
+    }
+
+    ; tsoptions.ParseBuildCommandLine: the compiler options are the entries the build
+    ; table and the compiler table agree on, the projects default to "."
+    procedure parse_build(host: ref[Page], sys: ref[ExecSystem], args: ref[Array[Slice[char]]]) returns ref[ParsedCommandLine]
+    {
+        let raw TsOptions.create(host)
+        let projects &Array[Slice[char]]^host()
+        let errors &Array[ref[DriverDiagnostic]]^host()
+        CommandLine.parse_strings(host, sys, ParseModeBuild, args, raw, projects, errors)
+        let options TsOptions.create(host)
+        var k 0
+        while k < raw.count()
+        {
+            let name raw.name_at(k)
+            let v raw.value_at(k)
+            set k: k + 1
+            let i TsOptionDecls.index_of(name)
+            if (i >= 0) and (v <> null)
+            {
+                if TsOptionDecls.is_common_with_build(i) or name.equals("build")
+                    TsConfigParser.parse_compiler_option(host, options, i, v as ref[JsonValue])
+            }
+            ; TscBuildOption is no compiler declaration; ParseCompilerOptions sets Build
+            if (i < 0) and name.equals("build") and (v <> null)
+                TsOptions.put(host, options, "build", v)
+        }
+        if (projects.get_length() as int) = 0
+            projects.add(".")
+        let clean CommandLine.raw_true(raw, "clean")
+        if clean and CommandLine.raw_true(raw, "force")
+            CommandLine.error(host, errors, DiagOptions_0_and_1_cannot_be_combined, CommandLine.args2(host, "clean", String("force")))
+        if clean and CommandLine.raw_true(raw, "verbose")
+            CommandLine.error(host, errors, DiagOptions_0_and_1_cannot_be_combined, CommandLine.args2(host, "clean", String("verbose")))
+        if clean and CommandLine.raw_true(raw, "watch")
+            CommandLine.error(host, errors, DiagOptions_0_and_1_cannot_be_combined, CommandLine.args2(host, "clean", String("watch")))
+        if CommandLine.raw_true(raw, "watch") and CommandLine.raw_true(raw, "dry")
+            CommandLine.error(host, errors, DiagOptions_0_and_1_cannot_be_combined, CommandLine.args2(host, "watch", String("dry")))
+        &ParsedCommandLine^host(raw, options, projects, errors)
+    }
+
+    function raw_true(raw: ref[TsOptions], name: Slice[char]) returns bool
+    {
+        let v raw.get(name)
+        if v = null
+            return false
+        let jv v as ref[JsonValue]
+        (jv.kind = JsonKindBoolean) and jv.truth
+    }
+}
