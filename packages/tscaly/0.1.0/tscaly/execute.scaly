@@ -15,6 +15,10 @@ use tscaly.program.ProgramFiles
 use tscaly.tsoptions.TsOptions
 use tscaly.tsoptions.TsConfigParser
 use tscaly.tsoptions.TsParsedCommandLine
+use tscaly.tsoptions.ProjectReference
+use tscaly.TsOptionDecls.TsOptionDecls
+use tscaly.buildinfojson.JsonText
+use tscaly.emitter.EmitOptions
 use tscaly.system.ExecSystem
 use tscaly.system.VfsFile
 use tscaly.commandline.CommandLine
@@ -150,6 +154,11 @@ define Execute (reserved: int)
         let host sys.host
         let options cl.options
         var report_diagnostic Execute.reporter(sys, options)
+        if CommandLine.locale_is_translated(host, options.text_of("locale"))
+        {
+            sys.stop("locale-messages")
+            return ExitStatusNotImplemented
+        }
         if cl.errors.get_length() > 0
         {
             Execute.report_all(sys, report_diagnostic, cl.errors)
@@ -269,20 +278,20 @@ define Execute (reserved: int)
         }
         else
         {
-            let absolute_names &Array[Slice[char]]^host()
-            var ni 0
-            while ni < file_count
-            {
-                absolute_names.add(get_normalized_absolute_path(host, cl.file_names[ni as size_t], sys.cwd))
-                set ni: ni + 1
-            }
-            set root_names: absolute_names
+            ; ParseCommandLine keeps the file names as written (addRootFileTask
+            ; normalizes, a diagnostic names the file as given)
+            set root_names: cl.file_names
         }
         let summary_pretty Execute.should_be_pretty(sys, compile_options)
         if options.tristate_of("showConfig") = 1
         {
-            sys.stop("show-config")
-            return ExitStatusNotImplemented
+            if config_diagnostics.get_length() > 0
+            {
+                sys.stop("show-config-with-errors")
+                return ExitStatusNotImplemented
+            }
+            Execute.show_config(sys, compile_options, root_names, root_config, config_file_name)
+            return ExitStatusSuccess
         }
         if compile_options.tristate_of("watch") = 1
         {
@@ -299,22 +308,286 @@ define Execute (reserved: int)
     procedure parse_config(sys: ref[ExecSystem], cl: ref[ParsedCommandLine], config_file_name: Slice[char], text: Slice[char], diagnostics: ref[Array[ref[DriverDiagnostic]]]) returns ref[TsParsedCommandLine]?
         ConfigFiles.parse(sys, cl.options, cl.raw, config_file_name, text, diagnostics)
 
+    ; showConfig: tsoptions.ConvertToTSConfig, MarshalIndent with four spaces
+    procedure show_config(sys: ref[ExecSystem], options: ref[TsOptions], file_names: ref[Array[Slice[char]]], config: ref[TsParsedCommandLine]?, config_file_name_in: Slice[char])
+    {
+        let host sys.host
+        var config_file_name config_file_name_in
+        if (config_file_name.length as int) = 0
+            set config_file_name: "tsconfig.json"
+        let config_path get_normalized_absolute_path(host, config_file_name, sys.cwd)
+        let config_dir get_directory_path(host, config_path)
+        let option_map JsonText.new_object(host)
+        var f 0
+        while f < TsOptionDecls.compiler_field_count()
+        {
+            let i TsOptionDecls.compiler_field_option(f)
+            set f: f + 1
+            if i < 0
+                continue
+            let category TsOptionDecls.category_of(i)
+            ; Command_line_Options, Output_Formatting
+            if (category = 6171) or (category = 6256)
+                continue
+            let name TsOptionDecls.name_of(i)
+            if Execute.show_config_omits(name)
+                continue
+            let value options.get(name)
+            if value = null
+                continue
+            let v value as ref[JsonValue]
+            if TsOptions.is_zero(v)
+                continue
+            let serialized Execute.show_config_value(sys, i, v, config_path, config_dir)
+            if serialized <> null
+                JsonText.put_member(option_map, name, serialized as ref[JsonValue])
+        }
+        Execute.add_implied_options(sys, option_map, options, config_file_name_in)
+        let result JsonText.new_object(host)
+        JsonText.put_member(result, "compilerOptions", option_map)
+        if config <> null
+        {
+            let c config as ref[TsParsedCommandLine]
+            if c.references <> null
+            {
+                let refs c.references as ref[Array[ProjectReference]]
+                if refs.get_length() > 0
+                {
+                    let list JsonText.new_array(host)
+                    var r 0
+                    while r < (refs.get_length() as int)
+                    {
+                        let reference refs[r as size_t]
+                        set r: r + 1
+                        let entry JsonText.new_object(host)
+                        JsonText.put_member(entry, "path", JsonText.new_string(host, reference.original_path))
+                        if reference.circular
+                            JsonText.put_member(entry, "circular", JsonText.new_bool(host, true))
+                        JsonText.push(list, entry)
+                    }
+                    JsonText.put_member(result, "references", list)
+                }
+            }
+        }
+        if file_names.get_length() > 0
+        {
+            let files JsonText.new_array(host)
+            var k 0
+            while k < (file_names.get_length() as int)
+            {
+                let absolute get_normalized_absolute_path(host, file_names[k as size_t], sys.cwd)
+                set k: k + 1
+                JsonText.push(files, JsonText.new_string(host, Execute.relative_path_from_file(sys, config_dir, absolute)))
+            }
+            JsonText.put_member(result, "files", files)
+        }
+        if config <> null
+        {
+            let c config as ref[TsParsedCommandLine]
+            var default_include false
+            if c.include_specs.get_length() = 1
+            {
+                let only c.include_specs[0]
+                set default_include: only.equals("**/*")
+            }
+            if (c.include_specs.get_length() > 0) and (default_include = false)
+                JsonText.put_member(result, "include", Execute.string_array(host, c.include_specs))
+            if c.exclude_specs.get_length() > 0
+                JsonText.put_member(result, "exclude", Execute.string_array(host, c.exclude_specs))
+            if c.compile_on_save
+                JsonText.put_member(result, "compileOnSave", JsonText.new_bool(host, true))
+        }
+        let text JsonText.to_text(host, result, true)
+        Execute.append_four_space_indent(sys.output, text)
+    }
+
+    function show_config_omits(name: Slice[char]) returns bool
+    {
+        name.equals("showConfig") or name.equals("configFile") or name.equals("configFilePath") or name.equals("help") or name.equals("init") or name.equals("listFilesOnly") or name.equals("listEmittedFiles") or name.equals("project") or name.equals("build") or name.equals("version")
+    }
+
+    function string_array(host: ref[Page], list: ref[Array[Slice[char]]]) returns ref[JsonValue]
+    {
+        let arr JsonText.new_array(host)
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            JsonText.push(arr, JsonText.new_string(host, list[i as size_t]))
+            set i: i + 1
+        }
+        arr
+    }
+
+    ; the two-space MarshalIndent text with every indentation doubled
+    procedure append_four_space_indent(out: ref[StringBuilder], text: Slice[char])
+    {
+        var at_line_start true
+        var i 0
+        while i < (text.length as int)
+        {
+            let c text[i as size_t]
+            if at_line_start and ((c as int) = (" " as char) as int)
+            {
+                out.append("  ")
+                set i: i + 1
+                continue
+            }
+            set at_line_start: (c as int) = ("\n" as char) as int
+            out.append(c)
+            set i: i + 1
+        }
+    }
+
+    ; tspath.GetRelativePathFromFile: relative to the config's directory, `./` led
+    function relative_path_from_file(sys: ref[ExecSystem], from_directory: Slice[char], to: Slice[char]) returns Slice[char]
+    {
+        let host sys.host
+        let relative get_relative_path_to_directory_or_url(host, from_directory, to, false, sys.cwd)
+        if is_rooted_disk_path(relative) or relative.starts_with("./") or relative.starts_with("../")
+            return relative
+        join_slices(host, "./", relative)
+    }
+
+    ; serializeCompilerOptions' value of option `i`; null to leave it out
+    procedure show_config_value(sys: ref[ExecSystem], i: int, v: ref[JsonValue], config_path: Slice[char], config_dir: Slice[char]) returns ref[JsonValue]?
+    {
+        let host sys.host
+        let kind TsOptionDecls.kind_of(i)
+        if kind = TsOptionKindEnum
+        {
+            var n 0 - 1
+            if v.kind = JsonKindString
+                set n: TsOptionDecls.enum_number(i, TsConfigParser.to_lower(host, v.text))
+            if v.kind = JsonKindNumber
+                set n: JsonText.int_of(v)
+            let key TsOptionDecls.enum_key_of_number(i, n)
+            if (key.length as int) = 0
+                return null
+            return JsonText.new_string(host, key)
+        }
+        if (kind = TsOptionKindList) and (v.kind = JsonKindArray)
+        {
+            if TsOptionDecls.element_is_file_path(i)
+            {
+                let arr JsonText.new_array(host)
+                var k 0
+                while k < v.size()
+                {
+                    let e v.value_at(k)
+                    set k: k + 1
+                    if e = null
+                        continue
+                    let ev e as ref[JsonValue]
+                    if ev.kind = JsonKindString
+                        JsonText.push(arr, JsonText.new_string(host, Execute.relative_path_from_file(sys, config_dir, get_normalized_absolute_path(host, ev.text, config_dir))))
+                    else
+                        JsonText.push(arr, ev)
+                }
+                return arr
+            }
+            if TsOptionDecls.element_kind_of(i) = TsOptionKindEnum
+            {
+                sys.stop("show-config-enum-list")
+                return null
+            }
+            return v
+        }
+        if (kind = TsOptionKindString) and TsOptionDecls.is_file_path(i) and (v.kind = JsonKindString)
+            return JsonText.new_string(host, Execute.relative_path_from_file(sys, config_dir, get_normalized_absolute_path(host, v.text, config_dir)))
+        v
+    }
+
+    ; addImpliedOptions over the implied options' table
+    procedure add_implied_options(sys: ref[ExecSystem], option_map: ref[JsonValue], options: ref[TsOptions], config_path: Slice[char])
+    {
+        let host sys.host
+        let provided &Array[Slice[char]]^host()
+        var p 0
+        while p < option_map.size()
+        {
+            provided.add(option_map.key_at(p))
+            set p: p + 1
+        }
+        let o DriverProgram.emit_options_of(host, options, sys.cwd, config_path)
+        let d EmitOptions.defaults()
+        ; module (Target)
+        if Execute.implied_eligible(provided, "module", "target", "", "", "")
+        {
+            let n o.get_emit_module_kind()
+            if n <> d.get_emit_module_kind()
+                Execute.put_implied_enum(host, option_map, "module", n)
+        }
+        if Execute.implied_eligible(provided, "moduleResolution", "module", "target", "", "")
+        {
+            let n o.get_module_resolution_kind()
+            if n <> d.get_module_resolution_kind()
+                Execute.put_implied_enum(host, option_map, "moduleResolution", n)
+        }
+        if Execute.implied_eligible(provided, "moduleDetection", "module", "target", "", "")
+        {
+            let n o.get_module_detection_kind()
+            ; the emitter numbers Auto 0, Legacy 1, Force 2; core.ModuleDetectionKind 1, 2, 3
+            if n <> d.get_module_detection_kind()
+                Execute.put_implied_enum(host, option_map, "moduleDetection", n + 1)
+        }
+        if Execute.implied_eligible(provided, "isolatedModules", "verbatimModuleSyntax", "", "", "")
+            Execute.put_implied_bool(host, option_map, "isolatedModules", o.get_isolated_modules(), d.get_isolated_modules())
+        if Execute.implied_eligible(provided, "preserveConstEnums", "isolatedModules", "verbatimModuleSyntax", "", "")
+            Execute.put_implied_bool(host, option_map, "preserveConstEnums", o.should_preserve_const_enums(), d.should_preserve_const_enums())
+        let declaration EmitOptions.on(o.declaration) or EmitOptions.on(o.composite)
+        if Execute.implied_eligible(provided, "declaration", "composite", "", "", "")
+            Execute.put_implied_bool(host, option_map, "declaration", declaration, false)
+        if Execute.implied_eligible(provided, "declarationMap", "declaration", "composite", "", "")
+            Execute.put_implied_bool(host, option_map, "declarationMap", EmitOptions.on(o.declaration_map) and declaration, false)
+        if Execute.implied_eligible(provided, "incremental", "composite", "", "", "")
+            Execute.put_implied_bool(host, option_map, "incremental", EmitOptions.on(o.incremental) or EmitOptions.on(o.composite), false)
+        if Execute.implied_eligible(provided, "useDefineForClassFields", "target", "module", "", "")
+            Execute.put_implied_bool(host, option_map, "useDefineForClassFields", o.get_use_define_for_class_fields(), d.get_use_define_for_class_fields())
+        ; resolvePackageJsonExports/Imports: IsTrueOrUnknown answers the default for
+        ; every unset value, so neither is ever implied
+        if Execute.implied_eligible(provided, "resolveJsonModule", "moduleResolution", "module", "target", "")
+            Execute.put_implied_bool(host, option_map, "resolveJsonModule", o.get_resolve_json_module(), d.get_resolve_json_module())
+        if Execute.implied_eligible(provided, "allowJs", "checkJs", "", "", "")
+            Execute.put_implied_bool(host, option_map, "allowJs", EmitOptions.on(o.allow_js), false)
+        if Execute.implied_eligible(provided, "allowImportingTsExtensions", "rewriteRelativeImportExtensions", "", "", "")
+            Execute.put_implied_bool(host, option_map, "allowImportingTsExtensions", EmitOptions.on(o.allow_importing_ts_extensions) or EmitOptions.on(o.rewrite_relative_import_extensions), false)
+    }
+
+    ; not provided itself, and one of its dependencies provided
+    function implied_eligible(provided: ref[Array[Slice[char]]], name: Slice[char], dep1: Slice[char], dep2: Slice[char], dep3: Slice[char], dep4: Slice[char]) returns bool
+    {
+        if ExecSystem.contains(provided, name)
+            return false
+        if ExecSystem.contains(provided, dep1)
+            return true
+        if ((dep2.length as int) > 0) and ExecSystem.contains(provided, dep2)
+            return true
+        if ((dep3.length as int) > 0) and ExecSystem.contains(provided, dep3)
+            return true
+        ((dep4.length as int) > 0) and ExecSystem.contains(provided, dep4)
+    }
+
+    procedure put_implied_enum(host: ref[Page], option_map: ref[JsonValue], name: Slice[char], n: int)
+    {
+        let key TsOptionDecls.enum_key_of_number(TsOptionDecls.index_of(name), n)
+        if (key.length as int) > 0
+            JsonText.put_member(option_map, name, JsonText.new_string(host, key))
+    }
+
+    procedure put_implied_bool(host: ref[Page], option_map: ref[JsonValue], name: Slice[char], value: bool, default_value: bool)
+    {
+        if value <> default_value
+            JsonText.put_member(option_map, name, JsonText.new_bool(host, value))
+    }
+
     ; the compile options this port does not implement, as a stop; true when one stopped
     procedure unported_compile_options(sys: ref[ExecSystem], options: ref[TsOptions]) returns bool
     {
-        if (options.tristate_of("diagnostics") = 1) or (options.tristate_of("extendedDiagnostics") = 1)
-        {
-            sys.stop("statistics")
-            return true
-        }
+        ; diagnostics/extendedDiagnostics: the statistics sit between the harness's
+        ; markers, which the baseline drops with their contents
         if (options.text_of("generateTrace").length as int) > 0
         {
             sys.stop("generate-trace")
-            return true
-        }
-        if (options.text_of("locale").length as int) > 0
-        {
-            sys.stop("locale")
             return true
         }
         if options.tristate_of("traceResolution") = 1
@@ -384,7 +657,8 @@ define Execute (reserved: int)
         {
             let file result.emitted_files[ti as size_t]
             set ti: ti + 1
-            sys.touch(file)
+            if sys.touch_emitted(file) = false
+                continue
             if mtimes <> null
             {
                 let cache mtimes as ref[PathMap[int]]
@@ -430,19 +704,9 @@ define Execute (reserved: int)
             sys.stop("trace-resolution")
             return ExitStatusNotImplemented
         }
-        if (options.tristate_of("diagnostics") = 1) or (options.tristate_of("extendedDiagnostics") = 1)
-        {
-            sys.stop("statistics")
-            return ExitStatusNotImplemented
-        }
         if (options.text_of("generateTrace").length as int) > 0
         {
             sys.stop("generate-trace")
-            return ExitStatusNotImplemented
-        }
-        if (options.text_of("locale").length as int) > 0
-        {
-            sys.stop("locale")
             return ExitStatusNotImplemented
         }
         sys.now()
@@ -474,7 +738,8 @@ define Execute (reserved: int)
         var ti 0
         while ti < (program.emitted_files.get_length() as int)
         {
-            sys.touch(program.emitted_files[ti as size_t])
+            let emitted_file program.emitted_files[ti as size_t]
+            sys.touch_emitted(emitted_file)
             set ti: ti + 1
         }
         let sorted DriverProgram.sort_and_deduplicate(host, all)
