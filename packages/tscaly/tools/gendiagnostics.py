@@ -127,6 +127,8 @@ SOURCES = [
     # table through checker.go and grammarchecks.go, so the cost is small and
     # stated with the diff.
     os.path.join(SUB, "internal/checker/jsx.go"),
+    # Slice 285. utilities.go carries CreateModuleNotFoundChain's four messages.
+    os.path.join(SUB, "internal/checker/utilities.go"),
     # Slice 182. checker/jsdoc.go joins under the same per-FILE rule:
     # checkUnmatchedJSDocParameters reports, and its two messages appear in NO
     # other source of this list — TS8029 (the `arguments` advice) and TS8032 (the
