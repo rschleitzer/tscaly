@@ -19,11 +19,16 @@
 ; literal whose every element converted to nil is a NIL slice, and the port marks
 ; such an array with `truth` set.
 ;
-; ★ No diagnostics are produced: the case yardstick compares emitted files, and a
-; config error changes neither the options nor the file list except where the
-; reference's own control flow reads it (an extended config with parse errors is
-; skipped, and that one is ported). validateJsonOptionValue's locale check is not
-; ported — no ported reader asks for the locale.
+; ★ The conversion's diagnostics (slice 273) are collected only when asked for
+; (`config_file_diagnostics`, the errors run): the config file's parse diagnostics,
+; then onPropertySet's and convertJsonOption's reports, the extends lookups and the
+; worker's spec, empty-files and no-inputs reports. A diagnostic positioned in an
+; EXTENDED config file is not kept — the dump prints the root config's section
+; only — while a compiler diagnostic from any config of the chain is.
+; validateJsonOptionValue's locale check is not ported — no ported reader asks for
+; the locale. An object literal inside an ARRAY answers its properties' option
+; from the array's own level, so `"extends": [{"extends": 1}]` reports TS1328
+; where the reference's element option map reports TS5024.
 
 use scaly.memory.Page
 use scaly.containers.Array
@@ -32,12 +37,14 @@ use tscaly.ast.*
 use tscaly.parser.Parser
 use tscaly.program.*
 use tscaly.Diagnostics.DiagnosticList
+use tscaly.scanner.Scanner
 use tscaly.TsOptionDecls.TsOptionDecls
 
 ; which notifier an object literal's properties report to
 define TsConfigLevelNone: int 0
 define TsConfigLevelRoot: int 1
 define TsConfigLevelCompilerOptions: int 2
+define TsConfigLevelTypeAcquisition: int 3
 
 ; vfsmatch.Usage
 define TsGlobUsageFiles: int 0
@@ -273,6 +280,8 @@ define TsOwnConfig
     extends_paths: ref[Array[Slice[char]]]?
     base_path: Slice[char]
     config_file_name: Slice[char]
+    ; the root config file's own parse, whose reports are kept (slice 273)
+    reporting: bool
 )
 
 ; extendsResult
@@ -889,10 +898,16 @@ define TsConfigParser
     current_directory: Slice[char]
     ; the first shape this port has not written (the case is then UNPORTED)
     stop_tag: Slice[char]
+    ; the conversion's diagnostics as (pos, end, code), pos -1 for a compiler
+    ; diagnostic; null when nobody asked (slice 273)
+    diagnostics: ref[Array[int]]?
+    report_file: ref[AstNode]?
+    report_text: Slice[char]
+    reporting_next: bool
 )
 {
     function create(host: ref[Page], files: ref[ProgramFiles], current_directory: Slice[char]) returns ref[TsConfigParser]
-        &TsConfigParser^host(host, files, current_directory, null)
+        &TsConfigParser^host(host, files, current_directory, null, null, null, null, false)
 
     procedure stop(this, tag: Slice[char])
     {
@@ -946,6 +961,186 @@ define TsConfigParser
         if (stop_tag.length as int) > 0
             return null
         parsed
+    }
+
+    ; GetConfigFileParsingDiagnostics for the harness's config (slice 273): the
+    ; file's parse diagnostics, then ParseJsonSourceFileConfigFileContent's errors,
+    ; as (pos, end, code) triples with pos -1 for a compiler diagnostic; null after
+    ; a stop
+    procedure config_file_diagnostics(this, config_file_name: Slice[char], text: Slice[char]) returns ref[Array[int]]?
+    {
+        let list &Array[int]^host()
+        set this.diagnostics: list
+        set this.report_text: text
+        let name String^host(config_file_name.data as pointer[const_char], config_file_name.length)
+        let source String^host(text.data as pointer[const_char], text.length)
+        var unported 0 - 1
+        var tag: Slice[char] ""
+        var detail 0
+        let p Parser.parse_ex(host, name, source, ScriptKindJSON, &unported, &tag, &detail)
+        if unported >= 0
+        {
+            this.stop("tsconfig-json-parse")
+            return null
+        }
+        let d p.diagnostics
+        if d <> null
+        {
+            let dl d as ref[DiagnosticList]
+            var i 0
+            while i < dl.length()
+            {
+                var dp 0
+                var de 0
+                var dc 0
+                if dl.at(i, &dp, &de, &dc)
+                {
+                    list.add(dp)
+                    list.add(de)
+                    list.add(dc)
+                }
+                set i: i + 1
+            }
+        }
+        let file Parser.source_file_of(p)
+        if file = null
+        {
+            this.stop("tsconfig-json-parse")
+            return null
+        }
+        set this.report_file: file
+        set this.reporting_next: true
+        this.parse_json_config_file_content(file as ref[AstNode], get_directory_path(host, config_file_name), config_file_name)
+        if (stop_tag.length as int) > 0
+            return null
+        list
+    }
+
+    ; ast.NewCompilerDiagnostic: kept from any config of the chain, since the
+    ; reference appends an extended config's errors to its own
+    procedure report_global(this, code: int)
+    {
+        if diagnostics = null
+            return
+        let list diagnostics as ref[Array[int]]
+        list.add(0 - 1)
+        list.add(0 - 1)
+        list.add(code)
+    }
+
+    ; ast.NewDiagnostic over a Loc of the config being converted (no trivia skipped)
+    procedure report_range(this, own: ref[TsOwnConfig], pos: int, end: int, code: int)
+    {
+        if diagnostics = null
+            return
+        if own.reporting = false
+            return
+        let list diagnostics as ref[Array[int]]
+        list.add(pos)
+        list.add(end)
+        list.add(code)
+    }
+
+    ; CreateDiagnosticForNodeInSourceFileOrCompilerDiagnostic in the config being
+    ; converted
+    procedure report_node(this, own: ref[TsOwnConfig], node: ref[AstNode]?, code: int)
+    {
+        if node = null
+        {
+            this.report_global(code)
+            return
+        }
+        let n node as ref[AstNode]
+        this.report_range(own, Scanner.skip_trivia(report_text, AstNode.pos_of(n)), AstNode.end_of(n), code)
+    }
+
+    ; the worker's CreateDiagnosticForNodeInSourceFileOrCompilerDiagnostic, always
+    ; in the root config
+    procedure report_root_node(this, node: ref[AstNode]?, code: int)
+    {
+        if diagnostics = null
+            return
+        if node = null
+        {
+            this.report_global(code)
+            return
+        }
+        let n node as ref[AstNode]
+        let list diagnostics as ref[Array[int]]
+        list.add(Scanner.skip_trivia(report_text, AstNode.pos_of(n)))
+        list.add(AstNode.end_of(n))
+        list.add(code)
+    }
+
+    ; ForEachTsConfigPropArray's property: the initializer of the root object
+    ; literal's first property named `key`
+    function root_property_initializer(this, key: Slice[char]) returns ref[AstNode]?
+    {
+        if report_file = null
+            return null
+        let statements AstNode.statements_of(report_file)
+        if statements = null
+            return null
+        let list statements as ref[Array[ref[AstNode]?]]
+        if list.get_length() = 0
+            return null
+        let root AstNode.expression_of(list[0])
+        if AstNode.kind_of(root) <> KindObjectLiteralExpression
+            return null
+        let props AstNode.properties_of(root)
+        if props = null
+            return null
+        let pl props as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (pl.get_length() as int)
+        {
+            let property pl[i as size_t]
+            set i: i + 1
+            if AstNode.kind_of(property) <> KindPropertyAssignment
+                continue
+            let name AstNode.property_name_text_of(AstNode.name_of(property))
+            if name.equals(key)
+                return AstNode.initializer_of(property)
+        }
+        null
+    }
+
+    ; GetTsConfigPropArrayElementValue: the string literal `spec` in that array
+    function prop_array_element_value(this, key: Slice[char], spec: Slice[char]) returns ref[AstNode]?
+    {
+        let initializer this.root_property_initializer(key)
+        if AstNode.kind_of(initializer) <> KindArrayLiteralExpression
+            return null
+        let elements AstNode.elements_of(initializer)
+        if elements = null
+            return null
+        let el elements as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (el.get_length() as int)
+        {
+            let e el[i as size_t]
+            set i: i + 1
+            if AstNode.kind_of(e) <> KindStringLiteral
+                continue
+            let text AstNode.literal_text_of(e)
+            if text.equals(spec)
+                return e
+        }
+        null
+    }
+
+    ; the `index`th element of an array literal, null past its end
+    function element_node_at(node: ref[AstNode]?, index: int) returns ref[AstNode]?
+    {
+        if AstNode.kind_of(node) <> KindArrayLiteralExpression
+            return null
+        let elements AstNode.elements_of(node)
+        if elements = null
+            return null
+        let el elements as ref[Array[ref[AstNode]?]]
+        if index >= (el.get_length() as int)
+            return null
+        el[index as size_t]
     }
 
     ; parser.ParseSourceFile(…, ScriptKindJSON); `out_errors` when the parse reported
@@ -1036,6 +1231,7 @@ define TsConfigParser
             return this.new_object()
         if AstNode.kind_of(root) <> KindObjectLiteralExpression
         {
+            this.report_global(DiagThe_root_value_of_a_0_file_must_be_an_object)
             if AstNode.kind_of(root) = KindArrayLiteralExpression
             {
                 let elements AstNode.elements_of(root)
@@ -1048,17 +1244,19 @@ define TsConfigParser
                         let e el[i as size_t]
                         set i: i + 1
                         if AstNode.kind_of(e) = KindObjectLiteralExpression
-                            return this.convert_value(e, TsConfigLevelRoot, own)
+                            return this.convert_value(e, TsConfigLevelRoot, true, true, own)
                     }
                 }
             }
             return this.new_object()
         }
-        this.convert_value(root, TsConfigLevelRoot, own)
+        this.convert_value(root, TsConfigLevelRoot, true, true, own)
     }
 
-    ; convertPropertyValueToJson; Go's nil is a JsonKindNull value
-    procedure convert_value(this, node: ref[AstNode]?, level: int, own: ref[TsOwnConfig]) returns ref[JsonValue]
+    ; convertPropertyValueToJson; Go's nil is a JsonKindNull value. `has_option`:
+    ; the value's key names an option (the report for a value that is not JSON);
+    ; `notify`: its object's properties reach onPropertySet
+    procedure convert_value(this, node: ref[AstNode]?, level: int, has_option: bool, notify: bool, own: ref[TsOwnConfig]) returns ref[JsonValue]
     {
         let k AstNode.kind_of(node)
         if k = KindTrueKeyword
@@ -1077,17 +1275,28 @@ define TsConfigParser
                 if AstNode.kind_of(operand) = KindNumericLiteral
                     return this.new_value(JsonKindNumber, join_slices(host, "-", AstNode.literal_text_of(operand)), false)
             }
-            return this.new_value(JsonKindNull, Slice[char](), false)
         }
         if k = KindObjectLiteralExpression
-            return this.convert_object(node as ref[AstNode], level, own)
+            return this.convert_object(node as ref[AstNode], level, notify, own)
         if k = KindArrayLiteralExpression
-            return this.convert_array(node as ref[AstNode], own)
+            return this.convert_array(node as ref[AstNode], level, has_option, own)
+        if k = KindNullKeyword
+            return this.new_value(JsonKindNull, Slice[char](), false)
+        ; not in the expected format
+        if node <> null
+        {
+            var code DiagProperty_value_can_only_be_string_literal_numeric_literal_true_false_null_object_literal_or_array_literal
+            if has_option
+                set code: DiagCompiler_option_0_requires_a_value_of_type_1
+            let n node as ref[AstNode]
+            this.report_range(own, AstNode.pos_of(n), AstNode.end_of(n), code)
+        }
         this.new_value(JsonKindNull, Slice[char](), false)
     }
 
-    ; convertObjectLiteralExpressionToJson with the notifier of `level`
-    procedure convert_object(this, node: ref[AstNode], level: int, own: ref[TsOwnConfig]) returns ref[JsonValue]
+    ; convertObjectLiteralExpressionToJson with the notifier of `level` (none below
+    ; an array: `notify` false)
+    procedure convert_object(this, node: ref[AstNode], level: int, notify: bool, own: ref[TsOwnConfig]) returns ref[JsonValue]
     {
         let obj this.new_object()
         let props AstNode.properties_of(node)
@@ -1100,33 +1309,258 @@ define TsConfigParser
             let element list[i as size_t]
             set i: i + 1
             if AstNode.kind_of(element) <> KindPropertyAssignment
+            {
+                if element <> null
+                {
+                    let en element as ref[AstNode]
+                    this.report_range(own, AstNode.pos_of(en), AstNode.end_of(en), DiagProperty_assignment_expected)
+                }
                 continue
-            let key AstNode.property_name_text_of(AstNode.name_of(element))
+            }
+            let question AstNode.question_token_of(element)
+            if question <> null
+            {
+                let qn question as ref[AstNode]
+                this.report_range(own, AstNode.pos_of(qn), AstNode.end_of(qn), DiagThe_0_modifier_can_only_be_used_in_TypeScript_files)
+            }
+            let name_node AstNode.name_of(element)
+            let key AstNode.property_name_text_of(name_node)
             ; the option a key names is exact (a case-insensitive hit is not it)
             var child_level TsConfigLevelNone
+            var has_option false
             if level = TsConfigLevelRoot
             {
                 if key.equals("compilerOptions")
                     set child_level: TsConfigLevelCompilerOptions
+                if key.equals("typeAcquisition")
+                    set child_level: TsConfigLevelTypeAcquisition
+                let is_extends key.equals("extends")
+                set has_option: (TsConfigParser.root_option_kind(key) <> 0) or is_extends
             }
-            let value this.convert_value(AstNode.initializer_of(element), child_level, own)
+            if level = TsConfigLevelCompilerOptions
+                set has_option: TsOptionDecls.index_of(key) >= 0
+            if level = TsConfigLevelTypeAcquisition
+                set has_option: TsConfigParser.type_acquisition_option_kind(key) <> 0
+            let initializer AstNode.initializer_of(element)
+            let value this.convert_value(initializer, child_level, has_option, true, own)
             if (key.length as int) = 0
                 continue
             this.json_set(obj, key, value)
+            if notify = false
+                continue
             if level = TsConfigLevelRoot
             {
                 if key.equals("extends")
-                    this.set_extends(own, value)
+                    this.set_extends(own, value, initializer)
+                else
+                {
+                    let root_kind TsConfigParser.root_option_kind(key)
+                    if root_kind <> 0
+                        this.check_json_option(own, 0 - 1, root_kind, TsConfigParser.root_option_element_kind(key), value, name_node, initializer)
+                    else
+                    {
+                        if key.equals("excludes")
+                            this.report_node(own, name_node, DiagUnknown_option_excludes_Did_you_mean_exclude)
+                    }
+                }
             }
             if level = TsConfigLevelCompilerOptions
+            {
+                let oi TsOptionDecls.index_of(key)
+                if oi >= 0
+                    this.check_json_option(own, oi, TsOptionDecls.kind_of(oi), TsOptionDecls.element_kind_of(oi), value, name_node, initializer)
+                else
+                {
+                    if value.kind <> JsonKindNull
+                    {
+                        if TsConfigParser.compiler_option_index_folded(key) >= 0
+                            this.report_node(own, name_node, DiagUnknown_compiler_option_0_Did_you_mean_1)
+                        else
+                            this.report_node(own, name_node, DiagUnknown_compiler_option_0)
+                    }
+                }
                 this.on_compiler_option(own, key, value)
+            }
+            if level = TsConfigLevelTypeAcquisition
+            {
+                let ta_kind TsConfigParser.type_acquisition_option_kind(key)
+                if ta_kind <> 0
+                    this.check_json_option(own, 0 - 1, ta_kind, TsOptionKindString, value, name_node, initializer)
+                else
+                {
+                    if value.kind <> JsonKindNull
+                    {
+                        if TsConfigParser.type_acquisition_option_kind_folded(key) <> 0
+                            this.report_node(own, name_node, DiagUnknown_type_acquisition_option_0_Did_you_mean_1)
+                        else
+                            this.report_node(own, name_node, DiagUnknown_type_acquisition_option_0)
+                    }
+                }
+            }
         }
         obj
     }
 
+    ; tsconfigRootOptionsMap's kinds (extends aside), 0 for a key it does not declare
+    function root_option_kind(key: Slice[char]) returns int
+    {
+        if key.equals("compilerOptions")
+            return TsOptionKindObject
+        if key.equals("typeAcquisition")
+            return TsOptionKindObject
+        if key.equals("references")
+            return TsOptionKindList
+        if key.equals("files")
+            return TsOptionKindList
+        if key.equals("include")
+            return TsOptionKindList
+        if key.equals("exclude")
+            return TsOptionKindList
+        if key.equals("compileOnSave")
+            return TsOptionKindBoolean
+        0
+    }
+
+    ; CommandLineOption.Elements() of a root option
+    function root_option_element_kind(key: Slice[char]) returns int
+    {
+        if key.equals("references")
+            return TsOptionKindObject
+        TsOptionKindString
+    }
+
+    ; typeAcquisitionDecls' kinds, 0 for a key they do not declare
+    function type_acquisition_option_kind(key: Slice[char]) returns int
+    {
+        if key.equals("enable")
+            return TsOptionKindBoolean
+        if key.equals("include")
+            return TsOptionKindList
+        if key.equals("exclude")
+            return TsOptionKindList
+        if key.equals("disableFilenameBasedTypeAcquisition")
+            return TsOptionKindBoolean
+        0
+    }
+
+    ; the same under CommandLineOptionNameMap.Get's lower-cased second lookup
+    function type_acquisition_option_kind_folded(key: Slice[char]) returns int
+    {
+        if TsGlobPattern.equal_fold(key, "enable")
+            return TsOptionKindBoolean
+        if TsGlobPattern.equal_fold(key, "include")
+            return TsOptionKindList
+        if TsGlobPattern.equal_fold(key, "exclude")
+            return TsOptionKindList
+        if TsGlobPattern.equal_fold(key, "disableFilenameBasedTypeAcquisition")
+            return TsOptionKindBoolean
+        0
+    }
+
+    ; CommandLineCompilerOptionsMap.Get: a declaration whose name matches `key` up to
+    ; ASCII case, -1 for none
+    function compiler_option_index_folded(key: Slice[char]) returns int
+    {
+        var i 0
+        repeat
+        {
+            let name TsOptionDecls.name_of(i)
+            if (name.length as int) = 0
+                return 0 - 1
+            if TsGlobPattern.equal_fold(name, key)
+                return i
+            set i: i + 1
+        }
+    }
+
+    ; convertJsonOption's reports for an option of `kind` (declaration `i`, -1 for a
+    ; root or type-acquisition option); the conversion itself is convert_json_option
+    procedure check_json_option(this, own: ref[TsOwnConfig], i: int, kind: int, element_kind: int, value: ref[JsonValue], name_node: ref[AstNode]?, value_node: ref[AstNode]?)
+    {
+        if i >= 0
+        {
+            if TsOptionDecls.is_command_line_only(i)
+            {
+                this.report_node(own, name_node, DiagOption_0_can_only_be_specified_on_command_line)
+                return
+            }
+        }
+        ; isCompilerOptionsValue(opt, nil) holds, and every arm answers nil quietly
+        if value.kind = JsonKindNull
+            return
+        var list_kind kind = TsOptionKindList
+        if kind = TsOptionKindListOrElement
+        {
+            if value.kind = JsonKindArray
+                set list_kind: true
+            else
+            {
+                this.check_json_option(own, i, element_kind, 0, value, name_node, value_node)
+                return
+            }
+        }
+        if list_kind
+        {
+            if value.kind <> JsonKindArray
+            {
+                this.report_node(own, value_node, DiagCompiler_option_0_requires_a_value_of_type_1)
+                return
+            }
+            if value.truth
+                return
+            ; convertJsonOptionOfListType: the element expression at the VALUE's index
+            var j 0
+            while j < value.size()
+            {
+                let e value.value_at(j)
+                let element_node TsConfigParser.element_node_at(value_node, j)
+                set j: j + 1
+                if e = null
+                    continue
+                this.check_json_option(own, 0 - 1, element_kind, 0, e as ref[JsonValue], name_node, element_node)
+                if (element_kind = TsOptionKindEnum) and ((e as ref[JsonValue]).kind = JsonKindString)
+                    this.check_enum_value(own, i, (e as ref[JsonValue]).text, element_node)
+            }
+            return
+        }
+        if kind = TsOptionKindEnum
+        {
+            if value.kind <> JsonKindString
+            {
+                this.report_node(own, value_node, DiagCompiler_option_0_requires_a_value_of_type_1)
+                return
+            }
+            if i >= 0
+                this.check_enum_value(own, i, value.text, value_node)
+            return
+        }
+        var wanted JsonKindAbsent
+        if kind = TsOptionKindString
+            set wanted: JsonKindString
+        if kind = TsOptionKindBoolean
+            set wanted: JsonKindBoolean
+        if kind = TsOptionKindNumber
+            set wanted: JsonKindNumber
+        if kind = TsOptionKindObject
+            set wanted: JsonKindObject
+        if value.kind <> wanted
+            this.report_node(own, value_node, DiagCompiler_option_0_requires_a_value_of_type_1)
+    }
+
+    ; convertJsonOptionOfEnumType's report: a non-empty key not in the enum map
+    procedure check_enum_value(this, own: ref[TsOwnConfig], i: int, text: Slice[char], value_node: ref[AstNode]?)
+    {
+        if (text.length as int) = 0
+            return
+        let lower TsConfigParser.to_lower(host, text)
+        let v TsOptionDecls.enum_value(i, lower)
+        if (v.length as int) = 0
+            this.report_node(own, value_node, DiagArgument_for_0_option_must_be_Colon_1)
+    }
+
     ; convertArrayLiteralExpressionToJson (no notifier below an array): nil elements
     ; dropped, an empty literal an empty slice, all dropped a nil one
-    procedure convert_array(this, node: ref[AstNode], own: ref[TsOwnConfig]) returns ref[JsonValue]
+    procedure convert_array(this, node: ref[AstNode], level: int, has_option: bool, own: ref[TsOwnConfig]) returns ref[JsonValue]
     {
         let out this.new_array()
         let elements AstNode.elements_of(node)
@@ -1137,7 +1571,7 @@ define TsConfigParser
         var i 0
         while i < (list.get_length() as int)
         {
-            let v this.convert_value(list[i as size_t], TsConfigLevelNone, own)
+            let v this.convert_value(list[i as size_t], level, has_option, false, own)
             set i: i + 1
             if v.kind <> JsonKindNull
                 vals.add(v)
@@ -1148,9 +1582,9 @@ define TsConfigParser
     }
 
     ; onPropertySet's root arm for `extends`
-    procedure set_extends(this, own: ref[TsOwnConfig], value: ref[JsonValue])
+    procedure set_extends(this, own: ref[TsOwnConfig], value: ref[JsonValue], value_node: ref[AstNode]?)
     {
-        let paths this.get_extends_config_path_or_array(value, own.base_path, own.config_file_name)
+        let paths this.get_extends_config_path_or_array(own, value, value_node, own.base_path, own.config_file_name)
         set own.extends_paths: paths
     }
 
@@ -1344,15 +1778,21 @@ define TsConfigParser
     ; ── extends ──────────────────────────────────────────────────────────────
 
     ; getExtendsConfigPathOrArray
-    procedure get_extends_config_path_or_array(this, value: ref[JsonValue], base_path: Slice[char], config_file_name: Slice[char]) returns ref[Array[Slice[char]]]
+    procedure get_extends_config_path_or_array(this, own: ref[TsOwnConfig], value: ref[JsonValue], value_node: ref[AstNode]?, base_path: Slice[char], config_file_name: Slice[char]) returns ref[Array[Slice[char]]]
     {
         let out &Array[Slice[char]]^host()
         var new_base base_path
         if (config_file_name.length as int) > 0
             set new_base: get_directory_path(host, get_normalized_absolute_path(host, config_file_name, base_path))
+        ; convertJsonOption(extendsOptionDeclaration, nil): extends disallows null
+        if value.kind = JsonKindNull
+        {
+            this.report_node(own, value_node, DiagCompiler_option_0_requires_a_value_of_type_1)
+            return out
+        }
         if value.kind = JsonKindString
         {
-            let p this.get_extends_config_path(value.text, new_base)
+            let p this.get_extends_config_path(own, value.text, new_base, value_node)
             if (p.length as int) > 0
                 out.add(p)
             return out
@@ -1363,23 +1803,29 @@ define TsConfigParser
             while i < value.size()
             {
                 let e value.value_at(i)
+                let expression TsConfigParser.element_node_at(value_node, i)
                 set i: i + 1
                 if e = null
                     continue
                 let ev e as ref[JsonValue]
                 if ev.kind <> JsonKindString
+                {
+                    this.report_node(own, expression, DiagCompiler_option_0_requires_a_value_of_type_1)
                     continue
-                let p2 this.get_extends_config_path(ev.text, new_base)
+                }
+                let p2 this.get_extends_config_path(own, ev.text, new_base, expression)
                 if (p2.length as int) > 0
                     out.add(p2)
             }
+            return out
         }
+        this.report_node(own, value_node, DiagCompiler_option_0_requires_a_value_of_type_1)
         out
     }
 
     ; getExtendsConfigPath: a rooted or relative path (with `.json` added when the
     ; name as written is absent), else a module resolved by ResolveConfig
-    procedure get_extends_config_path(this, extended_config: Slice[char], base_path: Slice[char]) returns Slice[char]
+    procedure get_extends_config_path(this, own: ref[TsOwnConfig], extended_config: Slice[char], base_path: Slice[char], value_node: ref[AstNode]?) returns Slice[char]
     {
         let ext normalize_slashes(host, extended_config)
         var path_like is_rooted_disk_path(ext)
@@ -1396,7 +1842,10 @@ define TsConfigParser
                 {
                     set path: join_slices(host, path, ".json")
                     if files.file_exists(path) = false
+                    {
+                        this.report_node(own, value_node, DiagFile_0_not_found)
                         return Slice[char]()
+                    }
                 }
             }
             return path
@@ -1410,6 +1859,10 @@ define TsConfigParser
         }
         if r >= 0
             return files.path_at(r)
+        if (ext.length as int) = 0
+            this.report_node(own, value_node, DiagCompiler_option_0_cannot_be_given_an_empty_string)
+        else
+            this.report_node(own, value_node, DiagFile_0_not_found)
         Slice[char]()
     }
 
@@ -1428,7 +1881,9 @@ define TsConfigParser
             TsOptions.put(host, options, "skipLibCheck", this.new_value(JsonKindBoolean, Slice[char](), true))
             TsOptions.put(host, options, "noEmit", this.new_value(JsonKindBoolean, Slice[char](), true))
         }
-        let own &TsOwnConfig^host(options, null, base_path, config_file_name)
+        let reporting reporting_next
+        set this.reporting_next: false
+        let own &TsOwnConfig^host(options, null, base_path, config_file_name, reporting)
         let raw this.convert_config_file(file, own)
         &TsParsedConfig^host(raw, options, own.extends_paths)
     }
@@ -1439,7 +1894,10 @@ define TsConfigParser
         let base_path normalize_slashes(host, base_path_in)
         let resolved_path get_normalized_absolute_path(host, config_file_name, base_path)
         if TsConfigParser.slices_contain(resolution_stack, resolved_path)
+        {
+            this.report_global(DiagCircularity_detected_while_resolving_configuration_Colon_0)
             return &TsParsedConfig^host(null, null, null)
+        }
         let own this.parse_own_config(file, base_path, config_file_name)
         if own.extends_paths = null
             return own
@@ -1589,6 +2047,33 @@ define TsConfigParser
             }
         }
         let files_slice TsConfigParser.non_nil_slice(files_prop)
+        ; the empty files list, reported without references and extends
+        if files_slice <> null
+        {
+            if (files_slice as ref[JsonValue]).size() = 0
+            {
+                var no_references true
+                let references TsConfigParser.non_nil_slice(TsConfigParser.prop_from_raw(parsed.raw, "references"))
+                if references <> null
+                {
+                    if (references as ref[JsonValue]).size() > 0
+                        set no_references: false
+                }
+                var has_extends false
+                if parsed.raw <> null
+                {
+                    let raw_object parsed.raw as ref[JsonValue]
+                    if raw_object.kind = JsonKindObject
+                    {
+                        let extends_value raw_object.get("extends")
+                        if extends_value <> null
+                            set has_extends: (extends_value as ref[JsonValue]).kind <> JsonKindNull
+                    }
+                }
+                if no_references and (has_extends = false)
+                    this.report_root_node(this.root_property_initializer("files"), DiagThe_files_list_in_config_file_0_is_empty)
+            }
+        }
         var include_slice TsConfigParser.non_nil_slice(include_prop)
         if (files_slice = null) and (include_slice = null)
         {
@@ -1599,11 +2084,11 @@ define TsConfigParser
         }
         let include_specs &Array[Slice[char]]^host()
         if include_slice <> null
-            this.validate_specs(include_slice as ref[JsonValue], true, include_specs)
+            this.validate_specs(include_slice as ref[JsonValue], true, "include", include_specs)
         let exclude_specs &Array[Slice[char]]^host()
         let exclude_slice TsConfigParser.non_nil_slice(exclude_prop)
         if exclude_slice <> null
-            this.validate_specs(exclude_slice as ref[JsonValue], false, exclude_specs)
+            this.validate_specs(exclude_slice as ref[JsonValue], false, "exclude", exclude_specs)
         let file_specs &Array[Slice[char]]^host()
         if files_slice <> null
         {
@@ -1623,6 +2108,21 @@ define TsConfigParser
         this.substitute_config_dir_list(exclude_specs, base_for_names)
         this.substitute_config_dir_list(file_specs, base_for_names)
         let names this.get_file_names_from_config_specs(file_specs, include_specs, exclude_specs, base_for_names, options)
+        ; shouldReportNoInputFiles for the root config
+        if names.get_length() = 0
+        {
+            var can_report true
+            if parsed.raw <> null
+            {
+                let raw_config parsed.raw as ref[JsonValue]
+                let has_files TsConfigParser.object_has(raw_config, "files")
+                let has_references TsConfigParser.object_has(raw_config, "references")
+                if has_files or has_references
+                    set can_report: false
+            }
+            if can_report
+                this.report_global(DiagNo_inputs_were_found_in_config_file_0_Specified_include_paths_were_1_and_exclude_paths_were_2)
+        }
         &TsParsedCommandLine^host(options, names)
     }
 
@@ -1653,7 +2153,7 @@ define TsConfigParser
     }
 
     ; validateSpecs: the string specs without a diagnostic
-    procedure validate_specs(this, specs: ref[JsonValue], disallow_trailing_recursion: bool, out: ref[Array[Slice[char]]])
+    procedure validate_specs(this, specs: ref[JsonValue], disallow_trailing_recursion: bool, spec_key: Slice[char], out: ref[Array[Slice[char]]])
     {
         var i 0
         while i < specs.size()
@@ -1669,10 +2169,18 @@ define TsConfigParser
             if disallow_trailing_recursion
             {
                 if TsConfigParser.invalid_trailing_recursion(spec)
+                {
+                    if diagnostics <> null
+                        this.report_root_node(this.prop_array_element_value(spec_key, spec), DiagFile_specification_cannot_end_in_a_recursive_directory_wildcard_Asterisk_Asterisk_Colon_0)
                     continue
+                }
             }
             if TsConfigParser.invalid_dot_dot_after_recursive_wildcard(spec)
+            {
+                if diagnostics <> null
+                    this.report_root_node(this.prop_array_element_value(spec_key, spec), DiagFile_specification_cannot_contain_a_parent_directory_that_appears_after_a_recursive_directory_wildcard_Asterisk_Asterisk_Colon_0)
                 continue
+            }
             out.add(spec)
         }
     }

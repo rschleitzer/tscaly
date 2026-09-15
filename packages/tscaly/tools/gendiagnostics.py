@@ -111,6 +111,12 @@ SOURCES = [
     # Slice 268. The program's file loader reports its explaining diagnostics
     # (File_0_not_found, the allowJs hint, the reference to itself) from these.
     os.path.join(SUB, "internal/compiler/fileloader.go"),
+    # Slice 273. The resolver's own diagnostics (the ambiguous project root).
+    os.path.join(SUB, "internal/module/resolver.go"),
+    # Slice 273. The tsconfig conversion reports (the unknown option, the invalid
+    # enum value, the wrong value type) from these two.
+    os.path.join(SUB, "internal/tsoptions/tsconfigparsing.go"),
+    os.path.join(SUB, "internal/tsoptions/errors.go"),
     os.path.join(SUB, "internal/compiler/filesparser.go"),
     os.path.join(SUB, "internal/compiler/processingDiagnostic.go"),
     # Slice 119. jsx.go joins under the same per-FILE rule: the JSX element chapter
@@ -186,6 +192,12 @@ def main():
     for category in ("CategoryError", "CategoryWarning", "CategorySuggestion",
                      "CategoryMessage"):
         used.discard(category)
+    # ★ Slice 273: tsconfigparsing.go names two messages inside COMMENTED-OUT
+    # DefaultValueDescription fields, and the table no longer carries them. The
+    # set is narrow and named, as above.
+    for commented in ("Node_modules_bower_components_jspm_packages_plus_the_value_of_outDir_if_one_is_specified",
+                      "if_files_is_specified_otherwise_Asterisk_Asterisk_Slash_Asterisk"):
+        used.discard(commented)
     missing = sorted(n for n in used if n not in codes)
     if missing:
         sys.exit(
