@@ -129,6 +129,8 @@ SOURCES = [
     os.path.join(SUB, "internal/checker/jsx.go"),
     # Slice 285. utilities.go carries CreateModuleNotFoundChain's four messages.
     os.path.join(SUB, "internal/checker/utilities.go"),
+    # includeprocessor.go carries the file-casing messages.
+    os.path.join(SUB, "internal/compiler/includeprocessor.go"),
     # Slice 182. checker/jsdoc.go joins under the same per-FILE rule:
     # checkUnmatchedJSDocParameters reports, and its two messages appear in NO
     # other source of this list — TS8029 (the `arguments` advice) and TS8032 (the
