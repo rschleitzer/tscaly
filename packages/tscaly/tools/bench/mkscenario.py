@@ -12,7 +12,12 @@ ensure_default_libs does not substitute its one-line stand-in), then one `run`.
 
 Usage:
   mkscenario.py <project dir> <out file> [--src src] [--tsconfig src/tsconfig.json]
-                [--extra-config src/tsconfig.base.json ...]
+                [--extra-config src/tsconfig.base.json ...] [--paths-only]
+
+--paths-only writes the file NAMES and no text: `file <path>` for a project file
+(read from disk by tscaly_exec the first time something asks for its text) and
+`file-as <virtual path>\t<disk path>` for a default library. The scenario shrinks
+from the whole text of the tree to its paths, and a file nothing reads is never read.
 
 Measured 2026-09-16 on VS Code: 17 677 files, 187 MB of text.
 """
@@ -31,11 +36,15 @@ def main():
     ap.add_argument("--src", default="src")
     ap.add_argument("--tsconfig", default="src/tsconfig.json")
     ap.add_argument("--extra-config", action="append", default=["src/tsconfig.base.json"])
+    ap.add_argument("--paths-only", action="store_true")
     args = ap.parse_args()
     project = os.path.abspath(args.project)
     entries = []
 
     def add(path, disk):
+        if args.paths_only:
+            entries.append((path, disk))
+            return
         with open(disk, "rb") as f:
             entries.append((path, f.read()))
 
@@ -73,11 +82,20 @@ def main():
         o.write(b"deflib %d\n" % len(deflib) + deflib + b"\n")
         o.write(b"step 0\n")
         for path, text in entries:
+            if args.paths_only:
+                if path == text:
+                    o.write(b"file " + path.encode() + b"\n")
+                else:
+                    o.write(b"file-as " + path.encode() + b"\t" + text.encode() + b"\n")
+                continue
             o.write(b"write %d %s\n" % (len(text), path.encode()))
             o.write(text + b"\n")
         o.write(("run -p\x1f" + args.tsconfig + "\x1f--noEmit\n").encode())
         o.write(b"==== TSCALY-END\n")
-    print("files %d, bytes %d" % (len(entries), sum(len(t) for _, t in entries)))
+    if args.paths_only:
+        print("files %d (paths only)" % len(entries))
+    else:
+        print("files %d, bytes %d" % (len(entries), sum(len(t) for _, t in entries)))
 
 
 if __name__ == "__main__":

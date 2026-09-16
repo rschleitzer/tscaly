@@ -39,6 +39,9 @@ TSCALY_PROGRESS=1 <repo>/packages/tscaly/tools/bench/runwatch.sh vscode 1800 160
   ./tscaly_exec_o2 --bench-batch vscode.scenario
 ```
 
+`--paths-only` writes the file names without their texts; tscaly_exec reads a text
+from disk the first time something asks for it (vs/editor: 2.7 → 1.9 GB).
+
 `--bench-batch` replays the scenario without the file trees, the snapshots and the
 shadow build that the driver yardstick needs (`--batch`); on a one-file config that
 is 1.66 → 0.92 GB of harness alone.
