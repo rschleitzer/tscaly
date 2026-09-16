@@ -497,13 +497,16 @@ def is_config_unit(unit_name):
 
 def stack_wrapper(args):
     """the dump under the stack tests/run.sh sets (a 40 KB binary-expression chain is a
-    SIGSEGV at the default 8 MB)"""
-    os.makedirs(args.scratch, exist_ok=True)
-    wrapper = os.path.join(args.scratch, "dump-with-stack.sh")
-    with open(wrapper, "w") as fh:
-        fh.write("#!/bin/sh\nulimit -s 65520 2>/dev/null\nexec %s \"$@\"\n" % os.path.abspath(args.binary))
-    os.chmod(wrapper, 0o755)
-    return wrapper
+    SIGSEGV at the default 8 MB): raised once in THIS process, which every dump inherits
+    — a shell wrapper per chunk was a script file and a second exec per process"""
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+    want = 65520 * 1024
+    if hard != resource.RLIM_INFINITY:
+        want = min(want, hard)
+    if soft == resource.RLIM_INFINITY or soft < want:
+        resource.setrlimit(resource.RLIMIT_STACK, (want, hard))
+    return os.path.abspath(args.binary)
 
 
 def read_tsconfigs(args, case_rows):

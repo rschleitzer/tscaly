@@ -175,6 +175,18 @@ def write_units_file(path, units):
             fh.write(b"\n")
 
 
+def units_bytes(units):
+    """units: iterable of (unit path, content bytes) → the `--batch` input as bytes,
+    handed to the program through its standard input (`--batch -`): a batch writes no
+    file, so nothing on the disk changes and nothing is scanned on the way"""
+    parts = []
+    for upath, content in units:
+        parts.append(b"==== TSCALY-UNIT %d %s\n" % (len(content), upath.encode("utf-8", "surrogateescape")))
+        parts.append(content)
+        parts.append(b"\n")
+    return b"".join(parts)
+
+
 def parse_dump_stream(blob: bytes):
     """→ (complete: {path: body}, in_progress: path or None) of a `--batch` answer."""
     complete = {}
@@ -344,21 +356,14 @@ def run_batch(binary, flag, units, scratch, jobs, timeout):
     """Our side: `binary [flag] --batch <units file>` over `units` [(path, content)],
     in `jobs` chunks. → {path: (rc, body, err)}; rc 0 = answered, TIMED_OUT = the
     process fell silent on this unit, anything else = it died on this unit."""
-    os.makedirs(scratch, exist_ok=True)
     results = {}
     rlock = threading.Lock()
 
     def one_chunk(ci, pending):
         attempt = 0
         while pending:
-            path = os.path.join(scratch, "units.%d.%d" % (ci, attempt))
-            write_units_file(path, pending)
-            argv = [binary] + ([flag] if flag else []) + ["--batch", path]
-            rc, out, err, timed_out = stream_process(argv, None, timeout)
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+            argv = [binary] + ([flag] if flag else []) + ["--batch", "-"]
+            rc, out, err, timed_out = stream_process(argv, units_bytes(pending), timeout)
             complete, in_progress = parse_dump_stream(out)
             with rlock:
                 for p, body in complete.items():
@@ -396,7 +401,6 @@ def run_batch_groups(binary, groups, jobs, timeout, chunk_size=25):
         units = list(units)
         if not units:
             continue
-        os.makedirs(scratch, exist_ok=True)
         k = max(1, -(-len(units) // chunk_size))
         for ci, chunk in enumerate(_chunks(units, k)):
             tasks.append((len(chunk), gi, ci, flag, chunk, scratch))
@@ -408,14 +412,8 @@ def run_batch_groups(binary, groups, jobs, timeout, chunk_size=25):
     def one_chunk(ci, flag, pending, scratch):
         attempt = 0
         while pending:
-            path = os.path.join(scratch, "units.%d.%d" % (ci, attempt))
-            write_units_file(path, pending)
-            argv = [binary] + ([flag] if flag else []) + ["--batch", path]
-            rc, out, err, timed_out = stream_process(argv, None, timeout)
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+            argv = [binary] + ([flag] if flag else []) + ["--batch", "-"]
+            rc, out, err, timed_out = stream_process(argv, units_bytes(pending), timeout)
             complete, in_progress = parse_dump_stream(out)
             with rlock:
                 for p, body in complete.items():
