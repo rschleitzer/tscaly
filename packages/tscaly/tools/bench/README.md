@@ -36,8 +36,12 @@ packages/tscaly/tools/bench/build.sh ~/repos/bench/tscaly_exec_o2
 python3 packages/tscaly/tools/bench/mkscenario.py ~/repos/bench/vscode ~/repos/bench/vscode.scenario
 cd ~/repos/bench
 TSCALY_PROGRESS=1 <repo>/packages/tscaly/tools/bench/runwatch.sh vscode 1800 16000 -- \
-  ./tscaly_exec_o2 --batch vscode.scenario
+  ./tscaly_exec_o2 --bench-batch vscode.scenario
 ```
+
+`--bench-batch` replays the scenario without the file trees, the snapshots and the
+shadow build that the driver yardstick needs (`--batch`); on a one-file config that
+is 1.66 → 0.92 GB of harness alone.
 
 `TSCALY_PROGRESS=1` prints `check <index> <path>` as each file is checked, so a
 run that ends early says how far it came (`grep -c '^check ' vscode.out`). The

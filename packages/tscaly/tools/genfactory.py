@@ -1475,15 +1475,8 @@ define NodeFactory
         set n.data: data
         set n.parent: null
         set n.symbol: null
-        set n.local_symbol: null
-        set n.locals: null
+        set n.extras: null
         set n.flow_node: null
-        set n.end_flow_node: null
-        set n.return_flow_node: null
-        set n.fallthrough_flow_node: null
-        set n.original: null
-        set n.emit_index: 0
-        set n.emit_context_id: 0
         set n.subtree_facts: 0
         set this.node_count: node_count + 1
         if context <> null
@@ -1523,13 +1516,13 @@ define NodeFactory
             {
                 if (sf.statements = statements) and (sf.end_of_file_token = end_of_file_token)
                     return node
-                var d sf
+                var d: SourceFileData sf
                 set d.statements: statements
                 set d.end_of_file_token: end_of_file_token
                 let c AstNode.alloc(host)
                 set c: node
                 set c.subtree_facts: 0
-                set c.data: NodeData.SourceFile(d)
+                set c.data: NodeData.SourceFile(AstNode.box_source_file(host, d))
                 return this.update_node(c, node)
             }
         node
