@@ -46,6 +46,9 @@ for m in re.finditer(r'\ndefine (\w+Data) \((.*?)\)\n', ast_src):
     records[m.group(1)] = [(f.strip(), t.strip()) for f, t in re.findall(r'([a-z_0-9]+):\s*([^\s]+(?:\[[^\]]*\])?\??)', body)] if body else []
 union = re.search(r'\ndefine NodeData union\n\((.*?)\n\)', ast_src, re.S).group(1)
 arms = dict(re.findall(r'^\s{4}(\w+): (\w+Data)', union, re.M))
+# the large arms hold a reference to their record (ast.scaly's box_node_data)
+boxed = {k: v for k, v in re.findall(r'^\s{4}(\w+): ref\[(\w+Data)\]', union, re.M) if k != 'SourceFile'}
+arms.update(boxed)
 
 # ── overrides: (GoStruct, GoField) → port field; '' drops the value ──
 OVERRIDE = {
@@ -1649,6 +1652,8 @@ for name in order:
     out('    {')
     body = 'NodeData.%s(%s(%s))'
     def ctor(arm):
+        if arm in boxed:
+            return 'NodeData.%s(box_node_data[%s](host, %s(%s)))' % (arm, record, record, ', '.join(args))
         return body % (arm, record, ', '.join(args))
     if kind_param:
         if len(arm_list) == 1:
