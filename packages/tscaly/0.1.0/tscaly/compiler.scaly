@@ -36,6 +36,7 @@ use tscaly.tsoptions.TsConfigParser
 use tscaly.Diagnostics.ChainLine
 use tscaly.tracing.Tracing
 use tscaly.tracing.TraceArg
+use tscaly.program.ResolutionContext
 
 ; fileIncludeKind
 define FileIncludeKindImport: int 0
@@ -126,7 +127,11 @@ define ProgramLoader
     host: ref[Page]
     files: ref[ProgramFiles]
     options: EmitOptions
-    checker: ref[Checker]
+    ; ★NULLABLE since slice 293 — upstream's `fileloader.go` holds no checker at
+    ; all, and this port's held one only so the walk could ask four questions that
+    ; are pure (see ResolutionContext). It is set after the walk, for the two
+    ; output-path calls `verify_emit_file_paths` makes.
+    checker: ref[Checker]?
     specifiers: ref[SpecifierHost]
     nodes: ref[Array[ref[LoaderNode]]]
     root_edges: ref[Array[ref[LoaderEdge]]]
@@ -178,7 +183,13 @@ define ProgramLoader
     tracing: ref[Tracing]?
 )
 {
-    function create(host: ref[Page], files: ref[ProgramFiles], options: EmitOptions, checker: ref[Checker]) returns ref[ProgramLoader]
+    procedure set_checker(this, c: ref[Checker])
+    {
+        set checker: c
+        specifiers.set_checker(c)
+    }
+
+    function create(host: ref[Page], files: ref[ProgramFiles], options: EmitOptions, checker: ref[Checker]?) returns ref[ProgramLoader]
     {
         let members &Array[bool]^host()
         let searched &Array[bool]^host()
@@ -229,6 +240,11 @@ define ProgramLoader
         if (stop_tag.length as int) = 0
             set this.stop_tag: tag
     }
+
+    ; the loader's own inputs to getModeForUsageLocation — upstream's fileloader
+    ; passes `(fileName, meta, options)` and holds no checker at all
+    function resolution_context(this) returns ResolutionContext
+        ResolutionContext(files, options.get_emit_module_kind(), options.get_module_resolution_kind(), options.resolve_package_json_exports, options.resolve_package_json_imports, ModuleKindNone)
 
     ; ★★★ fileLoader.parseSourceFile — the file at `index` parsed and bound THE
     ; FIRST TIME THE LOADER REACHES IT (slice 292). It used to be
@@ -300,22 +316,60 @@ define ProgramLoader
                 set is_external: true
             }
         }
-        Binder.set_symbol_id_base(index * 1000000)
-        let bs_args Tracing.no_args(host)
-        Tracing.add_arg(host, bs_args, "path", path_data)
-        let bs_tid ProgramLoader.session_push(tracing, TracePhaseBind, "bindSourceFile", bs_args)
-        let b Binder.bind_source_file_ex(host, file, text_copy, path, is_external, forced)
-        ProgramLoader.session_pop(tracing, bs_tid, TracePhaseBind, "bindSourceFile", bs_args)
-        Binder.set_symbol_id_base(0)
-        if Binder.unported_at(b) >= 0
-            return Binder.unported_tag_at(b)
         ; ★The FORMAT is not recomputed here: the registration pass has already
         ; set it per entry from the nearest package.json's `type`
         ; (`unit_package_json_type`), which this loader's own options do not carry
         ; — recomputing it without one answered CJS where the file is ESM and
         ; turned four moduleResolution baselines red.
-        files.set_parsed(index, Slice[char](text_copy.get_length() as int, text_copy.get_buffer() as pointer[char]), file, b, p, files.format_at(index))
+        ; ★★★ THE BIND IS NOT DONE HERE SINCE SLICE 293 — `bind_all` below is the
+        ; reference's own `bindSourceFiles`, a block of its own after createProgram
+        ; closes. What made the split possible is that nothing in the walk asks a
+        ; binder any more: the two questions it had (external module, declaration
+        ; file) are parse-time and are recorded on the next line.
+        files.set_parsed(index, Slice[char](text_copy.get_length() as int, text_copy.get_buffer() as pointer[char]), file, null, p, files.format_at(index))
+        files.set_module_kindness(index, is_external, forced)
         Slice[char]()
+    }
+
+    ; program.go's `bindSourceFiles`, over every file the walk parsed
+    procedure bind_all(this) returns bool
+    {
+        var i 0
+        while i < files.count()
+        {
+            if this.bind_one(i) = false
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    procedure bind_one(this, index: int) returns bool
+    {
+        let f files.file_at(index)
+        if f = null
+            return true
+        if files.binder_at(index) <> null
+            return true
+        let host Page.get(this)
+        let path_data files.path_at(index)
+        let path String^host(path_data.data as pointer[const_char], path_data.length as size_t)
+        let raw files.text_at(index)
+        let text String^host(raw.data as pointer[const_char], raw.length as size_t)
+        Binder.set_symbol_id_base(index * 1000000)
+        let bs_args Tracing.no_args(host)
+        Tracing.add_arg(host, bs_args, "path", path_data)
+        let bs_tid ProgramLoader.session_push(tracing, TracePhaseBind, "bindSourceFile", bs_args)
+        let b Binder.bind_source_file_ex(host, f as ref[AstNode], text, path, files.external_at(index), files.forced_module_at(index))
+        ProgramLoader.session_pop(tracing, bs_tid, TracePhaseBind, "bindSourceFile", bs_args)
+        Binder.set_symbol_id_base(0)
+        if Binder.unported_at(b) >= 0
+        {
+            this.stop(Binder.unported_tag_at(b))
+            return false
+        }
+        files.set_binder(index, b)
+        true
     }
 
     ; the extensions DriverProgram.source_extension names, minus `.json`: a JSON
@@ -823,7 +877,7 @@ define ProgramLoader
     procedure lib_spelling_suggestion(this, name: Slice[char]) returns String
     {
         let keys TsOptionDecls.enum_keys_text(TsOptionDecls.index_of("lib"))
-        let rune_name checker.name_runes(name)
+        let rune_name Checker.name_runes_on(host, name)
         let rune_n rune_name.length as int
         var maximum_length_difference (rune_n * 34) / 100
         if maximum_length_difference < 2
@@ -863,8 +917,8 @@ define ProgramLoader
                 if Checker.names_equal_fold(candidate, name) = false
                     continue
             }
-            let rune_cand checker.name_runes(candidate)
-            let distance checker.levenshtein_with_max(rune_name, rune_n, rune_cand, rune_cand.length as int, best_distance)
+            let rune_cand Checker.name_runes_on(host, candidate)
+            let distance Checker.levenshtein_with_max_on(host, rune_name, rune_n, rune_cand, rune_cand.length as int, best_distance)
             if distance < 0
                 continue
             if distance < best_distance
@@ -1213,7 +1267,7 @@ define ProgramLoader
             set is_declaration_file: (binder as ref[Binder]).is_declaration_file_of()
         }
         let is_js ProgramLoader.has_js_file_extension(path)
-        checker.select_program_file(index, files.format_at(index))
+
         let names &Array[ref[AstNode]?]^host()
         let synthetic_names &Array[Slice[char]]^host()
         ; the synthetic tslib import
@@ -1224,7 +1278,13 @@ define ProgramLoader
         }
         if path.ends_with(".jsx") or path.ends_with(".tsx")
         {
-            let jsx_import checker.get_jsx_runtime_import_specifier(file)
+            ; `ast.GetJSXRuntimeImport(ast.GetJSXImplicitImportBase(optionsForFile, file), optionsForFile)`
+            ; — fileloader.go:551, over the OPTIONS and not over a checker
+            var script_kind ScriptKindUnknown
+            let jp files.parser_at(index)
+            if jp <> null
+                set script_kind: (jp as ref[Parser]).script_kind
+            let jsx_import Checker.jsx_runtime_import_of(host, file, script_kind, options.jsx, options.jsx_import_source)
             if (jsx_import.length as int) > 0
                 synthetic_names.add(jsx_import)
         }
@@ -1319,9 +1379,9 @@ define ProgramLoader
         let path files.path_at(index)
         var mode ModuleKindNone
         if entry <> null
-            set mode: checker.usage_mode_of(entry, files.format_at(index))
+            set mode: Checker.usage_mode_in(this.resolution_context(), entry, files.format_at(index))
         else
-            set mode: checker.usage_mode_of(null, files.format_at(index))
+            set mode: Checker.usage_mode_in(this.resolution_context(), null, files.format_at(index))
         let resolver this.resolver_for(path, mode, false)
         let r resolver.resolve(module_name, this.resolution_containing_path(path))
         ProgramLoader.append_traces(node.traces, resolver)
@@ -1380,6 +1440,12 @@ define ProgramLoader
         if entry <> null
         {
             let en entry as ref[AstNode]
+            ; ★The one place the walk still needs a binder: the SPAN of an import's
+            ; module specifier, which `error_range_for_node` reads off the binder's
+            ; own text. It binds that file where it needs it and the stream says so,
+            ; because that is what happens — the alternative is the fallback span
+            ; under the guard below, which nobody would see (§3.5la).
+            this.bind_one(index)
             let b files.binder_at(index)
             var s 0
             var e 0
@@ -1981,7 +2047,7 @@ define ProgramLoader
             let is_json path.ends_with(".json")
             if EmitOptions.on(o.emit_declaration_only) = false
             {
-                let js emitter.js_output_path(info, o, cwd, checker)
+                let js emitter.js_output_path(info, o, cwd, (checker as ref[Checker]))
                 if (is_json and js.equals(path)) = false
                 {
                     this.verify_emit_file_path(js, seen)
@@ -1991,7 +2057,7 @@ define ProgramLoader
             }
             if (EmitOptions.on(o.declaration) or EmitOptions.on(o.composite)) and (is_json = false)
             {
-                let dts emitter.dts_output_path(info, o, cwd, checker)
+                let dts emitter.dts_output_path(info, o, cwd, (checker as ref[Checker]))
                 this.verify_emit_file_path(dts, seen)
                 if EmitOptions.on(o.declaration_map)
                     this.verify_emit_file_path(join_slices(host, dts, ".map"), seen)
