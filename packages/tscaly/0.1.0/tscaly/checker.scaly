@@ -5997,6 +5997,12 @@ define Checker
     ; the rest of the lib chain (slice 248): the first lib stays `lib_file`
     extra_lib_files: ref[Array[ref[AstNode]?]]?
     extra_lib_binders: ref[Array[ref[Binder]?]]?
+    ; the WHOLE lib chain's parsers and paths, indexed 0..n-1 beside
+    ; (lib_file, lib_b) + extra_lib_* — `select_lib_file` needs the two things
+    ; the chain does not otherwise carry. Null until the driver sets them; the
+    ; checker's own lib loader (tscaly_types) never selects a lib.
+    all_lib_parsers: ref[Array[ref[Parser]?]]?
+    all_lib_paths: ref[Array[Slice[char]]]?
     ; slice 248: the program — every unit of a case with its binder and parser,
     ; the table the module resolver answers over; null in the single-unit runs
     program: ref[ProgramFiles]?
@@ -8176,6 +8182,8 @@ define Checker
         set c.lib_b: lib_b
         set c.extra_lib_files: extra_files
         set c.extra_lib_binders: extra_binders
+        set c.all_lib_parsers: null
+        set c.all_lib_paths: null
         set c.program: program
         set c.module_resolution_kind: ModuleResolutionKindUnknown
         ; GetResolveJsonModule under the unset configuration: bundler resolution, so
@@ -42941,25 +42949,54 @@ define Checker
         let file Checker.source_file_of_node(n)
         if file = null
             return null
-        if program = null
-            return null
-        let pf program as ref[ProgramFiles]
-        let idx pf.index_of_file(file)
-        if idx < 0
+        ; ★The path comes from the program's table for a program file and from the
+        ; lib chain for a lib, because this port keeps the two apart (see
+        ; select_lib_file) and EVERY row of the smaller trace baseline's types file
+        ; but two names a lib declaration.
+        var path Slice[char]()
+        if program <> null
+        {
+            let pf program as ref[ProgramFiles]
+            let idx pf.index_of_file(file)
+            if idx >= 0
+                set path: pf.paths[idx as size_t]
+        }
+        if (path.length as int) = 0
+            set path: this.lib_path_of_file(file)
+        if (path.length as int) = 0
             return null
         let h host
-        let path pf.paths[idx as size_t]
-        let text pf.texts[idx as size_t]
         let bn this.binder_of_node(n)
-        var start 0
-        var stop 0
-        if bn.error_range_for_node(null, n, &start, &stop) = false
-            return null
+        ; `scanner.GetTokenPosOfNode(node, file, false)` — the node's OWN token
+        ; start and not the error range a diagnostic would use: the reference's
+        ; firstDeclaration for `interface Boolean {}` is the `interface` keyword,
+        ; where the error range is the name.
+        let start bn.skip_trivia_at(AstNode.pos_of(n))
         let obj JsonText.new_object(h)
         JsonText.put_member(obj, "path", JsonText.new_string(h, Checker.lower_path(h, path)))
-        JsonText.put_member(obj, "start", this.line_and_char(text, AstNode.pos_of(n), start))
-        JsonText.put_member(obj, "end", this.line_and_char(text, AstNode.end_of(n), AstNode.end_of(n)))
+        JsonText.put_member(obj, "start", this.line_and_char(bn, start))
+        JsonText.put_member(obj, "end", this.line_and_char(bn, AstNode.end_of(n)))
         obj
+    }
+
+    ; the lib chain's path for one of its files, empty for anything else
+    function lib_path_of_file(this, file: ref[AstNode]?) returns Slice[char]
+    {
+        if file = null
+            return Slice[char]()
+        if lib_file = file
+            return this.lib_chain_path(0)
+        if extra_lib_files = null
+            return Slice[char]()
+        let ef extra_lib_files as ref[Array[ref[AstNode]?]]
+        var i 0
+        while i < (ef.get_length() as int)
+        {
+            if ef[i as size_t] = file
+                return this.lib_chain_path(i + 1)
+            set i: i + 1
+        }
+        Slice[char]()
     }
 
     function lower_path(host: ref[Page], p: Slice[char]) returns Slice[char]
@@ -42992,9 +43029,10 @@ define Checker
     ; GetECMALineAndUTF16CharacterOfPosition, 1-indexed on both members. The line
     ; breaks are stringutil.IsLineBreak's four (see ecma_lines_differ) and the
     ; character counts UTF-16 CODE UNITS, so an astral character is two.
-    function line_and_char(this, text: Slice[char], pos_unused: int, pos: int) returns ref[JsonValue]
+    function line_and_char(this, bn: ref[Binder], pos: int) returns ref[JsonValue]
     {
         let h host
+        let text bn.source_slice(0, pos)
         var line 1
         var line_start 0
         let n text.length as int
@@ -95565,6 +95603,77 @@ define Checker
 
     ; the driver's switch between units: the checker's per-file state (the
     ; reference reads them off the SourceFile; this port keeps them as fields)
+    ; the lib chain's parsers and paths, so that `select_lib_file` can make the
+    ; i-th lib the current file — the reference's program holds its libs in
+    ; `SourceFiles()` and `checkSourceFiles` walks them like any other file.
+    procedure set_lib_chain(this, parsers: ref[Array[ref[Parser]?]]?, paths: ref[Array[Slice[char]]]?)
+    {
+        set all_lib_parsers: parsers
+        set all_lib_paths: paths
+    }
+
+    function lib_chain_count(this) returns int
+    {
+        if all_lib_paths = null
+            return 0
+        (all_lib_paths as ref[Array[Slice[char]]]).get_length() as int
+    }
+
+    function lib_chain_path(this, i: int) returns Slice[char]
+    {
+        if all_lib_paths = null
+            return Slice[char]()
+        (all_lib_paths as ref[Array[Slice[char]]])[i as size_t]
+    }
+
+    function lib_chain_binder(this, i: int) returns ref[Binder]?
+    {
+        if i = 0
+            return lib_b
+        if extra_lib_binders = null
+            return null
+        (extra_lib_binders as ref[Array[ref[Binder]?]])[(i - 1) as size_t]
+    }
+
+    ; checkSourceFile over the i-th default library. It is select_program_file
+    ; with the file taken off the lib chain instead of the program's table, and
+    ; the per-file state reset the same way.
+    procedure select_lib_file(this, i: int) returns bool
+    {
+        if all_lib_parsers = null
+            return false
+        var f: ref[AstNode]? lib_file
+        if i > 0
+        {
+            if extra_lib_files = null
+                return false
+            let ef extra_lib_files as ref[Array[ref[AstNode]?]]
+            set f: ef[(i - 1) as size_t]
+        }
+        if f = null
+            return false
+        let bb this.lib_chain_binder(i)
+        if bb = null
+            return false
+        let lp (all_lib_parsers as ref[Array[ref[Parser]?]])[i as size_t]
+        if lp = null
+            return false
+        set file: f
+        set b: bb as ref[Binder]
+        set p: lp as ref[Parser]
+        let path this.lib_chain_path(i)
+        let name String^host(path.data as pointer[const_char], path.length)
+        set is_declaration_file: is_declaration_file_name(name)
+        set is_mts_or_cts_file: file_extension_is_mts_or_cts(name)
+        set emit_module_format: ModuleKindNone
+        set implied_node_format: Checker.implied_node_format_for_file(path, Slice[char]())
+        set implied_node_format_for_emit: Checker.implied_node_format_for_emit_of(path, module_kind, implied_node_format, Slice[char]())
+        set renamed_binding_elements_in_types: &Array[ref[AstNode]?]^host()
+        set requested_external_emit_helpers: 0
+        set external_helpers_module: null
+        true
+    }
+
     procedure select_program_file(this, index: int, format: int)
     {
         let pf program as ref[ProgramFiles]
