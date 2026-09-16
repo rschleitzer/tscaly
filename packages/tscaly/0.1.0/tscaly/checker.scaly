@@ -5966,6 +5966,24 @@ define DeferredCheckKindReflect: int 1
 define DeferredCheckKindNotIterable: int 2
 define DeferredCheck (kind: int  node: ref[AstNode]?  t: ref[Type]?  flag: bool)
 
+; One resolution the checker has made (program.GetResolvedModule's answer): the
+; file it names and the four facts resolveExternalModule reads, keyed by the
+; importing file, the name and the usage mode. Upstream the checker asks the
+; program's resolution cache and never resolves; here it resolved per REFERENCE,
+; and a resolver with its candidate paths was ~70 MB of vs/editor's allocations.
+define ResolutionMemo
+(
+    importing_index: int
+    mode: int
+    name: Slice[char]
+    resolved_index: int
+    package_id: Slice[char]
+    alternate_result: Slice[char]
+    stop_tag: Slice[char]
+    arbitrary_extension: bool
+    using_ts_extension: bool
+)
+
 define Checker
 (
     host: ref[Page]
@@ -6249,6 +6267,11 @@ define Checker
 
     ; nextTypeId, in creation order.
     type_count: int
+    ; resolve_external_module's resolutions, with an open-addressed index (1-based
+    ; row, 0 empty) keyed on (importing file, name, mode)
+    resolution_memos: ref[Array[ref[ResolutionMemo]?]]?
+    resolution_memo_buckets: ref[Vector[int]]?
+    resolution_memo_mask: int
     ; what TSCALY_STATS reports beside type_count: the checker's own nodes, flow
     ; nodes and transient symbols
     nodes_allocated: int
@@ -8285,6 +8308,9 @@ define Checker
         let pas &Array[ref[Symbol]?]^host()
         set c.pattern_augmentation_symbols: pas
         set c.type_count: 0
+        set c.resolution_memos: null
+        set c.resolution_memo_buckets: null
+        set c.resolution_memo_mask: 0
         set c.nodes_allocated: 0
         set c.flow_nodes_allocated: 0
         set c.symbols_allocated: 0
@@ -23890,6 +23916,112 @@ define Checker
         best
     }
 
+    function resolution_memo_hash(importing_index: int, mode: int, d: Slice[char]) returns int
+    {
+        var h: u64 14695981039346656037
+        set h: h xor (importing_index as u64)
+        set h: h * 1099511628211
+        set h: h xor (mode as u64)
+        set h: h * 1099511628211
+        var i: size_t 0
+        while i < d.length
+        {
+            set h: h xor (((d[i] as int) & 255) as u64)
+            set h: h * 1099511628211
+            set i: i + 1
+        }
+        ((h >> 1) as int)
+    }
+
+    ; The resolution of `d` from the importing file under `mode`, made once. A miss
+    ; resolves on a SCRATCH page that is released afterwards: the resolver, its
+    ; candidate paths and its package.json directories are garbage the moment it
+    ; answers, and what outlives it is copied into the memo first (the program
+    ; table's own records — package.json cache, lookups, seen paths — copy onto the
+    ; table's page already).
+    procedure resolution_memo_for(this, pf: ref[ProgramFiles], importing_index: int, d: Slice[char], mode: int, containing_path: Slice[char]) returns ref[ResolutionMemo]
+    {
+        let h Checker.resolution_memo_hash(importing_index, mode, d)
+        if resolution_memo_buckets <> null
+        {
+            let v resolution_memo_buckets as ref[Vector[int]]
+            let rows resolution_memos as ref[Array[ref[ResolutionMemo]?]]
+            var slot h & resolution_memo_mask
+            while true
+            {
+                let e v.get(slot as size_t)
+                if e = null
+                    break
+                let idx *e
+                if idx = 0
+                    break
+                let row rows[(idx - 1) as size_t]
+                if row <> null
+                {
+                    let m row as ref[ResolutionMemo]
+                    if m.importing_index = importing_index
+                    {
+                        if m.mode = mode
+                        {
+                            if m.name.equals(d)
+                                return m
+                        }
+                    }
+                }
+                set slot: (slot + 1) & resolution_memo_mask
+            }
+        }
+        let scratch host.allocate_exclusive_page()
+        let resolver ModuleResolver.create(scratch, pf, module_resolution_kind, resolve_json_module, mode, allow_js, resolve_package_json_exports, resolve_package_json_imports, out_dir, root_dir)
+        pf.apply_redirect_paths(importing_index, resolver)
+        let resolved resolver.resolve(d, containing_path)
+        let memo &ResolutionMemo^host(importing_index, mode, slice_copy_on(host, d), resolved, slice_copy_on(host, resolver.package_id), slice_copy_on(host, resolver.alternate_result), slice_copy_on(host, resolver.stop_tag), resolver.resolved_arbitrary_extension, resolver.resolved_using_ts_extension)
+        host.deallocate_exclusive_page(scratch)
+        if resolution_memos = null
+        {
+            let fresh &Array[ref[ResolutionMemo]?]^host()
+            set resolution_memos: fresh
+        }
+        let rows resolution_memos as ref[Array[ref[ResolutionMemo]?]]
+        rows.add(memo)
+        let count rows.get_length() as int
+        var cap 0
+        if resolution_memo_buckets <> null
+            set cap: resolution_memo_mask + 1
+        var first count - 1
+        if (count * 2) > cap
+        {
+            var new_cap 64
+            while (count * 2) > new_cap
+                set new_cap: new_cap * 2
+            let fresh_buckets Vector[int]^host(new_cap as size_t)
+            set resolution_memo_buckets: fresh_buckets
+            set resolution_memo_mask: new_cap - 1
+            set first: 0
+        }
+        let v resolution_memo_buckets as ref[Vector[int]]
+        var j first
+        while j < count
+        {
+            let r rows[j as size_t] as ref[ResolutionMemo]
+            var slot Checker.resolution_memo_hash(r.importing_index, r.mode, r.name) & resolution_memo_mask
+            while true
+            {
+                let e v.get(slot as size_t)
+                if e = null
+                    break
+                if *e = 0
+                {
+                    v.put(slot as size_t, j + 1)
+                    break
+                }
+                set slot: (slot + 1) & resolution_memo_mask
+            }
+            set j: j + 1
+        }
+        memo
+    }
+
     ; resolveExternalModule (slice 264: whole but for project references): the
     ; resolution, its resolution diagnostic, the file it names when the program
     ; holds it, the TS-extension and CommonJS/ESM reports, the pattern ambient
@@ -23933,21 +24065,20 @@ define Checker
             {
                 let containing_path pf.resolution_containing_path(importing_index)
                 set mode: this.usage_mode_of(location, pf.format_at(importing_index))
-                let resolver ModuleResolver.create(host, pf, module_resolution_kind, resolve_json_module, mode, allow_js, resolve_package_json_exports, resolve_package_json_imports, out_dir, root_dir)
-                pf.apply_redirect_paths(importing_index, resolver)
-                set resolved_index: resolver.resolve(d, containing_path)
-                set resolved_package_key: resolver.package_id
-                set alternate_result: resolver.alternate_result
-                if (resolver.stop_tag.length as int) > 0
+                let memo this.resolution_memo_for(pf, importing_index, d, mode, containing_path)
+                set resolved_index: memo.resolved_index
+                set resolved_package_key: memo.package_id
+                set alternate_result: memo.alternate_result
+                if (memo.stop_tag.length as int) > 0
                 {
-                    this.record_unported(resolver.stop_tag, 0)
+                    this.record_unported(memo.stop_tag, 0)
                     return null
                 }
                 if resolved_index >= 0
                 {
                     let rpath pf.path_at(resolved_index)
-                    set resolved_ext: Checker.resolution_extension_for(rpath, resolver.resolved_arbitrary_extension)
-                    set resolved_using_ts_extension: resolver.resolved_using_ts_extension
+                    set resolved_ext: Checker.resolution_extension_for(rpath, memo.arbitrary_extension)
+                    set resolved_using_ts_extension: memo.using_ts_extension
                     if error_node <> null
                         set resolution_diagnostic: this.get_resolution_diagnostic(resolved_ext, pf.path_at(importing_index))
                     if (resolution_diagnostic = 0) or (resolution_diagnostic = DiagModule_0_was_resolved_to_1_but_jsx_is_not_set)
