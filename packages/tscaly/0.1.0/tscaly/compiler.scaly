@@ -34,6 +34,8 @@ use tscaly.printer.SourceFileInfo
 use tscaly.TsOptionDecls.TsOptionDecls
 use tscaly.tsoptions.TsConfigParser
 use tscaly.Diagnostics.ChainLine
+use tscaly.tracing.Tracing
+use tscaly.tracing.TraceArg
 
 ; fileIncludeKind
 define FileIncludeKindImport: int 0
@@ -171,6 +173,9 @@ define ProgramLoader
     ; lower-cased path and its node
     casing_keys: ref[Array[Slice[char]]]
     casing_nodes: ref[Array[ref[LoaderNode]]]
+    ; the `--generateTrace` session, null unless the option was given: the parse
+    ; and bind events belong where the work is, and since slice 292 the work is here
+    tracing: ref[Tracing]?
 )
 {
     function create(host: ref[Page], files: ref[ProgramFiles], options: EmitOptions, checker: ref[Checker]) returns ref[ProgramLoader]
@@ -188,13 +193,142 @@ define ProgramLoader
         if options.max_node_module_js_depth > 0
             set depth: options.max_node_module_js_depth
         let sh SpecifierHost.create(host, checker, files, options)
-        &ProgramLoader^host(host, files, options, checker, sh, &Array[ref[LoaderNode]]^host(), &Array[ref[LoaderEdge]]^host(), depth, &Array[int]^host(), &Array[Slice[char]]^host(), members, searched, &Array[ProgramDiagnostic]^host(), Slice[char](), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[int]^host(), false, false, &Array[String]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[EmitOptions]^host(), &Array[ref[JsonValue]?]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[ref[LoaderNode]]^host())
+        &ProgramLoader^host(host, files, options, checker, sh, &Array[ref[LoaderNode]]^host(), &Array[ref[LoaderEdge]]^host(), depth, &Array[int]^host(), &Array[Slice[char]]^host(), members, searched, &Array[ProgramDiagnostic]^host(), Slice[char](), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[int]^host(), false, false, &Array[String]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[EmitOptions]^host(), &Array[ref[JsonValue]?]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[ref[LoaderNode]]^host(), null)
+    }
+
+    procedure session_push(tracing: ref[Tracing]?, phase: int, name: Slice[char], args: ref[Array[ref[TraceArg]]]?) returns int
+    {
+        if tracing = null
+            return TraceMainThreadId
+        (tracing as ref[Tracing]).push(phase, name, args)
+    }
+
+    procedure session_pop(tracing: ref[Tracing]?, tid: int, phase: int, name: Slice[char], args: ref[Array[ref[TraceArg]]]?)
+    {
+        if tracing = null
+            return
+        (tracing as ref[Tracing]).pop(tid, phase, name, args)
+    }
+
+    procedure trace_push(this, phase: int, name: Slice[char], args: ref[Array[ref[TraceArg]]]?) returns int
+    {
+        if tracing = null
+            return TraceMainThreadId
+        (tracing as ref[Tracing]).push(phase, name, args)
+    }
+
+    procedure trace_pop(this, tid: int, phase: int, name: Slice[char], args: ref[Array[ref[TraceArg]]]?)
+    {
+        if tracing = null
+            return
+        (tracing as ref[Tracing]).pop(tid, phase, name, args)
     }
 
     procedure stop(this, tag: Slice[char])
     {
         if (stop_tag.length as int) = 0
             set this.stop_tag: tag
+    }
+
+    ; ★★★ fileLoader.parseSourceFile — the file at `index` parsed and bound THE
+    ; FIRST TIME THE LOADER REACHES IT (slice 292). It used to be
+    ; DriverProgram.add_source_unit, run over every source-extension file of the
+    ; whole test filesystem before the walk began; the table now registers a path
+    ; and its raw text and nothing else, and this is what fills an entry in.
+    ; ★The symbol id base is the entry's INDEX. It used to be `pf.count()`, which
+    ; was the same number only because a file was appended at the moment it was
+    ; parsed.
+    procedure ensure_parsed(this, index: int) returns bool
+    {
+        let tag ProgramLoader.parse_entry(Page.get(this), files, options, index, tracing)
+        if (tag.length as int) = 0
+            return true
+        this.stop(tag)
+        false
+    }
+
+    ; the same parse as a STATIC, because `DriverProgram` needs ONE file parsed
+    ; before it can build the checker the loader is handed — the reference's
+    ; program is fully loaded before `GetTypeChecker` is asked, and this port
+    ; creates its checker first (the loader's SpecifierHost needs one). Answers
+    ; the stop tag, empty when the entry parsed or needed no parse.
+    procedure parse_entry(host: ref[Page], files: ref[ProgramFiles], options: EmitOptions, index: int, tracing: ref[Tracing]?) returns Slice[char]
+    {
+        if files.file_at(index) <> null
+            return Slice[char]()
+        let path_data files.path_at(index)
+        if ProgramLoader.parseable_extension(path_data) = false
+            return Slice[char]()
+        let raw files.text_at(index)
+        let path String^host(path_data.data as pointer[const_char], path_data.length as size_t)
+        let script_kind Parser.supported_script_kind(path)
+        let content String^host(raw.data as pointer[const_char], raw.length as size_t)
+        var parse_text content
+        let decoded StringBuilder^host()
+        if Emitter.decode_bytes(raw, &decoded)
+            set parse_text: decoded.to_string()
+        let text_copy String^host(parse_text)
+        var unported 0 - 1
+        var unported_tag: Slice[char] ""
+        var unported_detail 0
+        let cs_args Tracing.no_args(host)
+        Tracing.add_arg(host, cs_args, "path", path_data)
+        let cs_tid ProgramLoader.session_push(tracing, TracePhaseParse, "createSourceFile", cs_args)
+        let p Parser.parse_ex(host, path, text_copy, script_kind, &unported, &unported_tag, &unported_detail)
+        ProgramLoader.session_pop(tracing, cs_tid, TracePhaseParse, "createSourceFile", cs_args)
+        if unported >= 0
+            return unported_tag
+        let file_opt Parser.source_file_of(p)
+        if file_opt = null
+            return "parse-no-tree"
+        let file file_opt as ref[AstNode]
+        var is_external Parser.external_module_indicator(file, AstNode.statements_of(file)) or Emitter.is_file_module_from_using_jsx_tag(file, script_kind, options)
+        var forced false
+        let is_json path_data.ends_with(".json")
+        if options.module_detection_is_force() and (is_declaration_file_name_of(path_data) = false) and (is_json = false)
+        {
+            if is_external = false
+                set forced: true
+            set is_external: true
+        }
+        if (is_declaration_file_name_of(path_data) = false) and (is_json = false) and options.module_detection_is_auto()
+        {
+            if Emitter.is_file_forced_to_be_module_by_format(path_data, options)
+            {
+                if is_external = false
+                    set forced: true
+                set is_external: true
+            }
+        }
+        Binder.set_symbol_id_base(index * 1000000)
+        let bs_args Tracing.no_args(host)
+        Tracing.add_arg(host, bs_args, "path", path_data)
+        let bs_tid ProgramLoader.session_push(tracing, TracePhaseBind, "bindSourceFile", bs_args)
+        let b Binder.bind_source_file_ex(host, file, text_copy, path, is_external, forced)
+        ProgramLoader.session_pop(tracing, bs_tid, TracePhaseBind, "bindSourceFile", bs_args)
+        Binder.set_symbol_id_base(0)
+        if Binder.unported_at(b) >= 0
+            return Binder.unported_tag_at(b)
+        ; ★The FORMAT is not recomputed here: the registration pass has already
+        ; set it per entry from the nearest package.json's `type`
+        ; (`unit_package_json_type`), which this loader's own options do not carry
+        ; — recomputing it without one answered CJS where the file is ESM and
+        ; turned four moduleResolution baselines red.
+        files.set_parsed(index, Slice[char](text_copy.get_length() as int, text_copy.get_buffer() as pointer[char]), file, b, p, files.format_at(index))
+        Slice[char]()
+    }
+
+    ; the extensions DriverProgram.source_extension names, minus `.json`: a JSON
+    ; file reached as a MODULE is parsed by the same path, but the config file and
+    ; every other stray `.json` of the test filesystem is never reached at all,
+    ; which is the whole point of parsing on demand.
+    function parseable_extension(path: Slice[char]) returns bool
+    {
+        if path.ends_with(".ts") or path.ends_with(".tsx") or path.ends_with(".mts") or path.ends_with(".cts")
+            return true
+        if path.ends_with(".js") or path.ends_with(".jsx") or path.ends_with(".mjs") or path.ends_with(".cjs")
+            return true
+        path.ends_with(".json")
     }
 
     ; processAllProgramFiles over the harness's root file names (lib files are the
@@ -588,6 +722,10 @@ define ProgramLoader
         }
         let index files.index_of_path(path)
         if index < 0
+            return
+        ; fileLoader.findSourceFile: the entry exists in the table as a path and a
+        ; text; reaching it is what parses it
+        if this.ensure_parsed(index) = false
             return
         if files.file_at(index) = null
             return
