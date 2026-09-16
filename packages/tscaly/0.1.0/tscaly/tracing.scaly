@@ -1,0 +1,536 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; tracing — internal/tracing/tracing.go: the `--generateTrace` session, its event
+; stream (trace.json) and its per-checker legend (legend.json).
+;
+; The THIRD artifact, types_<n>.json, is built in `checker.scaly` where
+; `internal/checker/tracer.go` builds it, because every field of a type
+; descriptor is a question only the checker can answer.
+;
+; ★★★ THE SESSION HOLDS NO FILESYSTEM, WHICH IS THE ONE DEPARTURE FROM THE
+; REFERENCE'S SHAPE AND IT IS FORCED BY THE MODULE ORDER. Upstream's `Tracing`
+; carries a `vfs.FS` and truncates trace.json at StartTracing, appending every
+; 256 KB; this module is declared BEFORE `checker` (the checker pushes its own
+; check events) and therefore before `system`, so it cannot hold one. It buffers
+; the whole stream instead and `Execute` writes the three files at Stop. What a
+; baseline compares is the finished file, and the finished file is the same
+; bytes — the flush threshold is a peak-memory decision, not a format one.
+;
+; ★★ THE HARNESS ALWAYS RUNS DETERMINISTIC (`StartTracing(..., testing != nil)`),
+; and that is worth knowing before reading `push`: in deterministic mode the
+; timestamp is a monotonic counter and a SAMPLED event — `separateBeginAndEnd`
+; false, which is most of the reference's call sites — is skipped entirely, so
+; the stream is exactly the begin/end pairs.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use tscaly.program.JsonValue
+use tscaly.buildinfojson.JsonText
+use tscaly.xxh3.Xxh3
+
+; the phases, `tracing.Phase`
+define TracePhaseParse: int 0
+define TracePhaseProgram: int 1
+define TracePhaseBind: int 2
+define TracePhaseCheck: int 3
+define TracePhaseCheckTypes: int 4
+define TracePhaseEmit: int 5
+define TracePhaseSession: int 6
+
+; mainThreadID / firstSyntheticThreadID / firstFileThreadID / fileThreadIDHashRange
+define TraceMainThreadId: int 1
+define TraceFirstSyntheticThreadId: int 2
+define TraceFirstFileThreadId: int 1000000
+define TraceFileThreadIdHashRange: int 1000000000
+
+; one entry of the args map. The reference's `map[string]any` is written with
+; `json.Deterministic(true)`, so its members come out in KEY ORDER — a list kept
+; sorted says the same thing and needs no map (§3.8's question does not arise for
+; four keys).
+define TraceArg (key: Slice[char]  text: Slice[char]  num: int  is_num: bool)
+
+; a thread the stream has named: `traceThreadKey` plus the id it was given
+define TraceThread (is_checker: bool  text: Slice[char]  index: int  tid: int)
+
+; TraceRecord — one line of the legend
+define TraceRecord (config_file_path: Slice[char]  trace_path: Slice[char]  types_path: Slice[char]  checker_id: int)
+
+define Tracing
+(
+    host: ref[Page]
+    trace_dir: Slice[char]
+    trace_path: Slice[char]
+    config_file_path: Slice[char]
+    legend: ref[Array[ref[TraceRecord]]]
+    content: ref[StringBuilder]
+    threads: ref[Array[ref[TraceThread]]]
+    started: bool
+    deterministic: bool
+    ts_counter: int
+    metadata_ts: int
+)
+{
+    ; StartTracing. The header's three metadata events share ONE timestamp, which
+    ; every later `thread_name` event reuses — see `thread_id_of`.
+    function create(host: ref[Page], trace_dir: Slice[char], config_file_path: Slice[char], deterministic: bool) returns ref[Tracing]
+    {
+        let legend &Array[ref[TraceRecord]]^host()
+        let content StringBuilder^host()
+        let threads &Array[ref[TraceThread]]^host()
+        let tp Tracing.combine(host, trace_dir, "trace.json")
+        let tr &Tracing^host(host, trace_dir, tp, config_file_path, legend, &content, threads, true, deterministic, 0, 0)
+        content.append("[\n")
+        let meta tr.timestamp()
+        set tr.metadata_ts: meta
+        tr.write_event(TraceMainThreadId, "M", "__metadata", meta, "process_name", "", Tracing.one_arg(host, "name", "tsgo"))
+        content.append(",\n")
+        tr.write_event(TraceMainThreadId, "M", "__metadata", meta, "thread_name", "", Tracing.one_arg(host, "name", "Main"))
+        content.append(",\n")
+        tr.write_event(TraceMainThreadId, "M", "disabled-by-default-devtools.timeline", meta, "TracingStartedInBrowser", "", null)
+        tr
+    }
+
+    ; tspath.CombinePaths for the two names this module builds
+    function combine(host: ref[Page], dir: Slice[char], name: Slice[char]) returns Slice[char]
+    {
+        var sb StringBuilder()
+        sb.append(dir.data, dir.length)
+        if (dir.length as int) > 0
+        {
+            if (*(dir.data + (dir.length - 1)) as int) <> (("/" as char) as int)
+                sb.append("/")
+        }
+        sb.append(name.data, name.length)
+        let s String^host(sb.to_string())
+        Slice[char](s.get_length(), s.get_buffer() as pointer[char])
+    }
+
+    ; the timestamp in microseconds. ★The non-deterministic arm is the reference's
+    ; `1000 * timestamp()` and this port has no monotonic clock reachable from a
+    ; module declared this early; it answers the counter too, which is wrong only
+    ; for a profile nobody in this repository reads and is never what the harness
+    ; asks for. A clock belongs here the day `--generateTrace` is used for real.
+    procedure timestamp(this) returns int
+    {
+        set this.ts_counter: ts_counter + 1
+        ts_counter
+    }
+
+    function one_arg(host: ref[Page], key: Slice[char], text: Slice[char]) returns ref[Array[ref[TraceArg]]]
+    {
+        let args &Array[ref[TraceArg]]^host()
+        args.add(&TraceArg^host(key, text, 0, false))
+        args
+    }
+
+    function no_args(host: ref[Page]) returns ref[Array[ref[TraceArg]]]
+        &Array[ref[TraceArg]]^host()
+
+    procedure add_arg(host: ref[Page], args: ref[Array[ref[TraceArg]]], key: Slice[char], text: Slice[char])
+        args.add(&TraceArg^host(key, text, 0, false))
+
+    procedure add_num_arg(host: ref[Page], args: ref[Array[ref[TraceArg]]], key: Slice[char], num: int)
+        args.add(&TraceArg^host(key, Slice[char](), num, true))
+
+    function phase_name(phase: int) returns Slice[char]
+    {
+        if phase = TracePhaseParse
+            return "parse"
+        if phase = TracePhaseProgram
+            return "program"
+        if phase = TracePhaseBind
+            return "bind"
+        if phase = TracePhaseCheck
+            return "check"
+        if phase = TracePhaseCheckTypes
+            return "checkTypes"
+        if phase = TracePhaseEmit
+            return "emit"
+        "session"
+    }
+
+    ; writeEventTo — the reference's struct order, its `omitzero` members left out
+    procedure write_event(this, tid: int, ph: Slice[char], cat: Slice[char], ts: int, name: Slice[char], scope: Slice[char], args: ref[Array[ref[TraceArg]]]?)
+    {
+        let sb content
+        sb.append("{\"pid\":1,\"tid\":")
+        sb.append(tid)
+        sb.append(",\"ph\":\"")
+        sb.append(ph.data, ph.length)
+        sb.append("\",\"cat\":\"")
+        sb.append(cat.data, cat.length)
+        sb.append("\",\"ts\":")
+        sb.append(ts)
+        if (name.length as int) > 0
+        {
+            sb.append(",\"name\":")
+            JsonText.quote(sb, name)
+        }
+        if (scope.length as int) > 0
+        {
+            sb.append(",\"s\":")
+            JsonText.quote(sb, scope)
+        }
+        if args <> null
+        {
+            let a args as ref[Array[ref[TraceArg]]]
+            if (a.get_length() as int) > 0
+            {
+                sb.append(",\"args\":{")
+                this.write_args(sb, a)
+                sb.append("}")
+            }
+        }
+        sb.append("}")
+    }
+
+    ; the args in KEY ORDER — the reference's json.Deterministic(true)
+    procedure write_args(this, sb: ref[StringBuilder], args: ref[Array[ref[TraceArg]]])
+    {
+        let n args.get_length() as int
+        let order &Array[int]^host()
+        var i 0
+        while i < n
+        {
+            order.add(i)
+            set i: i + 1
+        }
+        var a 0
+        while a < n
+        {
+            var b a + 1
+            while b < n
+            {
+                let ib order[b as size_t]
+                let ia order[a as size_t]
+                let eb args[ib as size_t]
+                let ea args[ia as size_t]
+                if Tracing.less_key(eb.key, ea.key)
+                {
+                    order.put(a as size_t, ib)
+                    order.put(b as size_t, ia)
+                }
+                set b: b + 1
+            }
+            set a: a + 1
+        }
+        var k 0
+        while k < n
+        {
+            if k > 0
+                sb.append(",")
+            let ik order[k as size_t]
+            let e args[ik as size_t]
+            JsonText.quote(sb, e.key)
+            sb.append(":")
+            if e.is_num
+                sb.append(e.num)
+            else
+                JsonText.quote(sb, e.text)
+            set k: k + 1
+        }
+    }
+
+    function less_key(x: Slice[char], y: Slice[char]) returns bool
+    {
+        let nx x.length as int
+        let ny y.length as int
+        var n nx
+        if ny < n
+            set n: ny
+        var i 0
+        while i < n
+        {
+            let cx *(x.data + (i as size_t)) as int
+            let cy *(y.data + (i as size_t)) as int
+            if cx < cy
+                return true
+            if cx > cy
+                return false
+            set i: i + 1
+        }
+        nx < ny
+    }
+
+    ; Push with separateBeginAndEnd — the begin half. The end half is `pop`, which
+    ; the caller runs where the reference runs its deferred closure, and it needs
+    ; the SAME thread id, which is why the begin answers one.
+    procedure push(this, phase: int, name: Slice[char], args: ref[Array[ref[TraceArg]]]?) returns int
+    {
+        if started = false
+            return TraceMainThreadId
+        let ts this.timestamp()
+        let tid this.thread_id_of(args)
+        content.append(",\n")
+        this.write_event(tid, "B", Tracing.phase_name(phase), ts, name, "", args)
+        tid
+    }
+
+    procedure pop(this, tid: int, phase: int, name: Slice[char], args: ref[Array[ref[TraceArg]]]?)
+    {
+        if started = false
+            return
+        let ts this.timestamp()
+        content.append(",\n")
+        this.write_event(tid, "E", Tracing.phase_name(phase), ts, name, "", args)
+    }
+
+    ; Instant
+    procedure instant(this, phase: int, name: Slice[char], args: ref[Array[ref[TraceArg]]]?)
+    {
+        if started = false
+            return
+        let ts this.timestamp()
+        let tid this.thread_id_of(args)
+        content.append(",\n")
+        this.write_event(tid, "I", Tracing.phase_name(phase), ts, name, "g", args)
+    }
+
+    ; threadIDLocked: the key off the args, the id off the key, and a `thread_name`
+    ; metadata event the first time an id is handed out.
+    procedure thread_id_of(this, args: ref[Array[ref[TraceArg]]]?) returns int
+    {
+        if args = null
+            return TraceMainThreadId
+        let a args as ref[Array[ref[TraceArg]]]
+        if (a.get_length() as int) = 0
+            return TraceMainThreadId
+        var is_checker false
+        var index 0
+        var text Slice[char]()
+        var found false
+        ; `checkerId` wins over every path key, as traceThreadKeyFromArgs asks first
+        var i 0
+        while i < (a.get_length() as int)
+        {
+            let e a[i as size_t]
+            if e.is_num
+            {
+                if Tracing.same_text(e.key, "checkerId")
+                {
+                    set is_checker: true
+                    set index: e.num
+                    set found: true
+                }
+            }
+            set i: i + 1
+        }
+        if found = false
+        {
+            ; traceThreadArgKeys, in the reference's own order
+            set text: Tracing.path_arg(a, "path")
+            if (text.length as int) = 0
+                set text: Tracing.path_arg(a, "fileName")
+            if (text.length as int) = 0
+                set text: Tracing.path_arg(a, "containingFileName")
+            if (text.length as int) = 0
+                set text: Tracing.path_arg(a, "jsFilePath")
+            if (text.length as int) = 0
+                set text: Tracing.path_arg(a, "declarationFilePath")
+            if (text.length as int) = 0
+                return TraceMainThreadId
+        }
+        var k 0
+        while k < (threads.get_length() as int)
+        {
+            let t threads[k as size_t]
+            if t.is_checker = is_checker
+            {
+                if is_checker
+                {
+                    if t.index = index
+                        return t.tid
+                }
+                else
+                {
+                    if Tracing.same_text(t.text, text)
+                        return t.tid
+                }
+            }
+            set k: k + 1
+        }
+        var tid Tracing.default_thread_id(is_checker, index, text)
+        ; the reference walks up from the default id until the slot is free
+        var taken true
+        while taken
+        {
+            set taken: false
+            var j 0
+            while j < (threads.get_length() as int)
+            {
+                let tj threads[j as size_t]
+                if tj.tid = tid
+                    set taken: true
+                set j: j + 1
+            }
+            if taken
+                set tid: tid + 1
+        }
+        let h host
+        let copied Tracing.copy_text(h, text)
+        threads.add(&TraceThread^h(is_checker, copied, index, tid))
+        this.write_thread_name(tid, is_checker, index, copied)
+        tid
+    }
+
+    function path_arg(args: ref[Array[ref[TraceArg]]], key: Slice[char]) returns Slice[char]
+    {
+        var i 0
+        while i < (args.get_length() as int)
+        {
+            let e args[i as size_t]
+            if e.is_num = false
+            {
+                if Tracing.same_text(e.key, key)
+                    return e.text
+            }
+            set i: i + 1
+        }
+        Slice[char]()
+    }
+
+    function copy_text(host: ref[Page], t: Slice[char]) returns Slice[char]
+    {
+        if (t.length as int) = 0
+            return Slice[char]()
+        let s String^host(t.data as pointer[const_char], t.length)
+        Slice[char](s.get_length(), s.get_buffer() as pointer[char])
+    }
+
+    function same_text(x: Slice[char], y: Slice[char]) returns bool
+    {
+        if x.length <> y.length
+            return false
+        var i 0
+        while i < (x.length as int)
+        {
+            if (*(x.data + (i as size_t)) as int) <> (*(y.data + (i as size_t)) as int)
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    ; defaultThreadID: a checker gets a synthetic id by index, a file a STABLE one
+    ; from the digest of its display name — see `Xxh3.hash64`, which exists for
+    ; this line and is gated by tests/hashcheck.sh.
+    function default_thread_id(is_checker: bool, index: int, text: Slice[char]) returns int
+    {
+        if is_checker
+        {
+            if index >= 0
+                return TraceFirstSyntheticThreadId + index
+        }
+        var sb StringBuilder()
+        if is_checker
+        {
+            sb.append("checker:")
+            sb.append(index)
+        }
+        else
+        {
+            sb.append("file:")
+            sb.append(text.data, text.length)
+        }
+        let s sb.to_string()
+        let h Xxh3.hash64(Slice[char](s.get_length(), s.get_buffer() as pointer[char]))
+        TraceFirstFileThreadId + ((h % (TraceFileThreadIdHashRange as u64)) as int)
+    }
+
+    procedure write_thread_name(this, tid: int, is_checker: bool, index: int, text: Slice[char])
+    {
+        var sb StringBuilder()
+        if is_checker
+        {
+            sb.append("checker:")
+            sb.append(index)
+        }
+        else
+        {
+            sb.append("file:")
+            sb.append(text.data, text.length)
+        }
+        let s sb.to_string()
+        let name Slice[char](s.get_length(), s.get_buffer() as pointer[char])
+        content.append(",\n")
+        this.write_event(tid, "M", "__metadata", metadata_ts, "thread_name", "", Tracing.one_arg(host, "name", name))
+    }
+
+    ; NewTypeTracer: the legend row, and the path its checker's types go to
+    procedure new_type_tracer(this, checker_index: int) returns Slice[char]
+    {
+        let h host
+        var nb StringBuilder()
+        nb.append("types_")
+        nb.append(checker_index)
+        nb.append(".json")
+        let ns nb.to_string()
+        let types_path Tracing.combine(h, trace_dir, Slice[char](ns.get_length(), ns.get_buffer() as pointer[char]))
+        legend.add(&TraceRecord^h(config_file_path, trace_path, types_path, checker_index))
+        types_path
+    }
+
+    ; the trace stream, closed. StopTracing's own last line.
+    function trace_text(this) returns Slice[char]
+    {
+        set this.started: false
+        content.append("\n]\n")
+        let h host
+        let s String^h(content.to_string())
+        Slice[char](s.get_length(), s.get_buffer() as pointer[char])
+    }
+
+    ; legend.json, its rows sorted by typesPath and marshalled with two-space
+    ; indentation (MarshalIndent("", "  "))
+    function legend_text(this) returns Slice[char]
+    {
+        let h host
+        let n legend.get_length() as int
+        let order &Array[int]^h()
+        var i 0
+        while i < n
+        {
+            order.add(i)
+            set i: i + 1
+        }
+        var a 0
+        while a < n
+        {
+            var b a + 1
+            while b < n
+            {
+                let ib order[b as size_t]
+                let ia order[a as size_t]
+                let rb legend[ib as size_t]
+                let ra legend[ia as size_t]
+                if Tracing.less_key(rb.types_path, ra.types_path)
+                {
+                    order.put(a as size_t, ib)
+                    order.put(b as size_t, ia)
+                }
+                set b: b + 1
+            }
+            set a: a + 1
+        }
+        let arr JsonText.new_array(h)
+        var k 0
+        while k < n
+        {
+            let ik order[k as size_t]
+            let r legend[ik as size_t]
+            let obj JsonText.new_object(h)
+            if (r.config_file_path.length as int) > 0
+                JsonText.put_member(obj, "configFilePath", JsonText.new_string(h, r.config_file_path))
+            if (r.trace_path.length as int) > 0
+                JsonText.put_member(obj, "tracePath", JsonText.new_string(h, r.trace_path))
+            if (r.types_path.length as int) > 0
+                JsonText.put_member(obj, "typesPath", JsonText.new_string(h, r.types_path))
+            JsonText.put_member(obj, "checkerId", JsonText.new_number(h, r.checker_id))
+            JsonText.push(arr, obj)
+            set k: k + 1
+        }
+        JsonText.to_text(h, arr, true)
+    }
+}

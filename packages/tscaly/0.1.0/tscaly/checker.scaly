@@ -121,6 +121,8 @@ use tscaly.scanner.Scanner
 use tscaly.parser.Parser
 use tscaly.binder.Binder
 use tscaly.program.ProgramFiles
+use tscaly.program.JsonValue
+use tscaly.buildinfojson.JsonText
 use tscaly.program.ModuleResolver
 use tscaly.Diagnostics.DiagnosticList
 use tscaly.Diagnostics.RelatedInfo
@@ -5941,6 +5943,8 @@ mutable checker_no_unused_locals: bool false
 mutable checker_no_unused_parameters: bool false
 ; the driver initializes the checker itself, after its options (slice 269)
 mutable checker_defer_initialize: bool false
+; `--generateTrace`: every checker this program builds records the types it mints
+mutable checker_trace_types: bool false
 ; allowUnreachableCode / allowUnusedLabels (Tristates: an error only when FALSE, no
 ; check when TRUE), noFallthroughCasesInSwitch, allowUmdGlobalAccess (slice 266)
 mutable checker_allow_unreachable_code: int 2
@@ -6233,6 +6237,9 @@ define Checker
 
     ; nextTypeId, in creation order.
     type_count: int
+    ; `--generateTrace`'s type list, in CREATION order — null unless the driver
+    ; asked for a trace (see dump_types_text)
+    trace_types: ref[Array[ref[Type]?]]?
 
     ; ── the intrinsic types, in the reference's own creation order ───────────
     ;
@@ -8219,6 +8226,12 @@ define Checker
         let pas &Array[ref[Symbol]?]^host()
         set c.pattern_augmentation_symbols: pas
         set c.type_count: 0
+        set c.trace_types: null
+        if checker_trace_types
+        {
+            let tt &Array[ref[Type]?]^host()
+            set c.trace_types: tt
+        }
         let ra &Array[ref[AstNode]?]^host()
         set c.reported_ambient: ra
         let rb &Array[ref[AstNode]?]^host()
@@ -8648,6 +8661,9 @@ define Checker
     procedure set_defer_initialize(defer: bool)
         set checker_defer_initialize: defer
 
+    procedure set_trace_types(on: bool)
+        set checker_trace_types: on
+
     ; ── the unported report ─────────────────────────────────────────────────
     ;
     ; The binder's mechanism, verbatim in intent: the FIRST report wins, so the
@@ -9069,6 +9085,7 @@ define Checker
     {
         set type_count: type_count + 1
         let t &Type^host(type_count, flags, object_flags, intrinsic_name, null, TypeData.None(NoTypeData()), null, null, null, null, null, null, false)
+        this.record_traced_type(t)
         t
     }
 
@@ -9116,6 +9133,7 @@ define Checker
         ; Four stage-2 units, no stop, no diagnostic — see §3.5dz.
         let masked object_flags & ~(ObjectFlagsCouldContainTypeVariablesComputed | ObjectFlagsCouldContainTypeVariables | ObjectFlagsMembersResolved)
         let t &Type^host(type_count, flags, masked, null, sym, d, null, null, null, null, null, null, false)
+        this.record_traced_type(t)
         t
     }
 
@@ -42528,16 +42546,20 @@ define Checker
         ; nothing else decides TS2362 and TS2363, so the field arrives in the commit
         ; that gives it a reader. It stands in the REFERENCE'S OWN POSITION so that
         ; the ids below it keep their relative order.
-        set number_or_bigint_type: this.get_union_type_pair(number_type, bigint_type)
-        ; c.stringOrNumberType and c.stringNumberSymbolType (slice 121), in the
-        ; reference's own two positions and for number_or_bigint_type's reason: the
-        ; keyof chapter is their reader and it lands with them.
+        ; ★★★ THE THREE STAND IN THE REFERENCE'S OWN ORDER SINCE SLICE 289, and
+        ; the note above claimed that of `number_or_bigint_type` while it stood
+        ; FIRST: initializeChecker mints stringOrNumberType (29), then
+        ; stringNumberSymbolType (30), then numberOrBigIntType (31), and slice 102
+        ; wrote its line where the three unminted ones were described rather than
+        ; where its own belonged. Nothing could see it until `--generateTrace`
+        ; printed the types in creation order.
         set string_or_number_type: this.get_union_type_pair(string_type, number_type)
         let sns this.new_type_list(null)
         sns.add(string_type)
         sns.add(number_type)
         sns.add(es_symbol_type)
         set string_number_symbol_type: this.get_union_type(sns)
+        set number_or_bigint_type: this.get_union_type_pair(number_type, bigint_type)
         ; ★★★ c.numericStringType, SLICE 136, AND THE NOTE ABOVE NAMED ITS OWN
         ; EXPIRY TWICE: this line was *"a second reason the same line is not
         ; written"* because it *"needs getTemplateLiteralType"*, and
@@ -42552,11 +42574,16 @@ define Checker
         let nst_types this.new_type_list(null)
         nst_types.add(number_type)
         set numeric_string_type: this.get_template_literal_type(nst_texts, nst_types)
-        ;
-        ; ★ The remaining absence shifts the type IDS of everything below by four
-        ; against the reference's numbering and nothing observes that — the dump
-        ; prints a type's STRING (see Type's note) and CompareTypes' id fallback only
-        ; ever compares types this port made, whose RELATIVE order is the reference's.
+        ; ★★★ c.templateConstraintType, SLICE 289, AND THE NOTE THAT HELD IT BACK
+        ; NAMED THE RULE RATHER THAN THE FIELD: *"each is read by a
+        ; checkTypeAssignableTo call site, and a field with no reader is a claim
+        ; about the future rather than a port"*. It HAS had its reader since the
+        ; template-literal chapter; what kept the line unwritten after that was the
+        ; memo below it, which mints the same union on first use. The ORDER is the
+        ; thing the memo cannot give: `--generateTrace` writes every type in
+        ; CREATION order with its id, so a type minted lazily is a type at the
+        ; wrong id, and the whole types file after it is off by one.
+        this.get_template_constraint_type()
         ; Special `never` flagged by union reduction to behave as a literal.
         set unique_literal_type: this.new_intrinsic_type(TypeFlagsNever, "never")
 
@@ -42599,6 +42626,14 @@ define Checker
         set etl_data: Binder.internal_name(host, "type")
         let etl_symbol Symbol.create(host, SymbolFlagsTypeLiteral, etl_data)
         set empty_type_literal_type: this.new_anonymous_type(etl_symbol, null, null, null, null)
+        ; c.unknownEmptyObjectType and c.unknownUnionType (slice 289), the two the
+        ; reference mints here and this port minted on first use. `createUnknownUnionType`
+        ; IS the second call: it mints the empty object and then the union over it,
+        ; which is the reference's own pair of ids in the reference's own order.
+        ; ★Under a non-strict compilation the union is `unknown` and no type is
+        ; minted — upstream's own branch, and the trace of such a compilation has
+        ; one fewer row here on both sides.
+        this.get_unknown_union_type()
         ; c.emptyGenericType, which the reference mints between emptyTypeLiteralType
         ; and the markers below. Its instantiation map is deliberately not carried
         ; (the field's note).
@@ -42630,11 +42665,611 @@ define Checker
         set circular_constraint_type: this.new_anonymous_type(null, null, null, null, null) as ref[Type]
         set resolving_default_type: this.new_anonymous_type(null, null, null, null, null) as ref[Type]
 
+        ; ★★★ THE FIVE MARKER TYPE PARAMETERS, SLICE 289. They were minted on first
+        ; use since slices 81/173, and the accessors' own note argued the laziness
+        ; was free because *"nothing compares an id"*. That was measured against the
+        ; five yardsticks, and it expired with `--generateTrace`, which prints every
+        ; type in CREATION order: the markers are ids 46–50 upstream and were the
+        ; last five in this port. The accessors STAY — they carry the constraint
+        ; wiring (`marker_sub_type`'s constraint is `marker_super_type`, and the
+        ; for-check pair the same one level over) and every reader still goes
+        ; through them; these five lines only decide WHEN the memo is filled.
+        this.get_marker_super_type()
+        this.get_marker_sub_type()
+        this.get_marker_other_type()
+        this.get_marker_super_type_for_check()
+        this.get_marker_sub_type_for_check()
+
         ; c.enumNumberIndexInfo / c.anyBaseTypeIndexInfo, slice 87. The reference's
         ; two struct literals; new_index_info is the same four slots and takes no
         ; type id, so nothing above moves.
         set enum_number_index_info: this.new_index_info(number_type, string_type, true, null)
         set any_base_type_index_info: this.new_index_info(string_type, any_type, false, null)
+    }
+
+    ; ── internal/checker/tracer.go: types_<n>.json ──────────────────────────
+    ;
+    ; The reference adapts every `Type` to a `tracing.TracedType` interface of 27
+    ; accessors, because `internal/tracing` may not import `internal/checker`.
+    ; That is §3.26's single-implementation rule at its plainest — there is
+    ; exactly one implementor — so the adapter collapses and the descriptor is
+    ; built here, off `t.data` directly.
+    ;
+    ; ★★★ THE FILE IS A LIST IN CREATION ORDER AND THE ID IS THE LINE NUMBER
+    ; (upstream's own comment: *"no newline so type ID matches line number"*).
+    ; That is what makes `trace_types` a list rather than a walk of the memo
+    ; tables, and it is why slice 289 had to make the eight lazily-minted
+    ; well-known types eager: a type at the wrong id is every later line wrong.
+
+    procedure record_traced_type(this, t: ref[Type])
+    {
+        if trace_types = null
+            return
+        let list trace_types as ref[Array[ref[Type]?]]
+        list.add(t)
+    }
+
+    ; FormatTypeFlags — typeFlagNames in the reference's own order, `None` when the
+    ; word is empty
+    procedure append_type_flags(this, arr: ref[JsonValue], flags: int)
+    {
+        let h host
+        var n 0
+        if (flags & TypeFlagsAny) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "Any"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsUnknown) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "Unknown"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsUndefined) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "Undefined"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsNull) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "Null"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsVoid) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "Void"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsString) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "String"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsNumber) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "Number"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsBigInt) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "BigInt"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsBoolean) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "Boolean"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsESSymbol) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "ESSymbol"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsStringLiteral) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "StringLiteral"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsNumberLiteral) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "NumberLiteral"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsBigIntLiteral) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "BigIntLiteral"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsBooleanLiteral) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "BooleanLiteral"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsUniqueESSymbol) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "UniqueESSymbol"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsEnumLiteral) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "EnumLiteral"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsEnum) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "Enum"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsNonPrimitive) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "NonPrimitive"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsNever) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "Never"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsTypeParameter) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "TypeParameter"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsObject) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "Object"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsIndex) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "Index"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsTemplateLiteral) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "TemplateLiteral"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsStringMapping) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "StringMapping"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsSubstitution) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "Substitution"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsIndexedAccess) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "IndexedAccess"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsConditional) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "Conditional"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsUnion) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "Union"))
+            set n: n + 1
+        }
+        if (flags & TypeFlagsIntersection) <> 0
+        {
+            JsonText.push(arr, JsonText.new_string(h, "Intersection"))
+            set n: n + 1
+        }
+        if n = 0
+            JsonText.push(arr, JsonText.new_string(h, "None"))
+    }
+
+    ; EscapeAllInternalSymbolNames: the `\xFE` sentinel spells `__`
+    function escaped_symbol_name(this, s: ref[Symbol]) returns Slice[char]
+    {
+        let name Symbol.name_of(s)
+        var has false
+        var i 0
+        while i < (name.length as int)
+        {
+            if ((*(name.data + (i as size_t)) as int) & 255) = 254
+                set has: true
+            set i: i + 1
+        }
+        if has = false
+            return name
+        var sb StringBuilder()
+        var k 0
+        while k < (name.length as int)
+        {
+            let c (*(name.data + (k as size_t)) as int) & 255
+            if c = 254
+                sb.append("__")
+            else
+                sb.append(*(name.data + (k as size_t)))
+            set k: k + 1
+        }
+        let out String^host(sb.to_string())
+        Slice[char](out.get_length(), out.get_buffer() as pointer[char])
+    }
+
+    ; the three ReverseMapped slots the trace prints; they have no accessor of
+    ; their own because nothing else reads them one at a time
+    function reverse_mapped_slot_of(t: ref[Type], which: int) returns ref[Type]?
+    {
+        choose t.data
+            when rm: ReverseMapped
+            {
+                if which = 0
+                    return rm.source
+                if which = 1
+                    return rm.mapped_type
+                return rm.constraint_type
+            }
+        null
+    }
+
+    ; the recursion identity's TOKEN — a unique integer per identity, in first-seen
+    ; order, exactly as the reference's `recursionIdentityMap` hands them out
+    procedure recursion_token(this, t: ref[Type], syms: ref[Array[ref[Symbol]?]], tys: ref[Array[ref[Type]?]], nodes: ref[Array[ref[AstNode]?]]) returns int
+    {
+        let rid this.get_recursion_identity(t)
+        let sym rid.target_symbol
+        let ty rid.target_type
+        let nd rid.target_node
+        var i 0
+        while i < (syms.get_length() as int)
+        {
+            let a syms[i as size_t]
+            let b tys[i as size_t]
+            let c nodes[i as size_t]
+            if (a = sym) and (b = ty) and (c = nd)
+                return i
+            set i: i + 1
+        }
+        let n syms.get_length() as int
+        syms.add(sym)
+        tys.add(ty)
+        nodes.add(nd)
+        n
+    }
+
+    ; getLocation: the file's path lower-cased (tspath.ToPath(name, "", false)) and
+    ; the 1-indexed ECMA line / UTF-16 character of the node's token start and end
+    function location_of(this, n: ref[AstNode]) returns ref[JsonValue]?
+    {
+        let file Checker.source_file_of_node(n)
+        if file = null
+            return null
+        if program = null
+            return null
+        let pf program as ref[ProgramFiles]
+        let idx pf.index_of_file(file)
+        if idx < 0
+            return null
+        let h host
+        let path pf.paths[idx as size_t]
+        let text pf.texts[idx as size_t]
+        let bn this.binder_of_node(n)
+        var start 0
+        var stop 0
+        if bn.error_range_for_node(null, n, &start, &stop) = false
+            return null
+        let obj JsonText.new_object(h)
+        JsonText.put_member(obj, "path", JsonText.new_string(h, Checker.lower_path(h, path)))
+        JsonText.put_member(obj, "start", this.line_and_char(text, AstNode.pos_of(n), start))
+        JsonText.put_member(obj, "end", this.line_and_char(text, AstNode.end_of(n), AstNode.end_of(n)))
+        obj
+    }
+
+    function lower_path(host: ref[Page], p: Slice[char]) returns Slice[char]
+    {
+        var any false
+        var i 0
+        while i < (p.length as int)
+        {
+            let c (*(p.data + (i as size_t)) as int) & 255
+            if (c >= 65) and (c <= 90)
+                set any: true
+            set i: i + 1
+        }
+        if any = false
+            return p
+        var sb StringBuilder()
+        var k 0
+        while k < (p.length as int)
+        {
+            var c (*(p.data + (k as size_t)) as int) & 255
+            if (c >= 65) and (c <= 90)
+                set c: c + 32
+            sb.append(c as char)
+            set k: k + 1
+        }
+        let s String^host(sb.to_string())
+        Slice[char](s.get_length(), s.get_buffer() as pointer[char])
+    }
+
+    ; GetECMALineAndUTF16CharacterOfPosition, 1-indexed on both members. The line
+    ; breaks are stringutil.IsLineBreak's four (see ecma_lines_differ) and the
+    ; character counts UTF-16 CODE UNITS, so an astral character is two.
+    function line_and_char(this, text: Slice[char], pos_unused: int, pos: int) returns ref[JsonValue]
+    {
+        let h host
+        var line 1
+        var line_start 0
+        let n text.length as int
+        var i 0
+        while i < pos
+        {
+            if i >= n
+                break
+            let c (*(text.data + (i as size_t)) as int) & 255
+            if c = 13
+            {
+                var q i + 1
+                if q < n
+                {
+                    if ((*(text.data + (q as size_t)) as int) & 255) = 10
+                        set q: q + 1
+                }
+                set line: line + 1
+                set line_start: q
+                set i: q
+                continue
+            }
+            if c = 10
+            {
+                set line: line + 1
+                set line_start: i + 1
+                set i: i + 1
+                continue
+            }
+            if c = 226
+            {
+                if (i + 2) < n
+                {
+                    if ((*(text.data + ((i + 1) as size_t)) as int) & 255) = 128
+                    {
+                        let third (*(text.data + ((i + 2) as size_t)) as int) & 255
+                        if (third = 168) or (third = 169)
+                        {
+                            set line: line + 1
+                            set line_start: i + 3
+                            set i: i + 3
+                            continue
+                        }
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        ; the UTF-16 units between the line start and the position
+        var ch 0
+        var j line_start
+        while j < pos
+        {
+            if j >= n
+                break
+            let c (*(text.data + (j as size_t)) as int) & 255
+            if c < 128
+            {
+                set ch: ch + 1
+                set j: j + 1
+                continue
+            }
+            if c < 224
+            {
+                set ch: ch + 1
+                set j: j + 2
+                continue
+            }
+            if c < 240
+            {
+                set ch: ch + 1
+                set j: j + 3
+                continue
+            }
+            ; an astral code point is a surrogate PAIR in UTF-16
+            set ch: ch + 2
+            set j: j + 4
+        }
+        let obj JsonText.new_object(h)
+        JsonText.put_member(obj, "line", JsonText.new_number(h, line))
+        JsonText.put_member(obj, "character", JsonText.new_number(h, ch + 1))
+        obj
+    }
+
+    procedure put_type_id(this, obj: ref[JsonValue], key: Slice[char], t: ref[Type]?)
+    {
+        if t = null
+            return
+        JsonText.put_member(obj, key, JsonText.new_number(host, (t as ref[Type]).id))
+    }
+
+    procedure put_type_ids(this, obj: ref[JsonValue], key: Slice[char], list: ref[Array[ref[Type]?]]?)
+    {
+        if list = null
+            return
+        let l list as ref[Array[ref[Type]?]]
+        if (l.get_length() as int) = 0
+            return
+        let h host
+        let arr JsonText.new_array(h)
+        var i 0
+        while i < (l.get_length() as int)
+        {
+            let e l[i as size_t]
+            var id 0
+            if e <> null
+                set id: (e as ref[Type]).id
+            JsonText.push(arr, JsonText.new_number(h, id))
+            set i: i + 1
+        }
+        JsonText.put_member(obj, key, arr)
+    }
+
+    ; Display: the reference computes it for anonymous objects and for the literal,
+    ; template-literal, union and intersection flags, and swallows a panic with an
+    ; empty string. Here the printer ANSWERS whether it could serialize, so the
+    ; recovery is that answer rather than a recover().
+    function trace_display(this, t: ref[Type]) returns Slice[char]
+    {
+        var wanted false
+        if (t.object_flags & ObjectFlagsAnonymous) <> 0
+            set wanted: true
+        if (t.flags & (TypeFlagsLiteral | TypeFlagsTemplateLiteral | TypeFlagsUnion | TypeFlagsIntersection)) <> 0
+            set wanted: true
+        if wanted = false
+            return Slice[char]()
+        var sb StringBuilder()
+        if this.type_to_string_serialized(t, &sb) = false
+            return Slice[char]()
+        let s String^host(sb.to_string())
+        Slice[char](s.get_length(), s.get_buffer() as pointer[char])
+    }
+
+    ; buildTypeDescriptor, in the reference's own field order
+    function type_descriptor(this, t: ref[Type], syms: ref[Array[ref[Symbol]?]], tys: ref[Array[ref[Type]?]], nodes: ref[Array[ref[AstNode]?]]) returns ref[JsonValue]
+    {
+        let h host
+        let obj JsonText.new_object(h)
+        JsonText.put_member(obj, "id", JsonText.new_number(h, t.id))
+        if (t.flags & TypeFlagsIntrinsic) <> 0
+        {
+            if (t.intrinsic_name.length as int) > 0
+                JsonText.put_member(obj, "intrinsicName", JsonText.new_string(h, t.intrinsic_name))
+        }
+        ; `aliasSymbol ?? symbol`
+        var named: ref[Symbol]? t.alias_symbol
+        if named = null
+            set named: t.symbol
+        if named <> null
+            JsonText.put_member(obj, "symbolName", JsonText.new_string(h, this.escaped_symbol_name(named as ref[Symbol])))
+        JsonText.put_member(obj, "recursionId", JsonText.new_number(h, this.recursion_token(t, syms, tys, nodes)))
+        if (t.object_flags & ObjectFlagsTuple) <> 0
+            JsonText.put_member(obj, "isTuple", JsonText.new_bool(h, true))
+        if (t.flags & TypeFlagsUnion) <> 0
+            this.put_type_ids(obj, "unionTypes", Checker.union_types_of(t))
+        if (t.flags & TypeFlagsIntersection) <> 0
+            this.put_type_ids(obj, "intersectionTypes", Checker.intersection_types_of(t))
+        if t.alias_symbol <> null
+            this.put_type_ids(obj, "aliasTypeArguments", t.alias_type_arguments)
+        if (t.flags & TypeFlagsIndex) <> 0
+            this.put_type_id(obj, "keyofType", Checker.index_target_of(t))
+        if (t.flags & TypeFlagsIndexedAccess) <> 0
+        {
+            this.put_type_id(obj, "indexedAccessObjectType", Checker.indexed_access_object_type_of(t))
+            this.put_type_id(obj, "indexedAccessIndexType", Checker.indexed_access_index_type_of(t))
+        }
+        if (t.flags & TypeFlagsConditional) <> 0
+        {
+            this.put_type_id(obj, "conditionalCheckType", Checker.conditional_check_type_of(t))
+            this.put_type_id(obj, "conditionalExtendsType", Checker.conditional_extends_type_of(t))
+            let tt Checker.conditional_true_type_of(t)
+            if tt = null
+                JsonText.put_member(obj, "conditionalTrueType", JsonText.new_number(h, 0 - 1))
+            else
+                JsonText.put_member(obj, "conditionalTrueType", JsonText.new_number(h, (tt as ref[Type]).id))
+            let ft Checker.conditional_false_type_of(t)
+            if ft = null
+                JsonText.put_member(obj, "conditionalFalseType", JsonText.new_number(h, 0 - 1))
+            else
+                JsonText.put_member(obj, "conditionalFalseType", JsonText.new_number(h, (ft as ref[Type]).id))
+        }
+        if (t.flags & TypeFlagsSubstitution) <> 0
+        {
+            this.put_type_id(obj, "substitutionBaseType", Checker.substitution_base_type_of(t))
+            this.put_type_id(obj, "constraintType", Checker.substitution_constraint_of(t))
+        }
+        if (t.flags & TypeFlagsObject) <> 0
+        {
+            if (t.object_flags & ObjectFlagsReference) <> 0
+            {
+                this.put_type_id(obj, "instantiatedType", Checker.target_of(t))
+                this.put_type_ids(obj, "typeArguments", Checker.resolved_type_arguments_of(t))
+                let rn Checker.reference_node_of(t)
+                if rn <> null
+                {
+                    let loc this.location_of(rn as ref[AstNode])
+                    if loc <> null
+                        JsonText.put_member(obj, "referenceLocation", loc as ref[JsonValue])
+                }
+            }
+            if (t.object_flags & ObjectFlagsReverseMapped) <> 0
+            {
+                this.put_type_id(obj, "reverseMappedSourceType", Checker.reverse_mapped_slot_of(t, 0))
+                this.put_type_id(obj, "reverseMappedMappedType", Checker.reverse_mapped_slot_of(t, 1))
+                this.put_type_id(obj, "reverseMappedConstraintType", Checker.reverse_mapped_slot_of(t, 2))
+            }
+            if (t.object_flags & ObjectFlagsEvolvingArray) <> 0
+            {
+                this.put_type_id(obj, "evolvingArrayElementType", Checker.evolving_array_element_type_of(t))
+                this.put_type_id(obj, "evolvingArrayFinalType", Checker.evolving_array_final_type_of(t))
+            }
+        }
+        let pat this.pattern_for_type(t)
+        if pat <> null
+        {
+            let loc this.location_of(pat as ref[AstNode])
+            if loc <> null
+                JsonText.put_member(obj, "destructuringPattern", loc as ref[JsonValue])
+        }
+        if named <> null
+        {
+            let s named as ref[Symbol]
+            if Symbol.declaration_count(s) > 0
+            {
+                let d Symbol.declaration_at(s, 0)
+                if d <> null
+                {
+                    let loc this.location_of(d as ref[AstNode])
+                    if loc <> null
+                        JsonText.put_member(obj, "firstDeclaration", loc as ref[JsonValue])
+                }
+            }
+        }
+        let flags JsonText.new_array(h)
+        this.append_type_flags(flags, t.flags)
+        JsonText.put_member(obj, "flags", flags)
+        let disp this.trace_display(t)
+        if (disp.length as int) > 0
+            JsonText.put_member(obj, "display", JsonText.new_string(h, disp))
+        obj
+    }
+
+    ; DumpTypes: the whole list, one descriptor per line, the opening bracket
+    ; carrying no newline so a type's id IS its line number
+    function dump_types_text(this) returns Slice[char]
+    {
+        let h host
+        if trace_types = null
+            return Slice[char]()
+        let list trace_types as ref[Array[ref[Type]?]]
+        let n list.get_length() as int
+        if n = 0
+            return Slice[char]()
+        let syms &Array[ref[Symbol]?]^h()
+        let tys &Array[ref[Type]?]^h()
+        let nodes &Array[ref[AstNode]?]^h()
+        var sb StringBuilder()
+        sb.append("[")
+        var i 0
+        while i < n
+        {
+            let e list[i as size_t]
+            if e <> null
+            {
+                let d this.type_descriptor(e as ref[Type], syms, tys, nodes)
+                let text JsonText.to_text(h, d, false)
+                sb.append(text.data, text.length)
+            }
+            if i < (n - 1)
+                sb.append(",\n")
+            set i: i + 1
+        }
+        sb.append("]\n")
+        let s String^h(sb.to_string())
+        Slice[char](s.get_length(), s.get_buffer() as pointer[char])
     }
 
     ; ── the type printer ────────────────────────────────────────────────────
