@@ -63,8 +63,17 @@ def main():
             p = os.path.join(root, f)
             if p in config_paths:
                 continue
-            if f.endswith(".ts") or f == "package.json" or (f.endswith(".json") and "typings" in root):
+            if f.endswith(".ts") or f.endswith(".json"):
                 add(p, p)
+    # JSON modules imported from outside the source root (VS Code's component
+    # fixtures import the theme files under extensions/): tsgo reads them from
+    # disk, so the scenario has to name them or the port reports TS2307
+    extensions = os.path.join(project, "extensions")
+    for root, dirs, files in os.walk(extensions):
+        dirs[:] = sorted(d for d in dirs if d != "node_modules")
+        for f in sorted(files):
+            if f.endswith(".json"):
+                add(os.path.join(root, f), os.path.join(root, f))
     for root, dirs, files in os.walk(os.path.join(project, "node_modules")):
         dirs.sort()
         for f in sorted(files):
