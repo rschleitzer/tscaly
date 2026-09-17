@@ -1084,8 +1084,8 @@ FACTORY_EXTRAS = """
         let b StringBuilder^host()
         b.append(parameter_offset)
         let helper this.helper_call("__param", this.list2(this.new_numeric_literal(Printer.slice_on(host, b.to_string()), TokenFlagsNone), expression))
-        set helper.pos: location.pos
-        set helper.end: location.end
+        set helper.pos: location.pos as i32
+        set helper.end: location.end as i32
         helper
     }
 
@@ -1471,7 +1471,7 @@ define NodeFactory
     procedure new_node(this, kind: int, data: NodeData) returns ref[AstNode]
     {
         let n AstNode.alloc(host)
-        set n.kind: kind
+        set n.kind: kind as i32
         set n.flags: NodeFlagsNone
         set n.pos: 0 - 1
         set n.end: 0 - 1
@@ -1674,8 +1674,8 @@ for name in order:
     if info['flags']:
         op, expr = info['flags']
         expr = expr.replace('NodeFlagsOptionalChain', 'NodeFlagsOptionalChain')
-        if op == '|=': out('        set %s.flags: %s.flags | (%s)' % (nvar, nvar, expr))
-        else: out('        set %s.flags: %s' % (nvar, expr))
+        if op == '|=': out('        set %s.flags: (%s.flags | (%s)) as u32' % (nvar, nvar, expr))
+        else: out('        set %s.flags: %s as u32' % (nvar, expr))
     out('        %s' % nvar)
     out('    }')
     out()
