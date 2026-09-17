@@ -641,6 +641,20 @@ define TypeInstantiation
     instantiated: ref[Type]?
 )
 
+; The map upstream's `instantiations` is, over the port's association list: the
+; hash's FIRST row through an address index, the rows of one hash chained in list
+; order, caught up with the rows added since (catch_up_instantiation_index#). A
+; generic interface (`Event<T>`, `Promise<T>`) collects thousands of rows, and the
+; list scan per lookup was a leading item of a 2 800-file profile (2026-09-17).
+; `list` names the list the index was built over.
+define InstantiationIndex
+(
+    list: ref[Array[ref[TypeInstantiation]?]]
+    firsts: ref[AddressIndex]
+    next: ref[Array[int]]
+    indexed: int
+)
+
 ; TupleNormalizer, slice 115 — the reference's own struct, and its two methods are
 ; Checker methods here because `add` needs addOptionalityEx.
 ;
@@ -1191,6 +1205,7 @@ define InterfaceTypeData
     target: ref[Type]?
     resolved_type_arguments: ref[Array[ref[Type]?]]?
     instantiations: ref[Array[ref[TypeInstantiation]?]]?
+    instantiation_index: ref[InstantiationIndex]?
 
     ; allTypeParameters is outer + local + thisType, in that order, and the two
     ; counts below are what slice the three apart — which is why
@@ -1254,6 +1269,7 @@ define InterfaceTypeData
         set target: null
         set resolved_type_arguments: null
         set instantiations: null
+        set instantiation_index: null
         set all_type_parameters: null
         set outer_type_parameter_count: 0
         set this_type: null
@@ -1668,6 +1684,8 @@ define FlowLoopCacheLink
     flow: ref[FlowNode]?
     key: ref[Array[ref[FlowKeyPart]?]]?
     t: ref[Type]?
+    ; the next row of the SAME flow node, in insertion order
+    next_same_flow: ref[FlowLoopCacheLink]?
 )
 
 ; c.flowLoopStack — the junctions currently being analyzed, with the antecedent
@@ -6020,6 +6038,12 @@ define Checker
     lib_b: ref[Binder]?
     ; the rest of the lib chain (slice 248): the first lib stays `lib_file`
     extra_lib_files: ref[Array[ref[AstNode]?]]?
+    ; extra_lib_index_of's address index over extra_lib_files, rebuilt when the list
+    ; has grown, and lib_chain_index_of's rank per lib file (computed once per lib
+    ; count): both were linear scans on every node comparison
+    extra_lib_index: ref[AddressIndex]?
+    extra_lib_indexed: int
+    lib_ranks: ref[Array[int]]?
     extra_lib_binders: ref[Array[ref[Binder]?]]?
     ; the WHOLE lib chain's parsers and paths, indexed 0..n-1 beside
     ; (lib_file, lib_b) + extra_lib_* — `select_lib_file` needs the two things
@@ -6618,6 +6642,8 @@ define Checker
     ; analyzed"*, and the way out of that is the FIRST antecedent of a loop
     ; junction always being the non-looping path.
     flow_loop_cache: ref[Array[ref[FlowLoopCacheLink]?]]
+    ; flow node address -> its first row; the rows of one node are chained
+    flow_loop_cache_index: ref[AddressIndex]
     flow_loop_stack: ref[FlowLoopInfo]?
     flow_invocation_count: int
 
@@ -8255,6 +8281,9 @@ define Checker
         set c.lib_file: lib_file
         set c.lib_b: lib_b
         set c.extra_lib_files: extra_files
+        set c.extra_lib_index: null
+        set c.extra_lib_indexed: 0
+        set c.lib_ranks: null
         set c.extra_lib_binders: extra_binders
         set c.all_lib_parsers: null
         set c.all_lib_paths: null
@@ -8361,6 +8390,7 @@ define Checker
         set c.context_free_types_index: AddressIndex.create(host)
         let flc &Array[ref[FlowLoopCacheLink]?]^host()
         set c.flow_loop_cache: flc
+        set c.flow_loop_cache_index: AddressIndex.create(host)
         set c.flow_loop_stack: null
         set c.flow_invocation_count: 0
         let tal &Array[ref[TypeAliasLink]?]^host()
@@ -11963,11 +11993,27 @@ define Checker
                 if d.instantiations = null
                     return null
                 let list d.instantiations as ref[Array[ref[TypeInstantiation]?]]
-                let n list.get_length() as int
-                var i 0
-                while i < n
+                var rebuild false
+                if d.instantiation_index = null
+                    set rebuild: true
+                else
                 {
-                    let row list[i]
+                    let old_ix d.instantiation_index as ref[InstantiationIndex]
+                    if old_ix.list <> list
+                        set rebuild: true
+                }
+                if rebuild
+                {
+                    let pg Page.get(list)
+                    let fresh &InstantiationIndex^pg(list, AddressIndex.create(pg), &Array[int]^pg(), 0)
+                    set d.instantiation_index: fresh
+                }
+                let ix d.instantiation_index as ref[InstantiationIndex]
+                Checker.catch_up_instantiation_index(ix)
+                var at ix.firsts.find(Checker.instantiation_key(h)) - 1
+                while at >= 0
+                {
+                    let row list[at as size_t]
                     if row <> null
                     {
                         let r row as ref[TypeInstantiation]
@@ -11977,11 +12023,42 @@ define Checker
                                 return r.instantiated
                         }
                     }
-                    set i: i + 1
+                    set at: ix.next[at as size_t]
                 }
                 return null
             }
         null
+    }
+
+    ; a list hash as an address-index key: never 0, which the index reads as empty
+    function instantiation_key(h: int) returns int
+        ((h & 4611686018427387903) * 2) + 1
+
+    procedure catch_up_instantiation_index(ix: ref[InstantiationIndex])
+    {
+        let list ix.list
+        let n list.get_length() as int
+        while ix.indexed < n
+        {
+            let i ix.indexed
+            ix.next.add(0 - 1)
+            let row list[i as size_t]
+            if row <> null
+            {
+                let key Checker.instantiation_key((row as ref[TypeInstantiation]).hash)
+                let first ix.firsts.find(key)
+                if first = 0
+                    ix.firsts.insert(key, i)
+                else
+                {
+                    var last first - 1
+                    while ix.next[last as size_t] >= 0
+                        set last: ix.next[last as size_t]
+                    ix.next.put(last as size_t, i)
+                }
+            }
+            set ix.indexed: i + 1
+        }
     }
 
     ; ── the OBJECT instantiation table (slice 125) ──────────────────────────
@@ -59075,25 +59152,20 @@ define Checker
     ; loop label writes a row only where the junction completed.
     function flow_loop_cache_lookup(this, flow: ref[FlowNode], key: ref[Array[ref[FlowKeyPart]?]]) returns ref[Type]?
     {
-        let len flow_loop_cache.get_length() as int
-        var i 0
-        while i < len
+        ; upstream's map lookup: the rows of this flow node through the index, the
+        ; first row with an equal key answering, as the scan over all rows did
+        let hit flow_loop_cache_index.find(flow as int)
+        if hit = 0
+            return null
+        var walk: ref[FlowLoopCacheLink]? flow_loop_cache[(hit - 1) as size_t]
+        while walk <> null
         {
-            let row flow_loop_cache[i]
-            set i: i + 1
-            if row = null
-                continue
-            let r row as ref[FlowLoopCacheLink]
-            if r.flow <> null
+            let r walk as ref[FlowLoopCacheLink]
+            set walk: r.next_same_flow
+            if r.key <> null
             {
-                if (r.flow as ref[FlowNode]) = flow
-                {
-                    if r.key <> null
-                    {
-                        if Checker.flow_key_equal(r.key as ref[Array[ref[FlowKeyPart]?]], key)
-                            return r.t
-                    }
-                }
+                if Checker.flow_key_equal(r.key as ref[Array[ref[FlowKeyPart]?]], key)
+                    return r.t
             }
         }
         null
@@ -59101,7 +59173,18 @@ define Checker
 
     procedure flow_loop_cache_put(this, flow: ref[FlowNode], key: ref[Array[ref[FlowKeyPart]?]], t: ref[Type])
     {
-        flow_loop_cache.add(&FlowLoopCacheLink^host(flow, key, t))
+        let made &FlowLoopCacheLink^host(flow, key, t, null)
+        let hit flow_loop_cache_index.find(flow as int)
+        flow_loop_cache.add(made)
+        if hit = 0
+        {
+            flow_loop_cache_index.insert(flow as int, (flow_loop_cache.get_length() as int) - 1)
+            return
+        }
+        var tail flow_loop_cache[(hit - 1) as size_t] as ref[FlowLoopCacheLink]
+        while tail.next_same_flow <> null
+            set tail: tail.next_same_flow as ref[FlowLoopCacheLink]
+        set tail.next_same_flow: made
     }
 
     ; A fresh, empty flow type cache — check_expression_cached_ex's *clear*, where
@@ -95590,18 +95673,26 @@ define Checker
         if (extra_lib_files = null) or (sf = null)
             return 0 - 1
         let efs extra_lib_files as ref[Array[ref[AstNode]?]]
-        var li 0
-        while li < (efs.get_length() as int)
+        let n efs.get_length() as int
+        if (extra_lib_index = null) or (extra_lib_indexed <> n)
         {
-            let ef efs[li as size_t]
-            if ef <> null
+            let idx AddressIndex.create(host)
+            var li 0
+            while li < n
             {
-                if (ef as ref[AstNode]) = (sf as ref[AstNode])
-                    return li
+                let ef efs[li as size_t]
+                if ef <> null
+                {
+                    if idx.find((ef as ref[AstNode]) as int) = 0
+                        idx.insert((ef as ref[AstNode]) as int, li)
+                }
+                set li: li + 1
             }
-            set li: li + 1
+            set extra_lib_index: idx
+            set extra_lib_indexed: n
         }
-        0 - 1
+        let ix extra_lib_index as ref[AddressIndex]
+        ix.find((sf as ref[AstNode]) as int) - 1
     }
 
     ; ast.GetSourceFileOfNode — the walk up to the SourceFile.
@@ -109970,7 +110061,40 @@ define Checker
                 return 0 - 1
             set my_index: li + 1
         }
-        let my_priority Checker.lib_priority(Checker.base_name_of((this.binder_of_node(sf)).file_name))
+        return this.lib_rank_at(my_index)
+    }
+
+    ; the rank of lib file `my_index` in the lib files' sorted order, computed for
+    ; every lib file at once and kept while the lib count stands
+    function lib_rank_at(this, my_index: int) returns int
+    {
+        let count this.lib_file_count()
+        var ranks_ok false
+        if lib_ranks <> null
+        {
+            if ((lib_ranks as ref[Array[int]]).get_length() as int) = count
+                set ranks_ok: true
+        }
+        if ranks_ok = false
+        {
+            let fresh &Array[int]^host()
+            var k 0
+            while k < count
+            {
+                fresh.add(this.lib_rank_uncached(k))
+                set k: k + 1
+            }
+            set lib_ranks: fresh
+        }
+        (lib_ranks as ref[Array[int]])[my_index as size_t]
+    }
+
+    function lib_rank_uncached(this, my_index: int) returns int
+    {
+        let mine this.lib_file_at(my_index)
+        if mine = null
+            return 0
+        let my_priority Checker.lib_priority(Checker.base_name_of((this.binder_of_node(mine)).file_name))
         var rank 0
         var ci 0
         let count this.lib_file_count()

@@ -59,5 +59,16 @@ diagnostics are in the `==== OUTPUT` block of `vscode.out`, in pretty format.
 | tsgo `--singleThreaded` | 19.3 s | 6.3 GB |
 | tscaly `-O2` | 492 s, swapping | 23.1 GB peak |
 
-tscaly reproduced all 355 of tsgo's diagnostics text-identically. The time is not
-a comparison yet — most of it was the swap.
+That run reported 709 errors: all 355 of tsgo's, text-identical, and 354 more that
+are port defects (an earlier version of this line read the intersection as equality).
+The time is not a comparison yet — most of it was the swap.
+
+## Measured 2026-09-17 (same machine, `--paths-only` scenario)
+
+| | wall | CPU | memory |
+|---|---|---|---|
+| tscaly after the memory work | 470 s | 392 s | 10.85 GB footprint |
+| tscaly after the project-size indexes (slice 312) | 105.5 s | 97 s | 11.2 GB footprint |
+
+630 errors: tsgo's 355 and 275 port defects (the `@xterm/addon-*` typings' self-augmenting
+`declare module`, JSON modules outside the scenario, and what follows from them).
