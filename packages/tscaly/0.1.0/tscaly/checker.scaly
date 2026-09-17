@@ -647,15 +647,19 @@ define TypeInstantiation
 ; order, caught up with the rows added since (catch_up_instantiation_index#). A
 ; generic interface (`Event<T>`, `Promise<T>`) collects thousands of rows, and the
 ; list scan per lookup was a leading item of a 2 800-file profile (2026-09-17).
-; `list` names the list the index was built over.
+; `list` names the list the index was built over. ★Since slice 326 the index is
+; open-addressed slots of row + 1 probed by the row's own hash (the rows of one
+; hash lie in list order along the probe path, so the first equal row still
+; answers), made only for a list of ObjectRowChainMin rows or more: an
+; AddressIndex per interface took an exclusive page even for one row.
 ; an instantiation list this long or longer is searched through its hash chain
 define ObjectRowChainMin: int 8
 
 define InstantiationIndex
 (
     list: ref[Array[ref[TypeInstantiation]?]]
-    firsts: ref[AddressIndex]
-    next: ref[Array[int]]
+    slots: ref[Vector[int]]
+    mask: int
     indexed: int
 )
 
@@ -12083,6 +12087,25 @@ define Checker
                 if d.instantiations = null
                     return null
                 let list d.instantiations as ref[Array[ref[TypeInstantiation]?]]
+                let n list.get_length() as int
+                if n < ObjectRowChainMin
+                {
+                    var k 0
+                    while k < n
+                    {
+                        let row list[k as size_t]
+                        set k: k + 1
+                        if row = null
+                            continue
+                        let r row as ref[TypeInstantiation]
+                        if r.hash = h
+                        {
+                            if Checker.type_lists_equal(r.arguments, args)
+                                return r.instantiated
+                        }
+                    }
+                    return null
+                }
                 var rebuild false
                 if d.instantiation_index = null
                     set rebuild: true
@@ -12092,18 +12115,21 @@ define Checker
                     if old_ix.list <> list
                         set rebuild: true
                 }
+                let pg Page.get(list)
                 if rebuild
                 {
-                    let pg Page.get(list)
-                    let fresh &InstantiationIndex^pg(list, AddressIndex.create(pg), &Array[int]^pg(), 0)
+                    let fresh &InstantiationIndex^pg(list, AddressIndex.fresh_buckets(pg, 16), 15, 0)
                     set d.instantiation_index: fresh
                 }
                 let ix d.instantiation_index as ref[InstantiationIndex]
-                Checker.catch_up_instantiation_index(ix)
-                var at ix.firsts.find(Checker.instantiation_key(h)) - 1
-                while at >= 0
+                Checker.catch_up_instantiation_index(pg, ix)
+                var slot h & ix.mask
+                repeat
                 {
-                    let row list[at as size_t]
+                    let e ix.slots[slot as size_t]
+                    if e = 0
+                        return null
+                    let row list[(e - 1) as size_t]
                     if row <> null
                     {
                         let r row as ref[TypeInstantiation]
@@ -12113,58 +12139,43 @@ define Checker
                                 return r.instantiated
                         }
                     }
-                    set at: ix.next[at as size_t]
+                    set slot: (slot + 1) & ix.mask
                 }
-                return null
             }
         null
     }
 
-    ; a list hash as an address-index key: never 0, which the index reads as empty
-    function instantiation_key(h: int) returns int
-        ((h & 4611686018427387903) * 2) + 1
-
-    procedure catch_up_instantiation_index(ix: ref[InstantiationIndex])
+    ; the rows added since, into the slots; grown (from scratch, in list order)
+    ; before passing three quarters full
+    procedure catch_up_instantiation_index(pg: ref[Page], ix: ref[InstantiationIndex])
     {
         let list ix.list
         let n list.get_length() as int
+        if (n * 4) > ((ix.mask + 1) * 3)
+        {
+            var cap (ix.mask + 1) * 2
+            while (n * 4) > (cap * 3)
+                set cap: cap * 2
+            let old ix.slots
+            set ix.slots: AddressIndex.fresh_buckets(pg, cap)
+            AddressIndex.release_buckets(pg, old)
+            set ix.mask: cap - 1
+            set ix.indexed: 0
+        }
         while ix.indexed < n
         {
             let i ix.indexed
-            ix.next.add(0 - 1)
-            let row list[i as size_t]
-            if row <> null
-            {
-                let key Checker.instantiation_key((row as ref[TypeInstantiation]).hash)
-                let first ix.firsts.find(key)
-                if first = 0
-                    ix.firsts.insert(key, i)
-                else
-                {
-                    var last first - 1
-                    while ix.next[last as size_t] >= 0
-                        set last: ix.next[last as size_t]
-                    ix.next.put(last as size_t, i)
-                }
-            }
             set ix.indexed: i + 1
+            let row list[i as size_t]
+            if row = null
+                continue
+            var slot (row as ref[TypeInstantiation]).hash & ix.mask
+            while ix.slots[slot as size_t] <> 0
+                set slot: (slot + 1) & ix.mask
+            ix.slots.put(slot as size_t, i + 1)
         }
     }
 
-    ; ── the OBJECT instantiation table (slice 125) ──────────────────────────
-    ;
-    ; `ObjectType.instantiations`, whose key upstream is
-    ; getTypeInstantiationKey(typeArguments, alias, singleSignature). The two
-    ; procedures below are find_instantiation / add_instantiation for the
-    ; anonymous and mapped arms, and they differ in exactly one way: the key here
-    ; is THREE parts and not one, so the row carries all three (§3.16).
-    ;
-    ; ★★★ THE ALIAS IS PART OF THE KEY AND LEAVING IT OUT IS NOT A CACHE MISS BUT
-    ; A WRONG ANSWER: `type A<T> = { x: T }` and `type B<T> = { x: T }` share a
-    ; declaration node in nothing, but ONE mapped or anonymous target instantiated
-    ; under two different aliases is exactly what getObjectTypeInstantiation is
-    ; asked for by getTypeAliasInstantiation, and the answer differs only in the
-    ; alias the printer reads back.
     function find_object_instantiation(this, target: ref[Type], args: ref[Array[ref[Type]?]]?, alias: ref[TypeAlias]?, single_signature: bool) returns ref[Type]?
     {
         let list Checker.object_instantiations_of(target)
