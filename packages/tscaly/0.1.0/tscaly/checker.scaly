@@ -94,6 +94,7 @@ use scaly.containers.String
 use scaly.containers.StringBuilder
 use tscaly.TsOptionDecls.TsOptionDecls
 use tscaly.addressindex.AddressIndex
+use tscaly.addressindex.HashChain
 use tscaly.ast.AstNode
 use tscaly.ast.Symbol
 use tscaly.ast.FlowNode
@@ -5268,6 +5269,8 @@ define ConditionalRoot
     outer_type_parameters: ref[Array[ref[Type]?]]?
     alias: ref[TypeAlias]?
     instantiations: ref[Array[ref[ConditionalInstantiation]?]]?
+    ; `instantiations` by argument hash (HashChain)
+    instantiation_chain: ref[HashChain]?
 )
 {
     init(n: ref[AstNode], ct: ref[Type], et: ref[Type], dist: bool, ip: ref[Array[ref[Type]?]]?, otp: ref[Array[ref[Type]?]]?, al: ref[TypeAlias]?)
@@ -5280,6 +5283,7 @@ define ConditionalRoot
         set outer_type_parameters: otp
         set alias: al
         set instantiations: null
+        set instantiation_chain: null
     }
 }
 
@@ -6628,6 +6632,10 @@ define Checker
     ; get_type_of_expression. It is not a lookup table with a fast path: the cache
     ; decides how many times an expression is CHECKED, and a check reports.
     flow_type_cache: ref[Array[ref[FlowTypeCacheLink]?]]
+    ; one HashChain per flow type cache list (the cache is swapped around every
+    ; looping antecedent): the list's address -> its row in flow_type_cache_chains
+    flow_type_cache_chain_index: ref[AddressIndex]
+    flow_type_cache_chains: ref[Array[ref[HashChain]?]]
 
     ; ── c.contextFreeTypes (slice 141) ───────────────────────────────────────
     context_free_types: ref[Array[ref[ContextFreeTypeLink]?]]
@@ -7006,6 +7014,7 @@ define Checker
     ; c.intersectionTypes (slice 121). Its rows are ENTRIES rather than types —
     ; see IntersectionEntry for why two thirds of the key are not on the answer.
     intersection_types: ref[Array[ref[IntersectionEntry]?]]
+    intersection_chain: ref[HashChain]
 
     ; c.subtypeReductionCache (slice 135) — see SubtypeReductionRow.
     subtype_reduction_cache: ref[Array[ref[SubtypeReductionRow]?]]
@@ -7177,6 +7186,7 @@ define Checker
     ;
     ; The same idiom keyed on the PAIR — see DiscriminatedContextualTypeLink.
     discriminated_contextual_type_links: ref[Array[ref[DiscriminatedContextualTypeLink]?]]
+    discriminated_chain: ref[HashChain]
 
     ; ── c.typeAliasLinks (slice 105) ────────────────────────────────────────
     ;
@@ -8374,6 +8384,7 @@ define Checker
         set c.simplified_indexed_access_links_index: AddressIndex.create(host)
         let dctl &Array[ref[DiscriminatedContextualTypeLink]?]^host()
         set c.discriminated_contextual_type_links: dctl
+        set c.discriminated_chain: HashChain.create(host)
         let altl &Array[ref[ArrayLiteralTypeLink]?]^host()
         set c.array_literal_type_links: altl
         set c.array_literal_type_links_index: AddressIndex.create(host)
@@ -8385,6 +8396,9 @@ define Checker
         set c.assertion_links_index: AddressIndex.create(host)
         let ftc &Array[ref[FlowTypeCacheLink]?]^host()
         set c.flow_type_cache: ftc
+        set c.flow_type_cache_chain_index: AddressIndex.create(host)
+        let ftcc &Array[ref[HashChain]?]^host()
+        set c.flow_type_cache_chains: ftcc
         let cft &Array[ref[ContextFreeTypeLink]?]^host()
         set c.context_free_types: cft
         set c.context_free_types_index: AddressIndex.create(host)
@@ -8673,6 +8687,7 @@ define Checker
         set c.union_type_mask: 0
         let it &Array[ref[IntersectionEntry]?]^host()
         set c.intersection_types: it
+        set c.intersection_chain: HashChain.create(host)
         let src &Array[ref[SubtypeReductionRow]?]^host()
         set c.subtype_reduction_cache: src
         set c.boolean_type: null
@@ -10462,13 +10477,28 @@ define Checker
     ;
     ; ★ NOT a mint-on-miss reader: the key is a PAIR and a fresh row would answer
     ; null, which here means *the walk stopped*. The caller tests for the row.
+    function discriminated_key_hash(node: ref[AstNode]?, contextual: ref[Type]?) returns int
+        (node as int) xor ((contextual as int) * 31)
+
     function discriminated_contextual_type_link_of(this, node: ref[AstNode], contextual: ref[Type]) returns ref[DiscriminatedContextualTypeLink]?
     {
         let len discriminated_contextual_type_links.get_length() as int
-        var i 0
-        while i < len
+        let chain discriminated_chain
+        while chain.count() < len
         {
-            let row discriminated_contextual_type_links[i]
+            let pending discriminated_contextual_type_links[chain.count() as size_t]
+            if pending = null
+                chain.add_blank()
+            else
+            {
+                let pr pending as ref[DiscriminatedContextualTypeLink]
+                chain.add(Checker.discriminated_key_hash(pr.node, pr.contextual))
+            }
+        }
+        var i chain.first(Checker.discriminated_key_hash(node, contextual))
+        while i >= 0
+        {
+            let row discriminated_contextual_type_links[i as size_t]
             if row <> null
             {
                 let r row as ref[DiscriminatedContextualTypeLink]
@@ -10478,7 +10508,7 @@ define Checker
                         return r
                 }
             }
-            set i: i + 1
+            set i: chain.after(i)
         }
         null
     }
@@ -10551,17 +10581,44 @@ define Checker
     ; one means *not computed*.
     function flow_type_cache_lookup(this, node: ref[AstNode]) returns ref[Type]?
     {
-        let len flow_type_cache.get_length() as int
-        var i 0
-        while i < len
+        let list flow_type_cache
+        let len list.get_length() as int
+        if len = 0
+            return null
+        let slot flow_type_cache_chain_index.find(list as int)
+        var chain_opt: ref[HashChain]? null
+        if slot = 0
         {
-            let row flow_type_cache[i]
-            set i: i + 1
-            if row = null
-                continue
-            let r row as ref[FlowTypeCacheLink]
-            if r.node = node
-                return r.t
+            let made HashChain.create(host)
+            flow_type_cache_chains.add(made)
+            flow_type_cache_chain_index.insert(list as int, (flow_type_cache_chains.get_length() as int) - 1)
+            set chain_opt: made
+        }
+        else
+            set chain_opt: flow_type_cache_chains[(slot - 1) as size_t]
+        let chain chain_opt as ref[HashChain]
+        while chain.count() < len
+        {
+            let pending list[chain.count() as size_t]
+            if pending = null
+                chain.add_blank()
+            else
+            {
+                let pr pending as ref[FlowTypeCacheLink]
+                chain.add(pr.node as int)
+            }
+        }
+        var i chain.first(node as int)
+        while i >= 0
+        {
+            let row list[i as size_t]
+            if row <> null
+            {
+                let r row as ref[FlowTypeCacheLink]
+                if r.node = node
+                    return r.t
+            }
+            set i: chain.after(i)
         }
         null
     }
@@ -38913,14 +38970,30 @@ define Checker
     function new_intersection_type(this, object_flags: int, types: ref[Array[ref[Type]?]]) returns ref[Type]
         this.new_type(TypeFlagsIntersection, object_flags, null, TypeData.Intersection(box_node_data[IntersectionTypeData](host, IntersectionTypeData(types))))
 
+    ; an intersection's key as a hash: its key list and its flags
+    function intersection_key_hash(types: ref[Array[ref[Type]?]]?, flags: int) returns int
+        Checker.type_list_hash(types) xor (flags * 1000003)
+
     function find_intersection_type(this, types: ref[Array[ref[Type]?]], flags: int, alias: ref[TypeAlias]?) returns ref[Type]?
     {
         let n types.get_length() as int
         let count intersection_types.get_length() as int
-        var i 0
-        while i < count
+        let chain intersection_chain
+        while chain.count() < count
         {
-            let row intersection_types[i]
+            let pending intersection_types[chain.count() as size_t]
+            if pending = null
+                chain.add_blank()
+            else
+            {
+                let pe pending as ref[IntersectionEntry]
+                chain.add(Checker.intersection_key_hash(pe.key_types, pe.key_flags))
+            }
+        }
+        var i chain.first(Checker.intersection_key_hash(types, flags))
+        while i >= 0
+        {
+            let row intersection_types[i as size_t]
             if row <> null
             {
                 let entry row as ref[IntersectionEntry]
@@ -38959,7 +39032,7 @@ define Checker
                     }
                 }
             }
-            set i: i + 1
+            set i: chain.after(i)
         }
         null
     }
@@ -114290,10 +114363,21 @@ define Checker
         }
         let h Checker.type_list_hash(args)
         let n rows.get_length() as int
-        var i 0
-        while i < n
+        if root.instantiation_chain = null
+            set root.instantiation_chain: HashChain.create(Page.get(rows))
+        let chain root.instantiation_chain as ref[HashChain]
+        while chain.count() < n
         {
-            let row rows[i]
+            let pending rows[chain.count() as size_t]
+            if pending = null
+                chain.add_blank()
+            else
+                chain.add((pending as ref[ConditionalInstantiation]).hash)
+        }
+        var i chain.first(h)
+        while i >= 0
+        {
+            let row rows[i as size_t]
             if row <> null
             {
                 let r row as ref[ConditionalInstantiation]
@@ -114312,7 +114396,7 @@ define Checker
                     }
                 }
             }
-            set i: i + 1
+            set i: chain.after(i)
         }
         null
     }
