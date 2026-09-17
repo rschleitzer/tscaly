@@ -648,6 +648,9 @@ define TypeInstantiation
 ; generic interface (`Event<T>`, `Promise<T>`) collects thousands of rows, and the
 ; list scan per lookup was a leading item of a 2 800-file profile (2026-09-17).
 ; `list` names the list the index was built over.
+; an instantiation list this long or longer is searched through its hash chain
+define ObjectRowChainMin: int 8
+
 define InstantiationIndex
 (
     list: ref[Array[ref[TypeInstantiation]?]]
@@ -6652,6 +6655,13 @@ define Checker
     flow_loop_cache: ref[Array[ref[FlowLoopCacheLink]?]]
     ; flow node address -> its first row; the rows of one node are chained
     flow_loop_cache_index: ref[AddressIndex]
+    ; an instantiation list's address -> its row in object_row_chain_list: the
+    ; list's rows chained by argument hash (the reference's map key)
+    object_row_chains: ref[AddressIndex]
+    object_row_chain_list: ref[Array[ref[HashChain]]]
+    ; the same for a signature's cache rows, chained by type-argument hash
+    signature_row_chains: ref[AddressIndex]
+    signature_row_chain_list: ref[Array[ref[HashChain]]]
     flow_loop_stack: ref[FlowLoopInfo]?
     flow_invocation_count: int
 
@@ -6674,6 +6684,8 @@ define Checker
     ; tuples with the same flags differ when their labelled declarations differ, so
     ; `[a: string]` and `[b: string]` are two targets.
     tuple_targets: ref[Array[ref[TupleTarget]?]]
+    ; its rows chained by tuple_key_hash (getTupleKey's parts), caught up per lookup
+    tuple_target_chain: ref[HashChain]
 
     ; ── the three constraint markers (slice 81) ──────────────────────────────
     ;
@@ -7018,6 +7030,8 @@ define Checker
 
     ; c.subtypeReductionCache (slice 135) — see SubtypeReductionRow.
     subtype_reduction_cache: ref[Array[ref[SubtypeReductionRow]?]]
+    ; its rows chained by the key's type_list_hash, caught up per lookup
+    subtype_reduction_chain: ref[HashChain]
 
     ; ── the three intern tables, slice 71 ───────────────────────────────────
     ;
@@ -8405,6 +8419,10 @@ define Checker
         let flc &Array[ref[FlowLoopCacheLink]?]^host()
         set c.flow_loop_cache: flc
         set c.flow_loop_cache_index: AddressIndex.create(host)
+        set c.object_row_chains: AddressIndex.create(host)
+        set c.object_row_chain_list: &Array[ref[HashChain]]^host()
+        set c.signature_row_chains: AddressIndex.create(host)
+        set c.signature_row_chain_list: &Array[ref[HashChain]]^host()
         set c.flow_loop_stack: null
         set c.flow_invocation_count: 0
         let tal &Array[ref[TypeAliasLink]?]^host()
@@ -8690,6 +8708,7 @@ define Checker
         set c.intersection_chain: HashChain.create(host)
         let src &Array[ref[SubtypeReductionRow]?]^host()
         set c.subtype_reduction_cache: src
+        set c.subtype_reduction_chain: HashChain.create(host)
         set c.boolean_type: null
         set c.number_or_bigint_type: null
         set c.string_or_number_type: null
@@ -8713,6 +8732,7 @@ define Checker
         ; stay null after the first ask and the null is not a second sentinel.
         let tt &Array[ref[TupleTarget]?]^host()
         set c.tuple_targets: tt
+        set c.tuple_target_chain: HashChain.create(host)
         set c.global_array_type: null
         set c.global_readonly_array_type: null
         set c.global_object_type: null
@@ -12132,7 +12152,7 @@ define Checker
     ; under two different aliases is exactly what getObjectTypeInstantiation is
     ; asked for by getTypeAliasInstantiation, and the answer differs only in the
     ; alias the printer reads back.
-    function find_object_instantiation(target: ref[Type], args: ref[Array[ref[Type]?]]?, alias: ref[TypeAlias]?, single_signature: bool) returns ref[Type]?
+    function find_object_instantiation(this, target: ref[Type], args: ref[Array[ref[Type]?]]?, alias: ref[TypeAlias]?, single_signature: bool) returns ref[Type]?
     {
         let list Checker.object_instantiations_of(target)
         if list = null
@@ -12148,8 +12168,15 @@ define Checker
         }
         let h Checker.type_list_hash(args)
         let n rows.get_length() as int
+        let chained n >= ObjectRowChainMin
+        var ch: ref[HashChain]? null
         var i 0
-        while i < n
+        if chained
+        {
+            set ch: this.object_row_chain(rows)
+            set i: (ch as ref[HashChain]).first(h)
+        }
+        while (i >= 0) and (i < n)
         {
             let row rows[i]
             if row <> null
@@ -12170,9 +12197,79 @@ define Checker
                     }
                 }
             }
-            set i: i + 1
+            if chained
+                set i: (ch as ref[HashChain]).after(i)
+            else
+                set i: i + 1
         }
         null
+    }
+
+    ; a signature's cache rows chained by type-argument hash (every kind; the
+    ; lookup filters the kind), caught up like object_row_chain
+    function signature_row_chain(this, rows: ref[Array[ref[CachedSignature]?]]) returns ref[HashChain]
+    {
+        let address rows as int
+        let n rows.get_length() as int
+        let hit signature_row_chains.find(address)
+        var chain: ref[HashChain]? null
+        if hit > 0
+        {
+            let known signature_row_chain_list[(hit - 1) as size_t]
+            if known.count() <= n
+                set chain: known
+        }
+        if chain = null
+        {
+            let made HashChain.create(host)
+            signature_row_chain_list.add(made)
+            signature_row_chains.insert(address, (signature_row_chain_list.get_length() as int) - 1)
+            set chain: made
+        }
+        let c chain as ref[HashChain]
+        while c.count() < n
+        {
+            let row rows[c.count() as size_t]
+            if row = null
+                c.add_blank()
+            else
+                c.add(Checker.type_list_hash((row as ref[CachedSignature]).type_arguments))
+        }
+        c
+    }
+
+    ; an instantiation list's rows chained by argument hash, caught up with the
+    ; rows added since; a list shorter than its chain is a new list at a released
+    ; address and gets a fresh chain
+    function object_row_chain(this, rows: ref[Array[ref[ObjectInstantiation]?]]) returns ref[HashChain]
+    {
+        let address rows as int
+        let n rows.get_length() as int
+        let hit object_row_chains.find(address)
+        var chain: ref[HashChain]? null
+        if hit > 0
+        {
+            let known object_row_chain_list[(hit - 1) as size_t]
+            if known.count() <= n
+                set chain: known
+        }
+        if chain = null
+        {
+            let made HashChain.create(host)
+            object_row_chain_list.add(made)
+            object_row_chains.insert(address, (object_row_chain_list.get_length() as int) - 1)
+            set chain: made
+        }
+        let c chain as ref[HashChain]
+        while c.count() < n
+        {
+            let row rows[c.count() as size_t]
+            if row = null
+                c.add_blank()
+            else
+                c.add((row as ref[ObjectInstantiation]).hash)
+        }
+        c
     }
 
     function object_instantiations_of(t: ref[Type]) returns ref[Array[ref[ObjectInstantiation]?]]?
@@ -21721,7 +21818,7 @@ define Checker
                 return this.get_global_array_type()
             }
         }
-        let cached Checker.find_tuple_target(tuple_targets, infos, readonly)
+        let cached this.find_tuple_target(tuple_targets, infos, readonly)
         if cached <> null
             return cached
         let made this.create_tuple_target_type(infos, readonly)
@@ -21743,12 +21840,26 @@ define Checker
     ; getTupleKey, as a structural comparison — see the `tuple_targets` field for
     ; why there is no hash here. ★The reference's key distinguishes the four flag
     ; classes and the labelled DECLARATION, and nothing else; so does this.
-    function find_tuple_target(rows: ref[Array[ref[TupleTarget]?]], infos: ref[Array[ref[TupleElementInfo]?]], readonly: bool) returns ref[Type]?
+    function find_tuple_target(this, rows: ref[Array[ref[TupleTarget]?]], infos: ref[Array[ref[TupleElementInfo]?]], readonly: bool) returns ref[Type]?
     {
         let n infos.get_length() as int
         let rn rows.get_length() as int
-        var i 0
-        while i < rn
+        while tuple_target_chain.count() < rn
+        {
+            let pending rows[tuple_target_chain.count() as size_t]
+            if pending = null
+                tuple_target_chain.add_blank()
+            else
+            {
+                let pr pending as ref[TupleTarget]
+                if pr.element_infos = null
+                    tuple_target_chain.add_blank()
+                else
+                    tuple_target_chain.add(Checker.tuple_key_hash(pr.element_infos as ref[Array[ref[TupleElementInfo]?]], pr.readonly))
+            }
+        }
+        var i tuple_target_chain.first(Checker.tuple_key_hash(infos, readonly))
+        while i >= 0
         {
             let row rows[i]
             if row <> null
@@ -21788,9 +21899,36 @@ define Checker
                     }
                 }
             }
-            set i: i + 1
+            set i: tuple_target_chain.after(i)
         }
         null
+    }
+
+    ; getTupleKey's parts as a hash: readonly, and per element its flags and its
+    ; labelled declaration
+    function tuple_key_hash(infos: ref[Array[ref[TupleElementInfo]?]], readonly: bool) returns int
+    {
+        var h: u64 14695981039346656037
+        if readonly
+            set h: h xor 1
+        set h: h * 1099511628211
+        let n infos.get_length() as int
+        var j 0
+        while j < n
+        {
+            let e infos[j]
+            if e <> null
+            {
+                let ei e as ref[TupleElementInfo]
+                set h: h xor (ei.flags as u64)
+                set h: h * 1099511628211
+                if ei.labeled_declaration <> null
+                    set h: h xor ((ei.labeled_declaration as ref[AstNode]) as int as u64)
+                set h: h * 1099511628211
+            }
+            set j: j + 1
+        }
+        ((h >> 1) as int)
     }
 
     ; createTupleTargetType, whole.
@@ -31333,7 +31471,7 @@ define Checker
             set links.instantiations: seeded
         }
         let rows links.instantiations as ref[Array[ref[ObjectInstantiation]?]]
-        let found Checker.find_instantiation_row(rows, type_arguments, alias)
+        let found this.find_instantiation_row(rows, type_arguments, alias)
         if found <> null
             return found
         if type_parameters = null
@@ -31358,7 +31496,7 @@ define Checker
     ; `add_object_instantiation` over a list handed in rather than read off a
     ; TYPE, because a type alias link is not a type — the row shape is the same
     ; (see TypeAliasLink's header for why the third key field is unused).
-    function find_instantiation_row(rows: ref[Array[ref[ObjectInstantiation]?]], args: ref[Array[ref[Type]?]]?, alias: ref[TypeAlias]?) returns ref[Type]?
+    function find_instantiation_row(this, rows: ref[Array[ref[ObjectInstantiation]?]], args: ref[Array[ref[Type]?]]?, alias: ref[TypeAlias]?) returns ref[Type]?
     {
         var asym: ref[Symbol]? null
         var aargs: ref[Array[ref[Type]?]]? null
@@ -31369,8 +31507,15 @@ define Checker
             set aargs: al.type_arguments
         }
         let n rows.get_length() as int
+        let chained n >= ObjectRowChainMin
+        var ch: ref[HashChain]? null
         var i 0
-        while i < n
+        if chained
+        {
+            set ch: this.object_row_chain(rows)
+            set i: (ch as ref[HashChain]).first(Checker.type_list_hash(args))
+        }
+        while (i >= 0) and (i < n)
         {
             let row rows[i]
             if row <> null
@@ -31385,7 +31530,10 @@ define Checker
                     }
                 }
             }
-            set i: i + 1
+            if chained
+                set i: (ch as ref[HashChain]).after(i)
+            else
+                set i: i + 1
         }
         null
     }
@@ -37401,8 +37549,20 @@ define Checker
     {
         let n types.get_length() as int
         let count subtype_reduction_cache.get_length() as int
-        var i 0
-        while i < count
+        let chain subtype_reduction_chain
+        while chain.count() < count
+        {
+            let pending subtype_reduction_cache[chain.count() as size_t]
+            var pending_key: ref[Array[ref[Type]?]]? null
+            if pending <> null
+                set pending_key: (pending as ref[SubtypeReductionRow]).key
+            if pending_key = null
+                chain.add_blank()
+            else
+                chain.add(Checker.type_list_hash(pending_key))
+        }
+        var i chain.first(Checker.type_list_hash(types))
+        while i >= 0
         {
             let row subtype_reduction_cache[i]
             if row <> null
@@ -37427,7 +37587,7 @@ define Checker
                     }
                 }
             }
-            set i: i + 1
+            set i: chain.after(i)
         }
         null
     }
@@ -113597,7 +113757,7 @@ define Checker
                 set target_alias: &TypeAlias^host(tgt.alias_symbol, tgt.alias_type_arguments) as ref[TypeAlias]?
             Checker.add_object_instantiation(tgt, type_parameters, target_alias, false, tgt)
         }
-        let found Checker.find_object_instantiation(tgt, type_arguments, alias, single_signature)
+        let found this.find_object_instantiation(tgt, type_arguments, alias, single_signature)
         if found <> null
             return found
         ; ★ combineTypeMappers and NOT mergeTypeMappers, which is what stood here
@@ -149708,8 +149868,15 @@ define Checker
         {
             let rows sig.cache_rows as ref[Array[ref[CachedSignature]?]]
             let n rows.get_length() as int
+            let chained n >= ObjectRowChainMin
+            var ch: ref[HashChain]? null
             var i 0
-            while i < n
+            if chained
+            {
+                set ch: this.signature_row_chain(rows)
+                set i: (ch as ref[HashChain]).first(Checker.type_list_hash(type_arguments))
+            }
+            while (i >= 0) and (i < n)
             {
                 let e rows[i]
                 if e <> null
@@ -149721,7 +149888,10 @@ define Checker
                             return row.instantiation
                     }
                 }
-                set i: i + 1
+                if chained
+                    set i: (ch as ref[HashChain]).after(i)
+                else
+                    set i: i + 1
             }
         }
         let made this.create_signature_instantiation(sig, type_arguments)
