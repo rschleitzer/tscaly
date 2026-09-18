@@ -509,7 +509,9 @@ define ProgramLoader
 
     ; a resolver for an import (or a type reference directive) of the file at `path`:
     ; the program's options, or its project reference redirect's
-    procedure resolver_for(this, path: Slice[char], mode: int, for_type_reference: bool) returns ref[ModuleResolver]
+    ; `on_page` holds the resolver and every path it builds: the program's host, or
+    ; resolve_one's scratch page (see there)
+    procedure resolver_for(this, on_page: ref[Page], path: Slice[char], mode: int, for_type_reference: bool) returns ref[ModuleResolver]
     {
         let redirect this.redirect_for(path)
         var o options
@@ -518,7 +520,7 @@ define ProgramLoader
         var resolve_json o.get_resolve_json_module()
         if for_type_reference
             set resolve_json: false
-        let resolver ModuleResolver.create(host, files, o.get_module_resolution_kind(), resolve_json, mode, EmitOptions.on(o.allow_js), o.resolve_package_json_exports, o.resolve_package_json_imports, o.out_dir, o.project_root_directory(host))
+        let resolver ModuleResolver.create(on_page, files, o.get_module_resolution_kind(), resolve_json, mode, EmitOptions.on(o.allow_js), o.resolve_package_json_exports, o.resolve_package_json_imports, o.out_dir, o.project_root_directory(on_page))
         if redirect >= 0
         {
             set resolver.module_suffixes: o.module_suffixes
@@ -539,15 +541,18 @@ define ProgramLoader
             resolver.enable_trace(options.module_resolution = options.get_module_resolution_kind())
     }
 
+    ; the lines are COPIED onto the list's own page: a resolver may live on a
+    ; scratch page that goes back after the resolution (resolve_one)
     procedure append_traces(out: ref[Array[String]], resolver: ref[ModuleResolver])
     {
         if resolver.traces = null
             return
         let list resolver.traces as ref[Array[String]]
+        let pg Page.get(out)
         var i 0
         while i < (list.get_length() as int)
         {
-            out.add(list[i as size_t])
+            out.add(String^pg(list[i as size_t]))
             set i: i + 1
         }
     }
@@ -1070,7 +1075,7 @@ define ProgramLoader
         var mode directive_mode
         if mode < 0
             set mode: this.default_resolution_mode_for_file(index)
-        let resolver this.resolver_for(files.path_at(index), mode, true)
+        let resolver this.resolver_for(host, files.path_at(index), mode, true)
         let r resolver.resolve_type_reference_directive(type_name, files.path_at(index), type_roots, from_config, false)
         ProgramLoader.append_traces(node.type_traces, resolver)
         if (resolver.stop_tag.length as int) > 0
@@ -1423,7 +1428,24 @@ define ProgramLoader
 
     ; one module name of resolveImportsAndModuleAugmentations; `entry` null for a
     ; synthetic import, `import_count` the length of file.Imports()
+    ;
+    ; ★★ The resolution runs on a SCRATCH page that goes back when it is done: the
+    ; resolver and every candidate path it builds are garbage the moment the answer
+    ; is in, which upstream's GC collects and a region would keep to the end — 857 000
+    ; resolvers and their paths, ~150 MB over the whole of VS Code (slice 354). What
+    ; outlives it is copied onto the host in resolve_one_on: the package id, the
+    ; stop tag, the trace lines (append_traces), the resolved path (the edge's own
+    ; copy); ProgramFiles copies the keys it caches itself.
     procedure resolve_one(this, node: ref[LoaderNode], index: int, module_name: Slice[char], entry: ref[AstNode]?, import_index: int, import_count: int)
+    {
+        ; a page of its own, registered nowhere, so the host keeps no list cell for it
+        let scratch Page.allocate_page()
+        this.resolve_one_on(scratch, node, index, module_name, entry, import_index, import_count)
+        scratch.deallocate_extensions()
+        Page.release_page(scratch)
+    }
+
+    procedure resolve_one_on(this, scratch: ref[Page], node: ref[LoaderNode], index: int, module_name: Slice[char], entry: ref[AstNode]?, import_index: int, import_count: int)
     {
         if (module_name.length as int) = 0
             return
@@ -1434,14 +1456,15 @@ define ProgramLoader
             set mode: Checker.usage_mode_in(this.resolution_context(), entry, files.format_at(index))
         else
             set mode: Checker.usage_mode_in(this.resolution_context(), null, files.format_at(index))
-        let resolver this.resolver_for(path, mode, false)
+        let resolver this.resolver_for(scratch, path, mode, false)
         let r resolver.resolve(module_name, this.resolution_containing_path(path))
         ProgramLoader.append_traces(node.traces, resolver)
         if (resolver.stop_tag.length as int) > 0
         {
-            this.stop(resolver.stop_tag)
+            this.stop(slice_copy_on(host, resolver.stop_tag))
             return
         }
+        let package_id slice_copy_on(host, resolver.package_id)
         ; the resolution's own diagnostics join the program's (includeProcessor)
         var rd 0
         while rd < (resolver.diagnostic_codes.get_length() as int)
@@ -1453,8 +1476,8 @@ define ProgramLoader
         }
         if r < 0
             return
-        if (resolver.package_id.length as int) > 0
-            files.record_package(resolver.package_id, files.path_at(r))
+        if (package_id.length as int) > 0
+            files.record_package(package_id, files.path_at(r))
         var resolved_path files.path_at(r)
         var found resolver.found_path
         if (found.length as int) = 0
@@ -1488,7 +1511,7 @@ define ProgramLoader
                     return
             }
         }
-        var reason &IncludeReason^host(FileIncludeKindImport, index, 0, 0, true, null, resolver.package_id)
+        var reason &IncludeReason^host(FileIncludeKindImport, index, 0, 0, true, null, package_id)
         if entry <> null
         {
             let en entry as ref[AstNode]
@@ -1503,9 +1526,9 @@ define ProgramLoader
             let e AstNode.end_of(en)
             if s <> e
                 set s: Scanner.skip_trivia(files.text_at(index), s)
-            set reason: &IncludeReason^host(FileIncludeKindImport, index, s, e, false, null, resolver.package_id)
+            set reason: &IncludeReason^host(FileIncludeKindImport, index, s, e, false, null, package_id)
         }
-        node.edges.add(&LoaderEdge^host(slice_copy_on(host, resolved_path), is_external_library_import, is_js_from_node_modules, reason, resolver.package_id))
+        node.edges.add(&LoaderEdge^host(slice_copy_on(host, resolved_path), is_external_library_import, is_js_from_node_modules, reason, package_id))
     }
 
     ; module.GetResolutionDiagnostic over the options
