@@ -135,6 +135,47 @@ define LoaderNode
     in_seen: bool
 )
 
+; PROTOTYPE (parallel parse): one file for a TaskPool worker. The worker reads and
+; parses onto a heap page of its own (Page.allocate_page — a heap page outlives the
+; worker thread, ROADMAP 2.3b) and writes its result into the job, a slot nobody
+; else writes while the wave runs.
+define PreparseJob
+(
+    index: int
+    path: Slice[char]
+    disk: Slice[char]
+    text: Slice[char]
+    result: ref[PreparsedFile]?
+    ; 1 once `result` is written, stored atomically by the worker
+    done: u64
+)
+
+function sched_yield() returns i32 extern
+
+procedure preparse_task(arg: pointer[void]) returns pointer[void]
+{
+    let job arg as ref[PreparseJob]
+    let pg Page.allocate_page()
+    var content String()
+    if (job.disk.length as int) > 0
+        set content: ProgramFiles.read_disk_string(pg, job.disk)
+    else
+        set content: String^pg(job.text.data as pointer[const_char], job.text.length)
+    let path String^pg(job.path.data as pointer[const_char], job.path.length)
+    let script_kind Parser.supported_script_kind(path)
+    var parse_text content
+    let decoded StringBuilder^pg()
+    if Emitter.decode_bytes(Slice[char](content.get_length(), content.get_buffer() as pointer[char]), &decoded)
+        set parse_text: String^pg(decoded.to_string())
+    var unported 0 - 1
+    var tag: Slice[char] ""
+    var detail 0
+    let p Parser.parse_ex(pg, path, parse_text, script_kind, &unported, &tag, &detail)
+    set job.result: &PreparsedFile^pg(parse_text, p, unported, tag, detail)
+    scaly_atomic_store_u64(&job.done, 1 as u64)
+    null
+}
+
 define ProgramLoader
 (
     host: ref[Page]
@@ -200,6 +241,11 @@ define ProgramLoader
     ; --diagnostics' timings, the driver's (slice 348): the bind is measured here,
     ; where the walk binds each file it parses
     stats: ref[CompileStats]?
+    ; PROTOTYPE (parallel parse): the pool of the walk, its group, and the job
+    ; queued for each file index
+    prepool: ref[TaskPool]?
+    pregroup: ref[TaskGroup]?
+    prejobs: ref[Array[ref[PreparseJob]?]]?
 )
 {
     procedure set_checker(this, c: ref[Checker])
@@ -223,7 +269,7 @@ define ProgramLoader
         if options.max_node_module_js_depth > 0
             set depth: options.max_node_module_js_depth
         let sh SpecifierHost.create(host, checker, files, options)
-        &ProgramLoader^host(host, files, options, checker, sh, &Array[ref[LoaderNode]]^host(), &Array[ref[LoaderEdge]]^host(), depth, &Array[int]^host(), &Array[Slice[char]]^host(), members, searched, &Array[ProgramDiagnostic]^host(), Slice[char](), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[int]^host(), false, false, &Array[String]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[EmitOptions]^host(), &Array[ref[JsonValue]?]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[ref[LoaderNode]]^host(), null, HashChain.create(host), null)
+        &ProgramLoader^host(host, files, options, checker, sh, &Array[ref[LoaderNode]]^host(), &Array[ref[LoaderEdge]]^host(), depth, &Array[int]^host(), &Array[Slice[char]]^host(), members, searched, &Array[ProgramDiagnostic]^host(), Slice[char](), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[int]^host(), false, false, &Array[String]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[EmitOptions]^host(), &Array[ref[JsonValue]?]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[ref[LoaderNode]]^host(), null, HashChain.create(host), null, null, null, null)
     }
 
     procedure session_push(tracing: ref[Tracing]?, phase: int, name: Slice[char], args: ref[Array[ref[TraceArg]]]?) returns int
@@ -275,6 +321,7 @@ define ProgramLoader
     ; parsed.
     procedure ensure_parsed(this, index: int) returns bool
     {
+        this.await_preparse(index)
         let tag ProgramLoader.parse_entry(Page.get(this), files, options, index, tracing)
         if (tag.length as int) = 0
             return true
@@ -294,10 +341,22 @@ define ProgramLoader
         let path_data files.path_at(index)
         if ProgramLoader.parseable_extension(path_data) = false
             return Slice[char]()
-        let content files.string_at(index)
-        let raw files.text_at(index)
         let path String^host(path_data.data as pointer[const_char], path_data.length as size_t)
         let script_kind Parser.supported_script_kind(path)
+        ; PROTOTYPE (parallel parse): a file a worker parsed ahead of the walk
+        let pre files.take_preparsed(index)
+        if pre <> null
+        {
+            let pf pre as ref[PreparsedFile]
+            files.keep_string(index, pf.text)
+            if pf.unported >= 0
+                return pf.tag
+            if pf.parser = null
+                return "parse-no-tree"
+            return ProgramLoader.finish_entry(files, options, index, path_data, script_kind, pf.text, pf.parser as ref[Parser])
+        }
+        let content files.string_at(index)
+        let raw files.text_at(index)
         var parse_text content
         let decoded StringBuilder^host()
         if Emitter.decode_bytes(raw, &decoded)
@@ -313,6 +372,12 @@ define ProgramLoader
         ProgramLoader.session_pop(tracing, cs_tid, TracePhaseParse, "createSourceFile", cs_args)
         if unported >= 0
             return unported_tag
+        ProgramLoader.finish_entry(files, options, index, path_data, script_kind, text_copy, p)
+    }
+
+    ; parse_entry after the parse: the file's module kindness, and the entry filled
+    procedure finish_entry(files: ref[ProgramFiles], options: EmitOptions, index: int, path_data: Slice[char], script_kind: int, text_copy: String, p: ref[Parser]) returns Slice[char]
+    {
         let file_opt Parser.source_file_of(p)
         if file_opt = null
             return "parse-no-tree"
@@ -432,7 +497,9 @@ define ProgramLoader
         }
         if roots.get_length() > 0
             this.add_automatic_type_directive_tasks()
+        this.preparse_roots()
         this.start(root_edges, 0)
+        this.finish_preparse()
         let seen &Array[ref[LoaderNode]]^host()
         var ni 0
         while ni < (nodes.get_length() as int)
@@ -452,6 +519,105 @@ define ProgramLoader
 
     ; getRedirectForResolution's file name: a referenced project's output declaration
     ; file resolves from its source
+    ; PROTOTYPE (parallel parse): TSCALY_PREPARSE=<n> reads and parses every root
+    ; file on n TaskPool workers before the walk; the walk then takes the results
+    ; (parse_entry). Off (0) by default; off whenever a trace is recorded.
+    function preparse_workers() returns int
+    {
+        let env getenv("TSCALY_PREPARSE")
+        if env = null
+            return 0
+        let bytes env as pointer[u8]
+        var n 0
+        var i 0
+        while true
+        {
+            let b *(bytes + i) as int
+            if (b < 48) or (b > 57)
+                break
+            set n: (n * 10) + (b - 48)
+            set i: i + 1
+        }
+        n
+    }
+
+    ; the pool for the whole walk; the roots are queued by the walk's first
+    ; start (prefetch_edges), which is where every later file is queued too
+    procedure preparse_roots(this)
+    {
+        let n ProgramLoader.preparse_workers()
+        if n <= 0
+            return
+        if tracing <> null
+            return
+        set this.prepool: TaskPool.create(n as i64)
+        set this.pregroup: TaskGroup.create()
+        set this.prejobs: &Array[ref[PreparseJob]?]^host()
+    }
+
+    ; queue a parse for every edge target not parsed and not queued, in the
+    ; order the walk will reach them (it walks the list from its end)
+    procedure prefetch_edges(this, edges: ref[Array[ref[LoaderEdge]]])
+    {
+        if prepool = null
+            return
+        let list prejobs as ref[Array[ref[PreparseJob]?]]
+        var i (edges.get_length() as int) - 1
+        while i >= 0
+        {
+            let edge edges[i as size_t]
+            set i: i - 1
+            let index files.index_of_path(edge.path)
+            if index < 0
+                continue
+            if files.file_at(index) <> null
+                continue
+            while (list.get_length() as int) <= index
+                list.add(null)
+            if list[index as size_t] <> null
+                continue
+            let path_data files.path_at(index)
+            if ProgramLoader.parseable_extension(path_data) = false
+                continue
+            let disk files.disk_path_at(index)
+            var text Slice[char]()
+            if (disk.length as int) = 0
+                set text: files.text_at(index)
+            let job &PreparseJob^host(index, path_data, disk, text, null, 0 as u64)
+            list.put(index as size_t, job)
+            TaskPool.submit(prepool as ref[TaskPool], &preparse_task, job as pointer[void], pregroup as ref[TaskGroup])
+        }
+    }
+
+    ; the walk needs file `index` now: wait for its job, if one was queued
+    procedure await_preparse(this, index: int)
+    {
+        if prejobs = null
+            return
+        let list prejobs as ref[Array[ref[PreparseJob]?]]
+        if index >= (list.get_length() as int)
+            return
+        let row list[index as size_t]
+        if row = null
+            return
+        let job row as ref[PreparseJob]
+        while scaly_atomic_load_u64(&job.done) = (0 as u64)
+            sched_yield()
+        if job.result <> null
+            files.set_preparsed(index, job.result as ref[PreparsedFile])
+    }
+
+    procedure finish_preparse(this)
+    {
+        if prepool = null
+            return
+        TaskGroup.wait(pregroup as ref[TaskGroup])
+        TaskGroup.dispose(pregroup as ref[TaskGroup])
+        TaskPool.shutdown(prepool as ref[TaskPool])
+        set this.prepool: null
+        set this.pregroup: null
+    }
+
     function resolution_containing_path(this, path_in: Slice[char]) returns Slice[char]
     {
         let path this.symlink_dts_path(path_in)
@@ -761,6 +927,7 @@ define ProgramLoader
     ; two were fused; none moves now.
     procedure start(this, edges: ref[Array[ref[LoaderEdge]]], depth: int)
     {
+        this.prefetch_edges(edges)
         var i (edges.get_length() as int) - 1
         while i >= 0
         {
