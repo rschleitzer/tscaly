@@ -1933,11 +1933,32 @@ function box_node_data[T](host: ref[Page], d: T) returns ref[T]
     p as ref[T]
 }
 
-; the next node link ordinal (slice 339). Handed out while checking, which is
-; single-threaded per checker; parallel checkers over one tree need this bumped
-; atomically (or handed out by the binder). It starts at 1: a node carries 0
-; until it is asked for, and every allocation site writes that 0.
-mutable node_ordinal_next: int 1
+; The link ordinal counters of nodes and symbols, and the lock under which a
+; node's ordinal is handed out (slice 359). PROCESS-WIDE: a `mutable` global is
+; thread-local, so a checker on a second thread would restart the count and
+; share link rows with the first. A record on a heap page of its own, because
+; the atomics work on a record's field; made by the first symbol, which the
+; binder creates on the main thread before any checker runs. Node ordinals start
+; at 1: a node carries 0 until it is asked for, and every allocation site writes
+; that 0.
+define OrdinalCounters
+(
+    nodes: u64
+    symbols: u64
+    lock: u64
+)
+
+shared ordinal_counters: ref[OrdinalCounters]? null
+
+function ordinal_counters_of() returns ref[OrdinalCounters]
+{
+    if ordinal_counters = null
+    {
+        let pg Page.allocate_page()
+        set ordinal_counters: &OrdinalCounters^pg(1 as u64, 0 as u64, 0 as u64)
+    }
+    ordinal_counters as ref[OrdinalCounters]
+}
 
 define AstNode
 (
@@ -2060,9 +2081,24 @@ define AstNode
         let ord node.link_ordinal as int
         if ord <> 0
             return ord
-        let next node_ordinal_next
-        set node_ordinal_next: next + 1
-        set node.link_ordinal: next as i32
+        ; the first ask: under the lock, and asked again there — another checker
+        ; may have numbered the node in between (an aligned i32 is never read torn)
+        let c ordinal_counters_of()
+        let lp &c.lock
+        var spinning true
+        while spinning
+        {
+            if scaly_atomic_cas_u64(lp, 0 as u64, 1 as u64) = (0 as u64)
+                set spinning: false
+        }
+        var next node.link_ordinal as int
+        if next = 0
+        {
+            set next: c.nodes as int
+            set c.nodes: c.nodes + (1 as u64)
+            set node.link_ordinal: next as i32
+        }
+        scaly_atomic_store_u64(lp, 0 as u64)
         next
     }
 
@@ -10153,9 +10189,9 @@ define AstNode
 ; a buffer the binder built on its own page for a synthesized name (`__type`,
 ; `"module"`, `__#1@x`). Nothing here copies, and nothing may free either.
 
-; the next symbol ordinal (slice 338). Symbols are made while parsing and binding,
-; which is single-threaded, and a checker only reads the number.
-mutable symbol_ordinal_next: int 0
+; A symbol's link ordinal (slice 338) comes from `ordinal_counters` above: the
+; binder makes symbols, and so does every checker (new_symbol), so since slice 359
+; the count is process-wide and bumped atomically.
 
 define Symbol
 (
@@ -10241,8 +10277,9 @@ define Symbol
     ; region garbage rather than null.
     function create(host: ref[Page], flags: int, name_data: Slice[char]) returns ref[Symbol]
     {
-        set symbol_ordinal_next: symbol_ordinal_next + 1
-        let s &Symbol^host(name_data, null, null, null, null, null, null, null, 0, 0, 0, flags as u32, symbol_ordinal_next as i32)
+        let c ordinal_counters_of()
+        let ordinal (scaly_atomic_add_u64(&c.symbols, 1 as u64) + (1 as u64)) as int
+        let s &Symbol^host(name_data, null, null, null, null, null, null, null, 0, 0, 0, flags as u32, ordinal as i32)
         s
     }
 
