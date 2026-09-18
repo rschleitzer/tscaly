@@ -72,3 +72,38 @@ The time is not a comparison yet — most of it was the swap.
 
 630 errors: tsgo's 355 and 275 port defects (the `@xterm/addon-*` typings' self-augmenting
 `declare module`, JSON modules outside the scenario, and what follows from them).
+
+## Profile-guided optimization — a reserve for the demo, not the default build
+
+Tried 2026-09-18 and kept out of every default build on purpose: the port ships as
+`.ll`, and a reviewer who builds it should measure what we measure without a
+training run. Bring it out for the real demo only, and name it whenever it is used.
+
+| VS Code, three alternating rounds, output identical | user | real |
+|---|---|---|
+| today's bench build | 10.56 s | 12.3 s |
+| `opt` told the host triple | 10.04 s | 12.0 s |
+| host triple + PGO trained on VS Code | 8.15 s | 9.7 s |
+
+The profile transfers: trained on VS Code alone, the TypeScript repository's own
+`src/compiler` (305 files, 22 errors = tsgo) goes 0.89 → 0.71 s user.
+
+```bash
+source tools/llvm-env.sh
+T=-mtriple=$("$LLC" --version | awk '/Default target/{print $3}')
+RT=$LLVM_PREFIX/lib/clang/20/lib/darwin/libclang_rt.profile_osx.a
+LTO_OPT_FLAGS="$T --pgo-kind=pgo-instr-gen-pipeline" LINK_EXTRA=$RT \
+  packages/tscaly/tools/bench/build.sh ~/repos/bench/bin/tscaly_pgogen
+(cd ~/repos/bench && LLVM_PROFILE_FILE=$PWD/pgo/tscaly-%p.profraw \
+  ./bin/tscaly_pgogen --bench-batch vscode-paths.scenario > /dev/null)
+"$LLVM_PREFIX/bin/llvm-profdata" merge -o ~/repos/bench/pgo/tscaly.profdata ~/repos/bench/pgo/*.profraw
+LTO_OPT_FLAGS="$T --pgo-kind=pgo-instr-use-pipeline --profile-file=$HOME/repos/bench/pgo/tscaly.profdata" \
+  packages/tscaly/tools/bench/build.sh ~/repos/bench/bin/tscaly_pgo
+```
+
+★ The triple is required, not optional: the seed's IR carries none, and the
+instrumentation then emits COMDATs that MachO cannot lower (`llc` aborts). ★ Take the
+triple from the host (`llc --version`), never write one in — the same build must work
+on an x86_64 machine. ★ The CPU Bottlenecks shares of `tools/xctrace-bottleneck.py`
+cannot compare two builds: one build read 46 % and 35 % useful in two recordings.
+Compare alternating user times.
