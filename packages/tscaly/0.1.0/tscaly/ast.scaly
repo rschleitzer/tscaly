@@ -10157,7 +10157,18 @@ define Symbol
     ; binder met them, and the reason the symbols dump prints them all: a merge
     ; (two `var x`, an interface reopened) is ONE symbol with several
     ; declarations, which is invisible in the SHAPE at any single node.
-    declarations: ref[Array[ref[AstNode]?]]?
+    ;
+    ; ★★★ THE FIRST ONE SITS IN THE SYMBOL AND THE LIST IS THE EXCEPTION (slice
+    ; 345). Measured over the whole of VS Code: 2 134 334 symbols get a
+    ; declaration and only 6 688 ever reach a SECOND one — while a one-element
+    ; `Array` costs 64 bytes of region for an eight-byte pointer (the Array 16,
+    ; the Vector it allocates 16, its four-slot buffer 32) that nothing can give
+    ; back. `declaration` therefore always holds the first; `declaration_list` is
+    ; null until there is a second, and then holds them ALL, first included, so
+    ; that a reader which wants the list has one. Go through `declaration_count`
+    ; and `declaration_at` — they are the two the rest of the port uses anyway.
+    declaration: ref[AstNode]?
+    declaration_list: ref[Array[ref[AstNode]?]]?
     value_declaration: ref[AstNode]?
 
     members: ref[SymbolTable]?
@@ -10219,7 +10230,7 @@ define Symbol
     function create(host: ref[Page], flags: int, name_data: Slice[char]) returns ref[Symbol]
     {
         set symbol_ordinal_next: symbol_ordinal_next + 1
-        let s &Symbol^host(name_data, null, null, null, null, null, null, 0, 0, 0, flags as u32, symbol_ordinal_next as i32)
+        let s &Symbol^host(name_data, null, null, null, null, null, null, null, 0, 0, 0, flags as u32, symbol_ordinal_next as i32)
         s
     }
 
@@ -10253,7 +10264,8 @@ define Symbol
     ; second declaration.
     procedure copy_declarations_from(dest: ref[Symbol], src: ref[Symbol])
     {
-        set dest.declarations: src.declarations
+        set dest.declaration: src.declaration
+        set dest.declaration_list: src.declaration_list
         set dest.value_declaration: src.value_declaration
         set dest.parent: src.parent
     }
@@ -10264,7 +10276,10 @@ define Symbol
     ; property has no value declaration and no parent of its own, and giving it
     ; the source property's would answer a question about the wrong symbol.
     procedure share_declarations(dest: ref[Symbol], src: ref[Symbol])
-        set dest.declarations: src.declarations
+    {
+        set dest.declaration: src.declaration
+        set dest.declaration_list: src.declaration_list
+    }
 
     ; ast.GetMembers / ast.GetExports: the table is made on FIRST USE, exactly as
     ; upstream's are, because whether a symbol has one at all is observable — the
@@ -10303,7 +10318,27 @@ define Symbol
     ; SYNTHESIZED property's declaration list is the CONCATENATION of its
     ; constituents' and not a share of any one of them.
     procedure set_declarations(s: ref[Symbol], d: ref[Array[ref[AstNode]?]]?)
-        set s.declarations: d
+    {
+        if d = null
+        {
+            set s.declaration: null
+            set s.declaration_list: null
+            return
+        }
+        let list d as ref[Array[ref[AstNode]?]]
+        let n list.get_length() as int
+        if n = 0
+        {
+            set s.declaration: null
+            set s.declaration_list: null
+            return
+        }
+        set s.declaration: list[0]
+        if n > 1
+            set s.declaration_list: d
+        if n = 1
+            set s.declaration_list: null
+    }
 
     procedure set_value_declaration(s: ref[Symbol], d: ref[AstNode]?)
         set s.value_declaration: d
@@ -10323,9 +10358,62 @@ define Symbol
     ; the declarations it kept. Everywhere else the OR-in setter is the right one.
     procedure append_declaration(host: ref[Page], s: ref[Symbol], n: ref[AstNode])
     {
-        if s.declarations = null
-            set s.declarations: &Array[ref[AstNode]?]^host()
-        (s.declarations as ref[Array[ref[AstNode]?]]).add(n)
+        if s.declaration = null
+        {
+            set s.declaration: n
+            return
+        }
+        if s.declaration_list = null
+        {
+            let list &Array[ref[AstNode]?]^host()
+            list.add(s.declaration)
+            set s.declaration_list: list
+        }
+        (s.declaration_list as ref[Array[ref[AstNode]?]]).add(n)
+    }
+
+    ; addDeclarationToSymbol's AppendIfUnique: a node may reach the binder twice —
+    ; a parameter property declares into two tables — and must not be listed twice.
+    procedure append_declaration_unique(host: ref[Page], s: ref[Symbol], n: ref[AstNode])
+    {
+        if s.declaration = null
+        {
+            set s.declaration: n
+            return
+        }
+        if s.declaration_list = null
+        {
+            if s.declaration = n
+                return
+            let list &Array[ref[AstNode]?]^host()
+            list.add(s.declaration)
+            list.add(n)
+            set s.declaration_list: list
+            return
+        }
+        let list s.declaration_list as ref[Array[ref[AstNode]?]]
+        let len list.get_length() as int
+        var i 0
+        while i < len
+        {
+            if list[i] = n
+                return
+            set i: i + 1
+        }
+        list.add(n)
+    }
+
+    ; The declarations as a LIST, for the one reader that needs one rather than
+    ; the pair of accessors: the list itself when there is one, a fresh
+    ; one-element list otherwise, and an empty one for a symbol with none.
+    function declarations_list(host: ref[Page], s: ref[Symbol]) returns ref[Array[ref[AstNode]?]]
+    {
+        if s.declaration_list <> null
+            return s.declaration_list as ref[Array[ref[AstNode]?]]
+        let list &Array[ref[AstNode]?]^host()
+        if s.declaration <> null
+            list.add(s.declaration)
+        list
     }
 
     procedure set_flags(s: ref[Symbol], f: int)
@@ -10371,18 +10459,24 @@ define Symbol
 
     function declaration_count(s: ref[Symbol]) returns int
     {
-        if s.declarations = null
+        if s.declaration_list <> null
+            return s.declaration_list.get_length() as int
+        if s.declaration = null
             return 0
-        s.declarations.get_length() as int
+        1
     }
 
     function declaration_at(s: ref[Symbol], i: int) returns ref[AstNode]?
     {
-        if s.declarations = null
+        if s.declaration_list <> null
+        {
+            if i >= (s.declaration_list.get_length() as int)
+                return null
+            return s.declaration_list[i]
+        }
+        if i <> 0
             return null
-        if i >= (s.declarations.get_length() as int)
-            return null
-        s.declarations[i]
+        s.declaration
     }
 }
 
