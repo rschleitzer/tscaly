@@ -10480,19 +10480,16 @@ define Symbol
     }
 }
 
-; One slot of a SymbolTable. The hash is stored beside the key because the whole
-; table is rebuilt on growth and rehashing a name means walking its bytes again.
-; a symbol table this small is searched in order, without buckets
+; One slot of a SymbolTable: the key and its symbol, 24 bytes. No hash is kept —
+; the index is rebuilt from the names on growth, which a table that knows its size
+; (create_sized) never does.
+; a symbol table this small is searched in order, without an index
 define SymbolTableSmallMax: int 8
 
 define SymbolTableEntry
 (
     name: Slice[char]
-    hash: int
     symbol: ref[Symbol]?
-    ; the next entry in insertion order: the order list is threaded through the
-    ; entries (slice 329), where a List cell per entry cost sixteen bytes more
-    next: ref[SymbolTableEntry]?
 )
 
 ; The reference's `SymbolTable map[string]*Symbol`.
@@ -10500,23 +10497,29 @@ define SymbolTableEntry
 ; ★★★ WHY A HASH TABLE AND NOT A LIST, measured rather than assumed: the largest
 ; locals table in the stage-2 corpus holds 5000 entries and so does the largest
 ; exports table, so a linear probe would be 12.5 million name comparisons for one
-; container. Open addressing over a power-of-two bucket array whose slots point
-; straight at the entries, and the entries kept in INSERTION order — the order is
-; not compared (the dump sorts by name, because a Go map has no order to compare)
-; but it makes a table walkable without touching the buckets.
+; container. The entries are kept in INSERTION order — the order is not compared
+; (the dump sorts by name, because a Go map has no order to compare) but it makes
+; a table walkable without touching the index.
 ;
-; ★★★ THE ENTRIES ARE RECORDS ON THE TABLE'S OWN PAGE, CHAINED BY A List (since
-; 2026-09-16). They stood in a doubling Array[SymbolTableEntry], and every doubling
-; left the previous buffer behind as region garbage: 209 MB of vs/editor's
-; allocations were symbol-table growth. A List cell never moves, so a bucket holds
-; the entry itself and a growing table leaves nothing behind. The entries live on
-; the TABLE's page, never a caller's host — a record on a shorter-lived page than
-; its table dangles (the NodeExtras lesson, slice 301).
+; ★★★ THE LAYOUT OF A COMPACT DICT (slice 351): the entries stand DENSE in one
+; buffer in insertion order, and above SymbolTableSmallMax an open-addressing
+; index of u32 slots (entry position + 1, 0 = empty, load at most one half) points
+; into it. It replaced entries chained through a `next` pointer with a stored hash
+; (40 bytes) behind an index of 8-byte pointers, which the live-bytes census of
+; slice 350 put at ~62 bytes per entry over the whole of VS Code, 867 MB for 13.9
+; million entries, against ~30 for a Go map: the instantiated member tables of a
+; generic interface are 30 to 100 entries each and grew through two abandoned
+; bucket vectors on the way to their size, a size their builder knew beforehand.
+; A builder that knows it says so (create_sized / reserve) and the table is then
+; allocated once. Positional reads (`entry_symbol_at(t, i)`, eighty callers) are
+; O(1) now, where they walked a cursor along the chain.
 ;
-; ★ Positional reads (`entry_symbol_at(t, i)`, eighty callers, almost all walking
-; i = 0..length) go through a CURSOR on the order list, so a sequential walk is
-; O(1) per step; a jump backwards restarts at the head. A reader that jumps around
-; — the symbol dump's name sort — takes a snapshot instead.
+; ★ Entries MOVE when an unsized table grows: an `entry_at` answer is good until
+; the next insertion into that table, which every reader in the tree respects (they
+; read a name or a symbol and let go). The buffers live on the TABLE's page, never
+; a caller's host — a record on a shorter-lived page than its table dangles (the
+; NodeExtras lesson, slice 301). A growing buffer leaves the old one to the region
+; as garbage, which is why the sized path exists.
 ;
 ; ★ It is OURS rather than the stdlib's HashMap, and that is a decision with two
 ; halves. The stdlib's map is IMMUTABLE — built once from a HashMapBuilder — and a
@@ -10525,21 +10528,24 @@ define SymbolTableEntry
 ; would have been allowed, but nothing here may travel back).
 define SymbolTable
 (
-    ; the entries in insertion order, threaded through their `next`; the entries
-    ; are on the table's page
-    first: ref[SymbolTableEntry]?
-    last: ref[SymbolTableEntry]?
+    ; the entries in insertion order; the capacity is the view's length
+    entries: Slice[SymbolTableEntry]
     count: int
-    buckets: ref[Vector[ref[SymbolTableEntry]?]]?
-    mask: int
-    ; the entry at position `cursor_pos`, for positional reads
-    cursor: ref[SymbolTableEntry]?
-    cursor_pos: int
+    ; empty until the table passes SymbolTableSmallMax; a power of two
+    index: Slice[u32]
 )
 {
     function create(host: ref[Page]) returns ref[SymbolTable]
     {
-        &SymbolTable^host(null, null, 0, null, 0, null, 0)
+        &SymbolTable^host(null, 0, null)
+    }
+
+    ; A table that will hold up to `n` entries, allocated once.
+    function create_sized(host: ref[Page], n: int) returns ref[SymbolTable]
+    {
+        let t &SymbolTable^host(null, 0, null)
+        SymbolTable.reserve(t, n)
+        t
     }
 
     ; FNV-1a over the bytes, folded to a non-negative int. The function is ours;
@@ -10579,7 +10585,7 @@ define SymbolTable
         t.count
     }
 
-    ; The entry at insertion position `i`, through the cursor (see the header).
+    ; The entry at insertion position `i`; good until the next insertion.
     function entry_at(t: ref[SymbolTable]?, i: int) returns ref[SymbolTableEntry]?
     {
         if t = null
@@ -10589,23 +10595,7 @@ define SymbolTable
             return null
         if i >= tt.count
             return null
-        var restart false
-        if tt.cursor = null
-            set restart: true
-        if i < tt.cursor_pos
-            set restart: true
-        if restart
-        {
-            set tt.cursor: tt.first
-            set tt.cursor_pos: 0
-        }
-        while tt.cursor_pos < i
-        {
-            let cell tt.cursor as ref[SymbolTableEntry]
-            set tt.cursor: cell.next
-            set tt.cursor_pos: tt.cursor_pos + 1
-        }
-        tt.cursor
+        tt.entries.at(i as size_t)
     }
 
     function entry_symbol_at(t: ref[SymbolTable]?, i: int) returns ref[Symbol]?
@@ -10636,57 +10626,50 @@ define SymbolTable
     }
 
     ; Every entry in insertion order, as a Vector on `host`: for a reader that
-    ; jumps around rather than walking (the symbol dump sorts by name).
+    ; jumps around rather than walking (the symbol dump sorts by name). The
+    ; references are good until the next insertion into `t`.
     function snapshot(host: ref[Page], t: ref[SymbolTable]) returns ref[Vector[ref[SymbolTableEntry]?]]
     {
         let v &Vector[ref[SymbolTableEntry]?]^host(t.count as size_t)
-        var e t.first
-        var i: size_t 0
-        while e <> null
+        var i 0
+        while i < t.count
         {
-            let ent e as ref[SymbolTableEntry]
-            v.put(i, ent)
+            v.put(i as size_t, t.entries.at(i as size_t))
             set i: i + 1
-            set e: ent.next
         }
         v
     }
 
-    ; The bucket that holds `d`, or null.
-    function find_entry(t: ref[SymbolTable], h: int, d: Slice[char]) returns ref[SymbolTableEntry]?
+    ; The position of `d`, or -1.
+    function find_pos(t: ref[SymbolTable], h: int, d: Slice[char]) returns int
     {
-        if t.buckets = null
+        if t.index.length = 0
         {
-            ; a small table has no buckets: its few entries are walked in order
-            var e t.first
-            while e <> null
+            ; a small table has no index: its few entries are walked in order
+            var i 0
+            while i < t.count
             {
-                let ent e as ref[SymbolTableEntry]
-                if ent.hash = h
-                {
-                    if SymbolTable.names_equal(ent.name, d)
-                        return ent
-                }
-                set e: ent.next
+                let ent t.entries.at(i as size_t)
+                if SymbolTable.names_equal(ent.name, d)
+                    return i
+                set i: i + 1
             }
-            return null
+            return 0 - 1
         }
-        let v t.buckets as ref[Vector[ref[SymbolTableEntry]?]]
-        var slot h & t.mask
+        let mask (t.index.length as int) - 1
+        var slot h & mask
         while true
         {
-            let e v[slot as size_t]
-            if e = null
-                return null
-            let ent e as ref[SymbolTableEntry]
-            if ent.hash = h
-            {
-                if SymbolTable.names_equal(ent.name, d)
-                    return ent
-            }
-            set slot: (slot + 1) & t.mask
+            let cell: u32 t.index.at(slot as size_t)
+            let v cell as int
+            if v = 0
+                return 0 - 1
+            let ent t.entries.at((v - 1) as size_t)
+            if SymbolTable.names_equal(ent.name, d)
+                return v - 1
+            set slot: (slot + 1) & mask
         }
-        null
+        0 - 1
     }
 
     ; The map read: `symbolTable[name]`, which answers nil for an absent name.
@@ -10694,82 +10677,124 @@ define SymbolTable
     {
         if t = null
             return null
-        let ent SymbolTable.find_entry(t as ref[SymbolTable], SymbolTable.hash_name(d), d)
-        if ent = null
+        let tt t as ref[SymbolTable]
+        let pos SymbolTable.find_pos(tt, SymbolTable.hash_name(d), d)
+        if pos < 0
             return null
-        let found ent as ref[SymbolTableEntry]
-        found.symbol
+        let ent tt.entries.at(pos as size_t)
+        ent.symbol
     }
 
     ; The map write: `symbolTable[name] = symbol`. An existing name is REPLACED in
     ; place, which is what the reference's assignment does when a conflict throws
     ; the old symbol away (declareSymbolEx does exactly that). `host` is not where
-    ; anything is placed — the entry and its cell go on the TABLE's page.
+    ; anything is placed — the entries and the index go on the TABLE's page.
     procedure set_entry(host: ref[Page], t: ref[SymbolTable], d: Slice[char], sym: ref[Symbol]?)
     {
         let h SymbolTable.hash_name(d)
-        let existing SymbolTable.find_entry(t, h, d)
-        if existing <> null
+        let pos SymbolTable.find_pos(t, h, d)
+        if pos >= 0
         {
-            let ent existing as ref[SymbolTableEntry]
+            let ent t.entries.at(pos as size_t)
             set ent.symbol: sym
             return
         }
-
-        let table_page Page.get(t)
-        let made &SymbolTableEntry^table_page(d, h, sym, null)
-        if t.last = null
-            set t.first: made
-        else
+        if t.count = (t.entries.length as int)
         {
-            let tail t.last as ref[SymbolTableEntry]
-            set tail.next: made
+            var want (t.entries.length as int) * 2
+            if want < 4
+                set want: 4
+            SymbolTable.grow_entries(t, want)
         }
-        set t.last: made
-        set t.count: t.count + 1
-        let count t.count
-        ; up to SymbolTableSmallMax entries a table keeps no buckets (most member
-        ; and export tables do not grow past it; slice 323)
-        if count <= SymbolTableSmallMax
-            return
-
-        ; Grow while the load factor would pass one half, and rebuild every bucket
-        ; from the order list — the entries themselves never move.
-        var cap 0
-        if t.buckets <> null
-            set cap: (t.mask + 1)
-        if (count * 2) > cap
+        let at t.count
+        t.entries.put(at as size_t, SymbolTableEntry(d, sym))
+        set t.count: at + 1
+        ; a table without an index gets one when it passes SymbolTableSmallMax; one
+        ; with an index (grown, or reserved) keeps its load at one half at most —
+        ; below that the new entry is placed, past it the index is rebuilt larger
+        if t.index.length = 0
         {
-            var new_cap 32
-            while (count * 2) > new_cap
-                set new_cap: new_cap * 2
-            ; Vector[T](len) memsets its buffer, so every slot starts null.
-            let v Vector[ref[SymbolTableEntry]?]^table_page(new_cap as size_t)
-            set t.buckets: v
-            set t.mask: new_cap - 1
-            var e t.first
-            while e <> null
-            {
-                let ent e as ref[SymbolTableEntry]
-                SymbolTable.place(t, ent)
-                set e: ent.next
-            }
+            if t.count <= SymbolTableSmallMax
+                return
+            SymbolTable.rebuild_index(t, SymbolTable.index_size_for(t.count))
             return
         }
-        SymbolTable.place(t, made)
+        if (t.count * 2) > (t.index.length as int)
+        {
+            SymbolTable.rebuild_index(t, SymbolTable.index_size_for(t.count))
+            return
+        }
+        SymbolTable.place(t, h, at)
     }
 
-    procedure place(t: ref[SymbolTable], ent: ref[SymbolTableEntry])
+    ; Room for `n` entries, and the index they will need, in one allocation each.
+    procedure reserve(t: ref[SymbolTable], n: int)
     {
-        let v t.buckets as ref[Vector[ref[SymbolTableEntry]?]]
-        var slot ent.hash & t.mask
+        if n > (t.entries.length as int)
+            SymbolTable.grow_entries(t, n)
+        if n > SymbolTableSmallMax
+        {
+            let size SymbolTable.index_size_for(n)
+            if size > (t.index.length as int)
+                SymbolTable.rebuild_index(t, size)
+        }
+    }
+
+    function index_size_for(n: int) returns int
+    {
+        var size 16
+        while (n * 2) > size
+            set size: size * 2
+        size
+    }
+
+    procedure grow_entries(t: ref[SymbolTable], n: int)
+    {
+        let table_page Page.get(t)
+        let fresh allocate_slice[SymbolTableEntry](table_page, n as size_t)
+        var i 0
+        while i < t.count
+        {
+            fresh.put(i as size_t, t.entries.at(i as size_t))
+            set i: i + 1
+        }
+        set t.entries.data: fresh.data
+        set t.entries.length: fresh.length
+    }
+
+    ; A fresh index of `size` slots holding every entry.
+    procedure rebuild_index(t: ref[SymbolTable], size: int)
+    {
+        let table_page Page.get(t)
+        let fresh allocate_slice[u32](table_page, size as size_t)
+        var s 0
+        while s < size
+        {
+            fresh.put(s as size_t, 0)
+            set s: s + 1
+        }
+        set t.index.data: fresh.data
+        set t.index.length: fresh.length
+        var i 0
+        while i < t.count
+        {
+            let ent t.entries.at(i as size_t)
+            SymbolTable.place(t, SymbolTable.hash_name(ent.name), i)
+            set i: i + 1
+        }
+    }
+
+    procedure place(t: ref[SymbolTable], h: int, pos: int)
+    {
+        let mask (t.index.length as int) - 1
+        var slot h & mask
         while true
         {
-            let e v[slot as size_t]
-            if e = null
+            let cell: u32 t.index.at(slot as size_t)
+            if cell = 0
                 break
-            set slot: (slot + 1) & t.mask
+            set slot: (slot + 1) & mask
         }
-        v.put(slot as size_t, ent)
+        t.index.put(slot as size_t, (pos + 1) as u32)
     }
 }
