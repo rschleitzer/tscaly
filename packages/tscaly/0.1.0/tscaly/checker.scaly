@@ -630,7 +630,7 @@ define PredicateSemanticsSometimes: int PredicateSemanticsAlways | PredicateSema
 ; ★ The successor is named: the slice that instantiates generics is the one whose
 ; lists get long enough for the hash to be worth its collision argument, and it is
 ; the slice that must port `getTypeListKey` and `keyBuilder` with it.
-; ★ The leading `hash` is `RelationCacheRow`'s trick and not a key: these lists
+; ★ The leading `hash` is a filter and not a key: these lists
 ; are PER TARGET and stay association lists, so the hash only lets the scan
 ; compare an int before walking two argument lists. Measured on
 ; `recursiveReverseMappedType`, where `type_lists_equal` under these two scans was
@@ -1817,17 +1817,18 @@ define InstantiationCacheLink
 ; same type would then read the identity out of the cache and record no stop at
 ; all. That is a silent wrong answer standing in for a wall, which is the one
 ; thing this port may not trade a memo for.
-; One row of the relation's result cache — `getRelationKey`'s plain branch
-; (source id, target id, intersection state) plus the RELATION, and the FNV hash
-; of the four so that a bucket probe compares an int before the row.
+; One row of the relation's result cache: the reference's
+; `map[CacheHashKey]RelationComparisonResult`, one map per relation, as ONE table
+; whose key carries the relation. `key` is get_relation_key's hash; the relation is
+; one of five ids and the result a bit set below 1 << 7, so the row is 16 bytes.
+; It was six ints (48 bytes) with a stored hash and a source/target/state triple
+; that every writer had filled with (key, 0, 0) since slice 216 — 126 MB of the
+; checker's region over the whole of VS Code (slice 352, the census).
 define RelationCacheRow
 (
-    hash: int
-    rel: int
-    source_id: int
-    target_id: int
-    state: int
-    result: int
+    key: int
+    rel: u8
+    result: u8
 )
 
 define SimplifiedIndexedAccessLink
@@ -83424,13 +83425,29 @@ define Checker
     ; push past the high-water mark adds and one below it overwrites. The
     ; reference clears the popped entry "to avoid memory leaks"; the overwrite is
     ; the same statement under RBMM.
+    ; `append(c.contextualInfos, ContextualInfo{…})`: the reference's rows are
+    ; VALUES in a slice that a pop shortens, so a push writes a slot and allocates
+    ; nothing once the stack has been that deep. The rows here are records, and
+    ; the one at the current depth belongs to nobody after its pop (the reference
+    ; zeroes it), so a push fills it in place — a record per push was 54 MB of the
+    ; checker's region over the whole of VS Code (slice 352, 2.2 million pushes).
     procedure push_contextual_type(this, node: ref[AstNode]?, t: ref[Type]?, is_cache: bool)
     {
-        let info &ContextualInfo^host(node, t, is_cache)
         if contextual_depth < (contextual_infos.get_length() as int)
-            contextual_infos.put(contextual_depth as size_t, info as ref[ContextualInfo])
+        {
+            let row contextual_infos[contextual_depth]
+            if row <> null
+            {
+                let info row as ref[ContextualInfo]
+                set info.node: node
+                set info.t: t
+                set info.is_cache: is_cache
+            }
+            else
+                contextual_infos.put(contextual_depth as size_t, &ContextualInfo^host(node, t, is_cache))
+        }
         else
-            contextual_infos.add(info as ref[ContextualInfo])
+            contextual_infos.add(&ContextualInfo^host(node, t, is_cache))
         set contextual_depth: contextual_depth + 1
     }
 
@@ -127499,7 +127516,7 @@ define Checker
                 set bits: RelationComparisonResultComplexityOverflow
             var overflow_constrained false
             let overflow_key this.get_relation_key(source, target, IntersectionStateNone, relation = RelationIdentity, false, &overflow_constrained)
-            this.rel_result_set(relation, overflow_key, 0, 0, RelationComparisonResultFailed | bits)
+            this.rel_result_set(relation, overflow_key, RelationComparisonResultFailed | bits)
             var code DiagExcessive_stack_depth_comparing_types_0_and_1
             if rel_relation_count <= 0
                 set code: DiagExcessive_complexity_comparing_types_0_and_1
@@ -130367,28 +130384,23 @@ define Checker
     ; ★ THE KEY CARRIES THE RELATION, where `rel_maybe_*`'s triple does not: the
     ; maybe stack is unwound inside one comparison and a cached row outlives it, so
     ; a failure under the identity relation must not answer for assignability.
-    function rel_result_hash(rel: int, s: int, t: int, i_state: int) returns int
+    function rel_result_hash(rel: int, key: int) returns int
     {
         var h: u64 14695981039346656037
         set h: h xor (rel as u64)
         set h: h * 1099511628211
-        set h: h xor (s as u64)
-        set h: h * 1099511628211
-        set h: h xor (t as u64)
-        set h: h * 1099511628211
-        set h: h xor (i_state as u64)
+        set h: h xor (key as u64)
         set h: h * 1099511628211
         ((h >> 1) as int)
     }
 
     ; `relation.get(id)` — 0 where the reference answers RelationComparisonResultNone.
-    function rel_result_get(this, rel: int, s: int, t: int, i_state: int) returns int
+    function rel_result_get(this, rel: int, key: int) returns int
     {
         if rel_result_buckets = null
             return 0
         let buckets rel_result_buckets as ref[Vector[int]]
-        let h Checker.rel_result_hash(rel, s, t, i_state)
-        var slot h & rel_result_mask
+        var slot Checker.rel_result_hash(rel, key) & rel_result_mask
         while true
         {
             let e buckets.get(slot as size_t)
@@ -130398,19 +130410,10 @@ define Checker
             if idx = 0
                 return 0
             let row rel_result_entries.at(idx - 1)
-            if row.hash = h
+            if row.key = key
             {
-                var same true
-                if row.rel <> rel
-                    set same: false
-                if row.source_id <> s
-                    set same: false
-                if row.target_id <> t
-                    set same: false
-                if row.state <> i_state
-                    set same: false
-                if same
-                    return row.result
+                if (row.rel as int) = rel
+                    return row.result as int
             }
             set slot: (slot + 1) & rel_result_mask
         }
@@ -130419,12 +130422,11 @@ define Checker
 
     ; `relation.set(id, result)`. An existing row is left alone: a key is written
     ; at most once, because the answer that wrote it is what every later ask reads.
-    procedure rel_result_set(this, rel: int, s: int, t: int, i_state: int, result: int)
+    procedure rel_result_set(this, rel: int, key: int, result: int)
     {
-        if this.rel_result_get(rel, s, t, i_state) <> 0
+        if this.rel_result_get(rel, key) <> 0
             return
-        let h Checker.rel_result_hash(rel, s, t, i_state)
-        rel_result_entries.add(RelationCacheRow(h, rel, s, t, i_state, result))
+        rel_result_entries.add(RelationCacheRow(key, rel as u8, result as u8))
         ; `relation.size()` — per relation, because the budget is. The five ids
         ; are dense, so the id indexes the counter directly.
         rel_result_counts.put(rel as size_t, rel_result_counts[rel as size_t] + 1)
@@ -130448,7 +130450,7 @@ define Checker
             while j < count
             {
                 let row rel_result_entries.at(j)
-                var slot row.hash & rel_result_mask
+                var slot Checker.rel_result_hash(row.rel as int, row.key) & rel_result_mask
                 while true
                 {
                     let e v.get(slot as size_t)
@@ -130466,7 +130468,7 @@ define Checker
             return
         }
         let buckets rel_result_buckets as ref[Vector[int]]
-        var slot h & rel_result_mask
+        var slot Checker.rel_result_hash(rel, key) & rel_result_mask
         while true
         {
             let e buckets.get(slot as size_t)
@@ -130698,7 +130700,7 @@ define Checker
         ; function of its key and wrong inside a measurement, where rows are
         ; provisional and upstream answers later asks from them. The tail below
         ; writes upstream's rows; the guard is gone.
-        let cached this.rel_result_get(relation, key, 0, 0)
+        let cached this.rel_result_get(relation, key)
         if cached <> 0
         {
             ; `r.c.reliabilityFlags |= entry & (ReportsUnmeasurable|ReportsUnreliable)`
@@ -130878,7 +130880,7 @@ define Checker
                     var q maybe_start
                     while q < rel_maybe_depth
                     {
-                        this.rel_result_set(relation, rel_maybe_source[q], rel_maybe_target[q], rel_maybe_state[q], RelationComparisonResultSucceeded | propagating)
+                        this.rel_result_set(relation, rel_maybe_source[q], RelationComparisonResultSucceeded | propagating)
                         set rel_relation_count: rel_relation_count - 1
                         set q: q + 1
                     }
@@ -130899,7 +130901,7 @@ define Checker
         ; answered from the cache at the first level. The guard that stood here left the
         ; chain unrecorded, the next ask walked the whole chain again to the same wall,
         ; and reported TS2321 a second time (`excessivelyDeepConditionalTypes`).
-        this.rel_result_set(relation, key, 0, 0, RelationComparisonResultFailed | propagating)
+        this.rel_result_set(relation, key, RelationComparisonResultFailed | propagating)
         set rel_relation_count: rel_relation_count - 1
         set rel_maybe_depth: maybe_start
         set rel_maybe_hits: maybe_before
