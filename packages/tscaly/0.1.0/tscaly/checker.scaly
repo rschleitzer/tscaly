@@ -132,6 +132,7 @@ use tscaly.Diagnostics.DiagnosticList
 use tscaly.Diagnostics.RelatedInfo
 use tscaly.modulespecifiers.SpecifierHost
 use tscaly.emitter.NodeBuilder
+use tscaly.xxh3.Xxh3
 ; ★ Slice 113: the Checker is this port's PROGRAM stub (see create's header), and
 ; a program is what reads the lib off the disk. The oracle's `main` does the same
 ; three steps — read, parse, bind — before it builds a checker at all.
@@ -1601,42 +1602,20 @@ define ContextFreeTypeLink
 ; separated by dots. The result is nonDottedNameCacheKey if the reference isn't a
 ; dotted name.*
 ;
-; ★★★ THE KEY IS THE KEY ITSELF HERE AND NOT A HASH OF IT, and that is the
-; decision the tuple cache and the instantiation cache already made in this file:
-; upstream writes the parts into an xxh3 hasher and keeps 128 bits, this port
-; keeps the PARTS and compares them. Nothing observable divides the two — a cache
-; key is never printed and never ordered, only compared for equality — and the
-; direction of the difference is the safe one: a structural comparison cannot
-; collide, where a hash can and upstream accepts that it can.
+; ★★★ THE KEY IS upstream's: the parts are written into a byte buffer in the
+; order `writeFlowCacheKey` writes them and the 128-bit xxh3 of the buffer is the
+; key (`keyBuilder.hash`, `Xxh3.hash128` being the port of the same Sum128). A
+; symbol, a type and a node are written as their ADDRESS — the pointer is the
+; identity upstream's ids stand for, and unlike an id it needs no counter.
 ;
-; ★★★ AND A SYMBOL OR NODE PART CARRIES THE REFERENCE, NOT AN ID, WHICH IS NOT A
-; STYLE CHOICE. Upstream's `writeSymbol` writes `ast.GetSymbolId(s)` from a
-; PROCESS-GLOBAL counter, so two symbols never share a number; this port's
-; counter is PER FILE (§3.10, slice 41) and the checker reads TWO files since
-; slice 113 — the unit and the lib — so a symbol id here is unique only within
-; its own binder and a key built from ids would collide across that boundary. The
-; identity upstream is really keying on is the POINTER, and that is what a `ref`
-; part holds. ★TYPE ids are safe (one counter on the Checker) and are carried as
-; upstream carries them, in `b`, so a type part compares without a hop.
-;
-; ★ A TEXT part holds the (data, length) pair the source text already has, which
-; is get_accessed_property_name's own out-shape — no String is built anywhere in
-; this family.
-define FlowKeyKindByte: int 0
-define FlowKeyKindSymbol: int 1
-define FlowKeyKindType: int 2
-define FlowKeyKindNode: int 3
-define FlowKeyKindText: int 4
-
-define FlowKeyPart
-(
-    kind: int
-    sym: ref[Symbol]?
-    t: ref[Type]?
-    node: ref[AstNode]?
-    text: Slice[char]
-    b: int
-)
+; ★ Until slice 353 the port kept the PARTS as records and compared them one by
+; one, on two arguments that have both expired: a symbol id was unique only per
+; FILE (§3.10) — an address has no such boundary — and a structural comparison
+; cannot collide where a hash can, which is the risk upstream accepts at 128 bits.
+; The parts cost ~300 bytes a key (a 64-byte record per part plus its list) where
+; the hash costs 16: 86 MB of the checker's region over the whole of VS Code. The
+; buffer is the key-building function's own and goes back with its frame; a text
+; part is consumed as it is written, so no key holds a view of anybody's bytes.
 
 ; One row of c.flowLoopCache — the reference's `FlowLoopKey{flowNode, refKey}`
 ; against the type computed for it. ★A row is written only where the loop
@@ -1644,7 +1623,7 @@ define FlowKeyPart
 define FlowLoopCacheLink
 (
     flow: ref[FlowNode]?
-    key: ref[Array[ref[FlowKeyPart]?]]?
+    key: ref[Xxh3]?
     t: ref[Type]?
     ; the next row of the SAME flow node, in insertion order
     next_same_flow: ref[FlowLoopCacheLink]?
@@ -1666,7 +1645,7 @@ define FlowLoopCacheLink
 define FlowLoopInfo
 (
     flow: ref[FlowNode]?
-    key: ref[Array[ref[FlowKeyPart]?]]?
+    key: ref[Xxh3]?
     types: ref[Array[ref[Type]?]]?
     next: ref[FlowLoopInfo]?
 )
@@ -5692,7 +5671,7 @@ define FlowState
     ; `nonDottedNameCacheKey` for *computed, and the reference is not a dotted
     ; name*; a null key here means the second, so the first needs the flag.
     ref_key_computed: bool
-    ref_key: ref[Array[ref[FlowKeyPart]?]]?
+    ref_key: ref[Xxh3]?
 )
 
 ; checker.FlowTraceEvent — the row of the FLOWPIN (slice 93).
@@ -58938,33 +58917,49 @@ define Checker
 
     ; ── the FLOW REFERENCE KEY, slice 141 ───────────────────────────────────
     ;
-    ; getFlowReferenceKey and writeFlowCacheKey. FlowKeyPart's header carries the
-    ; two decisions (the key is not a hash; a symbol or node part holds the
-    ; reference and not an id).
+    ; getFlowReferenceKey and writeFlowCacheKey. The header above FlowLoopCacheLink
+    ; carries the decision (upstream's 128-bit xxh3 of the parts; a symbol, type
+    ; or node is written as its address).
 
-    procedure key_write_byte(this, parts: ref[Array[ref[FlowKeyPart]?]], c: char)
+    procedure key_write_byte(this, parts: ref[Array[char]], c: char)
     {
-        parts.add(&FlowKeyPart^host(FlowKeyKindByte, null, null, null, Slice[char](), c as int))
+        parts.add(c)
     }
 
-    procedure key_write_symbol(this, parts: ref[Array[ref[FlowKeyPart]?]], s: ref[Symbol])
+    ; eight bytes, low first: `hashWrite64`
+    procedure key_write_u64(parts: ref[Array[char]], v: u64)
     {
-        parts.add(&FlowKeyPart^host(FlowKeyKindSymbol, s, null, null, Slice[char](), 0))
+        var k: u64 0
+        while k < 64
+        {
+            parts.add(((v >> k) & 255) as char)
+            set k: k + 8
+        }
     }
 
-    procedure key_write_type(this, parts: ref[Array[ref[FlowKeyPart]?]], t: ref[Type])
+    procedure key_write_symbol(this, parts: ref[Array[char]], s: ref[Symbol])
     {
-        parts.add(&FlowKeyPart^host(FlowKeyKindType, null, t, null, Slice[char](), t.id))
+        Checker.key_write_u64(parts, s as u64)
     }
 
-    procedure key_write_node(this, parts: ref[Array[ref[FlowKeyPart]?]], n: ref[AstNode])
+    procedure key_write_type(this, parts: ref[Array[char]], t: ref[Type])
     {
-        parts.add(&FlowKeyPart^host(FlowKeyKindNode, null, null, n, Slice[char](), 0))
+        Checker.key_write_u64(parts, t.id as u64)
     }
 
-    procedure key_write_text(this, parts: ref[Array[ref[FlowKeyPart]?]], data: Slice[char])
+    procedure key_write_node(this, parts: ref[Array[char]], n: ref[AstNode])
     {
-        parts.add(&FlowKeyPart^host(FlowKeyKindText, null, null, null, data, 0))
+        Checker.key_write_u64(parts, n as u64)
+    }
+
+    procedure key_write_text(this, parts: ref[Array[char]], text: Slice[char])
+    {
+        var i: size_t 0
+        while i < text.length
+        {
+            parts.add(text[i])
+            set i: i + 1
+        }
     }
 
     ; getFlowReferenceKey. ★★ A NULL ANSWER MEANS NON-DOTTED — the reference's
@@ -58973,7 +58968,7 @@ define Checker
     ; stop inside get_accessed_property_name are two different reasons for the same
     ; return value, and reading the second as the first would answer the declared
     ; type where the reference narrows (§3.5dt).
-    function get_flow_reference_key(this, f: ref[FlowState]) returns ref[Array[ref[FlowKeyPart]?]]?
+    function get_flow_reference_key(this, f: ref[FlowState]) returns ref[Xxh3]?
     {
         let reference_opt f.reference
         if reference_opt = null
@@ -58981,17 +58976,19 @@ define Checker
         let declared_opt f.declared_type
         if declared_opt = null
             return null
-        let parts &Array[ref[FlowKeyPart]?]^host()
+        ; the buffer is this frame's own; only the 16-byte hash reaches the host
+        let parts &Array[char]()
         if this.write_flow_cache_key(parts, reference_opt as ref[AstNode], declared_opt as ref[Type], f.initial_type, f.flow_container) = false
             return null
-        parts
+        let h Xxh3.hash128(parts.as_slice())
+        &Xxh3^host(h.hi, h.lo)
     }
 
     ; writeFlowCacheKey. ★★ THE `Identifier` ARM FALLS THROUGH INTO THE
     ; `ThisKeyword` ARM upstream — a Go `fallthrough`, which is why the two are one
     ; block here: a `this` reference writes the declared type and the container
     ; with no symbol in front of it, and an identifier writes the symbol first.
-    function write_flow_cache_key(this, parts: ref[Array[ref[FlowKeyPart]?]], node: ref[AstNode], declared_type: ref[Type], initial_type: ref[Type]?, flow_container: ref[AstNode]?) returns bool
+    function write_flow_cache_key(this, parts: ref[Array[char]], node: ref[AstNode], declared_type: ref[Type], initial_type: ref[Type]?, flow_container: ref[AstNode]?) returns bool
     {
         let k AstNode.kind_of(node)
         var head_written false
@@ -59147,75 +59144,19 @@ define Checker
         false
     }
 
-    ; The key comparison — `slices.Equal` over the parts, which is what upstream's
-    ; 128-bit equality stands for. ★Each optional slot is compared through a null
-    ; guard rather than by `=` on the two Options: an identity test on a
-    ; pointer-shaped Option is exactly the shape the root CLAUDE.md calls the
-    ; standing bug pattern, and one explicit guard per slot cannot be read two ways.
-    function flow_key_equal(a: ref[Array[ref[FlowKeyPart]?]], b: ref[Array[ref[FlowKeyPart]?]]) returns bool
+    ; The key comparison — upstream's `==` on two CacheHashKeys.
+    function flow_key_equal(a: ref[Xxh3], b: ref[Xxh3]) returns bool
     {
-        let n a.get_length() as int
-        if n <> b.get_length() as int
+        if a.hi <> b.hi
             return false
-        var i 0
-        while i < n
-        {
-            let x a[i]
-            let y b[i]
-            set i: i + 1
-            if x = null
-                return false
-            if y = null
-                return false
-            let p x as ref[FlowKeyPart]
-            let q y as ref[FlowKeyPart]
-            if p.kind <> q.kind
-                return false
-            if p.b <> q.b
-                return false
-            if p.text.length <> q.text.length
-                return false
-            if p.kind = FlowKeyKindSymbol
-            {
-                if p.sym = null
-                    return false
-                if q.sym = null
-                    return false
-                if (p.sym as ref[Symbol]) <> (q.sym as ref[Symbol])
-                    return false
-            }
-            if p.kind = FlowKeyKindType
-            {
-                if p.t = null
-                    return false
-                if q.t = null
-                    return false
-                if (p.t as ref[Type]) <> (q.t as ref[Type])
-                    return false
-            }
-            if p.kind = FlowKeyKindNode
-            {
-                if p.node = null
-                    return false
-                if q.node = null
-                    return false
-                if (p.node as ref[AstNode]) <> (q.node as ref[AstNode])
-                    return false
-            }
-            if p.kind = FlowKeyKindText
-            {
-                if Checker.text_equals(p.text, q.text) = false
-                    return false
-            }
-        }
-        true
+        a.lo = b.lo
     }
 
     ; ── c.flowLoopCache ─────────────────────────────────────────────────────
     ;
     ; ★ NOT a mint-on-miss reader: an absent row means *not computed*, and the
     ; loop label writes a row only where the junction completed.
-    function flow_loop_cache_lookup(this, flow: ref[FlowNode], key: ref[Array[ref[FlowKeyPart]?]]) returns ref[Type]?
+    function flow_loop_cache_lookup(this, flow: ref[FlowNode], key: ref[Xxh3]) returns ref[Type]?
     {
         ; upstream's map lookup: the rows of this flow node through the index, the
         ; first row with an equal key answering, as the scan over all rows did
@@ -59229,14 +59170,14 @@ define Checker
             set walk: r.next_same_flow
             if r.key <> null
             {
-                if Checker.flow_key_equal(r.key as ref[Array[ref[FlowKeyPart]?]], key)
+                if Checker.flow_key_equal(r.key as ref[Xxh3], key)
                     return r.t
             }
         }
         null
     }
 
-    procedure flow_loop_cache_put(this, flow: ref[FlowNode], key: ref[Array[ref[FlowKeyPart]?]], t: ref[Type])
+    procedure flow_loop_cache_put(this, flow: ref[FlowNode], key: ref[Xxh3], t: ref[Type])
     {
         let made &FlowLoopCacheLink^host(flow, key, t, null)
         let hit flow_loop_cache_index.find(flow as int)
@@ -60223,7 +60164,7 @@ define Checker
         {
             return f.declared_type
         }
-        let key f.ref_key as ref[Array[ref[FlowKeyPart]?]]
+        let key f.ref_key as ref[Xxh3]
         let cached this.flow_loop_cache_lookup(flow, key)
         if cached <> null
         {
@@ -60246,7 +60187,7 @@ define Checker
             }
             if w.key = null
                 continue
-            if Checker.flow_key_equal(w.key as ref[Array[ref[FlowKeyPart]?]], key) = false
+            if Checker.flow_key_equal(w.key as ref[Xxh3], key) = false
             {
                 continue
             }
