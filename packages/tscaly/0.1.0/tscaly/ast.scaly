@@ -10504,6 +10504,16 @@ define SymbolTableEntry
     symbol: ref[Symbol]?
 )
 
+; A block of entries past a table's first one (slice 356), chained BACKWARDS from
+; the table's `tail`: the last block holds half the entries, so a position is
+; found in about two steps; `base` is the position of the block's first entry.
+define SymbolChunk
+(
+    entries: Slice[SymbolTableEntry]
+    base: int
+    prev: ref[SymbolChunk]?
+)
+
 ; The reference's `SymbolTable map[string]*Symbol`.
 ;
 ; ★★★ WHY A HASH TABLE AND NOT A LIST, measured rather than assumed: the largest
@@ -10526,12 +10536,13 @@ define SymbolTableEntry
 ; allocated once. Positional reads (`entry_symbol_at(t, i)`, eighty callers) are
 ; O(1) now, where they walked a cursor along the chain.
 ;
-; ★ Entries MOVE when an unsized table grows: an `entry_at` answer is good until
-; the next insertion into that table, which every reader in the tree respects (they
-; read a name or a symbol and let go). The buffers live on the TABLE's page, never
-; a caller's host — a record on a shorter-lived page than its table dangles (the
-; NodeExtras lesson, slice 301). A growing buffer leaves the old one to the region
-; as garbage, which is why the sized path exists.
+; ★★ ENTRIES NEVER MOVE (slice 356): a table grows by BLOCKS, the first held in
+; the table itself and every later one chained from `tail`, so nothing is copied and
+; no buffer is left behind. Copying growth abandoned ~130 MB over VS Code — the
+; 350 000 unsized tables that pass four entries (the binder's, the object literals')
+; and the sized ones `add_inherited_members` enlarges. The buffers live on the
+; TABLE's page, never a caller's host — a record on a shorter-lived page than its
+; table dangles (the NodeExtras lesson, slice 301).
 ;
 ; ★ It is OURS rather than the stdlib's HashMap, and that is a decision with two
 ; halves. The stdlib's map is IMMUTABLE — built once from a HashMapBuilder — and a
@@ -10540,24 +10551,45 @@ define SymbolTableEntry
 ; would have been allowed, but nothing here may travel back).
 define SymbolTable
 (
-    ; the entries in insertion order; the capacity is the view's length
+    ; the first block of entries, in insertion order
     entries: Slice[SymbolTableEntry]
     count: int
     ; empty until the table passes SymbolTableSmallMax; a power of two
     index: Slice[u32]
+    ; the last block past the first, null while the first is the only one
+    tail: ref[SymbolChunk]?
 )
 {
     function create(host: ref[Page]) returns ref[SymbolTable]
     {
-        &SymbolTable^host(null, 0, null)
+        &SymbolTable^host(null, 0, null, null)
     }
 
     ; A table that will hold up to `n` entries, allocated once.
     function create_sized(host: ref[Page], n: int) returns ref[SymbolTable]
     {
-        let t &SymbolTable^host(null, 0, null)
+        let t &SymbolTable^host(null, 0, null, null)
         SymbolTable.reserve(t, n)
         t
+    }
+
+    function capacity(t: ref[SymbolTable]) returns int
+    {
+        if t.tail = null
+            return t.entries.length as int
+        let c t.tail as ref[SymbolChunk]
+        c.base + (c.entries.length as int)
+    }
+
+    ; the slot at position `i` (below the capacity)
+    function slot_at(t: ref[SymbolTable], i: int) returns ref[SymbolTableEntry]
+    {
+        if i < (t.entries.length as int)
+            return t.entries.at(i as size_t)
+        var c t.tail as ref[SymbolChunk]
+        while i < c.base
+            set c: c.prev as ref[SymbolChunk]
+        c.entries.at((i - c.base) as size_t)
     }
 
     ; FNV-1a over the bytes, folded to a non-negative int. The function is ours;
@@ -10607,7 +10639,7 @@ define SymbolTable
             return null
         if i >= tt.count
             return null
-        tt.entries.at(i as size_t)
+        SymbolTable.slot_at(tt, i)
     }
 
     function entry_symbol_at(t: ref[SymbolTable]?, i: int) returns ref[Symbol]?
@@ -10646,7 +10678,7 @@ define SymbolTable
         var i 0
         while i < t.count
         {
-            v.put(i as size_t, t.entries.at(i as size_t))
+            v.put(i as size_t, SymbolTable.slot_at(t, i))
             set i: i + 1
         }
         v
@@ -10661,7 +10693,7 @@ define SymbolTable
             var i 0
             while i < t.count
             {
-                let ent t.entries.at(i as size_t)
+                let ent SymbolTable.slot_at(t, i)
                 if SymbolTable.names_equal(ent.name, d)
                     return i
                 set i: i + 1
@@ -10676,7 +10708,7 @@ define SymbolTable
             let v cell as int
             if v = 0
                 return 0 - 1
-            let ent t.entries.at((v - 1) as size_t)
+            let ent SymbolTable.slot_at(t, v - 1)
             if SymbolTable.names_equal(ent.name, d)
                 return v - 1
             set slot: (slot + 1) & mask
@@ -10693,7 +10725,7 @@ define SymbolTable
         let pos SymbolTable.find_pos(tt, SymbolTable.hash_name(d), d)
         if pos < 0
             return null
-        let ent tt.entries.at(pos as size_t)
+        let ent SymbolTable.slot_at(tt, pos)
         ent.symbol
     }
 
@@ -10707,19 +10739,22 @@ define SymbolTable
         let pos SymbolTable.find_pos(t, h, d)
         if pos >= 0
         {
-            let ent t.entries.at(pos as size_t)
+            let ent SymbolTable.slot_at(t, pos)
             set ent.symbol: sym
             return
         }
-        if t.count = (t.entries.length as int)
+        let cap SymbolTable.capacity(t)
+        if t.count = cap
         {
-            var want (t.entries.length as int) * 2
+            var want cap * 2
             if want < 4
                 set want: 4
             SymbolTable.grow_entries(t, want)
         }
         let at t.count
-        t.entries.put(at as size_t, SymbolTableEntry(d, sym))
+        let slot SymbolTable.slot_at(t, at)
+        set slot.name: d
+        set slot.symbol: sym
         set t.count: at + 1
         ; a table without an index gets one when it passes SymbolTableSmallMax; one
         ; with an index (grown, or reserved) keeps its load at one half at most —
@@ -10742,7 +10777,7 @@ define SymbolTable
     ; Room for `n` entries, and the index they will need, in one allocation each.
     procedure reserve(t: ref[SymbolTable], n: int)
     {
-        if n > (t.entries.length as int)
+        if n > SymbolTable.capacity(t)
             SymbolTable.grow_entries(t, n)
         if n > SymbolTableSmallMax
         {
@@ -10760,18 +10795,22 @@ define SymbolTable
         size
     }
 
+    ; room for `n` entries in all: the first block if there is none yet, else one
+    ; more block for the difference — nothing already placed moves
     procedure grow_entries(t: ref[SymbolTable], n: int)
     {
         let table_page Page.get(t)
-        let fresh allocate_slice[SymbolTableEntry](table_page, n as size_t)
-        var i 0
-        while i < t.count
+        if (t.entries.length as int) = 0
         {
-            fresh.put(i as size_t, t.entries.at(i as size_t))
-            set i: i + 1
+            let first allocate_slice[SymbolTableEntry](table_page, n as size_t)
+            set t.entries.data: first.data
+            set t.entries.length: first.length
+            return
         }
-        set t.entries.data: fresh.data
-        set t.entries.length: fresh.length
+        let cap SymbolTable.capacity(t)
+        let block allocate_slice[SymbolTableEntry](table_page, (n - cap) as size_t)
+        let c &SymbolChunk^table_page(block, cap, t.tail)
+        set t.tail: c
     }
 
     ; A fresh index of `size` slots holding every entry.
@@ -10790,7 +10829,7 @@ define SymbolTable
         var i 0
         while i < t.count
         {
-            let ent t.entries.at(i as size_t)
+            let ent SymbolTable.slot_at(t, i)
             SymbolTable.place(t, SymbolTable.hash_name(ent.name), i)
             set i: i + 1
         }
