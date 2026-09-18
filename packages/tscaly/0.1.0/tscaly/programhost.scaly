@@ -25,6 +25,7 @@ use tscaly.compiler.LoaderNode
 use tscaly.compiler.LoaderEdge
 use tscaly.compiler.IncludeReason
 use tscaly.parser.Parser
+use tscaly.scanner.Scanner
 use tscaly.binder.Binder
 use tscaly.program.ProgramFiles
 use tscaly.program.JsonValue
@@ -51,6 +52,7 @@ use tscaly.Diagnostics.RelatedInfo
 use tscaly.diagnosticwriter.DriverDiagnostic
 use tscaly.diagnosticwriter.DiagnosticWriter
 use tscaly.system.ExecSystem
+use tscaly.system.CompileStats
 use tscaly.tracing.Tracing
 use tscaly.tracing.TraceArg
 use tscaly.system.VfsFile
@@ -960,6 +962,7 @@ define DriverProgram
         let ld ProgramLoader.create(host, pf, options, null)
         set ld.trace_resolution: this.flag("traceResolution")
         set ld.tracing: sys.tracing
+        set ld.stats: sys.stats
         pf.enable_resolution_records()
         set pf.package_json_recording: true
         if this.load_references(ld) = false
@@ -975,6 +978,12 @@ define DriverProgram
         ; before compilerOptions' (the program's checker is made over the set below)
         if ld.lib_ref_names.get_length() > 0
         {
+            ; the chain is loaded again: --diagnostics counts the final one's symbols
+            if sys.stats <> null
+            {
+                let st sys.stats as ref[CompileStats]
+                set st.lib_symbols: 0
+            }
             lib_files.clear()
             lib_binders.clear()
             seen.clear()
@@ -1190,6 +1199,213 @@ define DriverProgram
         cd.set_program_directories(o.out_dir, o.project_root_directory(host), o.get_current_directory())
     }
 
+    ; --diagnostics / --extendedDiagnostics (slice 348): the reference's
+    ; statisticsFromProgram and Statistics.Report — the same rows in the same order
+    ; and the same table, between the harness's markers (tsctests drops the block's
+    ; contents: the numbers are timings). Two rows are not here yet: `Memory used`
+    ; and `Memory allocs` read Go's runtime.MemStats, and the RBMM runtime has no
+    ; count of its pages to answer them with.
+    procedure report_statistics(this)
+    {
+        if (this.flag("diagnostics") = false) and (this.flag("extendedDiagnostics") = false)
+            return
+        if sys.stats = null
+            return
+        let st sys.stats as ref[CompileStats]
+        let total scaly_eio_now_ns() - st.start
+        ; GetSourceFiles — the default libraries, then the loader's files — is the
+        ; set --listFiles prints and the one the reference counts over
+        let files this.source_file_count()
+        var lines 0
+        var identifiers 0
+        var symbols st.lib_symbols
+        var i 0
+        while i < files
+        {
+            set lines: lines + DriverProgram.ecma_line_count(this.source_text(i))
+            let index this.source_pf_index(i)
+            if index < 0
+            {
+                if i < (lib_parsers.get_length() as int)
+                {
+                    let lp lib_parsers[i as size_t]
+                    if lp <> null
+                    {
+                        let lpp lp as ref[Parser]
+                        set identifiers: identifiers + lpp.identifier_count
+                    }
+                }
+            }
+            else
+            {
+                let p pf.parser_at(index)
+                if p <> null
+                {
+                    let pp p as ref[Parser]
+                    set identifiers: identifiers + pp.identifier_count
+                }
+                let b pf.binder_at(index)
+                if b <> null
+                {
+                    let bb b as ref[Binder]
+                    set symbols: symbols + bb.symbol_count
+                }
+            }
+            set i: i + 1
+        }
+        var types 0
+        var instantiations 0
+        if checker <> null
+        {
+            let cd checker as ref[Checker]
+            set symbols: symbols + cd.symbols_allocated
+            set types: cd.type_count
+            set instantiations: cd.total_instantiation_count
+        }
+        let names &Array[Slice[char]]()
+        let values &Array[String]()
+        names.add("Files")
+        values.add(DriverProgram.stat_count(host, files))
+        names.add("Lines")
+        values.add(DriverProgram.stat_count(host, lines))
+        names.add("Identifiers")
+        values.add(DriverProgram.stat_count(host, identifiers))
+        names.add("Symbols")
+        values.add(DriverProgram.stat_count(host, symbols))
+        names.add("Types")
+        values.add(DriverProgram.stat_count(host, types))
+        names.add("Instantiations")
+        values.add(DriverProgram.stat_count(host, instantiations))
+        if st.config <> 0
+        {
+            names.add("Config time")
+            values.add(DriverProgram.stat_seconds(host, st.config))
+        }
+        names.add("Parse time")
+        values.add(DriverProgram.stat_seconds(host, st.parse))
+        if st.bind <> 0
+        {
+            names.add("Bind time")
+            values.add(DriverProgram.stat_seconds(host, st.bind))
+        }
+        if st.check <> 0
+        {
+            names.add("Check time")
+            values.add(DriverProgram.stat_seconds(host, st.check))
+        }
+        if st.emit <> 0
+        {
+            names.add("Emit time")
+            values.add(DriverProgram.stat_seconds(host, st.emit))
+        }
+        names.add("Total time")
+        values.add(DriverProgram.stat_seconds(host, total))
+        ; table.print: `%-*s %*s` — the name and its colon left in the widest
+        ; name's width plus one, the value right in the widest value's
+        var name_width 0
+        var value_width 0
+        var r: size_t 0
+        while r < names.get_length()
+        {
+            let nm: Slice[char] names.at(r)
+            let vl: String values.at(r)
+            if (nm.length as int) > name_width
+                set name_width: nm.length as int
+            if (vl.get_length() as int) > value_width
+                set value_width: vl.get_length() as int
+            set r: r + 1
+        }
+        let out sys.output
+        out.append("!!! Statistics start\n")
+        set r: 0
+        while r < names.get_length()
+        {
+            let nm: Slice[char] names.at(r)
+            let vl: String values.at(r)
+            out.append(nm.data, nm.length)
+            out.append(":")
+            var pad (name_width + 1) - ((nm.length as int) + 1)
+            while pad > 0
+            {
+                out.append(" " as char)
+                set pad: pad - 1
+            }
+            out.append(" " as char)
+            set pad: value_width - (vl.get_length() as int)
+            while pad > 0
+            {
+                out.append(" " as char)
+                set pad: pad - 1
+            }
+            out.append(vl)
+            out.append("\n" as char)
+            set r: r + 1
+        }
+        out.append("!!! Statistics end\n")
+    }
+
+    function stat_count(host: ref[Page], n: int) returns String
+    {
+        let sb StringBuilder^host()
+        sb.append(n)
+        sb.to_string()
+    }
+
+    ; formatDuration: `%.3fs`
+    function stat_seconds(host: ref[Page], ns: int) returns String
+    {
+        let ms ns / 1000000
+        let frac ms % 1000
+        let sb StringBuilder^host()
+        sb.append(ms / 1000)
+        sb.append("." as char)
+        if frac < 100
+            sb.append("0" as char)
+        if frac < 10
+            sb.append("0" as char)
+        sb.append(frac)
+        sb.append("s" as char)
+        sb.to_string()
+    }
+
+    ; len(file.ECMALineMap()) without building the map: the rule of
+    ; Printer.compute_ecma_line_starts — CR, LF, CRLF, U+2028 and U+2029 end a
+    ; line — counted instead of recorded
+    function ecma_line_count(text: Slice[char]) returns int
+    {
+        let n text.length as int
+        var pos 0
+        var count 1
+        while pos < n
+        {
+            let b text[pos as size_t] as int
+            if b < 128
+            {
+                set pos: pos + 1
+                if b = 13
+                {
+                    if (pos < n) and ((text[pos as size_t] as int) = 10)
+                        set pos: pos + 1
+                    set count: count + 1
+                }
+                else
+                {
+                    if b = 10
+                        set count: count + 1
+                }
+            }
+            else
+            {
+                let size Scanner.utf8_size_in(text, n, pos)
+                let ch Scanner.utf8_decode_in(text, n, pos)
+                set pos: pos + size
+                if (ch = 8232) or (ch = 8233)
+                    set count: count + 1
+            }
+        }
+        count
+    }
+
     ; TSCALY_STATS: the program's persistent structures by COUNT — nodes, flow nodes,
     ; symbols, types, signatures and every table row the checker holds — so a memory
     ; measurement can price them with the layouts and see what the rest is
@@ -1392,7 +1608,14 @@ define DriverProgram
                 let lbs Tracing.no_args(host)
                 Tracing.add_arg(host, lbs, "path", lib_path)
                 let lbs_tid sys.trace_push(TracePhaseBind, "bindSourceFile", lbs)
+                let lib_bind_t0 scaly_eio_now_ns()
                 let lb Binder.bind_source_file(host, lf as ref[AstNode], text, path, is_external)
+                if sys.stats <> null
+                {
+                    let st sys.stats as ref[CompileStats]
+                    set st.bind: st.bind + (scaly_eio_now_ns() - lib_bind_t0)
+                    set st.lib_symbols: st.lib_symbols + lb.symbol_count
+                }
                 sys.trace_pop(lbs_tid, TracePhaseBind, "bindSourceFile", lbs)
                 if Binder.unported_at(lb) >= 0
                 {
