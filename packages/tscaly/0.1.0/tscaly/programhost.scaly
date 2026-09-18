@@ -268,6 +268,31 @@ define FileEmitOutput
     }
 }
 
+; PROTOTYPE (parallel checkers, slice 366): one checker's share of the check
+; phase — the reference's checkerpool.go hands file i to checker i % n. A unit
+; is a POSITION: the libs first, then the program's files, as checkSourceFiles
+; walks them. The worker writes only its own job; `stop_pos` is the first unit
+; that stopped (-1: none), and nothing after it in this share was checked.
+define CheckJob
+(
+    program: ref[DriverProgram]
+    checker: ref[Checker]
+    initialize: bool
+    positions: ref[Array[int]]
+    stop_pos: int
+    ; the stop's row in the checker's stop log (-1: a stop that logged nothing)
+    stop_row: int
+    done: u64
+)
+
+procedure check_task(arg: pointer[void]) returns pointer[void]
+{
+    let job arg as ref[CheckJob]
+    job.program.check_share(job)
+    scaly_atomic_store_u64(&job.done, 1 as u64)
+    null
+}
+
 define DriverProgram
 (
     host: ref[Page]
@@ -319,6 +344,9 @@ define DriverProgram
     lib_resolution_paths: ref[Array[Slice[char]]]
     lib_resolution_keys: ref[Array[Slice[char]]]
     lib_resolution_traces: ref[Array[ref[Array[String]]]]
+    ; PROTOTYPE (parallel checkers, slice 366): checkers 1..n-1 under
+    ; TSCALY_CHECKERS=<n>, each on a page of its own; `checker` is checker 0
+    extra_checkers: ref[Array[ref[Checker]]]?
 )
 {
     function create(host: ref[Page], sys: ref[ExecSystem], ts: ref[TsOptions], root_names: ref[Array[Slice[char]]], config_path: Slice[char], config_text: Slice[char], config_diagnostics: ref[Array[ref[DriverDiagnostic]]]) returns ref[DriverProgram]
@@ -327,7 +355,7 @@ define DriverProgram
         let pf ProgramFiles.create(host)
         set pf.directory_paths: sys.directories
         set pf.case_insensitive: sys.case_sensitive = false
-        &DriverProgram^host(host, sys, options, ts, pf, root_names, null, null, 0, null, config_path, config_text, config_diagnostics, &Array[Slice[char]]^host(), false, &Array[ref[DriverDiagnostic]]^host(), &Array[ref[AstNode]?]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), null, &Array[ref[ResolvedReference]]^host(), &Array[int]^host(), null, null, null, &Array[ref[DriverDiagnostic]]^host(), &Array[ref[Parser]?]^host(), &Array[ref[Array[int]]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[ref[Array[String]]]^host())
+        &DriverProgram^host(host, sys, options, ts, pf, root_names, null, null, 0, null, config_path, config_text, config_diagnostics, &Array[Slice[char]]^host(), false, &Array[ref[DriverDiagnostic]]^host(), &Array[ref[AstNode]?]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), null, &Array[ref[ResolvedReference]]^host(), &Array[int]^host(), null, null, null, &Array[ref[DriverDiagnostic]]^host(), &Array[ref[Parser]?]^host(), &Array[ref[Array[int]]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[ref[Array[String]]]^host(), null)
     }
 
     ; ── project references ───────────────────────────────────────────────────
@@ -1088,12 +1116,20 @@ define DriverProgram
         }
         ; the program's checker, `GetTypeChecker` after createProgram: the file
         ; table is complete, the members are set and every file is bound
+        ; PROTOTYPE (parallel checkers, slice 366): with a pool, checker 0 lives on
+        ; a page of its own like the others -- the program page is where the lazy
+        ; JSDoc parse of a lib parser allocates, under enter_shared, and an
+        ; allocation of checker 0 there raced it (ThreadSanitizer, vs/editor)
+        var pc_page host
+        if DriverProgram.checker_count() > 1
+            if sys.tracing = null
+                set pc_page: Page.allocate_page()
         Checker.set_defer_initialize(true)
-        let pc this.checker_over(first, lib_files, lib_binders)
+        let pc this.checker_over_on(pc_page, first, lib_files, lib_binders)
         set pc.record_events: false
         Checker.set_defer_initialize(false)
         this.apply_checker_options(pc)
-        pc.set_message_specifiers(SpecifierHost.create(host, pc, pf, options))
+        pc.set_message_specifiers(SpecifierHost.create(pc_page, pc, pf, options))
         ld.set_checker(pc)
         let removed_false &Array[Slice[char]]^host()
         if ts.tristate_of("alwaysStrict") = 0
@@ -1117,10 +1153,64 @@ define DriverProgram
         if this.checker_stopped(pc, mark, log_before)
             return false
         set this.checker: pc
+        this.create_extra_checkers(first, lib_files, lib_binders)
         true
     }
 
+    ; PROTOTYPE (parallel checkers, slice 366): TSCALY_CHECKERS=<n> — the reference's
+    ; checker pool (compiler/checkerpool.go: four by default, files round-robin)
+    function checker_count() returns int
+    {
+        let env getenv("TSCALY_CHECKERS")
+        if env = null
+            return 1
+        let bytes env as pointer[u8]
+        var n 0
+        var i 0
+        while true
+        {
+            let b *(bytes + i) as int
+            if (b < 48) or (b > 57)
+                break
+            set n: (n * 10) + (b - 48)
+            set i: i + 1
+        }
+        if n < 1
+            return 1
+        n
+    }
+
+    ; checkers 1..n-1, created and configured here on the main thread, each on a
+    ; heap page of its own; initialize_checker runs in its worker (check_parallel)
+    procedure create_extra_checkers(this, first: int, lib_files: ref[Array[ref[AstNode]?]], lib_binders: ref[Array[ref[Binder]?]])
+    {
+        let n DriverProgram.checker_count()
+        if n <= 1
+            return
+        if sys.tracing <> null
+            return
+        let extras &Array[ref[Checker]]^host()
+        var k 1
+        while k < n
+        {
+            let pg Page.allocate_page()
+            Checker.set_defer_initialize(true)
+            let xc this.checker_over_on(pg, first, lib_files, lib_binders)
+            set xc.record_events: false
+            Checker.set_defer_initialize(false)
+            this.apply_checker_options(xc)
+            xc.set_message_specifiers(SpecifierHost.create(pg, xc, pf, options))
+            extras.add(xc)
+            set k: k + 1
+        }
+        set this.extra_checkers: extras
+    }
+
     function checker_over(this, first: int, lib_files: ref[Array[ref[AstNode]?]], lib_binders: ref[Array[ref[Binder]?]]) returns ref[Checker]
+        this.checker_over_on(host, first, lib_files, lib_binders)
+
+    ; the checker's own page is `on_page` (slice 366: a parallel checker's)
+    function checker_over_on(this, on_page: ref[Page], first: int, lib_files: ref[Array[ref[AstNode]?]], lib_binders: ref[Array[ref[Binder]?]]) returns ref[Checker]
     {
         var lib_file: ref[AstNode]? null
         var lib_b: ref[Binder]? null
@@ -1144,7 +1234,7 @@ define DriverProgram
                 set extra_binders: eb
             }
             let lib_path0 lib_paths[0]
-            return Checker.create_ex(host, lib_files[0] as ref[AstNode], String(lib_path0.data as pointer[const_char], lib_path0.length as size_t), lib_binders[0] as ref[Binder], lib_parsers[0] as ref[Parser], lib_files[0], lib_binders[0], extra_files, extra_binders, pf)
+            return Checker.create_ex(on_page, lib_files[0] as ref[AstNode], String(lib_path0.data as pointer[const_char], lib_path0.length as size_t), lib_binders[0] as ref[Binder], lib_parsers[0] as ref[Parser], lib_files[0], lib_binders[0], extra_files, extra_binders, pf)
         }
         if lib_files.get_length() > 0
         {
@@ -1166,7 +1256,7 @@ define DriverProgram
             set extra_binders: eb
         }
         let path0 pf.path_at(first)
-        Checker.create_ex(host, pf.file_at(first) as ref[AstNode], String(path0.data as pointer[const_char], path0.length as size_t), pf.binder_at(first) as ref[Binder], pf.parser_at(first) as ref[Parser], lib_file, lib_b, extra_files, extra_binders, pf)
+        Checker.create_ex(on_page, pf.file_at(first) as ref[AstNode], String(path0.data as pointer[const_char], path0.length as size_t), pf.binder_at(first) as ref[Binder], pf.parser_at(first) as ref[Parser], lib_file, lib_b, extra_files, extra_binders, pf)
     }
 
     procedure apply_checker_options(this, cd: ref[Checker])
@@ -2026,6 +2116,161 @@ define DriverProgram
     ; libs, so `checkSourceFiles` walks them ahead of the loader's files and their
     ; diagnostics are ordinary semantic ones; this port keeps the chain beside the
     ; table (see lib_nodes) and this is the walk that reaches it.
+    ; PROTOTYPE (parallel checkers, slice 366): checkSourceFiles over the checker
+    ; pool. Every unit is checked by checker (position % n) — checker 0 on this
+    ; thread, the others on TaskPool workers — and the diagnostics are then
+    ; collected in position order, each file's from its own checker, as the
+    ; reference's getBindAndCheckDiagnosticsForFile asks the file's checker.
+    procedure check_parallel(this, ld: ref[ProgramLoader], out: ref[Array[ref[DriverDiagnostic]]]) returns bool
+    {
+        let cd0 checker as ref[Checker]
+        let extras extra_checkers as ref[Array[ref[Checker]]]
+        let n (extras.get_length() as int) + 1
+        let libs this.lib_count()
+        let total libs + (ld.program_files.get_length() as int)
+        ; the lazy per-file tables a checker builds on first use, built here so
+        ; that no two checkers race to build one
+        var li 0
+        while li < libs
+        {
+            if cd0.select_lib_file(li)
+            {
+                AstNode.prepare_list_range_index(cd0.file)
+                cd0.b.ecma_line_starts()
+            }
+            set li: li + 1
+        }
+        var pi 0
+        while pi < (ld.program_files.get_length() as int)
+        {
+            let index ld.program_files[pi as size_t]
+            AstNode.prepare_list_range_index(pf.file_at(index))
+            let pb pf.binder_at(index)
+            if pb <> null
+                (pb as ref[Binder]).ecma_line_starts()
+            set pi: pi + 1
+        }
+        let jobs &Array[ref[CheckJob]]^host()
+        var k 0
+        while k < n
+        {
+            var ck cd0
+            if k > 0
+                set ck: extras[(k - 1) as size_t]
+            jobs.add(&CheckJob^host(this, ck, k > 0, &Array[int]^host(), 0 - 1, 0 - 1, 0 as u64))
+            set k: k + 1
+        }
+        var p 0
+        while p < total
+        {
+            var wanted true
+            if p < libs
+                set wanted: this.skip_lib_checking(p) = false
+            else
+                set wanted: this.skip_type_checking(ld.program_files[(p - libs) as size_t]) = false
+            if wanted
+            {
+                let share jobs[(p % n) as size_t]
+                share.positions.add(p)
+            }
+            set p: p + 1
+        }
+        let pool TaskPool.create((n - 1) as i64)
+        let group TaskGroup.create()
+        var w 1
+        while w < n
+        {
+            TaskPool.submit(pool, &check_task, jobs[w as size_t] as pointer[void], group)
+            set w: w + 1
+        }
+        this.check_share(jobs[0 as size_t])
+        TaskGroup.wait(group)
+        TaskGroup.dispose(group)
+        TaskPool.shutdown(pool)
+        ; the first stop in position order ends the walk there, as it does sequentially
+        var stop_pos total
+        var stop_job 0 - 1
+        var j 0
+        while j < n
+        {
+            let job jobs[j as size_t]
+            if (job.stop_pos >= 0) and (job.stop_pos < stop_pos)
+            {
+                set stop_pos: job.stop_pos
+                set stop_job: j
+            }
+            set j: j + 1
+        }
+        var q libs
+        while q < stop_pos
+        {
+            let index ld.program_files[(q - libs) as size_t]
+            let share jobs[(q % n) as size_t]
+            this.bind_and_check_on(share.checker, index, out, false)
+            this.include_processor(index, out)
+            set q: q + 1
+        }
+        if stop_job >= 0
+        {
+            let sj jobs[stop_job as size_t]
+            var tag: Slice[char] "checker-stop"
+            if sj.stop_row >= 0
+                set tag: Checker.stop_tag_at(sj.checker, sj.stop_row)
+            this.stop(tag)
+            return false
+        }
+        true
+    }
+
+    ; one checker's share, on whichever thread runs it; writes only `job`
+    procedure check_share(this, job: ref[CheckJob])
+    {
+        let cd job.checker
+        let libs this.lib_count()
+        let ld loader as ref[ProgramLoader]
+        if job.initialize
+        {
+            let imark cd.unported_mark()
+            let ilog Checker.stop_count(cd)
+            cd.initialize_checker()
+            if cd.unported_mark() <> imark
+            {
+                set job.stop_pos: 0
+                if (job.positions.get_length() as int) > 0
+                    set job.stop_pos: job.positions[0 as size_t]
+                if Checker.stop_count(cd) > ilog
+                    set job.stop_row: ilog
+                return
+            }
+        }
+        var i 0
+        while i < (job.positions.get_length() as int)
+        {
+            let pos job.positions[i as size_t]
+            set i: i + 1
+            let mark cd.unported_mark()
+            let log_before Checker.stop_count(cd)
+            if pos < libs
+            {
+                if cd.select_lib_file(pos) = false
+                    continue
+            }
+            else
+            {
+                let index ld.program_files[(pos - libs) as size_t]
+                cd.select_program_file(index, pf.format_at(index))
+            }
+            cd.get_diagnostics()
+            if cd.unported_mark() <> mark
+            {
+                set job.stop_pos: pos
+                if Checker.stop_count(cd) > log_before
+                    set job.stop_row: log_before
+                return
+            }
+        }
+    }
+
     procedure semantic_lib(this, i: int, out: ref[Array[ref[DriverDiagnostic]]]) returns bool
     {
         if checker = null
@@ -2054,8 +2299,12 @@ define DriverProgram
 
     ; getBindAndCheckDiagnosticsWithChecker for one file; false after a stop
     procedure bind_and_check(this, index: int, out: ref[Array[ref[DriverDiagnostic]]]) returns bool
+        this.bind_and_check_on(checker as ref[Checker], index, out, true)
+
+    ; `run_check` false: the file was checked already, by `cd`, on a worker
+    ; (check_parallel); only its diagnostics are collected, as below
+    procedure bind_and_check_on(this, cd: ref[Checker], index: int, out: ref[Array[ref[DriverDiagnostic]]], run_check: bool) returns bool
     {
-        let cd checker as ref[Checker]
         if this.skip_type_checking(index)
             return true
         let path pf.path_at(index)
@@ -2069,13 +2318,16 @@ define DriverProgram
             this.from_list(bl, bi, index, diags)
             set bi: bi + 1
         }
-        Checker.report_progress(index, path)
-        let mark cd.unported_mark()
-        let log_before Checker.stop_count(cd)
-        cd.select_program_file(index, pf.format_at(index))
-        cd.get_diagnostics()
-        if this.checker_stopped(cd, mark, log_before)
-            return false
+        if run_check
+        {
+            Checker.report_progress(index, path)
+            let mark cd.unported_mark()
+            let log_before Checker.stop_count(cd)
+            cd.select_program_file(index, pf.format_at(index))
+            cd.get_diagnostics()
+            if this.checker_stopped(cd, mark, log_before)
+                return false
+        }
         let cl cd.diagnostics as ref[DiagnosticList]
         var ci 0
         while ci < cl.length()
@@ -2390,6 +2642,17 @@ define DriverProgram
                 sys.now()
             let cf_tid sys.trace_push(TracePhaseCheck, "checkSourceFiles", null)
             var lb 0
+            var s0 0
+            if extra_checkers <> null
+            {
+                if this.check_parallel(ld, out) = false
+                {
+                    sys.trace_pop(cf_tid, TracePhaseCheck, "checkSourceFiles", null)
+                    return false
+                }
+                set lb: this.lib_count()
+                set s0: ld.program_files.get_length() as int
+            }
             while lb < this.lib_count()
             {
                 let la Tracing.no_args(host)
@@ -2405,7 +2668,7 @@ define DriverProgram
                 }
                 set lb: lb + 1
             }
-            var s 0
+            var s s0
             while s < (ld.program_files.get_length() as int)
             {
                 let unit ld.program_files[s as size_t]
