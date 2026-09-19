@@ -156,7 +156,7 @@ FACTORY_TAIL = """
     ; ── visitor.go, hand-written ─────────────────────────────────────────────
 
     ; The `Visit` callback (§3.18: the tag is the func value).
-    procedure visit(this, node: ref[AstNode]) returns ref[AstNode]?
+    procedure visit(mutable this, mutable node: ref[AstNode]) returns ref[AstNode]?
     {
         if visit_tag = VisitTagDeepClone
             return this.deep_clone_visit(node)
@@ -172,7 +172,7 @@ FACTORY_TAIL = """
     }
 
     ; VisitNode: the callback, and a one-element SyntaxList unwrapped.
-    procedure visit_node(this, node: ref[AstNode]?) returns ref[AstNode]?
+    procedure visit_node(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]?
     {
         if node = null
             return null
@@ -202,7 +202,7 @@ FACTORY_TAIL = """
     }
 
     ; VisitEmbeddedStatement: the callback, lifted to a block when it answers several.
-    procedure visit_embedded_statement(this, node: ref[AstNode]?) returns ref[AstNode]?
+    procedure visit_embedded_statement(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]?
     {
         if node = null
             return null
@@ -215,7 +215,7 @@ FACTORY_TAIL = """
     }
 
     ; VisitNodes: a rebuilt list keeps the original's extent.
-    procedure visit_nodes(this, nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    procedure visit_nodes(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
     {
         if nodes = null
             return nodes
@@ -228,12 +228,12 @@ FACTORY_TAIL = """
         nodes
     }
 
-    procedure visit_modifiers(this, nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    procedure visit_modifiers(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
         this.visit_nodes(nodes)
 
     ; VisitSlice: the first element the callback changes or drops starts a copy;
     ; a SyntaxList answer splices its children in.
-    procedure visit_slice(this, nodes: ref[Array[ref[AstNode]?]], changed: ref[bool]) returns ref[Array[ref[AstNode]?]]
+    procedure visit_slice(mutable this, mutable nodes: ref[Array[ref[AstNode]?]], mutable changed: ref[bool]) returns ref[Array[ref[AstNode]?]]
     {
         set changed: false
         let n nodes.get_length() as int
@@ -294,7 +294,7 @@ FACTORY_TAIL = """
     }
 
     ; liftToBlock: several statements become one multi-line block.
-    procedure lift_to_block(this, node: ref[AstNode]) returns ref[AstNode]
+    procedure lift_to_block(mutable this, node: ref[AstNode]) returns ref[AstNode]
     {
         if node.kind <> KindSyntaxList
             return node
@@ -310,55 +310,55 @@ FACTORY_TAIL = """
 
     ; ── the hook-aware forms VisitEachChild calls (visitor.go's lowercase ones) ──
 
-    procedure visit_node_h(this, node: ref[AstNode]?) returns ref[AstNode]?
+    procedure visit_node_h(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]?
         this.visit_node(node)
 
-    procedure visit_embedded_statement_h(this, node: ref[AstNode]?) returns ref[AstNode]?
+    procedure visit_embedded_statement_h(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]?
     {
         if hooks_tag = HooksTagEmitContext
             return (context as ref[EmitContext]).visit_embedded_statement(node, this)
         this.visit_embedded_statement(node)
     }
 
-    procedure visit_iteration_body_h(this, node: ref[AstNode]?) returns ref[AstNode]?
+    procedure visit_iteration_body_h(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]?
     {
         if hooks_tag = HooksTagEmitContext
             return (context as ref[EmitContext]).visit_iteration_body(node, this)
         this.visit_embedded_statement_h(node)
     }
 
-    procedure visit_function_body_h(this, node: ref[AstNode]?) returns ref[AstNode]?
+    procedure visit_function_body_h(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]?
     {
         if hooks_tag = HooksTagEmitContext
             return (context as ref[EmitContext]).visit_function_body(node, this)
         this.visit_node_h(node)
     }
 
-    procedure visit_token_h(this, node: ref[AstNode]?) returns ref[AstNode]?
+    procedure visit_token_h(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]?
         this.visit_node(node)
 
-    procedure visit_nodes_h(this, nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    procedure visit_nodes_h(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
     {
         if hooks_tag = HooksTagDeepClone
             return this.deep_clone_visit_nodes(nodes)
         this.visit_nodes(nodes)
     }
 
-    procedure visit_modifiers_h(this, nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    procedure visit_modifiers_h(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
     {
         if hooks_tag = HooksTagDeepClone
             return this.deep_clone_visit_nodes(nodes)
         this.visit_modifiers(nodes)
     }
 
-    procedure visit_parameters_h(this, nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    procedure visit_parameters_h(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
     {
         if hooks_tag = HooksTagEmitContext
             return (context as ref[EmitContext]).visit_parameters(nodes, this)
         this.visit_nodes_h(nodes)
     }
 
-    procedure visit_top_level_statements_h(this, nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    procedure visit_top_level_statements_h(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
     {
         if hooks_tag = HooksTagEmitContext
             return (context as ref[EmitContext]).visit_variable_environment(nodes, this)
@@ -370,7 +370,7 @@ FACTORY_TAIL = """
     ; The deep-clone callback: a node whose children changed is the rebuilt
     ; one; a leaf is cloned outright, and the clones cascade up through the
     ; updaters. A synthetic location is (-1, -1).
-    procedure deep_clone_visit(this, node: ref[AstNode]) returns ref[AstNode]?
+    procedure deep_clone_visit(mutable this, mutable node: ref[AstNode]) returns ref[AstNode]?
     {
         let visited this.visit_each_child(node)
         if visited <> null
@@ -399,7 +399,7 @@ FACTORY_TAIL = """
     ; Array over the same elements, same extent); with synthetic locations the
     ; list has no extent and a trailing comma is kept as the last element's
     ; (-2, -2) location, exactly the reference's marker.
-    procedure deep_clone_visit_nodes(this, nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    procedure deep_clone_visit_nodes(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
     {
         if nodes = null
             return null
@@ -445,17 +445,17 @@ define DeepClone
     host: ref[Page]
 )
 {
-    procedure visitor(host: ref[Page], f: ref[NodeFactory], synthetic_location: bool) returns ref[NodeVisitor]
+    procedure visitor(host: ref[Page], mutable f: ref[NodeFactory], synthetic_location: bool) returns ref[NodeVisitor]
     {
         let v NodeVisitor.create(host, f, VisitTagDeepClone, HooksTagDeepClone)
         set v.synthetic_location: synthetic_location
         v
     }
 
-    procedure deep_clone_node(host: ref[Page], f: ref[NodeFactory], node: ref[AstNode]?) returns ref[AstNode]?
+    procedure deep_clone_node(host: ref[Page], mutable f: ref[NodeFactory], mutable node: ref[AstNode]?) returns ref[AstNode]?
         DeepClone.visitor(host, f, true).visit_node(node)
 
-    procedure deep_clone_reparse(host: ref[Page], f: ref[NodeFactory], node_in: ref[AstNode]?) returns ref[AstNode]?
+    procedure deep_clone_reparse(host: ref[Page], mutable f: ref[NodeFactory], mutable node_in: ref[AstNode]?) returns ref[AstNode]?
     {
         if node_in = null
             return null
@@ -468,7 +468,7 @@ define DeepClone
         n
     }
 
-    procedure deep_clone_reparse_modifiers(host: ref[Page], f: ref[NodeFactory], modifiers: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    procedure deep_clone_reparse_modifiers(host: ref[Page], mutable f: ref[NodeFactory], mutable modifiers: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
         DeepClone.visitor(host, f, false).visit_modifiers(modifiers)
 }
 """
@@ -486,7 +486,7 @@ FACTORY_EXTRAS = """
     ; The placeholder text of a generated identifier: `(auto@N)` or the
     ; original node's text or `(generated@N)`; the reference's N is a node id,
     ; this port's the node's address — never printed, only a key.
-    procedure placeholder_text(this, tag: Slice[char], n: int) returns Slice[char]
+    procedure placeholder_text(mutable this, tag: Slice[char], n: int) returns Slice[char]
     {
         let b StringBuilder^host()
         b.append("(" as char)
@@ -497,7 +497,7 @@ FACTORY_EXTRAS = """
         Printer.slice_on(host, b.to_string())
     }
 
-    procedure new_generated_identifier(this, kind: int, text_in: Slice[char], node: ref[AstNode]?, flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
+    procedure new_generated_identifier(mutable this, kind: int, mutable text_in: Slice[char], node: ref[AstNode]?, flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
     {
         let id this.next_auto_id()
         var text text_in
@@ -521,28 +521,28 @@ FACTORY_EXTRAS = """
         name
     }
 
-    procedure new_temp_variable(this) returns ref[AstNode]
+    procedure new_temp_variable(mutable this) returns ref[AstNode]
         this.new_generated_identifier(GeneratedIdentifierFlagsAuto, "", null, 0, "", "")
 
-    procedure new_temp_variable_ex(this, flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
+    procedure new_temp_variable_ex(mutable this, flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
         this.new_generated_identifier(GeneratedIdentifierFlagsAuto, "", null, flags, prefix, suffix)
 
-    procedure new_loop_variable(this) returns ref[AstNode]
+    procedure new_loop_variable(mutable this) returns ref[AstNode]
         this.new_generated_identifier(GeneratedIdentifierFlagsLoop, "", null, 0, "", "")
 
-    procedure new_loop_variable_ex(this, flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
+    procedure new_loop_variable_ex(mutable this, flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
         this.new_generated_identifier(GeneratedIdentifierFlagsLoop, "", null, flags, prefix, suffix)
 
-    procedure new_unique_name(this, text: Slice[char]) returns ref[AstNode]
+    procedure new_unique_name(mutable this, mutable text: Slice[char]) returns ref[AstNode]
         this.new_generated_identifier(GeneratedIdentifierFlagsUnique, text, null, 0, "", "")
 
-    procedure new_unique_name_ex(this, text: Slice[char], flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
+    procedure new_unique_name_ex(mutable this, mutable text: Slice[char], flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
         this.new_generated_identifier(GeneratedIdentifierFlagsUnique, text, null, flags, prefix, suffix)
 
-    procedure new_generated_name_for_node(this, node: ref[AstNode]) returns ref[AstNode]
+    procedure new_generated_name_for_node(mutable this, node: ref[AstNode]) returns ref[AstNode]
         this.new_generated_identifier(GeneratedIdentifierFlagsNode, "", node, 0, "", "")
 
-    procedure new_generated_name_for_node_ex(this, node: ref[AstNode], flags_in: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
+    procedure new_generated_name_for_node_ex(mutable this, node: ref[AstNode], flags_in: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
     {
         var flags flags_in
         if ((prefix.length as int) > 0) or ((suffix.length as int) > 0)
@@ -550,7 +550,7 @@ FACTORY_EXTRAS = """
         this.new_generated_identifier(GeneratedIdentifierFlagsNode, "", node, flags, prefix, suffix)
     }
 
-    procedure new_generated_private_identifier(this, kind: int, text_in: Slice[char], node: ref[AstNode]?, flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
+    procedure new_generated_private_identifier(mutable this, kind: int, mutable text_in: Slice[char], node: ref[AstNode]?, flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
     {
         let id this.next_auto_id()
         var text text_in
@@ -574,16 +574,16 @@ FACTORY_EXTRAS = """
         name
     }
 
-    procedure new_unique_private_name(this, text: Slice[char]) returns ref[AstNode]
+    procedure new_unique_private_name(mutable this, mutable text: Slice[char]) returns ref[AstNode]
         this.new_generated_private_identifier(GeneratedIdentifierFlagsUnique, text, null, 0, "", "")
 
-    procedure new_unique_private_name_ex(this, text: Slice[char], flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
+    procedure new_unique_private_name_ex(mutable this, mutable text: Slice[char], flags: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
         this.new_generated_private_identifier(GeneratedIdentifierFlagsUnique, text, null, flags, prefix, suffix)
 
-    procedure new_generated_private_name_for_node(this, node: ref[AstNode]) returns ref[AstNode]
+    procedure new_generated_private_name_for_node(mutable this, node: ref[AstNode]) returns ref[AstNode]
         this.new_generated_private_identifier(GeneratedIdentifierFlagsNode, "", node, 0, "", "")
 
-    procedure new_generated_private_name_for_node_ex(this, node: ref[AstNode], flags_in: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
+    procedure new_generated_private_name_for_node_ex(mutable this, node: ref[AstNode], flags_in: int, prefix: Slice[char], suffix: Slice[char]) returns ref[AstNode]
     {
         var flags flags_in
         if ((prefix.length as int) > 0) or ((suffix.length as int) > 0)
@@ -593,7 +593,7 @@ FACTORY_EXTRAS = """
 
     ; NewStringLiteralFromNode: a string literal whose text is the node's, with
     ; the node recorded as its text source.
-    procedure new_string_literal_from_node(this, text_source_node: ref[AstNode]) returns ref[AstNode]
+    procedure new_string_literal_from_node(mutable this, text_source_node: ref[AstNode]) returns ref[AstNode]
     {
         var text: Slice[char] ""
         let k text_source_node.kind
@@ -623,38 +623,38 @@ FACTORY_EXTRAS = """
         node
     }
 
-    procedure new_this_expression(this) returns ref[AstNode]
+    procedure new_this_expression(mutable this) returns ref[AstNode]
         this.new_keyword_expression(KindThisKeyword)
 
-    procedure new_true_expression(this) returns ref[AstNode]
+    procedure new_true_expression(mutable this) returns ref[AstNode]
         this.new_keyword_expression(KindTrueKeyword)
 
-    procedure new_false_expression(this) returns ref[AstNode]
+    procedure new_false_expression(mutable this) returns ref[AstNode]
         this.new_keyword_expression(KindFalseKeyword)
 
-    procedure new_comma_expression(this, left: ref[AstNode]?, right: ref[AstNode]?) returns ref[AstNode]
+    procedure new_comma_expression(mutable this, left: ref[AstNode]?, right: ref[AstNode]?) returns ref[AstNode]
         this.new_binary_expression(null, left, null, this.new_token(KindCommaToken), right)
 
-    procedure new_assignment_expression(this, left: ref[AstNode]?, right: ref[AstNode]?) returns ref[AstNode]
+    procedure new_assignment_expression(mutable this, left: ref[AstNode]?, right: ref[AstNode]?) returns ref[AstNode]
         this.new_binary_expression(null, left, null, this.new_token(KindEqualsToken), right)
 
-    procedure new_logical_or_expression(this, left: ref[AstNode]?, right: ref[AstNode]?) returns ref[AstNode]
+    procedure new_logical_or_expression(mutable this, left: ref[AstNode]?, right: ref[AstNode]?) returns ref[AstNode]
         this.new_binary_expression(null, left, null, this.new_token(KindBarBarToken), right)
 
-    procedure new_logical_and_expression(this, left: ref[AstNode]?, right: ref[AstNode]?) returns ref[AstNode]
+    procedure new_logical_and_expression(mutable this, left: ref[AstNode]?, right: ref[AstNode]?) returns ref[AstNode]
         this.new_binary_expression(null, left, null, this.new_token(KindAmpersandAmpersandToken), right)
 
-    procedure new_strict_equality_expression(this, left: ref[AstNode]?, right: ref[AstNode]?) returns ref[AstNode]
+    procedure new_strict_equality_expression(mutable this, left: ref[AstNode]?, right: ref[AstNode]?) returns ref[AstNode]
         this.new_binary_expression(null, left, null, this.new_token(KindEqualsEqualsEqualsToken), right)
 
-    procedure new_strict_inequality_expression(this, left: ref[AstNode]?, right: ref[AstNode]?) returns ref[AstNode]
+    procedure new_strict_inequality_expression(mutable this, left: ref[AstNode]?, right: ref[AstNode]?) returns ref[AstNode]
         this.new_binary_expression(null, left, null, this.new_token(KindExclamationEqualsEqualsToken), right)
 
-    procedure new_void_zero_expression(this) returns ref[AstNode]
+    procedure new_void_zero_expression(mutable this) returns ref[AstNode]
         this.new_void_expression(this.new_numeric_literal("0", TokenFlagsNone))
 
     ; flattenCommaElements: synthesized comma expressions flattened.
-    procedure flatten_comma_element(this, node: ref[AstNode], expressions: ref[Array[ref[AstNode]?]])
+    procedure flatten_comma_element(this, node: ref[AstNode], mutable expressions: ref[Array[ref[AstNode]?]])
     {
         var comma false
         if node.kind = KindBinaryExpression
@@ -682,7 +682,7 @@ FACTORY_EXTRAS = """
         expressions.add(node)
     }
 
-    procedure inline_expressions(this, expressions: ref[Array[ref[AstNode]?]]) returns ref[AstNode]?
+    procedure inline_expressions(mutable this, expressions: ref[Array[ref[AstNode]?]]) returns ref[AstNode]?
     {
         let n expressions.get_length() as int
         if n = 0
@@ -710,7 +710,7 @@ FACTORY_EXTRAS = """
 
     ; CreateExpressionFromEntityName: `a.b.c` from a qualified name, the parts
     ; cloned at their original locations and parents.
-    procedure create_expression_from_entity_name(this, node: ref[AstNode]) returns ref[AstNode]
+    procedure create_expression_from_entity_name(mutable this, mutable node: ref[AstNode]) returns ref[AstNode]
     {
         if node.kind = KindQualifiedName
         {
@@ -732,7 +732,7 @@ FACTORY_EXTRAS = """
         res
     }
 
-    procedure restore_enclosing_label(this, node: ref[AstNode], outermost_labeled_statement: ref[AstNode]?) returns ref[AstNode]
+    procedure restore_enclosing_label(mutable this, mutable node: ref[AstNode], mutable outermost_labeled_statement: ref[AstNode]?) returns ref[AstNode]
     {
         if outermost_labeled_statement = null
             return node
@@ -747,7 +747,7 @@ FACTORY_EXTRAS = """
         this.update_labeled_statement(outer, AstNode.label_name_of(outer), inner_label)
     }
 
-    procedure create_for_of_binding_statement(this, node: ref[AstNode], bound_value: ref[AstNode]) returns ref[AstNode]
+    procedure create_for_of_binding_statement(mutable this, mutable node: ref[AstNode], mutable bound_value: ref[AstNode]) returns ref[AstNode]
     {
         if node.kind = KindVariableDeclarationList
         {
@@ -771,7 +771,7 @@ FACTORY_EXTRAS = """
     }
 
     ; NewTypeCheck: `value === null`, `value === void 0`, or `typeof value === "tag"`.
-    procedure new_type_check(this, value: ref[AstNode], tag: Slice[char]) returns ref[AstNode]
+    procedure new_type_check(mutable this, value: ref[AstNode], tag: Slice[char]) returns ref[AstNode]
     {
         if tag.equals("null")
             return this.new_strict_equality_expression(value, this.new_keyword_expression(KindNullKeyword))
@@ -780,7 +780,7 @@ FACTORY_EXTRAS = """
         this.new_strict_equality_expression(this.new_type_of_expression(value), this.new_string_literal(tag, TokenFlagsNone))
     }
 
-    procedure new_method_call(this, object: ref[AstNode], method_name: ref[AstNode], arguments_list: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
+    procedure new_method_call(mutable this, object: ref[AstNode], method_name: ref[AstNode], arguments_list: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
     {
         var flags NodeFlagsNone
         if object.kind = KindCallExpression
@@ -791,10 +791,10 @@ FACTORY_EXTRAS = """
         this.new_call_expression(this.new_property_access_expression(object, null, method_name, NodeFlagsNone), null, null, arguments_list, flags)
     }
 
-    procedure new_global_method_call(this, global_object_name: Slice[char], method_name: Slice[char], arguments_list: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
+    procedure new_global_method_call(mutable this, global_object_name: Slice[char], method_name: Slice[char], arguments_list: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
         this.new_method_call(this.new_identifier(global_object_name), this.new_identifier(method_name), arguments_list)
 
-    procedure new_function_call_call(this, target: ref[AstNode], this_arg: ref[AstNode], arguments_list: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
+    procedure new_function_call_call(mutable this, target: ref[AstNode], this_arg: ref[AstNode], arguments_list: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
     {
         let args &Array[ref[AstNode]?]^host()
         args.add(this_arg)
@@ -807,7 +807,7 @@ FACTORY_EXTRAS = """
         this.new_method_call(target, this.new_identifier("call"), args)
     }
 
-    procedure new_array_slice_call(this, array: ref[AstNode], start: int) returns ref[AstNode]
+    procedure new_array_slice_call(mutable this, array: ref[AstNode], start: int) returns ref[AstNode]
     {
         let args &Array[ref[AstNode]?]^host()
         if start <> 0
@@ -831,7 +831,7 @@ FACTORY_EXTRAS = """
         ctx.comment_range(node).pos < 0
     }
 
-    procedure update_outer_expression(this, outer_expression: ref[AstNode], expression: ref[AstNode]?) returns ref[AstNode]
+    procedure update_outer_expression(mutable this, mutable outer_expression: ref[AstNode], mutable expression: ref[AstNode]?) returns ref[AstNode]
     {
         let k outer_expression.kind
         if k = KindParenthesizedExpression
@@ -851,7 +851,7 @@ FACTORY_EXTRAS = """
         outer_expression
     }
 
-    procedure restore_outer_expressions(this, outer_expression: ref[AstNode]?, inner_expression: ref[AstNode]?, kinds: int) returns ref[AstNode]?
+    procedure restore_outer_expressions(mutable this, mutable outer_expression: ref[AstNode]?, mutable inner_expression: ref[AstNode]?, kinds: int) returns ref[AstNode]?
     {
         if outer_expression <> null
         {
@@ -866,7 +866,7 @@ FACTORY_EXTRAS = """
     }
 
     ; EnsureUseStrict: a `"use strict"` prologue unless the first statement is one.
-    procedure ensure_use_strict(this, statements: ref[Array[ref[AstNode]?]]) returns ref[Array[ref[AstNode]?]]
+    procedure ensure_use_strict(mutable this, statements: ref[Array[ref[AstNode]?]]) returns ref[Array[ref[AstNode]?]]
     {
         if (statements.get_length() as int) > 0
         {
@@ -939,7 +939,7 @@ FACTORY_EXTRAS = """
         null
     }
 
-    procedure get_name(this, node: ref[AstNode]?, emit_flags_in: int, allow_comments: bool, allow_source_maps: bool, ignore_assigned_name: bool) returns ref[AstNode]
+    procedure get_name(mutable this, mutable node: ref[AstNode]?, emit_flags_in: int, allow_comments: bool, allow_source_maps: bool, ignore_assigned_name: bool) returns ref[AstNode]
     {
         let node_name NodeFactory.name_of_declaration(node, ignore_assigned_name)
         if node_name <> null
@@ -956,25 +956,25 @@ FACTORY_EXTRAS = """
         this.new_generated_name_for_node(node as ref[AstNode])
     }
 
-    procedure get_local_name(this, node: ref[AstNode]?) returns ref[AstNode]
+    procedure get_local_name(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]
         this.get_name(node, EFLocalName, false, false, false)
 
-    procedure get_local_name_ex(this, node: ref[AstNode]?, allow_comments: bool, allow_source_maps: bool, ignore_assigned_name: bool) returns ref[AstNode]
+    procedure get_local_name_ex(mutable this, mutable node: ref[AstNode]?, allow_comments: bool, allow_source_maps: bool, ignore_assigned_name: bool) returns ref[AstNode]
         this.get_name(node, EFLocalName, allow_comments, allow_source_maps, ignore_assigned_name)
 
-    procedure get_export_name(this, node: ref[AstNode]?) returns ref[AstNode]
+    procedure get_export_name(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]
         this.get_name(node, EFExportName, false, false, false)
 
-    procedure get_export_name_ex(this, node: ref[AstNode]?, allow_comments: bool, allow_source_maps: bool, ignore_assigned_name: bool) returns ref[AstNode]
+    procedure get_export_name_ex(mutable this, mutable node: ref[AstNode]?, allow_comments: bool, allow_source_maps: bool, ignore_assigned_name: bool) returns ref[AstNode]
         this.get_name(node, EFExportName, allow_comments, allow_source_maps, ignore_assigned_name)
 
-    procedure get_declaration_name(this, node: ref[AstNode]?) returns ref[AstNode]
+    procedure get_declaration_name(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]
         this.get_name(node, EFNone, false, false, false)
 
-    procedure get_declaration_name_ex(this, node: ref[AstNode]?, allow_comments: bool, allow_source_maps: bool) returns ref[AstNode]
+    procedure get_declaration_name_ex(mutable this, mutable node: ref[AstNode]?, allow_comments: bool, allow_source_maps: bool) returns ref[AstNode]
         this.get_name(node, EFNone, allow_comments, allow_source_maps, false)
 
-    procedure get_namespace_member_name(this, ns: ref[AstNode], name_in: ref[AstNode], allow_comments: bool, allow_source_maps: bool) returns ref[AstNode]
+    procedure get_namespace_member_name(mutable this, mutable ns: ref[AstNode], mutable name_in: ref[AstNode], allow_comments: bool, allow_source_maps: bool) returns ref[AstNode]
     {
         let ctx this.the_context()
         var name name_in
@@ -1010,7 +1010,7 @@ FACTORY_EXTRAS = """
         false
     }
 
-    procedure get_external_module_or_namespace_export_name(this, ns: ref[AstNode]?, node: ref[AstNode], allow_comments: bool, allow_source_maps: bool) returns ref[AstNode]
+    procedure get_external_module_or_namespace_export_name(mutable this, mutable ns: ref[AstNode]?, mutable node: ref[AstNode], allow_comments: bool, allow_source_maps: bool) returns ref[AstNode]
     {
         if ns <> null
         {
@@ -1020,14 +1020,14 @@ FACTORY_EXTRAS = """
         this.get_export_name_ex(node, allow_comments, allow_source_maps, false)
     }
 
-    procedure new_unscoped_helper_name(this, name: Slice[char]) returns ref[AstNode]
+    procedure new_unscoped_helper_name(mutable this, mutable name: Slice[char]) returns ref[AstNode]
     {
         let node this.new_identifier(name)
         this.the_context().set_emit_flags(node, EFHelperName)
         node
     }
 
-    procedure helper_call(this, name: Slice[char], args: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
+    procedure helper_call(mutable this, mutable name: Slice[char], args: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
         this.new_call_expression(this.new_unscoped_helper_name(name), null, null, args, NodeFlagsNone)
 
     function list1(this, a: ref[AstNode]?) returns ref[Array[ref[AstNode]?]]
@@ -1054,7 +1054,7 @@ FACTORY_EXTRAS = """
         l
     }
 
-    procedure new_decorate_helper(this, decorator_expressions: ref[Array[ref[AstNode]?]], target: ref[AstNode], member_name: ref[AstNode]?, descriptor: ref[AstNode]?) returns ref[AstNode]
+    procedure new_decorate_helper(mutable this, decorator_expressions: ref[Array[ref[AstNode]?]], target: ref[AstNode], member_name: ref[AstNode]?, descriptor: ref[AstNode]?) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.decorate_helper)
@@ -1070,14 +1070,14 @@ FACTORY_EXTRAS = """
         this.helper_call("__decorate", args)
     }
 
-    procedure new_metadata_helper(this, metadata_key: Slice[char], metadata_value: ref[AstNode]) returns ref[AstNode]
+    procedure new_metadata_helper(mutable this, metadata_key: Slice[char], metadata_value: ref[AstNode]) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.metadata_helper)
         this.helper_call("__metadata", this.list2(this.new_string_literal(metadata_key, TokenFlagsNone), metadata_value))
     }
 
-    procedure new_param_helper(this, expression: ref[AstNode], parameter_offset: int, location: TextRange) returns ref[AstNode]
+    procedure new_param_helper(mutable this, mutable expression: ref[AstNode], parameter_offset: int, location: TextRange) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.param_helper)
@@ -1089,7 +1089,7 @@ FACTORY_EXTRAS = """
         helper
     }
 
-    procedure new_add_disposable_resource_helper(this, env_binding: ref[AstNode], value: ref[AstNode], async: bool) returns ref[AstNode]
+    procedure new_add_disposable_resource_helper(mutable this, env_binding: ref[AstNode], value: ref[AstNode], async: bool) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.add_disposable_resource_helper)
@@ -1099,7 +1099,7 @@ FACTORY_EXTRAS = """
         this.helper_call("__addDisposableResource", this.list3(env_binding, value, this.new_keyword_expression(flag)))
     }
 
-    procedure new_dispose_resources_helper(this, env_binding: ref[AstNode]) returns ref[AstNode]
+    procedure new_dispose_resources_helper(mutable this, env_binding: ref[AstNode]) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.dispose_resources_helper)
@@ -1107,7 +1107,7 @@ FACTORY_EXTRAS = """
     }
 
     ; The private-identifier kinds are the strings "f", "m", "a", "untransformed".
-    procedure new_class_private_field_get_helper(this, receiver: ref[AstNode], state: ref[AstNode], kind: Slice[char], fn: ref[AstNode]?) returns ref[AstNode]
+    procedure new_class_private_field_get_helper(mutable this, mutable receiver: ref[AstNode], mutable state: ref[AstNode], mutable kind: Slice[char], fn: ref[AstNode]?) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.class_private_field_get_helper)
@@ -1117,7 +1117,7 @@ FACTORY_EXTRAS = """
         this.helper_call("__classPrivateFieldGet", args)
     }
 
-    procedure new_class_private_field_set_helper(this, receiver: ref[AstNode], state: ref[AstNode], value: ref[AstNode], kind: Slice[char], fn: ref[AstNode]?) returns ref[AstNode]
+    procedure new_class_private_field_set_helper(mutable this, mutable receiver: ref[AstNode], mutable state: ref[AstNode], mutable value: ref[AstNode], kind: Slice[char], fn: ref[AstNode]?) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.class_private_field_set_helper)
@@ -1128,27 +1128,27 @@ FACTORY_EXTRAS = """
         this.helper_call("__classPrivateFieldSet", args)
     }
 
-    procedure new_class_private_field_in_helper(this, state: ref[AstNode], receiver: ref[AstNode]) returns ref[AstNode]
+    procedure new_class_private_field_in_helper(mutable this, state: ref[AstNode], receiver: ref[AstNode]) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.class_private_field_in_helper)
         this.helper_call("__classPrivateFieldIn", this.list2(state, receiver))
     }
 
-    procedure new_object_define_property_call(this, target: ref[AstNode], name: ref[AstNode], descriptor: ref[AstNode]) returns ref[AstNode]
+    procedure new_object_define_property_call(mutable this, target: ref[AstNode], name: ref[AstNode], descriptor: ref[AstNode]) returns ref[AstNode]
         this.new_call_expression(this.new_property_access_expression(this.new_identifier("Object"), null, this.new_identifier("defineProperty"), NodeFlagsNone), null, null, this.list3(target, name, descriptor), NodeFlagsNone)
 
-    procedure new_reflect_get_call(this, target: ref[AstNode], property_key: ref[AstNode], receiver: ref[AstNode]) returns ref[AstNode]
+    procedure new_reflect_get_call(mutable this, target: ref[AstNode], property_key: ref[AstNode], receiver: ref[AstNode]) returns ref[AstNode]
         this.new_call_expression(this.new_property_access_expression(this.new_identifier("Reflect"), null, this.new_identifier("get"), NodeFlagsNone), null, null, this.list3(target, property_key, receiver), NodeFlagsNone)
 
-    procedure new_reflect_set_call(this, target: ref[AstNode], property_key: ref[AstNode], value: ref[AstNode], receiver: ref[AstNode]) returns ref[AstNode]
+    procedure new_reflect_set_call(mutable this, mutable target: ref[AstNode], mutable property_key: ref[AstNode], mutable value: ref[AstNode], receiver: ref[AstNode]) returns ref[AstNode]
     {
         let args this.list3(target, property_key, value)
         args.add(receiver)
         this.new_call_expression(this.new_property_access_expression(this.new_identifier("Reflect"), null, this.new_identifier("set"), NodeFlagsNone), null, null, args, NodeFlagsNone)
     }
 
-    procedure new_function_bind_call(this, target: ref[AstNode], this_arg: ref[AstNode], arguments_list: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
+    procedure new_function_bind_call(mutable this, target: ref[AstNode], mutable this_arg: ref[AstNode], arguments_list: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
     {
         let args this.list1(this_arg)
         var i 0
@@ -1160,7 +1160,7 @@ FACTORY_EXTRAS = """
         this.new_method_call(target, this.new_identifier("bind"), args)
     }
 
-    procedure new_immediately_invoked_arrow_function(this, statements: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
+    procedure new_immediately_invoked_arrow_function(mutable this, statements: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
     {
         let no_params &Array[ref[AstNode]?]^host()
         let arrow this.new_arrow_function(null, null, no_params, null, null, this.new_token(KindEqualsGreaterThanToken), this.new_block(statements, true))
@@ -1168,27 +1168,27 @@ FACTORY_EXTRAS = """
         this.new_call_expression(this.new_parenthesized_expression(arrow), null, null, no_args, NodeFlagsNone)
     }
 
-    procedure new_export_default(this, expression: ref[AstNode]) returns ref[AstNode]
+    procedure new_export_default(mutable this, expression: ref[AstNode]) returns ref[AstNode]
         this.new_export_assignment(null, false, null, expression)
 
-    procedure new_external_module_export(this, name: ref[AstNode]) returns ref[AstNode]
+    procedure new_external_module_export(mutable this, name: ref[AstNode]) returns ref[AstNode]
     {
         let specifier this.new_export_specifier(false, null, name)
         let named_exports this.new_named_exports(this.list1(specifier))
         this.new_export_declaration(null, false, named_exports, null, null)
     }
 
-    procedure new_assign_helper(this, attributes_segments: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
+    procedure new_assign_helper(mutable this, attributes_segments: ref[Array[ref[AstNode]?]]) returns ref[AstNode]
         this.new_call_expression(this.new_property_access_expression(this.new_identifier("Object"), null, this.new_identifier("assign"), NodeFlagsNone), null, null, attributes_segments, NodeFlagsNone)
 
-    procedure new_await_helper(this, expression: ref[AstNode]) returns ref[AstNode]
+    procedure new_await_helper(mutable this, expression: ref[AstNode]) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.await_helper)
         this.helper_call("__await", this.list1(expression))
     }
 
-    procedure new_async_generator_helper(this, generator_func: ref[AstNode], has_lexical_this: bool) returns ref[AstNode]
+    procedure new_async_generator_helper(mutable this, mutable generator_func: ref[AstNode], has_lexical_this: bool) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.await_helper)
@@ -1200,7 +1200,7 @@ FACTORY_EXTRAS = """
         this.helper_call("__asyncGenerator", this.list3(this_arg, this.new_identifier("arguments"), generator_func))
     }
 
-    procedure new_async_delegator_helper(this, expression: ref[AstNode]) returns ref[AstNode]
+    procedure new_async_delegator_helper(mutable this, expression: ref[AstNode]) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.await_helper)
@@ -1208,14 +1208,14 @@ FACTORY_EXTRAS = """
         this.helper_call("__asyncDelegator", this.list1(expression))
     }
 
-    procedure new_async_values_helper(this, expression: ref[AstNode]) returns ref[AstNode]
+    procedure new_async_values_helper(mutable this, expression: ref[AstNode]) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.async_values_helper)
         this.helper_call("__asyncValues", this.list1(expression))
     }
 
-    procedure new_awaiter_helper(this, has_lexical_this: bool, arguments_expression: ref[AstNode]?, parameters: ref[Array[ref[AstNode]?]]?, body: ref[AstNode]) returns ref[AstNode]
+    procedure new_awaiter_helper(mutable this, has_lexical_this: bool, arguments_expression: ref[AstNode]?, mutable parameters: ref[Array[ref[AstNode]?]]?, mutable body: ref[AstNode]) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.awaiter_helper)
@@ -1235,7 +1235,7 @@ FACTORY_EXTRAS = """
         this.helper_call("__awaiter", args)
     }
 
-    procedure new_es_decorate_class_context_object(this, name_expr: ref[AstNode]?, metadata: ref[AstNode]?) returns ref[AstNode]
+    procedure new_es_decorate_class_context_object(mutable this, name_expr: ref[AstNode]?, metadata: ref[AstNode]?) returns ref[AstNode]
     {
         let props this.list3(
             this.new_property_assignment(null, this.new_identifier("kind"), null, null, this.new_string_literal("class", TokenFlagsNone)),
@@ -1244,14 +1244,14 @@ FACTORY_EXTRAS = """
         this.new_object_literal_expression(props, false)
     }
 
-    procedure es_decorate_accessor(this, name_computed: bool, name_expr: ref[AstNode]?) returns ref[AstNode]
+    procedure es_decorate_accessor(mutable this, name_computed: bool, name_expr: ref[AstNode]?) returns ref[AstNode]
     {
         if name_computed
             return this.new_element_access_expression(this.new_identifier("obj"), null, name_expr, NodeFlagsNone)
         this.new_property_access_expression(this.new_identifier("obj"), null, name_expr, NodeFlagsNone)
     }
 
-    procedure new_es_decorate_class_element_access_get_method(this, name_computed: bool, name_expr: ref[AstNode]?) returns ref[AstNode]
+    procedure new_es_decorate_class_element_access_get_method(mutable this, name_computed: bool, name_expr: ref[AstNode]?) returns ref[AstNode]
     {
         let accessor this.es_decorate_accessor(name_computed, name_expr)
         let obj_param this.new_parameter_declaration(null, null, this.new_identifier("obj"), null, null, null)
@@ -1259,7 +1259,7 @@ FACTORY_EXTRAS = """
         this.new_property_assignment(null, this.new_identifier("get"), null, null, arrow)
     }
 
-    procedure new_es_decorate_class_element_access_set_method(this, name_computed: bool, name_expr: ref[AstNode]?) returns ref[AstNode]
+    procedure new_es_decorate_class_element_access_set_method(mutable this, name_computed: bool, name_expr: ref[AstNode]?) returns ref[AstNode]
     {
         let accessor this.es_decorate_accessor(name_computed, name_expr)
         let assignment this.new_assignment_expression(accessor, this.new_identifier("value"))
@@ -1271,7 +1271,7 @@ FACTORY_EXTRAS = """
         this.new_property_assignment(null, this.new_identifier("set"), null, null, arrow)
     }
 
-    procedure new_es_decorate_class_element_access_has_method(this, name_computed: bool, name_expr: ref[AstNode]?) returns ref[AstNode]
+    procedure new_es_decorate_class_element_access_has_method(mutable this, name_computed: bool, name_expr: ref[AstNode]?) returns ref[AstNode]
     {
         var property_name name_expr
         if name_computed = false
@@ -1288,7 +1288,7 @@ FACTORY_EXTRAS = """
         this.new_property_assignment(null, this.new_identifier("has"), null, null, arrow)
     }
 
-    procedure new_es_decorate_class_element_access_object(this, name_computed: bool, name_expr: ref[AstNode]?, has_get: bool, has_set: bool) returns ref[AstNode]
+    procedure new_es_decorate_class_element_access_object(mutable this, name_computed: bool, mutable name_expr: ref[AstNode]?, has_get: bool, has_set: bool) returns ref[AstNode]
     {
         let access_props this.list1(this.new_es_decorate_class_element_access_has_method(name_computed, name_expr))
         if has_get
@@ -1298,7 +1298,7 @@ FACTORY_EXTRAS = """
         this.new_object_literal_expression(access_props, false)
     }
 
-    procedure new_es_decorate_class_element_context_object(this, kind: Slice[char], name_computed: bool, name_expr: ref[AstNode]?, is_static: bool, is_private: bool, has_get: bool, has_set: bool, metadata: ref[AstNode]?) returns ref[AstNode]
+    procedure new_es_decorate_class_element_context_object(mutable this, mutable kind: Slice[char], name_computed: bool, mutable name_expr: ref[AstNode]?, is_static: bool, is_private: bool, has_get: bool, has_set: bool, metadata: ref[AstNode]?) returns ref[AstNode]
     {
         var name_value name_expr
         if name_computed = false
@@ -1327,7 +1327,7 @@ FACTORY_EXTRAS = """
         this.new_object_literal_expression(props, false)
     }
 
-    procedure new_es_decorate_helper(this, ctor: ref[AstNode], descriptor_in: ref[AstNode], decorators: ref[AstNode], context_in: ref[AstNode], initializers: ref[AstNode], extra_initializers: ref[AstNode]) returns ref[AstNode]
+    procedure new_es_decorate_helper(mutable this, mutable ctor: ref[AstNode], mutable descriptor_in: ref[AstNode], mutable decorators: ref[AstNode], context_in: ref[AstNode], initializers: ref[AstNode], extra_initializers: ref[AstNode]) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.es_decorate_helper)
@@ -1338,7 +1338,7 @@ FACTORY_EXTRAS = """
         this.helper_call("__esDecorate", args)
     }
 
-    procedure new_run_initializers_helper(this, this_arg: ref[AstNode], initializers: ref[AstNode], value: ref[AstNode]?) returns ref[AstNode]
+    procedure new_run_initializers_helper(mutable this, mutable this_arg: ref[AstNode], mutable initializers: ref[AstNode], value: ref[AstNode]?) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.run_initializers_helper)
@@ -1348,21 +1348,21 @@ FACTORY_EXTRAS = """
         this.helper_call("__runInitializers", args)
     }
 
-    procedure new_template_object_helper(this, cooked_array: ref[AstNode], raw_array: ref[AstNode]) returns ref[AstNode]
+    procedure new_template_object_helper(mutable this, cooked_array: ref[AstNode], raw_array: ref[AstNode]) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.make_template_object_helper)
         this.helper_call("__makeTemplateObject", this.list2(cooked_array, raw_array))
     }
 
-    procedure new_prop_key_helper(this, expr: ref[AstNode]) returns ref[AstNode]
+    procedure new_prop_key_helper(mutable this, expr: ref[AstNode]) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.prop_key_helper)
         this.helper_call("__propKey", this.list1(expr))
     }
 
-    procedure new_set_function_name_helper(this, fn: ref[AstNode], name: ref[AstNode], prefix: Slice[char]) returns ref[AstNode]
+    procedure new_set_function_name_helper(mutable this, mutable fn: ref[AstNode], mutable name: ref[AstNode], prefix: Slice[char]) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.set_function_name_helper)
@@ -1372,28 +1372,28 @@ FACTORY_EXTRAS = """
         this.helper_call("__setFunctionName", args)
     }
 
-    procedure new_import_default_helper(this, expression: ref[AstNode]) returns ref[AstNode]
+    procedure new_import_default_helper(mutable this, expression: ref[AstNode]) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.import_default_helper)
         this.helper_call("__importDefault", this.list1(expression))
     }
 
-    procedure new_import_star_helper(this, expression: ref[AstNode]) returns ref[AstNode]
+    procedure new_import_star_helper(mutable this, expression: ref[AstNode]) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.import_star_helper)
         this.helper_call("__importStar", this.list1(expression))
     }
 
-    procedure new_export_star_helper(this, module_expression: ref[AstNode], exports_expression: ref[AstNode]) returns ref[AstNode]
+    procedure new_export_star_helper(mutable this, module_expression: ref[AstNode], exports_expression: ref[AstNode]) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.export_star_helper)
         this.helper_call("__exportStar", this.list2(module_expression, exports_expression))
     }
 
-    procedure new_assignment_target_wrapper(this, param_name: ref[AstNode], expression: ref[AstNode]) returns ref[AstNode]
+    procedure new_assignment_target_wrapper(mutable this, param_name: ref[AstNode], expression: ref[AstNode]) returns ref[AstNode]
     {
         let param this.new_parameter_declaration(null, null, param_name, null, null, null)
         let body this.new_block(this.list1(this.new_expression_statement(expression)), false)
@@ -1402,7 +1402,7 @@ FACTORY_EXTRAS = """
         this.new_property_access_expression(this.new_parenthesized_expression(obj_literal), null, this.new_identifier("value"), NodeFlagsNone)
     }
 
-    procedure new_rewrite_relative_import_extensions_helper(this, first_argument: ref[AstNode], preserve_jsx: bool) returns ref[AstNode]
+    procedure new_rewrite_relative_import_extensions_helper(mutable this, mutable first_argument: ref[AstNode], preserve_jsx: bool) returns ref[AstNode]
     {
         let ctx this.the_context()
         ctx.request_emit_helper(ctx.helpers.rewrite_relative_import_extensions_helper)
@@ -1468,7 +1468,7 @@ define NodeFactory
 
     ; newNode: raw region memory, every slot set (AstNode.alloc zero-fills nothing),
     ; the location undefined (-1, -1), then the context's OnCreate.
-    procedure new_node(this, kind: int, data: NodeData) returns ref[AstNode]
+    procedure new_node(mutable this, kind: int, data: NodeData) returns ref[AstNode]
     {
         let n AstNode.alloc(host)
         set n.kind: kind as i16
@@ -1492,13 +1492,13 @@ define NodeFactory
     ; context records the original.
     ; `list.Loc = range` on a synthesized list: the transformers give a new
     ; statement list the source range of the one it replaces (slice 238)
-    procedure set_list_range(this, list: ref[Array[ref[AstNode]?]], pos: int, end: int)
+    procedure set_list_range(mutable this, list: ref[Array[ref[AstNode]?]], pos: int, end: int)
     {
         if list_ranges <> null
             (list_ranges as ref[Array[ListRange]]).add(ListRange(list, pos as i32, end as i32))
     }
 
-    procedure update_node(this, updated: ref[AstNode], original: ref[AstNode]) returns ref[AstNode]
+    procedure update_node(mutable this, mutable updated: ref[AstNode], original: ref[AstNode]) returns ref[AstNode]
     {
         if updated <> original
         {
@@ -1513,7 +1513,7 @@ define NodeFactory
 
     ; UpdateSourceFile (ast.go, hand-written in the reference): a copy of the
     ; node carrying the new statement list and token, else the node itself
-    procedure update_source_file(this, node: ref[AstNode], statements: ref[Array[ref[AstNode]?]]?, end_of_file_token: ref[AstNode]?) returns ref[AstNode]
+    procedure update_source_file(mutable this, mutable node: ref[AstNode], statements: ref[Array[ref[AstNode]?]]?, end_of_file_token: ref[AstNode]?) returns ref[AstNode]
     {
         choose node.data
             when sf: SourceFile
@@ -1533,7 +1533,7 @@ define NodeFactory
         node
     }
 
-    procedure clone_node(this, updated: ref[AstNode], original: ref[AstNode]) returns ref[AstNode]
+    procedure clone_node(mutable this, mutable updated: ref[AstNode], original: ref[AstNode]) returns ref[AstNode]
     {
         this.update_node(updated, original)
         if updated <> original
@@ -1546,7 +1546,7 @@ define NodeFactory
 
     ; NewNodeList over a list the visitor rebuilt: a fresh Array with the same
     ; elements' extent as `like` (`list.Loc = nodes.Loc`), recorded in the file's table.
-    procedure new_node_list_like(this, nodes: ref[Array[ref[AstNode]?]], like: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]
+    procedure new_node_list_like(mutable this, nodes: ref[Array[ref[AstNode]?]], like: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]
     {
         if list_ranges <> null
         {
@@ -1586,7 +1586,7 @@ define NodeFactory
     }
 
     ; SetParentInChildren, over the port's child enumerator.
-    procedure set_parent_in_children(node: ref[AstNode])
+    procedure set_parent_in_children(mutable node: ref[AstNode])
     {
         var i 0
         while true
@@ -1650,7 +1650,10 @@ for name in order:
     fn = snake(name)
     sig = ', '.join('%s: %s' % (a, b) for a, b in sparams)
     out('    ; New%s' % name)
-    out('    procedure new_%s(this%s) returns ref[AstNode]' % (fn, (', ' + sig) if sig else ''))
+    # R1 `mutable` marks (tools/purify/mark.py off the write census): a constructor
+    # writes only its factory; an update also hands every child to update_node
+    # through the new node, and the census counts that as a write of the child
+    out('    procedure new_%s(mutable this%s) returns ref[AstNode]' % (fn, (', ' + sig) if sig else ''))
     out('    {')
     body = 'NodeData.%s(%s(%s))'
     def ctor(arm):
@@ -1685,9 +1688,10 @@ for name in order:
     if name in updates:
         cond = updates[name]
         cmp_params = re.findall(r'(\w+) != node\.(\w+)', cond)
-        usig = ', '.join('%s: %s' % (a, b) for a, b in sparams if a != 'kind')
+        usig = ', '.join('%s%s: %s' % ('mutable ' if b.startswith('ref[') else '', a, b)
+                         for a, b in sparams if a != 'kind')
         out('    ; Update%s' % name)
-        out('    procedure update_%s(this, node: ref[AstNode]%s) returns ref[AstNode]' % (fn, (', ' + usig) if usig else ''))
+        out('    procedure update_%s(mutable this, node: ref[AstNode]%s) returns ref[AstNode]' % (fn, (', ' + usig) if usig else ''))
         out('    {')
         callargs = ', '.join(['node.kind' if a == 'kind' else a for a, _ in sparams])
         out('        choose node.data')
@@ -1724,7 +1728,7 @@ for name in order:
 # the hand-written printer/factory.go block, then clone (both inside NodeFactory)
 out(FACTORY_EXTRAS)
 out("""    ; Clone, per kind (generated): a new node over the same children, then cloneNode.
-    procedure clone(this, node: ref[AstNode]) returns ref[AstNode]
+    procedure clone(mutable this, mutable node: ref[AstNode]) returns ref[AstNode]
     {
         choose node.data""")
 cloned_arms = set()
@@ -1782,7 +1786,7 @@ define NodeVisitor
         &NodeVisitor^host(host, factory, visit_tag, hooks_tag, false, null, null, 0)
 
     ; VisitEachChild: the per-kind dispatch (generated).
-    procedure visit_each_child(this, node: ref[AstNode]?) returns ref[AstNode]?
+    procedure visit_each_child(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]?
     {
         if node = null
             return null
