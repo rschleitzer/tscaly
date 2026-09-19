@@ -156,7 +156,7 @@ FACTORY_TAIL = """
     ; ── visitor.go, hand-written ─────────────────────────────────────────────
 
     ; The `Visit` callback (§3.18: the tag is the func value).
-    procedure visit(mutable this, mutable node: ref[AstNode]) returns ref[AstNode]?
+    procedure visit(mutable this, mutable node: ref[AstNode]) returns ref[AstNode]? io
     {
         if visit_tag = VisitTagDeepClone
             return this.deep_clone_visit(node)
@@ -172,7 +172,7 @@ FACTORY_TAIL = """
     }
 
     ; VisitNode: the callback, and a one-element SyntaxList unwrapped.
-    procedure visit_node(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]?
+    procedure visit_node(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]? io
     {
         if node = null
             return null
@@ -202,7 +202,7 @@ FACTORY_TAIL = """
     }
 
     ; VisitEmbeddedStatement: the callback, lifted to a block when it answers several.
-    procedure visit_embedded_statement(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]?
+    procedure visit_embedded_statement(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]? io
     {
         if node = null
             return null
@@ -215,7 +215,7 @@ FACTORY_TAIL = """
     }
 
     ; VisitNodes: a rebuilt list keeps the original's extent.
-    procedure visit_nodes(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    procedure visit_nodes(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]? io
     {
         if nodes = null
             return nodes
@@ -228,12 +228,12 @@ FACTORY_TAIL = """
         nodes
     }
 
-    procedure visit_modifiers(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    procedure visit_modifiers(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]? io
         this.visit_nodes(nodes)
 
     ; VisitSlice: the first element the callback changes or drops starts a copy;
     ; a SyntaxList answer splices its children in.
-    procedure visit_slice(mutable this, mutable nodes: ref[Array[ref[AstNode]?]], mutable changed: ref[bool]) returns ref[Array[ref[AstNode]?]]
+    procedure visit_slice(mutable this, mutable nodes: ref[Array[ref[AstNode]?]], mutable changed: ref[bool]) returns ref[Array[ref[AstNode]?]] io
     {
         set changed: false
         let n nodes.get_length() as int
@@ -310,55 +310,55 @@ FACTORY_TAIL = """
 
     ; ── the hook-aware forms VisitEachChild calls (visitor.go's lowercase ones) ──
 
-    procedure visit_node_h(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]?
+    procedure visit_node_h(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]? io
         this.visit_node(node)
 
-    procedure visit_embedded_statement_h(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]?
+    procedure visit_embedded_statement_h(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]? io
     {
         if hooks_tag = HooksTagEmitContext
             return (context as ref[EmitContext]).visit_embedded_statement(node, this)
         this.visit_embedded_statement(node)
     }
 
-    procedure visit_iteration_body_h(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]?
+    procedure visit_iteration_body_h(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]? io
     {
         if hooks_tag = HooksTagEmitContext
             return (context as ref[EmitContext]).visit_iteration_body(node, this)
         this.visit_embedded_statement_h(node)
     }
 
-    procedure visit_function_body_h(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]?
+    procedure visit_function_body_h(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]? io
     {
         if hooks_tag = HooksTagEmitContext
             return (context as ref[EmitContext]).visit_function_body(node, this)
         this.visit_node_h(node)
     }
 
-    procedure visit_token_h(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]?
+    procedure visit_token_h(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]? io
         this.visit_node(node)
 
-    procedure visit_nodes_h(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    procedure visit_nodes_h(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]? io
     {
         if hooks_tag = HooksTagDeepClone
             return this.deep_clone_visit_nodes(nodes)
         this.visit_nodes(nodes)
     }
 
-    procedure visit_modifiers_h(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    procedure visit_modifiers_h(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]? io
     {
         if hooks_tag = HooksTagDeepClone
             return this.deep_clone_visit_nodes(nodes)
         this.visit_modifiers(nodes)
     }
 
-    procedure visit_parameters_h(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    procedure visit_parameters_h(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]? io
     {
         if hooks_tag = HooksTagEmitContext
             return (context as ref[EmitContext]).visit_parameters(nodes, this)
         this.visit_nodes_h(nodes)
     }
 
-    procedure visit_top_level_statements_h(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    procedure visit_top_level_statements_h(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]? io
     {
         if hooks_tag = HooksTagEmitContext
             return (context as ref[EmitContext]).visit_variable_environment(nodes, this)
@@ -370,7 +370,7 @@ FACTORY_TAIL = """
     ; The deep-clone callback: a node whose children changed is the rebuilt
     ; one; a leaf is cloned outright, and the clones cascade up through the
     ; updaters. A synthetic location is (-1, -1).
-    procedure deep_clone_visit(mutable this, mutable node: ref[AstNode]) returns ref[AstNode]?
+    procedure deep_clone_visit(mutable this, mutable node: ref[AstNode]) returns ref[AstNode]? io
     {
         let visited this.visit_each_child(node)
         if visited <> null
@@ -399,7 +399,7 @@ FACTORY_TAIL = """
     ; Array over the same elements, same extent); with synthetic locations the
     ; list has no extent and a trailing comma is kept as the last element's
     ; (-2, -2) location, exactly the reference's marker.
-    procedure deep_clone_visit_nodes(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    procedure deep_clone_visit_nodes(mutable this, mutable nodes: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]? io
     {
         if nodes = null
             return null
@@ -452,10 +452,10 @@ define DeepClone
         v
     }
 
-    procedure deep_clone_node(host: ref[Page], mutable f: ref[NodeFactory], mutable node: ref[AstNode]?) returns ref[AstNode]?
+    procedure deep_clone_node(host: ref[Page], mutable f: ref[NodeFactory], mutable node: ref[AstNode]?) returns ref[AstNode]? io
         DeepClone.visitor(host, f, true).visit_node(node)
 
-    procedure deep_clone_reparse(host: ref[Page], mutable f: ref[NodeFactory], mutable node_in: ref[AstNode]?) returns ref[AstNode]?
+    procedure deep_clone_reparse(host: ref[Page], mutable f: ref[NodeFactory], mutable node_in: ref[AstNode]?) returns ref[AstNode]? io
     {
         if node_in = null
             return null
@@ -468,7 +468,7 @@ define DeepClone
         n
     }
 
-    procedure deep_clone_reparse_modifiers(host: ref[Page], mutable f: ref[NodeFactory], mutable modifiers: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]?
+    procedure deep_clone_reparse_modifiers(host: ref[Page], mutable f: ref[NodeFactory], mutable modifiers: ref[Array[ref[AstNode]?]]?) returns ref[Array[ref[AstNode]?]]? io
         DeepClone.visitor(host, f, false).visit_modifiers(modifiers)
 }
 """
@@ -1786,7 +1786,7 @@ define NodeVisitor
         &NodeVisitor^host(host, factory, visit_tag, hooks_tag, false, null, null, 0)
 
     ; VisitEachChild: the per-kind dispatch (generated).
-    procedure visit_each_child(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]?
+    procedure visit_each_child(mutable this, mutable node: ref[AstNode]?) returns ref[AstNode]? io
     {
         if node = null
             return null
