@@ -1,0 +1,481 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; internal/modulespecifiers (compare.go, types.go, preferences.go, util.go,
+; specifiers.go) and the ModuleSpecifierGenerationHost the program answers
+; through (compiler/program.go's host methods, compiler/fileloader.go's
+; getDefaultResolutionModeForFile and getModeForUsageLocation, parser/references.go's
+; collectExternalModuleReferences for SourceFile.Imports(),
+; outputpaths/commonsourcedirectory.go). Ported in slice 253.
+;
+; ★ The generator's one non-editor caller is the node builder's
+; getSpecifierForModuleSymbol (the `import("./x")` of a declaration file), and
+; this file carries what that caller reaches. Not written, each because nothing
+; on that route calls it: GetNodeModulesPackageName, ProcessEntrypointEnding,
+; GetModuleSpecifier / UpdateModuleSpecifier (the language service's), and the
+; auto-import exclusion regexes (`forAutoImports` is false on the builder's route,
+; so IsExcludedByRegex never sees a pattern).
+;
+; ★★ THE HOST'S EMPTY ANSWERS ARE THE PROGRAM'S, NOT A SIMPLIFICATION. The symlink
+; cache holds directories only where the program followed a symlink (since slice 260
+; the program has symlinks: `ensure_symlink_cache`); redirect targets exist only where the
+; file loader deduplicated two copies of one package, which the port's program
+; does not; project references need a tsconfig, which the runner refuses too; the
+; global typings cache location is tsc's empty default. `paths`, `rootDirs` and
+; `baseUrl` never reach the program (the runner's unsupported list), so
+; compilerOptions.Paths is nil and RootDirs empty, and the typesVersions path
+; mapping — tryGetModuleNameFromPaths' one caller left — is the resolver's said
+; stop `module-types-versions` here as well.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use tscaly.ast.*
+use tscaly.binder.Binder
+use tscaly.parser.Parser
+use tscaly.checker.Checker
+use tscaly.program.*
+use tscaly.emitter.EmitOptions
+use tscaly.emitter.Transformer
+
+; types.go
+define SpecifierResultKindNone: int 0
+define SpecifierResultKindNodeModules: int 1
+define SpecifierResultKindPaths: int 2
+define SpecifierResultKindRedirect: int 3
+define SpecifierResultKindRelative: int 4
+define SpecifierResultKindAmbient: int 5
+
+define ImportSpecifierPreferenceNone: int 0
+define ImportSpecifierPreferenceShortest: int 1
+define ImportSpecifierPreferenceProjectRelative: int 2
+define ImportSpecifierPreferenceRelative: int 3
+define ImportSpecifierPreferenceNonRelative: int 4
+
+define ImportSpecifierEndingPreferenceNone: int 0
+define ImportSpecifierEndingPreferenceAuto: int 1
+define ImportSpecifierEndingPreferenceMinimal: int 2
+define ImportSpecifierEndingPreferenceIndex: int 3
+define ImportSpecifierEndingPreferenceJs: int 4
+
+define RelativePreferenceRelative: int 0
+define RelativePreferenceNonRelative: int 1
+define RelativePreferenceShortest: int 2
+define RelativePreferenceExternalNonRelative: int 3
+
+define SpecifierEndingMinimal: int 0
+define SpecifierEndingIndex: int 1
+define SpecifierEndingJsExtension: int 2
+define SpecifierEndingTsExtension: int 3
+
+define MatchingModeExact: int 0
+define MatchingModeDirectory: int 1
+define MatchingModePattern: int 2
+
+define ModulePath
+(
+    file_name: Slice[char]
+    is_in_node_modules: bool
+    is_redirect: bool
+)
+
+; specifiers.go's Info
+define SpecifierInfo
+(
+    use_case_sensitive_file_names: bool
+    importing_source_file_name: Slice[char]
+    source_directory: Slice[char]
+)
+
+; preferences.go's ModuleSpecifierPreferences; the reference's closure
+; getAllowedEndingsInPreferredOrder captured the user preferences, the importing
+; file and the old specifier, which ride here and are asked through
+; `allowed_endings_in_preferred_order`
+define SpecifierPreferences
+(
+    relative_preference: int
+    ending_preference: int
+    importing_file: ref[AstNode]
+    old_import_specifier: Slice[char]
+)
+
+define NodeModulePathParts
+(
+    ; false where the reference answers nil
+    found: bool
+    top_level_node_modules_index: int
+    top_level_package_name_index: int
+    package_root_index: int
+    file_name_index: int
+)
+
+define PackageJsonDirAttempt
+(
+    module_file_to_try: Slice[char]
+    package_root_path: Slice[char]
+    blocked_by_exports: bool
+    verbatim_from_exports: bool
+)
+
+define SpecifierHost
+(
+    host: ref[Page]
+    ; ★NULLABLE since slice 293: the file loader builds a SpecifierHost before any
+    ; checker exists (upstream's fileloader holds none), and every use below runs
+    ; at emit time, long after `set_checker`. The two the WALK reaches — the file's
+    ; name and whether it is a declaration or external module — are answered from
+    ; the table instead.
+    checker: ref[Checker]?
+    files: ref[ProgramFiles]
+    options: EmitOptions
+    current_directory: Slice[char]
+    import_files: ref[Array[ref[AstNode]?]]
+    import_lists: ref[Array[ref[Array[ref[AstNode]?]]?]]
+    common_source_directory_cache: Slice[char]
+    common_source_directory_known: bool
+    ; the program's KnownSymlinks (slice 260): directories by realpath — each
+    ; `symlink_reals[i]` has the symlinked directory `symlink_links[i]` (both with a
+    ; trailing separator); computed once
+    symlink_links: ref[Array[Slice[char]]]?
+    symlink_reals: ref[Array[Slice[char]]]?
+)
+{
+    procedure set_checker(mutable this, c: ref[Checker]) linked
+
+    function create(host: ref[Page], checker: ref[Checker]?, files: ref[ProgramFiles], options: EmitOptions) returns ref[SpecifierHost] linked
+
+    ; ── the host (compiler/program.go) ─────────────────────────────────────
+
+    ; the runner's virtual file system is case-sensitive (harnessutil)
+    function use_case_sensitive_file_names(this) returns bool linked
+
+    ; ProgramFiles' lookups fill its lazy path and directory indexes: every
+    ; one this host makes goes through enter_shared (slice 366, found by
+    ; --write-report's frozen mode), since checkers share the table
+    procedure file_exists(mutable this, path: Slice[char]) returns bool reads shared_lock linked
+
+    procedure locked_index_of_path(mutable this, path: Slice[char]) returns int reads shared_lock linked
+
+    procedure locked_text_of_path(mutable this, path: Slice[char]) @page true @direct true returns Slice[char] io reads shared_lock linked
+
+    procedure locked_directory_exists(mutable this, path: Slice[char]) returns bool reads shared_lock linked
+
+    procedure locked_real_path(mutable this, path: Slice[char]) @page true @direct true returns Slice[char] reads shared_lock linked
+
+    ; the importing file's name: its path in the program, else its binder's
+    procedure file_name_of(mutable this, file: ref[AstNode]) @page true @direct true returns Slice[char] linked
+
+    ; GetNearestAncestorDirectoryWithPackageJson: the package scope's directory
+    procedure get_nearest_ancestor_directory_with_package_json(mutable this, mutable dirname: Slice[char]) @page true @direct true returns Slice[char] io reads shared_lock linked
+
+    ; GetPackageJsonInfo: the scope of the package.json's directory, when the
+    ; scope IS that directory
+    procedure get_package_json_info(mutable this, mutable pkg_json_path: Slice[char]) @page true @direct true returns PackageJsonInfo io reads shared_lock linked
+
+    ; importSyntaxAffectsModuleResolution
+    function import_syntax_affects_module_resolution(this) returns bool linked
+
+    ; CompilerOptions.GetResolvePackageJsonExports / Imports: IsTrueOrUnknown
+    function get_resolve_package_json_exports(this) returns bool linked
+
+    function get_resolve_package_json_imports(this) returns bool linked
+
+    ; CompilerOptions.GetAllowImportingTsExtensions
+    function get_allow_importing_ts_extensions(this) returns bool linked
+
+    ; the emit format of a program file (formats[] is GetEmitModuleFormatOfFile)
+    function emit_module_format_of(this, file: ref[AstNode]) returns int linked
+
+    ; GetDefaultResolutionModeForFile: GetImpliedNodeFormatForEmitWorker when the
+    ; import syntax affects resolution
+    procedure get_default_resolution_mode_for_file(mutable this, file: ref[AstNode]) returns int linked
+
+    ; getModeForUsageLocation
+    procedure get_mode_for_usage_location(mutable this, file: ref[AstNode], usage: ref[AstNode]) returns int reads shared_lock linked
+
+    ; getEmitSyntaxForUsageLocationWorker
+    function get_emit_syntax_for_usage_location(this, file: ref[AstNode], usage: ref[AstNode]) returns int linked
+
+    ; ast.ShouldTransformImportCall
+    function should_transform_import_call(this, implied_node_format_for_emit: int) returns bool linked
+
+    ; GetResolvedModuleFromModuleSpecifier: the resolved file's name, empty when
+    ; unresolved (the port's resolver answers a table index)
+    procedure get_resolved_module_from_module_specifier(mutable this, file: ref[AstNode], module_specifier: ref[AstNode]) @page true @direct true returns Slice[char] io reads shared_lock linked
+
+    ; SourceFile.Imports() (parser/references.go collectExternalModuleReferences),
+    ; collected once per file
+    procedure imports_of(mutable this, mutable file: ref[AstNode]) @persists true returns ref[Array[ref[AstNode]?]] reads shared_lock linked
+
+    ; collectModuleReferences: the module name of an import or re-export, and
+    ; the imports inside an ambient module's body
+    procedure collect_module_references(this, file: ref[AstNode], node: ref[AstNode], in_ambient_module: bool, mutable out: ref[Array[ref[AstNode]?]]) linked
+
+    ; ast.ForEachDynamicImportOrRequireCall(file, includeTypeSpaceImports: true,
+    ; requireStringLiteralLikeArgument: true). The reference scans the TEXT for
+    ; `import`/`require` and asks GetNodeAtPosition for each hit; a hit resolves
+    ; to the innermost node that starts at or before it, which for an import call,
+    ; a require call and a literal import type is that node itself (their keyword
+    ; and callee are tokens, below KindFirstNode). A pre-order walk meets the same
+    ; nodes in the same order; the JSDoc of a JS file is walked where
+    ; GetNodeAtPosition would descend into it.
+    procedure for_each_dynamic_import_or_require_call(mutable this, file: ref[AstNode], mutable node: ref[AstNode], in_js: bool, mutable out: ref[Array[ref[AstNode]?]]) reads shared_lock linked
+
+    ; outputpaths.GetCommonSourceDirectory over the program's emittable
+    ; non-declaration files (Program.CommonSourceDirectory)
+    procedure common_source_directory(mutable this) @page true @direct true returns Slice[char] linked
+
+    ; ── tspath / stringutil / core, over Slice[char] ─────────────────────────
+
+    ; tspath.ToPath under a case-sensitive host
+    procedure to_path(mutable this, file_name: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; tspath.PathIsAbsolute
+    function path_is_absolute(path: Slice[char]) returns bool linked
+
+    ; PathIsBareSpecifier
+    function path_is_bare_specifier(path: Slice[char]) returns bool linked
+
+    ; CountPathComponents
+    function count_path_components(path: Slice[char]) returns int linked
+
+    function count_byte(s: Slice[char], c: int) returns int linked
+
+    ; tspath.Path.ContainsPath: equal, or a longer child with the parent as a
+    ; directory prefix
+    function path_contains_path(p: Slice[char], child: Slice[char]) returns bool linked
+
+    function contains_ignored_path(s: Slice[char]) returns bool linked
+
+    function contains_text(s: Slice[char], text: Slice[char]) returns bool linked
+
+    ; core.IndexAfter / strings.Index from a start
+    function index_of_text(s: Slice[char], text: Slice[char], start: int) returns int linked
+
+    function last_index_of_text(s: Slice[char], text: Slice[char]) returns int linked
+
+    ; tspath.FileExtensionIs: longer than the extension, and ending with it
+    function file_extension_is(path: Slice[char], ext: Slice[char]) returns bool linked
+
+    ; TryGetExtensionFromPath over extensionsToRemove
+    function try_get_extension_from_path(path: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; RemoveFileExtension
+    function remove_file_extension_of(path: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; HasTSFileExtension: .ts .tsx .d.ts .cts .d.cts .mts .d.mts
+    function has_ts_file_extension(path: Slice[char]) returns bool linked
+
+    ; HasJSFileExtension: .js .jsx .mjs .cjs
+    function has_js_file_extension(path: Slice[char]) returns bool linked
+
+    ; ExtensionsNotSupportingExtensionlessResolution
+    function extension_requires_extension(path: Slice[char]) returns bool linked
+
+    ; GetDeclarationFileExtension
+    procedure get_declaration_file_extension(mutable this, file_name: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; GetJSExtensionForDeclarationFileExtension
+    procedure get_js_extension_for_declaration_file_extension(this, ext: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; module.TryGetJSExtensionForFile
+    function try_get_js_extension_for_file(this, file_name: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; ChangeAnyExtension(path, ext, [pathExt], false)
+    procedure change_any_extension(mutable this, path: Slice[char], ext: Slice[char], path_ext: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; ChangeExtension (over extensionsToRemove)
+    procedure change_extension(mutable this, path: Slice[char], ext: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; ChangeFullExtension
+    procedure change_full_extension(mutable this, path: Slice[char], ext: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; tspath.GetRelativePathFromDirectory
+    procedure get_relative_path_from_directory(mutable this, from: Slice[char], to: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; ensurePathIsNonModuleName
+    procedure ensure_path_is_non_module_name(mutable this, path: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; getRelativePathIfInSameVolume
+    procedure get_relative_path_if_in_same_volume(mutable this, mutable path: Slice[char], mutable directory_path: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; tspath.ComparePaths for normalized absolute case-sensitive inputs: equal
+    ; after combining with the current directory and normalizing
+    procedure paths_equal(mutable this, a: Slice[char], b: Slice[char]) returns bool linked
+
+    ; tspath.ComparePaths' order: the roots case-insensitively, then the rest
+    procedure compare_paths(mutable this, a: Slice[char], b: Slice[char]) returns int linked
+
+    ; tspath.ContainsPath under a case-sensitive host
+    procedure contains_path(mutable this, parent: Slice[char], child: Slice[char]) returns bool linked
+
+    ; stringutil.HasPrefixAndSuffixWithoutOverlap (case-sensitive)
+    function has_prefix_and_suffix_without_overlap(s: Slice[char], prefix: Slice[char], suffix: Slice[char]) returns bool linked
+
+    ; replaceFirstStar
+    procedure replace_first_star(mutable this, s: Slice[char], replacement: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; module.GetPackageNameFromTypesPackageName: `@types/scope__name` → `@scope/name`
+    procedure get_package_name_from_types_package_name(mutable this, mangled_name: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; GetPackageNameFromDirectory is the language service's; not written
+
+    ; ── util.go ────────────────────────────────────────────────────────────
+
+    ; comparePathsByRedirect
+    procedure compare_paths_by_redirect(mutable this, a: ModulePath, b: ModulePath) returns int linked
+
+    ; TryGetRealFileNameForNonJSDeclarationFileName: `foo.d.json.ts` → `foo.json`
+    procedure try_get_real_file_name_for_non_js_declaration_file_name(mutable this, file_name: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; getJSExtensionForFile (the reference panics on an unsupported extension)
+    procedure get_js_extension_for_file(this, file_name: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; tryGetAnyFileFromPath: AllSupportedExtensions (the `node` and `json` extras
+    ; are neither Deferred nor JS, so GetSupportedExtensions drops them)
+    procedure try_get_any_file_from_path(mutable this, path: Slice[char]) returns bool reads shared_lock linked
+
+    ; packageJsonPathsAreEqual
+    procedure package_json_paths_are_equal(mutable this, a: Slice[char], b: Slice[char]) returns bool linked
+
+    function index_of_ending(endings: ref[Array[int]], ending: int) returns int linked
+
+    ; prefersTsExtension
+    function prefers_ts_extension(allowed_endings: ref[Array[int]]) returns bool linked
+
+    ; GetNodeModulePathParts: null when the path is no module file under node_modules
+    function get_node_module_path_parts(full_path: Slice[char]) @page true @direct true returns NodeModulePathParts linked
+
+    ; ── preferences.go ─────────────────────────────────────────────────────
+
+    ; shouldAllowImportingTsExtension
+    function should_allow_importing_ts_extension(this, from_file_name: Slice[char]) returns bool linked
+
+    ; usesExtensionsOnImports
+    procedure uses_extensions_on_imports(mutable this, mutable file: ref[AstNode]) returns bool reads shared_lock linked
+
+    ; inferPreference
+    procedure infer_preference(mutable this, resolution_mode: int, mutable file: ref[AstNode], module_resolution_is_node_next: bool) returns int reads shared_lock linked
+
+    function module_resolution_is_node_next(this) returns bool linked
+
+    ; getModuleSpecifierEndingPreference
+    procedure get_module_specifier_ending_preference(mutable this, pref: int, resolution_mode: int, mutable file: ref[AstNode]) returns int reads shared_lock linked
+
+    ; getPreferredEnding
+    procedure get_preferred_ending(mutable this, mutable prefs: SpecifierPreferences, resolution_mode_in: int) returns int reads shared_lock linked
+
+    ; GetAllowedEndingsInPreferredOrder
+    procedure allowed_endings_in_preferred_order(mutable this, mutable prefs: SpecifierPreferences, syntax_implied_node_format: int) returns ref[Array[int]] reads shared_lock linked
+
+    ; getModuleSpecifierPreferences
+    function get_module_specifier_preferences(this, specifier_preference: int, ending_preference: int, importing_file: ref[AstNode], old_import_specifier: Slice[char]) @page true @direct true returns SpecifierPreferences linked
+
+    ; ── specifiers.go ──────────────────────────────────────────────────────
+
+    ; GetModuleSpecifiers (forAutoImports false): the candidates, best first
+    procedure get_module_specifiers(mutable this, mutable module_symbol: ref[Symbol], mutable importing_file: ref[AstNode], specifier_preference: int, ending_preference: int, override_import_mode: int) returns ref[Array[Slice[char]]] io reads ordinal_lock linked
+
+    ; ast.GetSourceFileOfModule
+    procedure get_source_file_of_module(mutable this, module_symbol: ref[Symbol]) returns ref[AstNode]? linked
+
+    ; tryGetModuleNameFromAmbientModule
+    procedure try_get_module_name_from_ambient_module(mutable this, mutable module_symbol: ref[Symbol]) @page true @direct true returns Slice[char] io reads ordinal_lock linked
+
+    function is_module_with_string_literal_name(node: ref[AstNode]) returns bool linked
+
+    ; getInfo
+    procedure get_info(mutable this, importing_source_file_name: Slice[char]) @page true @direct true returns SpecifierInfo linked
+
+    ; getAllModulePathsWorker: the paths nearest the importing directory first
+    procedure get_all_module_paths_worker(mutable this, mutable info: SpecifierInfo, mutable imported_file_name: Slice[char]) returns ref[Array[ModulePath]] io reads shared_lock linked
+
+    ; slices.SortFunc(comparePathsByRedirect), an insertion sort
+    procedure sort_module_paths(mutable this, mutable paths: ref[Array[ModulePath]]) linked
+
+    ; GetEachFileNameOfModule (preferSymlinks: true). No redirects or project
+    ; references (the file header): the candidates are the paths the symlink cache
+    ; knows for an ancestor directory of the imported file (slice 260), then the
+    ; imported file's normalized name, filtered when ignored.
+    procedure get_each_file_name_of_module(mutable this, importing_file_name: Slice[char], imported_file_name: Slice[char]) returns ref[Array[ModulePath]] io reads shared_lock linked
+
+    ; tspath.StartsWithDirectory
+    function starts_with_directory(file_name: Slice[char], directory: Slice[char]) returns bool linked
+
+    ; Program.GetSymlinkCache: the resolutions that went through a symlink, then
+    ; each emitted file's nearest package.json's runtime dependencies resolved as
+    ; package directories
+    procedure ensure_symlink_cache(mutable this) io reads shared_lock linked
+
+    function slices_contain(list: ref[Array[Slice[char]]], s: Slice[char]) returns bool linked
+
+    ; the runtime dependency loop: skip a package whose directory (or @types one)
+    ; the cache already holds, else ResolvePackageDirectory(dep) and process it
+    procedure process_dependency_names(mutable this, package_directory: Slice[char], deps: ref[JsonValue]?) reads shared_lock linked
+
+    ; module.GetTypesPackageName: `@scope/name` → `@types/scope__name`
+    procedure get_types_package_name(mutable this, name: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    function has_symlink_directory(this, symlink_path: Slice[char]) returns bool linked
+
+    ; KnownSymlinks.ProcessResolution, the directory half (the files map has no
+    ; reader on the generator's route)
+    procedure process_symlink_resolution(mutable this, original_path: Slice[char], resolved_file_name: Slice[char]) linked
+
+    function take_components(host: ref[Page], parts: ref[Array[Slice[char]]], n: int) returns ref[Array[Slice[char]]] linked
+
+    function is_node_modules_or_scoped_package_directory(s: Slice[char]) returns bool linked
+
+    ; computeModuleSpecifiers (forAutoImport false)
+    procedure compute_module_specifiers(mutable this, mutable module_paths: ref[Array[ModulePath]], mutable importing_file: ref[AstNode], specifier_preference: int, ending_preference: int, override_import_mode: int) returns ref[Array[Slice[char]]] io reads shared_lock linked
+
+    ; getLocalModuleSpecifier. `paths` is nil and `rootDirs` empty under this
+    ; harness (the file header), so the relative path is computed directly and
+    ; the non-relative candidates come from package.json `imports` alone.
+    procedure get_local_module_specifier(mutable this, mutable module_file_name: Slice[char], mutable info: SpecifierInfo, import_mode: int, mutable preferences: SpecifierPreferences, paths_only: bool) @page true @direct true returns Slice[char] io reads shared_lock linked
+
+    ; processEnding; `with_host` false is the reference's nil host
+    procedure process_ending(mutable this, file_name: Slice[char], allowed_endings: ref[Array[int]], with_host: bool) @page true @direct true returns Slice[char] reads shared_lock linked
+
+    ; tryGetModuleNameAsNodeModule
+    procedure try_get_module_name_as_node_module(mutable this, mutable path_obj: ModulePath, info: SpecifierInfo, mutable importing_file: ref[AstNode], specifier_preference: int, ending_preference: int, package_name_only: bool, override_mode: int) @page true @direct true returns Slice[char] io reads shared_lock linked
+
+    ; tryDirectoryWithPackageJson
+    procedure try_directory_with_package_json(mutable this, parts: NodeModulePathParts, mutable path_obj: ModulePath, importing_file: ref[AstNode], override_mode: int, allowed_endings: ref[Array[int]]) @page true @direct true returns PackageJsonDirAttempt io reads shared_lock linked
+
+    ; tryGetModuleNameFromPaths: the key whose pattern, with its star filled from one
+    ; of the relative name's ending candidates, names the file; empty for none
+    procedure try_get_module_name_from_paths(mutable this, relative_to_base_url: Slice[char], paths: ref[JsonValue], allowed_endings: ref[Array[int]], mutable base_directory: Slice[char]) @page true @direct true returns Slice[char] reads shared_lock linked
+
+    ; validateEnding
+    procedure validate_specifier_ending(mutable this, ending: int, value: Slice[char], relative_to_base_url: Slice[char]) returns bool reads shared_lock linked
+
+    ; module.GetConditions (no customConditions, noDtsResolution unset)
+    procedure get_conditions(mutable this, resolution_mode_in: int) returns ref[Array[Slice[char]]] linked
+
+    ; the resolver's said stop, recorded on the checker like its own
+    procedure stop(mutable this, tag: Slice[char]) linked
+
+    ; tryGetModuleNameFromExports
+    procedure try_get_module_name_from_exports(mutable this, target_file_path: Slice[char], package_directory: Slice[char], package_name: Slice[char], mutable exports: ref[JsonValue], conditions: ref[Array[Slice[char]]]) @page true @direct true returns Slice[char] linked
+
+    ; tryGetModuleNameFromPackageJsonImports
+    procedure try_get_module_name_from_package_json_imports(mutable this, module_file_name: Slice[char], mutable source_directory: Slice[char], import_mode: int, prefer_ts_extension: bool) @page true @direct true returns Slice[char] io reads shared_lock linked
+
+    ; outputpaths.GetOutputJSFileNameWorker
+    procedure get_output_js_file_name(mutable this, input_file_name: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; outputpaths.GetOutputDeclarationFileNameWorker
+    procedure get_output_declaration_file_name(mutable this, input_file_name: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; getOutputPathWithoutChangingExtension
+    procedure get_output_path_without_changing_extension(mutable this, input_file_name: Slice[char], output_directory: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; tspath.GetDeclarationEmitExtensionForPath
+    procedure get_declaration_emit_extension_for_path(mutable this, path: Slice[char]) @page true @direct true returns Slice[char] linked
+
+    ; tryGetModuleNameFromExportsOrImports
+    procedure try_get_module_name_from_exports_or_imports(mutable this, target_file_path: Slice[char], package_directory: Slice[char], package_name: Slice[char], mutable exports: ref[JsonValue], conditions: ref[Array[Slice[char]]], mode: int, is_imports: bool, prefer_ts_extension: bool) @page true @direct true returns Slice[char] linked
+
+    function contains_condition(conditions: ref[Array[Slice[char]]], key: Slice[char]) returns bool linked
+}
