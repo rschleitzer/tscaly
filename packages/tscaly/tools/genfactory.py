@@ -445,7 +445,7 @@ define DeepClone
     host: ref[Page]
 )
 {
-    function visitor(host: ref[Page], f: ref[NodeFactory], synthetic_location: bool) returns ref[NodeVisitor]
+    procedure visitor(host: ref[Page], f: ref[NodeFactory], synthetic_location: bool) returns ref[NodeVisitor]
     {
         let v NodeVisitor.create(host, f, VisitTagDeepClone, HooksTagDeepClone)
         set v.synthetic_location: synthetic_location
@@ -480,13 +480,13 @@ FACTORY_EXTRAS = """
     function the_context(this) returns ref[EmitContext]
         context as ref[EmitContext]
 
-    function next_auto_id(this) returns int
+    procedure next_auto_id(this) returns int
         this.the_context().next_auto_id()
 
     ; The placeholder text of a generated identifier: `(auto@N)` or the
     ; original node's text or `(generated@N)`; the reference's N is a node id,
     ; this port's the node's address — never printed, only a key.
-    function placeholder_text(this, tag: Slice[char], n: int) returns Slice[char]
+    procedure placeholder_text(this, tag: Slice[char], n: int) returns Slice[char]
     {
         let b StringBuilder^host()
         b.append("(" as char)
@@ -1586,7 +1586,7 @@ define NodeFactory
     }
 
     ; SetParentInChildren, over the port's child enumerator.
-    function set_parent_in_children(node: ref[AstNode])
+    procedure set_parent_in_children(node: ref[AstNode])
     {
         var i 0
         while true
