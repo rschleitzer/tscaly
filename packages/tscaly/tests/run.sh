@@ -326,6 +326,17 @@ fi
 # ★ The check is a text scan and it is honest about that: it reads top-level
 # `define` lines, which is exactly what mangles without a namespace. Nested
 # concepts and generics are out of its reach and out of the hazard.
+#
+# ★★★ THE COMPILER REPORTS THIS CLASS SINCE 2026-09-20 (`Planner.check_layout_
+# collision#`, gate `tests/regress/xfail_record_layout_collision.scaly`), and
+# this scan STAYS — the two ask different questions. The compiler judges the
+# LAYOUT: it fires when both records are laid out in one compilation and their
+# field lists differ, and it stays silent where an explicit `use ns.Name`
+# disambiguates them, because that is a language feature. This scan judges the
+# DECLARATION, which for a port is the honest bar: two same-named top-level
+# records in one package are a porting mistake even when today's roots happen
+# not to lay both out, and a pair with the SAME field names would pass the
+# compiler's test and still be wrong here (TypeReferenceData was that pair).
 DUPES=$(grep -h '^define [A-Za-z_]' "$PKG"/0.1.0/tscaly/*.scaly \
         | awk '{print $2}' | sed 's/\[.*//' | grep -v ':' | sort | uniq -d)
 if [ -n "$DUPES" ]; then
