@@ -40,7 +40,8 @@ def snake(n):
 ast_src = open(AST, encoding='utf-8').read()
 records = {}
 for m in re.finditer(r'\ndefine (\w+Data)\s*\n\((.*?)\n\)', ast_src, re.S):
-    records[m.group(1)] = re.findall(r'^\s{4}([a-z_0-9]+):\s*(.+?)\s*$', m.group(2), re.M)
+    # a field may carry R2's `let`/`var` in front of its name (2026-09-20)
+    records[m.group(1)] = re.findall(r'^\s{4}(?:(?:let|var)\s+)?([a-z_0-9]+):\s*(.+?)\s*$', m.group(2), re.M)
 for m in re.finditer(r'\ndefine (\w+Data) \((.*?)\)\n', ast_src):
     body = m.group(2).strip()
     records[m.group(1)] = [(f.strip(), t.strip()) for f, t in re.findall(r'([a-z_0-9]+):\s*([^\s]+(?:\[[^\]]*\])?\??)', body)] if body else []
@@ -1457,9 +1458,9 @@ use scaly.containers.StringBuilder
 define NodeFactory
 (
     host: ref[Page]
-    context: ref[EmitContext]?
+    var context: ref[EmitContext]?
     list_ranges: ref[Array[ListRange]]?
-    node_count: int
+    var node_count: int
     text_count: int
 )
 {
@@ -1776,10 +1777,10 @@ define NodeVisitor
     factory: ref[NodeFactory]
     visit_tag: int
     hooks_tag: int
-    synthetic_location: bool
-    context: ref[EmitContext]?
-    transformer: ref[Transformer]?
-    sub_tag: int
+    var synthetic_location: bool
+    var context: ref[EmitContext]?
+    var transformer: ref[Transformer]?
+    var sub_tag: int
 )
 {
     function create(host: ref[Page], factory: ref[NodeFactory], visit_tag: int, hooks_tag: int) returns ref[NodeVisitor]
