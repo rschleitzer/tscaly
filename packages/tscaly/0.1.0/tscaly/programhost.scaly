@@ -285,6 +285,15 @@ define CheckJob
     done: u64
 )
 
+; one run of the checker pool over a set of positions (run_check_pool): the
+; jobs, the first stop in position order (`total` when none) and its job (-1)
+define PoolRun
+(
+    jobs: ref[Array[ref[CheckJob]]]
+    stop_pos: int
+    stop_job: int
+)
+
 procedure check_task(mutable arg: pointer[void]) returns pointer[void]
 {
     let job arg as ref[CheckJob]
@@ -2170,6 +2179,97 @@ define DriverProgram
     ; reference's getBindAndCheckDiagnosticsForFile asks the file's checker.
     procedure check_parallel(mutable this, ld: ref[ProgramLoader], mutable out: ref[Array[ref[DriverDiagnostic]]]) returns bool
     {
+        let libs this.lib_count()
+        let total libs + (ld.program_files.get_length() as int)
+        let wanted &Array[int]^host()
+        var p 0
+        while p < total
+        {
+            if this.wants_check(ld, p)
+                wanted.add(p)
+            set p: p + 1
+        }
+        let run this.run_check_pool(ld, wanted)
+        let n run.jobs.get_length() as int
+        var q libs
+        while q < run.stop_pos
+        {
+            let index ld.program_files[(q - libs) as size_t]
+            let share run.jobs[(q % n) as size_t]
+            this.bind_and_check_on(share.checker, index, out, false)
+            this.include_processor(index, out)
+            set q: q + 1
+        }
+        this.pool_stop(run)
+    }
+
+    ; GetSemanticDiagnosticsWithoutNoEmitFiltering over a SUBSET of the source
+    ; files, on the pool (slice 372): `positions` in source order (the default
+    ; libraries first, then the loader's files, as source_pf_index numbers
+    ; them), each file's bind-and-check diagnostics into per_file[k] — the
+    ; incremental program's affected files, which the reference hands to the
+    ; same pool the plain path uses (collectCheckerDiagnosticsFromFiles); the
+    ; port had checked them one by one on checker 0, so a `composite` project
+    ; never ran the pool at all. A library position is checked but yields no
+    ; list (the incremental snapshot keeps none for a library). False after a
+    ; stop, the way check_parallel is.
+    procedure check_files_parallel(mutable this, positions: ref[Array[int]], mutable per_file: ref[Array[ref[Array[ref[DriverDiagnostic]]]]]) returns bool
+    {
+        let ld loader as ref[ProgramLoader]
+        let libs this.lib_count()
+        let wanted &Array[int]^host()
+        var i 0
+        while i < (positions.get_length() as int)
+        {
+            let p positions[i as size_t]
+            if this.wants_check(ld, p)
+                wanted.add(p)
+            set i: i + 1
+        }
+        let run this.run_check_pool(ld, wanted)
+        let n run.jobs.get_length() as int
+        set i: 0
+        while i < (positions.get_length() as int)
+        {
+            let p positions[i as size_t]
+            if (p >= libs) and (p < run.stop_pos)
+            {
+                let index ld.program_files[(p - libs) as size_t]
+                let share run.jobs[(p % n) as size_t]
+                this.bind_and_check_on(share.checker, index, per_file[i as size_t], false)
+            }
+            set i: i + 1
+        }
+        this.pool_stop(run)
+    }
+
+    ; is position `p` (source order) one the checkers should check?
+    function wants_check(this, ld: ref[ProgramLoader], p: int) returns bool
+    {
+        let libs this.lib_count()
+        if p < libs
+            return this.skip_lib_checking(p) = false
+        this.skip_type_checking(ld.program_files[(p - libs) as size_t]) = false
+    }
+
+    ; the run's stop, reported the way the sequential walk reports one
+    procedure pool_stop(mutable this, run: ref[PoolRun]) returns bool
+    {
+        if run.stop_job < 0
+            return true
+        let sj run.jobs[run.stop_job as size_t]
+        var tag: Slice[char] "checker-stop"
+        if sj.stop_row >= 0
+            set tag: Checker.stop_tag_at(sj.checker, sj.stop_row)
+        this.stop(tag)
+        false
+    }
+
+    ; the pool over `wanted` (positions in source order): every position goes
+    ; to checker (position % n), checker 0 on this thread, the others on
+    ; TaskPool workers; answers the jobs and the first stop in position order
+    procedure run_check_pool(mutable this, ld: ref[ProgramLoader], wanted: ref[Array[int]]) returns ref[PoolRun]
+    {
         let cd0 checker as ref[Checker]
         let extras extra_checkers as ref[Array[ref[Checker]]]
         let n (extras.get_length() as int) + 1
@@ -2207,20 +2307,13 @@ define DriverProgram
             jobs.add(&CheckJob^host(this, ck, k > 0, &Array[int]^host(), 0 - 1, 0 - 1, 0 as u64))
             set k: k + 1
         }
-        var p 0
-        while p < total
+        var wi 0
+        while wi < (wanted.get_length() as int)
         {
-            var wanted true
-            if p < libs
-                set wanted: this.skip_lib_checking(p) = false
-            else
-                set wanted: this.skip_type_checking(ld.program_files[(p - libs) as size_t]) = false
-            if wanted
-            {
-                let share jobs[(p % n) as size_t]
-                share.positions.add(p)
-            }
-            set p: p + 1
+            let p wanted[wi as size_t]
+            let share jobs[(p % n) as size_t]
+            share.positions.add(p)
+            set wi: wi + 1
         }
         let pool TaskPool.create((n - 1) as i64)
         let group TaskGroup.create()
@@ -2248,25 +2341,7 @@ define DriverProgram
             }
             set j: j + 1
         }
-        var q libs
-        while q < stop_pos
-        {
-            let index ld.program_files[(q - libs) as size_t]
-            let share jobs[(q % n) as size_t]
-            this.bind_and_check_on(share.checker, index, out, false)
-            this.include_processor(index, out)
-            set q: q + 1
-        }
-        if stop_job >= 0
-        {
-            let sj jobs[stop_job as size_t]
-            var tag: Slice[char] "checker-stop"
-            if sj.stop_row >= 0
-                set tag: Checker.stop_tag_at(sj.checker, sj.stop_row)
-            this.stop(tag)
-            return false
-        }
-        true
+        &PoolRun^host(jobs, stop_pos, stop_job)
     }
 
     ; one checker's share, on whichever thread runs it; writes only `job`
