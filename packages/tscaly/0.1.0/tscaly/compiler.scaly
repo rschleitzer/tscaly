@@ -148,13 +148,72 @@ define PreparseJob
     var result: ref[PreparsedFile]?
     ; 1 once `result` is written, stored atomically by the worker
     done: u64
+    ; 1 once someone started the parse (CAS): the worker that takes the job, or
+    ; the walk, which parses a job nobody has started yet itself instead of
+    ; spinning on it (await_preparse) -- measured 2026-09-21: with one worker the
+    ; walk burned two seconds of CPU in sched_yield behind the queue
+    taken: u64
 )
 
 function sched_yield() returns i32 extern
 
+; The parallel bind (slice 374), as the reference's BindSourceFiles queues a
+; task per file on its work group: one job per worker, the files it binds by
+; position, each binder on a heap page of the job's own (a heap page outlives
+; the worker, ROADMAP 2.3b). The job also builds the two per-file tables the
+; check pool would otherwise build one by one before its workers start (the
+; list-range index and the ECMA line starts). A stop is recorded, never
+; raised, on the worker: the loader raises the one the sequential walk would
+; have met first after the wave (bind_all walks the files last to first).
+define BindJob
+(
+    loader: ref[ProgramLoader]
+    positions: ref[Array[int]]
+    var stop_index: int
+    var stop_tag: Slice[char]
+    var bind_ns: int
+)
+
+procedure bind_task(mutable arg: pointer[void]) returns pointer[void]
+{
+    let job arg as ref[BindJob]
+    let pg Page.allocate_page()
+    let ld job.loader
+    var i 0
+    while i < (job.positions.get_length() as int)
+    {
+        let index job.positions[i as size_t]
+        set i: i + 1
+        let t0 scaly_eio_now_ns()
+        let tag ld.bind_one_on(pg, index)
+        set job.bind_ns: job.bind_ns + (scaly_eio_now_ns() - t0)
+        if (tag.length as int) > 0
+        {
+            if index > job.stop_index
+            {
+                set job.stop_index: index
+                set job.stop_tag: tag
+            }
+        }
+    }
+    null
+}
+
 procedure preparse_task(mutable arg: pointer[void]) returns pointer[void]
 {
     let job arg as ref[PreparseJob]
+    if scaly_atomic_cas_u64(&job.taken, 0 as u64, 1 as u64) <> (0 as u64)
+        return null
+    preparse_run(job)
+    null
+}
+
+; the parse itself, on whichever thread took the job, onto a heap page of the
+; file's own (a page per thread instead would be a thread-local global, whose
+; write clause every caller up the walk would have to carry; measured 2026-09-21
+; the page per file costs about 0.2 s of CPU over VS Code's 10 066 files)
+procedure preparse_run(mutable job: ref[PreparseJob])
+{
     let pg Page.allocate_page()
     var content String()
     if (job.disk.length as int) > 0
@@ -173,7 +232,6 @@ procedure preparse_task(mutable arg: pointer[void]) returns pointer[void]
     let p Parser.parse_ex(pg, path, parse_text, script_kind, &unported, &tag, &detail)
     set job.result: &PreparsedFile^pg(parse_text, p, unported, tag, detail)
     scaly_atomic_store_u64(&job.done, 1 as u64)
-    null
 }
 
 define ProgramLoader
@@ -249,6 +307,10 @@ define ProgramLoader
     ; the parse workers the driver sized (DriverProgram.preparse_size); 0 = the
     ; walk parses each file itself
     var preparse_n: int
+    ; whether the bind jobs build each file's list-range index and line starts:
+    ; the check pool needs them built before its workers start, a single
+    ; checker builds them lazily for the files it asks about
+    var bind_tables: bool
 )
 {
     procedure set_checker(mutable this, c: ref[Checker])
@@ -272,7 +334,7 @@ define ProgramLoader
         if options.max_node_module_js_depth > 0
             set depth: options.max_node_module_js_depth
         let sh SpecifierHost.create(host, checker, files, options)
-        &ProgramLoader^host(host, files, options, checker, sh, &Array[ref[LoaderNode]]^host(), &Array[ref[LoaderEdge]]^host(), depth, &Array[int]^host(), &Array[Slice[char]]^host(), members, searched, &Array[ProgramDiagnostic]^host(), Slice[char](), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[int]^host(), false, false, &Array[String]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[EmitOptions]^host(), &Array[ref[JsonValue]?]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[ref[LoaderNode]]^host(), null, HashChain.create(host), null, null, null, null, 0)
+        &ProgramLoader^host(host, files, options, checker, sh, &Array[ref[LoaderNode]]^host(), &Array[ref[LoaderEdge]]^host(), depth, &Array[int]^host(), &Array[Slice[char]]^host(), members, searched, &Array[ProgramDiagnostic]^host(), Slice[char](), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[int]^host(), false, false, &Array[String]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[EmitOptions]^host(), &Array[ref[JsonValue]?]^host(), &Array[Slice[char]]^host(), &Array[Slice[char]]^host(), &Array[int]^host(), &Array[Slice[char]]^host(), &Array[ref[LoaderNode]]^host(), null, HashChain.create(host), null, null, null, null, 0, false)
     }
 
     procedure session_push(mutable tracing: ref[Tracing]?, phase: int, name: Slice[char], args: ref[Array[ref[TraceArg]]]?) returns int
@@ -432,6 +494,8 @@ define ProgramLoader
     ; until 2026-09-16, whose order is the registration's (§3.5le).
     procedure bind_all(mutable this) returns bool
     {
+        if (preparse_n > 0) and (tracing = null)
+            return this.bind_all_parallel(preparse_n)
         var i (program_files.get_length() as int) - 1
         while i >= 0
         {
@@ -440,6 +504,90 @@ define ProgramLoader
             set i: i - 1
         }
         true
+    }
+
+    ; bind_all over n TaskPool workers: file position p goes to worker p % n;
+    ; the stop raised afterwards is the one at the highest position, which is
+    ; the one the last-to-first sequential walk meets first
+    procedure bind_all_parallel(mutable this, n: int) returns bool
+    {
+        let host Page.get(this)
+        let jobs &Array[ref[BindJob]]^host()
+        var k 0
+        while k < n
+        {
+            jobs.add(&BindJob^host(this, &Array[int]^host(), 0 - 1, null, 0))
+            set k: k + 1
+        }
+        var p 0
+        while p < (program_files.get_length() as int)
+        {
+            let share jobs[(p % n) as size_t]
+            share.positions.add(program_files[p as size_t])
+            set p: p + 1
+        }
+        let pool TaskPool.create((n - 1) as i64)
+        let group TaskGroup.create()
+        var w 1
+        while w < n
+        {
+            TaskPool.submit(pool, &bind_task, jobs[w as size_t] as pointer[void], group)
+            set w: w + 1
+        }
+        bind_task(jobs[0 as size_t] as pointer[void])
+        TaskGroup.wait(group)
+        TaskGroup.dispose(group)
+        TaskPool.shutdown(pool)
+        var stop_index 0 - 1
+        var stop_tag: Slice[char] ""
+        var total_ns 0
+        var j 0
+        while j < n
+        {
+            let job jobs[j as size_t]
+            set total_ns: total_ns + job.bind_ns
+            if job.stop_index > stop_index
+            {
+                set stop_index: job.stop_index
+                set stop_tag: job.stop_tag
+            }
+            set j: j + 1
+        }
+        if stats <> null
+        {
+            let st stats as ref[CompileStats]
+            set st.bind: st.bind + total_ns
+        }
+        if stop_index >= 0
+        {
+            this.stop(stop_tag)
+            return false
+        }
+        true
+    }
+
+    ; one file's bind for a worker: the binder on `host`, the file's two lazy
+    ; tables built here, the stop answered as a tag ("" none) instead of raised
+    procedure bind_one_on(mutable this, host: ref[Page], index: int) returns Slice[char]
+    {
+        let f files.file_at(index)
+        if f = null
+            return ""
+        if files.binder_at(index) <> null
+            return ""
+        let path_data files.path_at(index)
+        let path String^host(path_data.data as pointer[const_char], path_data.length as size_t)
+        let text files.string_at(index)
+        let b Binder.bind_source_file_ex(host, f as ref[AstNode], text, path, files.external_at(index), files.forced_module_at(index))
+        if Binder.unported_at(b) >= 0
+            return Binder.unported_tag_at(b)
+        files.set_binder(index, b)
+        if bind_tables
+        {
+            AstNode.prepare_list_range_index(f)
+            b.ecma_line_starts()
+        }
+        ""
     }
 
     procedure bind_one(mutable this, index: int) returns bool
@@ -590,7 +738,7 @@ define ProgramLoader
             var text Slice[char]()
             if (disk.length as int) = 0
                 set text: files.text_at(index)
-            let job &PreparseJob^host(index, path_data, disk, text, null, 0 as u64)
+            let job &PreparseJob^host(index, path_data, disk, text, null, 0 as u64, 0 as u64)
             list.put(index as size_t, job)
             TaskPool.submit(prepool as ref[TaskPool], &preparse_task, job as pointer[void], pregroup as ref[TaskGroup])
         }
@@ -608,6 +756,9 @@ define ProgramLoader
         if row = null
             return
         let job row as ref[PreparseJob]
+        ; a job no worker has started yet is parsed here, on the walk's thread
+        if scaly_atomic_cas_u64(&job.taken, 0 as u64, 1 as u64) = (0 as u64)
+            preparse_run(job)
         while scaly_atomic_load_u64(&job.done) = (0 as u64)
             sched_yield()
         if job.result <> null
