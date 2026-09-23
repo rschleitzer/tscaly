@@ -138,6 +138,26 @@ checker on this machine; a second series right after the first):
 Output identical in every run. PGO takes about 15 % off wall and 17 % off user time
 here, a little less than the fifth measured on the first Mac.
 
+## The same fresh snapshot on the first Mac (2026-09-23, evening)
+
+VS Code `0a9c4d28` cloned beside the older snapshot (`vscode-new`, 19 259 scenario
+files), the default build before and after the visit-table index (`aac614ff` and
+its merge with `1895a25c`), one warm-up run, two alternating rounds. Every run
+reports tsgo's 359 errors — the same file, line, column and code — and both builds
+and both checker counts print identical text.
+
+| | wall | user | sys | footprint |
+|---|---|---|---|---|
+| tsgo | 7.23 / 7.24 s | 33.9 / 37.2 s | 2.1 / 1.8 s | 7.8 / 8.1 GB |
+| tscaly x4, linear visit table | 17.88 / 17.35 s | 29.8 / 30.1 s | 2.8 / 2.9 s | 9.3 GB |
+| tscaly x4, indexed | **5.55 / 5.77 s** | **17.5 / 17.9 s** | 2.8 / 2.9 s | 9.4 GB |
+| tscaly x1, indexed | 11.40 / 11.41 s | 14.2 / 14.3 s | 2.6 / 2.4 s | 7.8 GB |
+
+The older snapshot (355 errors) never showed the linear scan: an inference there
+stayed within the "handful" the table was written for. **A benchmark input ages
+like a measurement does** — the index was found only because the second Mac cloned
+a newer VS Code.
+
 ## Profile-guided optimization — a reserve for the demo, not the default build
 
 Tried 2026-09-18 and kept out of every default build on purpose: the port ships as
