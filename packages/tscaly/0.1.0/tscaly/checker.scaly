@@ -3502,8 +3502,14 @@ define SignatureCacheKindCanonical: int 5
 ; ★★ `visited` IS THREE PARALLEL ARRAYS rather than a map keyed on a pair. The
 ; reference keys `map[InferenceKey]InferencePriority` on (source id, target id);
 ; this file's standing answer to a small per-call map is an association list
-; (see the intern tables), and this one is smaller than those — it holds the
-; invokeOnce pairs of ONE inference, which is a handful.
+; (see the intern tables). ★★★ BUT "A HANDFUL" WAS WRONG ON A REAL PROGRAM: an
+; inference over VS Code's newer sources (2026-09-23) visited so many pairs that
+; the linear scan in invoke_once held 93 % of all samples. So past
+; VisitedIndexMin rows an open-addressed index (`visited_slots`, row + 1 per slot,
+; 0 empty; `visited_mask` 0 while there is none) finds the row; below it the scan
+; stays, because a table that small is cheaper to walk than to hash.
+define VisitedIndexMin: int 16
+
 define InferenceState
 (
     inferences: ref[Array[ref[InferenceInfo]?]]
@@ -3518,6 +3524,8 @@ define InferenceState
     visited_source: ref[Array[int]]
     visited_target: ref[Array[int]]
     visited_priority: ref[Array[int]]
+    visited_slots: ref[Array[int]]
+    var visited_mask: int
     source_stack: ref[Array[ref[Type]?]]
     target_stack: ref[Array[ref[Type]?]]
     var depth: int
@@ -144923,9 +144931,10 @@ define Checker
         let vs &Array[int]^host()
         let vt &Array[int]^host()
         let vp &Array[int]^host()
+        let vx &Array[int]^host()
         let ss &Array[ref[Type]?]^host()
         let ts &Array[ref[Type]?]^host()
-        &InferenceState^host(inferences, original_source, original_target, priority, InferencePriorityMaxValue, contravariant, false, ExpandingFlagsNone, null, vs, vt, vp, ss, ts, 0)
+        &InferenceState^host(inferences, original_source, original_target, priority, InferencePriorityMaxValue, contravariant, false, ExpandingFlagsNone, null, vs, vt, vp, vx, 0, ss, ts, 0)
     }
 
     procedure infer_types(mutable this, mutable inferences: ref[Array[ref[InferenceInfo]?]], mutable original_source: ref[Type]?, mutable original_target: ref[Type]?, priority: int, contravariant: bool)
@@ -144938,9 +144947,10 @@ define Checker
         var vs Array[int]()
         var vt Array[int]()
         var vp Array[int]()
+        var vx Array[int]()
         var ss Array[ref[Type]?]()
         var ts Array[ref[Type]?]()
-        var n_value InferenceState(inferences, original_source, original_target, priority, InferencePriorityMaxValue, contravariant, false, ExpandingFlagsNone, null, &vs, &vt, &vp, &ss, &ts, 0)
+        var n_value InferenceState(inferences, original_source, original_target, priority, InferencePriorityMaxValue, contravariant, false, ExpandingFlagsNone, null, &vs, &vt, &vp, &vx, 0, &ss, &ts, 0)
         this.infer_from_types(&n_value, original_source as ref[Type], original_target as ref[Type])
     }
 
@@ -146167,26 +146177,15 @@ define Checker
     ; walking it again.
     procedure invoke_once(mutable this, mutable n: ref[InferenceState], mutable source: ref[Type], mutable target: ref[Type], action: int)
     {
-        let cnt n.visited_source.get_length() as int
-        var i 0
-        while i < cnt
+        let seen Checker.visited_find(n, source.id, target.id)
+        if seen >= 0
         {
-            if n.visited_source[i] = source.id
-            {
-                if n.visited_target[i] = target.id
-                {
-                    let status n.visited_priority[i]
-                    if status < n.inference_priority
-                        set n.inference_priority: status
-                    return
-                }
-            }
-            set i: i + 1
+            let status n.visited_priority[seen]
+            if status < n.inference_priority
+                set n.inference_priority: status
+            return
         }
-        n.visited_source.add(source.id)
-        n.visited_target.add(target.id)
-        n.visited_priority.add(InferencePriorityCircularity)
-        let slot cnt
+        let slot Checker.visited_add(n, source.id, target.id)
         let save_inference_priority n.inference_priority
         set n.inference_priority: InferencePriorityMaxValue
         let save_expanding n.expanding_flags
@@ -146213,6 +146212,93 @@ define Checker
         n.visited_priority.put(slot as size_t, n.inference_priority)
         if save_inference_priority < n.inference_priority
             set n.inference_priority: save_inference_priority
+    }
+
+    ; The row of the pair (s, t) in the visit table, -1 when it has none.
+    function visited_find(n: ref[InferenceState], s: int, t: int) returns int
+    {
+        if n.visited_mask = 0
+        {
+            let cnt n.visited_source.get_length() as int
+            var i 0
+            while i < cnt
+            {
+                if n.visited_source[i] = s
+                {
+                    if n.visited_target[i] = t
+                        return i
+                }
+                set i: i + 1
+            }
+            return 0 - 1
+        }
+        var at Checker.visited_hash(s, t) & n.visited_mask
+        while true
+        {
+            let r n.visited_slots[at]
+            if r = 0
+                return 0 - 1
+            if n.visited_source[r - 1] = s
+            {
+                if n.visited_target[r - 1] = t
+                    return r - 1
+            }
+            set at: (at + 1) & n.visited_mask
+        }
+        0 - 1
+    }
+
+    function visited_hash(s: int, t: int) returns int
+        AddressIndex.hash_of((s * 4294967296) xor t)
+
+    ; Appends the pair with the `Circularity` placeholder and answers its row.
+    procedure visited_add(mutable n: ref[InferenceState], s: int, t: int) returns int
+    {
+        let row n.visited_source.get_length() as int
+        n.visited_source.add(s)
+        n.visited_target.add(t)
+        n.visited_priority.add(InferencePriorityCircularity)
+        let cnt row + 1
+        if cnt < VisitedIndexMin
+            return row
+        if (cnt * 4) > ((n.visited_mask + 1) * 3)
+        {
+            Checker.visited_rebuild(n, cnt)
+            return row
+        }
+        Checker.visited_place(n, row)
+        row
+    }
+
+    ; A fresh index at twice the rows' count, every row placed again.
+    procedure visited_rebuild(mutable n: ref[InferenceState], cnt: int)
+    {
+        var cap 64
+        while cap < (cnt * 2)
+            set cap: cap * 2
+        let slots n.visited_slots
+        set slots.length: 0
+        var i 0
+        while i < cap
+        {
+            slots.add(0)
+            set i: i + 1
+        }
+        set n.visited_mask: cap - 1
+        var row 0
+        while row < cnt
+        {
+            Checker.visited_place(n, row)
+            set row: row + 1
+        }
+    }
+
+    procedure visited_place(mutable n: ref[InferenceState], row: int)
+    {
+        var at Checker.visited_hash(n.visited_source[row], n.visited_target[row]) & n.visited_mask
+        while n.visited_slots[at] <> 0
+            set at: (at + 1) & n.visited_mask
+        n.visited_slots.put(at as size_t, row + 1)
     }
 
     ; The stack pop Scaly's Array has no method for: rebuild one shorter. The

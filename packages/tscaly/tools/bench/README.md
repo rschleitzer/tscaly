@@ -106,6 +106,25 @@ the footprint with four checkers came down from 9.2 to 8.7 GB and is still about
 another fifth off wall and user time and leaves the output and the memory unchanged
 — it stays out of the default build (below); name it whenever these rows are quoted.
 
+## Measured 2026-09-23 on the second Mac (M1 Pro, 8P+2E, 32 GB)
+
+A fresh VS Code clone (`0a9c4d28`, 19 259 scenario files, 359 errors in both
+compilers, identical file, line, column and code), the default build, three
+alternating rounds. The first series found `invoke_once`'s linear walk of the
+visit table in 93 % of all samples — VS Code's newer sources run one inference
+over far more than "a handful" of pairs — and the table has an index since:
+
+| | wall | user | sys | footprint |
+|---|---|---|---|---|
+| tsgo | 8.01–8.16 s | 36.5–40.0 s | 2.1–2.4 s | 7.7–8.1 GB |
+| tscaly x4, linear visit table | 20.92–21.07 s | 37.4–37.6 s | 3.8–3.9 s | 9.3 GB |
+| tscaly x1, linear visit table | 29.54–29.87 s | 32.9–33.3 s | 3.4–3.7 s | 7.7 GB |
+| tscaly x4, indexed | **6.51–6.53 s** | 22.4–23.4 s | 3.9 s | 9.4 GB |
+| tscaly x1, indexed | 14.62–15.00 s | 18.3–18.9 s | 3.6–3.7 s | 7.8 GB |
+
+Output byte-identical across both builds and both checker counts. The profile
+after the index is flat (the top entry, `AddressIndex::find`, at about 6 %).
+
 ## Profile-guided optimization — a reserve for the demo, not the default build
 
 Tried 2026-09-18 and kept out of every default build on purpose: the port ships as
