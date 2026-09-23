@@ -376,16 +376,21 @@ if [ $? -ne 0 ]; then
   red "the tscaly package failed to compile:"; sed 's/^/    /' "$OUT/pkg-build.log"; exit 2
 fi
 
-for prog in tscaly_tokens tscaly_ast tscaly_jsdoc tscaly_symbols tscaly_flow tscaly_types tscaly_dump; do
-  "$SCALYC" -c -o "$OUT/$prog.o" "$PKG/0.1.0/$prog.scaly" > "$OUT/$prog-build.log" 2>&1
-  if [ $? -ne 0 ]; then
-    red "$prog failed to compile:"; sed 's/^/    /' "$OUT/$prog-build.log"; exit 2
-  fi
-  clang -o "$OUT/$prog" "$OUT/$prog.o" "$OUT/tscaly.o" "$LIBSCALY" -lm \
-    > "$OUT/$prog-link.log" 2>&1
-  if [ $? -ne 0 ]; then
-    red "the $prog link failed:"; sed 's/^/    /' "$OUT/$prog-link.log"; exit 2
-  fi
+# The seven programs are independent of each other: one job each.
+PROGS="tscaly_tokens tscaly_ast tscaly_jsdoc tscaly_symbols tscaly_flow tscaly_types tscaly_dump"
+for prog in $PROGS; do
+  ( "$SCALYC" -c -o "$OUT/$prog.o" "$PKG/0.1.0/$prog.scaly" > "$OUT/$prog-build.log" 2>&1 || exit 1
+    clang -o "$OUT/$prog" "$OUT/$prog.o" "$OUT/tscaly.o" "$LIBSCALY" -lm > "$OUT/$prog-link.log" 2>&1 || exit 2
+  ) &
+  eval "pid_$prog=$!"
+done
+for prog in $PROGS; do
+  eval "wait \$pid_$prog"
+  case $? in
+    0) ;;
+    1) red "$prog failed to compile:"; sed 's/^/    /' "$OUT/$prog-build.log"; exit 2 ;;
+    *) red "the $prog link failed:"; sed 's/^/    /' "$OUT/$prog-link.log"; exit 2 ;;
+  esac
 done
 
 # The binaries above have just been built from the tree as it stands, so whatever
