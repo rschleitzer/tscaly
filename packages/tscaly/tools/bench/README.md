@@ -73,6 +73,39 @@ The time is not a comparison yet — most of it was the swap.
 630 errors: tsgo's 355 and 275 port defects (the `@xterm/addon-*` typings' self-augmenting
 `declare module`, JSON modules outside the scenario, and what follows from them).
 
+## Measured 2026-09-23 (same machine, idle, tree at `5a82fcd5`)
+
+The whole of VS Code, `--bench-batch vscode-paths.scenario`, tsgo built from the
+submodule (`-p src/tsconfig.json --noEmit`, default settings). One warm-up run, then
+rounds alternating between the binaries; `/usr/bin/time -l`, footprint = its
+`peak memory footprint`. Every tscaly run reports tsgo's 355 errors — the same file,
+line, column and code — and `TSCALY_CHECKERS=1` and `=4` print identical text.
+
+**The default build** (`build.sh`, LTO, no PGO):
+
+| | wall | user | sys | footprint |
+|---|---|---|---|---|
+| tsgo | 6.55 / 7.21 s | 30.5 / 35.7 s | 1.9 / 2.5 s | 7.6 / 7.8 GB |
+| tscaly, `TSCALY_CHECKERS=4` | **5.22 / 4.81 s** | **16.2 / 16.3 s** | 3.0 / 2.9 s | 8.7 GB |
+| tscaly, one checker (the default) | 10.72 / 10.43 s | 13.1 / 13.0 s | 2.4 / 2.4 s | 7.2 GB |
+
+**With PGO** (the recipe below, trained on this scenario with one checker; a second
+series the same evening):
+
+| | wall | user | sys | footprint |
+|---|---|---|---|---|
+| tsgo | 6.19 / 6.51 s | 27.8 / 30.1 s | 1.9 / 1.9 s | 7.9 / 7.7 GB |
+| tscaly, 4 checkers, no PGO | 5.13 / 5.01 s | 16.3 / 16.9 s | 3.1 / 3.0 s | 8.7 GB |
+| tscaly, 4 checkers, **PGO** | **3.95 / 4.17 s** | **13.1 / 13.5 s** | 2.7 / 3.2 s | 8.7 GB |
+| tscaly, one checker, PGO | 8.63 / 8.24 s | 10.5 / 10.5 s | 2.3 / 2.4 s | 7.2 GB |
+
+Against 2026-09-18 (6.0 s against tsgo's 6.5 s, four checkers) the wall clock moved
+with the parse pool, binding on the pool and file discovery inside the parse tasks;
+the footprint with four checkers came down from 9.2 to 8.7 GB and is still about
+0.9 GB above tsgo's. The sys time is the page faults of that footprint. PGO takes
+another fifth off wall and user time and leaves the output and the memory unchanged
+— it stays out of the default build (below); name it whenever these rows are quoted.
+
 ## Profile-guided optimization — a reserve for the demo, not the default build
 
 Tried 2026-09-18 and kept out of every default build on purpose: the port ships as
