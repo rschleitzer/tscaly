@@ -125,6 +125,19 @@ over far more than "a handful" of pairs — and the table has an index since:
 Output byte-identical across both builds and both checker counts. The profile
 after the index is flat (the top entry, `AddressIndex::find`, at about 6 %).
 
+**With PGO** on the indexed tree (the recipe below, trained on this scenario with one
+checker on this machine; a second series right after the first):
+
+| | wall | user | sys | footprint |
+|---|---|---|---|---|
+| tsgo | 7.96–8.40 s | 37.3–43.3 s | 2.3 s | 7.8–8.1 GB |
+| tscaly x4, no PGO | 6.52–6.58 s | 23.2–23.3 s | 3.8–3.9 s | 9.4 GB |
+| tscaly x4, **PGO** | **5.46–5.80 s** | **18.9–19.5 s** | 4.0–4.2 s | 9.4 GB |
+| tscaly x1, PGO | 11.67–12.15 s | 14.9–15.5 s | 3.6–3.8 s | 7.8 GB |
+
+Output identical in every run. PGO takes about 15 % off wall and 17 % off user time
+here, a little less than the fifth measured on the first Mac.
+
 ## Profile-guided optimization — a reserve for the demo, not the default build
 
 Tried 2026-09-18 and kept out of every default build on purpose: the port ships as
