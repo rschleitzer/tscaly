@@ -36,6 +36,8 @@ import sys
 import threading
 import time
 import difflib
+import hashlib
+import pickle
 
 # ★ A long listing piped into `head` closes the pipe under us; the default Python
 # handler then prints a BrokenPipeError traceback over the output a reader is looking
@@ -490,6 +492,111 @@ def run_oracle(binary, out_dir, selected, jobs, timeout):
     for t in threads:
         t.join()
     return results
+
+
+# ───────────────────────── the oracle cache ─────────────────────────
+#
+# ★ WHY (2026-09-25): the reference side is the same every run. Its answer for a
+# case depends on the oracle binaries and the reference submodule (both in the
+# oracle STAMP run.sh computes), on the case file's bytes, on its name and on the
+# out dir (which names the units' would-be paths) -- nothing else: oracle_batch
+# writes no file and resets its process-wide counters per artifact. Measured on
+# the stage-2 corpus: 87 s of a 302 s run, on the bar's critical lane. A case is
+# answered from here when all five match; a hit is byte-identical to a fresh
+# answer (checked on landing: the ref columns of two run.db, one cached, one
+# fresh, compare equal).
+#
+# Not stored: an answer the HARNESS marked (a hung or dead reference process --
+# `the reference process ...`), which says nothing about the case. A panic
+# inside the oracle is deterministic and is stored like any answer.
+# `TSCALY_FORCE_ORACLE=1` bypasses the lookups (and still refreshes the cache).
+# An unfiltered run drops the entries it did not use, so the file tracks the
+# corpus instead of growing.
+
+HARNESS_CAUSE = b"the reference process"
+
+
+def _case_marked_by_harness(c):
+    if c.get("split_rc") == 3 and (c.get("split_err") or b"").startswith(HARNESS_CAUSE):
+        return True
+    for u in c.get("units", []):
+        for art, triple in u.get("refs", {}).items():
+            if triple[0] == 3 and (triple[2] or b"").startswith(HARNESS_CAUSE):
+                return True
+    return False
+
+
+class OracleCache:
+    SCHEMA = "CREATE TABLE IF NOT EXISTS answers(key TEXT PRIMARY KEY, answer BLOB)"
+
+    def __init__(self, out_dir, stamp):
+        self.path = os.path.join(out_dir, "oracle-cache.db")
+        self.out_dir = out_dir
+        self.stamp = stamp or ""
+        self.db = sqlite3.connect(self.path, check_same_thread=False)
+        self.db.execute("PRAGMA journal_mode=OFF")
+        self.db.execute("PRAGMA synchronous=OFF")
+        self.db.execute(self.SCHEMA)
+        self.used = set()
+
+    def key(self, case_file, name):
+        h = hashlib.sha256()
+        for part in (self.stamp, self.out_dir, case_file, name):
+            h.update(part.encode("utf-8", "surrogateescape"))
+            h.update(b"\0")
+        with open(case_file, "rb") as fh:
+            h.update(fh.read())
+        return h.hexdigest()
+
+    def lookup(self, selected, force):
+        """→ ({name: case} answered from the cache, [(case_file, name)] still to run)."""
+        hits, misses = {}, []
+        for cf, name in selected:
+            k = self.key(cf, name)
+            self.used.add(k)
+            row = None if force else self.db.execute(
+                "SELECT answer FROM answers WHERE key = ?", (k,)).fetchone()
+            if row is None:
+                misses.append((cf, name))
+            else:
+                hits[name] = pickle.loads(row[0])
+        return hits, misses
+
+    def store(self, selected, answers):
+        for cf, name in selected:
+            c = answers.get(name)
+            if c is None or _case_marked_by_harness(c):
+                continue
+            self.db.execute("INSERT OR REPLACE INTO answers VALUES (?, ?)",
+                            (self.key(cf, name), pickle.dumps(c, protocol=pickle.HIGHEST_PROTOCOL)))
+        self.db.commit()
+
+    def prune(self):
+        """Drop every entry this run did not use (unfiltered runs only)."""
+        keep = self.used
+        stale = [k for (k,) in self.db.execute("SELECT key FROM answers") if k not in keep]
+        for k in stale:
+            self.db.execute("DELETE FROM answers WHERE key = ?", (k,))
+        self.db.commit()
+        return len(stale)
+
+    def close(self):
+        self.db.commit()
+        self.db.close()
+
+
+def run_oracle_cached(binary, out_dir, selected, jobs, timeout, stamp, force, prune):
+    """run_oracle behind the OracleCache: → (answers, hits, misses)."""
+    cache = OracleCache(out_dir, stamp)
+    hits, misses = cache.lookup(selected, force)
+    fresh = run_oracle(binary, out_dir, misses, jobs, timeout) if misses else {}
+    cache.store(misses, fresh)
+    if prune:
+        cache.prune()
+    cache.close()
+    answers = dict(hits)
+    answers.update(fresh)
+    return answers, len(hits), len(misses)
 
 
 # ───────────────────────── the store ─────────────────────────

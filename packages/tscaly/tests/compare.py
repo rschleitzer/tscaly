@@ -144,9 +144,14 @@ def main():
 
     # ── phase A: the reference, split and six dumps per unit, in one stream per chunk ──
     t0 = time.time()
-    ref = H.run_oracle(f"{out}/oracle_batch", out, selected, jobs, ctx.timeout)
+    ref, cache_hits, cache_misses = H.run_oracle_cached(
+        f"{out}/oracle_batch", out, selected, jobs, ctx.timeout,
+        os.environ.get("TSCALY_ORACLE_STAMP", ""),
+        bool(os.environ.get("TSCALY_FORCE_ORACLE")), not filt)
     wall["oracle"] = time.time() - t0
+    store.put_meta("oracle_cache", f"{cache_hits} hits, {cache_misses} run")
     progress("oracle", len(ref), len(selected))
+    progress("oracle cache hits", cache_hits, len(selected))
 
     counters = {}
     for art in H.ART_NAMES:
