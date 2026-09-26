@@ -198,24 +198,34 @@ def expected_errors(path, messages=None, chains=None):
     return out
 
 
+_BREAK_RE = re.compile(rb"\r\n?|\n|\xe2\x80[\xa8\xa9]")
+_BREAKS = {}
+
+
+def _line_breaks(text_bytes):
+    """every ECMA line break of the text as (first byte, byte after it), in order"""
+    b = _BREAKS.get(text_bytes)
+    if b is None:
+        b = [(m.start(), m.end()) for m in _BREAK_RE.finditer(text_bytes)]
+        _BREAKS[text_bytes] = b
+    return b
+
+
 def line_col(text_bytes, pos):
-    """scanner.GetECMALineAndCharacterOfPosition, 1-based: ECMA line breaks, UTF-16 columns"""
-    head = text_bytes[:max(pos, 0)].decode("utf-8", "replace")
-    line, start = 0, 0
-    i = 0
-    while i < len(head):
-        ch = head[i]
-        if ch == "\r":
-            if i + 1 < len(head) and head[i + 1] == "\n":
-                i += 1
-            line += 1
-            start = i + 1
-        elif ch in "\n\u2028\u2029":
-            line += 1
-            start = i + 1
-        i += 1
-    col = len(head[start:].encode("utf-16-le")) // 2
-    return line + 1, col + 1
+    """scanner.GetECMALineAndCharacterOfPosition, 1-based: ECMA line breaks, UTF-16 columns.
+    ★The breaks of a text are found ONCE (2026-09-26): decoding and walking the whole
+    prefix per call cost 18 of caseerrors' 36 single-threaded seconds. A break counts
+    when it has begun before `pos` -- a `\r\n` cut after its `\r` is a break, as the
+    character walk read it -- but a U+2028/U+2029 only whole (a cut one decodes to
+    U+FFFD). Breaks do not overlap, so only the last one before `pos` can be cut."""
+    pos = max(pos, 0)
+    breaks = _line_breaks(text_bytes)
+    k = bisect.bisect_left(breaks, (pos, -1))
+    if k and breaks[k - 1][1] - breaks[k - 1][0] == 3 and breaks[k - 1][1] > pos:
+        k -= 1
+    start = min(breaks[k - 1][1], pos) if k else 0
+    col = len(text_bytes[start:pos].decode("utf-8", "replace").encode("utf-16-le")) // 2
+    return k + 1, col + 1
 
 
 def parse_answer(body):

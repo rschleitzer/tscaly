@@ -361,21 +361,21 @@ def common_source_directory(units, cfg):
     return common
 
 
+_TEST_PATH_PAIRS = [("/.ts/", ""), ("/.lib/", ""), ("/.src/", ""), ("bundled:///libs/", ""),
+                    ("file:///./ts/", "file:///"), ("file:///./lib/", "file:///"), ("file:///./src/", "file:///")]
+_TEST_PATH_RE = re.compile("|".join(re.escape(o) for o, _ in _TEST_PATH_PAIRS))
+_TEST_PATH_REPL = dict(_TEST_PATH_PAIRS)
+
+
 def remove_test_path_prefixes(text):
-    """tsbaseline.removeTestPathPrefixes (a strings.Replacer: the leftmost match wins)"""
-    pairs = [("/.ts/", ""), ("/.lib/", ""), ("/.src/", ""), ("bundled:///libs/", ""),
-             ("file:///./ts/", "file:///"), ("file:///./lib/", "file:///"), ("file:///./src/", "file:///")]
-    out, i = [], 0
-    while i < len(text):
-        for old, repl in pairs:
-            if text.startswith(old, i):
-                out.append(repl)
-                i += len(old)
-                break
-        else:
-            out.append(text[i])
-            i += 1
-    return "".join(out)
+    """tsbaseline.removeTestPathPrefixes (a strings.Replacer: the leftmost match wins,
+    and at one position the first pair). ★One regular expression with the pairs in
+    that order (2026-09-26): an alternation tries its branches in order at each
+    position and scans left to right, which is the Replacer's rule; the character loop
+    it replaces made 142 million `startswith` calls in one caseerrors run (17 s)."""
+    if "/." not in text and ":///" not in text:
+        return text
+    return _TEST_PATH_RE.sub(lambda m: _TEST_PATH_REPL[m.group(0)], text)
 
 
 def section_name(unit_name, cfg, common, oname, out_dir):
