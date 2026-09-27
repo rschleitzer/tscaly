@@ -702,10 +702,12 @@ total_timeout=$(( timeout_tokens + timeout_ast + timeout_jsdoc + timeout_symbols
 # dumper answered differently" need different work and a mixed list hides the
 # first inside the second. The bash loop had no timeout at all; over 12 444 cases
 # a single non-terminating scan would have replaced the whole measurement with
-# nothing.
+# nothing. ★Since 2026-09-27 there is no limit unless TSCALY_TIMEOUT is set: the
+# 60 s default failed sound units on a thermally throttled machine, so a hang
+# now shows as a run that does not end — arm the limit to name it.
 if [ $total_timeout -ne 0 ]; then
   echo
-  red "$total_timeout dumps did not finish within ${TSCALY_TIMEOUT:-60}s (counted in UNEXPLAINED above)."
+  red "$total_timeout dumps did not finish within ${TSCALY_TIMEOUT:-?}s (counted in UNEXPLAINED above)."
   echo "  A non-terminating parse is a defect of its own class; grep 'timed out' in"
   echo "  $OUT/failures.txt for the list."
 fi
@@ -718,7 +720,7 @@ total_slow=$(( slow_tokens + slow_ast + slow_jsdoc + slow_symbols + slow_flow + 
 if [ $total_slow -ne 0 ]; then
   echo
   echo "$total_slow dumps are listed in slow.txt — they TERMINATE, but not inside"
-  echo "  ${TSCALY_TIMEOUT:-60}s. Not a pass and not a failure: the cause is named per entry, and"
+  echo "  ${TSCALY_TIMEOUT:-the}${TSCALY_TIMEOUT:+s} budget. Not a pass and not a failure: the cause is named per entry, and"
   echo "  the run fails as soon as one of them is no longer needed."
   printf '    %s\n' "${slows[@]}"
 fi

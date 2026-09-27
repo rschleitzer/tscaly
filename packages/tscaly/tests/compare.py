@@ -99,7 +99,10 @@ def main():
     filt = os.environ.get("TSCALY_FILTER", "")
     jobs = int(os.environ.get("TSCALY_JOBS") or min(16, os.cpu_count() or 8))
     stage = int(os.environ.get("TSCALY_STAGE") or 1)
-    ctx.timeout = float(os.environ.get("TSCALY_TIMEOUT") or 60)
+    # No inactivity limit by default (2026-09-27): a throttled machine took the
+    # stress units past 60 s of silence while they were fine. TSCALY_TIMEOUT=<s>
+    # arms the limit for a run that must not hang; 0 or unset means none.
+    ctx.timeout = float(os.environ.get("TSCALY_TIMEOUT") or 0)
     profile = os.environ.get("TSCALY_PROFILE")
     wall = {}
 
