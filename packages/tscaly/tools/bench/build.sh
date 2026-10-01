@@ -9,8 +9,11 @@
 #
 # The yardsticks build their programs at the default opt level (none); a time
 # measured on that binary is several times too slow to compare with tsgo.
-# Same pipeline as tests/dazzle/build-cli.sh: program, package and runtime IR,
-# merged and optimized by tools/link-lto.sh.
+# `scaly build --release`: program, package and runtime as one module at -O2
+# (until 2026-10-01 three IR emissions merged by tools/link-lto.sh; measured
+# against that binary on the whole of VS Code, three alternating rounds: wall
+# 4.9-5.0 s both, user 15.2-15.4 against 15.4-15.7 s, footprint 8.69 GB both,
+# the 1 872 output lines identical).
 #
 # ★ Build to a path no running measurement uses: overwriting a binary under a
 # live process invalidates its code signature on macOS and kills it.
@@ -24,17 +27,7 @@ BIN="${2:-$ROOT/scalyc/build/scalyc}"
 cd "$ROOT"
 ulimit -s 65520
 
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
-
 t0=$(date +%s)
-"$BIN" -S --no-prelude --no-tests -o "$WORK/scaly_rt.ll" packages/scaly/0.1.0/scaly.scaly > "$WORK/rt.log" 2>&1 \
-  || { echo "bench build: FAIL (runtime)"; tail -5 "$WORK/rt.log"; exit 1; }
-"$BIN" -S --no-prelude -o "$WORK/tscaly.ll" packages/tscaly/0.1.0/tscaly.scaly > "$WORK/pkg.log" 2>&1 \
-  || { echo "bench build: FAIL (package)"; tail -5 "$WORK/pkg.log"; exit 1; }
-"$BIN" -S -o "$WORK/tscaly_exec.ll" packages/tscaly/0.1.0/tscaly_exec.scaly > "$WORK/prog.log" 2>&1 \
-  || { echo "bench build: FAIL (program)"; tail -5 "$WORK/prog.log"; exit 1; }
-echo "bench build: IR emitted in $(( $(date +%s) - t0 ))s"
-tools/link-lto.sh "$OUT" "$WORK/tscaly_exec.ll" "$WORK/tscaly.ll" "$WORK/scaly_rt.ll" \
-  || { echo "bench build: FAIL (link-lto rc=$?)"; exit 1; }
+"$BIN" build packages/tscaly/0.1.0/tscaly_exec.scaly --release -o "$OUT" \
+  || { echo "bench build: FAIL (rc=$?)"; exit 1; }
 echo "bench build: $OUT in $(( $(date +%s) - t0 ))s"
