@@ -158,11 +158,12 @@ stayed within the "handful" the table was written for. **A benchmark input ages
 like a measurement does** — the index was found only because the second Mac cloned
 a newer VS Code.
 
-## Profile-guided optimization — a reserve for the demo, not the default build
+## Profile-guided optimization
 
-Tried 2026-09-18 and kept out of every default build on purpose: the port ships as
-`.ll`, and a reviewer who builds it should measure what we measure without a
-training run. Bring it out for the real demo only, and name it whenever it is used.
+An ordinary build step since 2026-10-02 (the author's decision; from 2026-09-18 it had
+been a reserve for the demo, kept out of every build because the port shipped as `.ll`
+and PGO was a script with environment variables). It is one switch on `scaly build` now.
+The figures below are the 2026-09-18 measurement.
 
 | VS Code, three alternating rounds, output identical | user | real |
 |---|---|---|
@@ -174,21 +175,17 @@ The profile transfers: trained on VS Code alone, the TypeScript repository's own
 `src/compiler` (305 files, 22 errors = tsgo) goes 0.89 → 0.71 s user.
 
 ```bash
-source tools/llvm-env.sh
-T=-mtriple=$("$LLC" --version | awk '/Default target/{print $3}')
-RT=$LLVM_PREFIX/lib/clang/20/lib/darwin/libclang_rt.profile_osx.a
-LTO_OPT_FLAGS="$T --pgo-kind=pgo-instr-gen-pipeline" LINK_EXTRA=$RT \
-  packages/tscaly/tools/bench/build.sh ~/repos/bench/bin/tscaly_pgogen
+# ★Written 2026-10-02 from the tool's switches (tests/tool/run.sh `pgo` runs them
+# on a small program); NOT yet rerun on this scenario in this form. The recipe
+# of 2026-09-18 went through tools/link-lto.sh, which is deleted.
+ulimit -s 65520
+scalyc/build/scaly build packages/tscaly/0.1.0/tscaly_exec.scaly --pgo-train -o ~/repos/bench/bin/tscaly_pgogen
 (cd ~/repos/bench && LLVM_PROFILE_FILE=$PWD/pgo/tscaly-%p.profraw \
   ./bin/tscaly_pgogen --bench-batch vscode-paths.scenario > /dev/null)
 "$LLVM_PREFIX/bin/llvm-profdata" merge -o ~/repos/bench/pgo/tscaly.profdata ~/repos/bench/pgo/*.profraw
-LTO_OPT_FLAGS="$T --pgo-kind=pgo-instr-use-pipeline --profile-file=$HOME/repos/bench/pgo/tscaly.profdata" \
-  packages/tscaly/tools/bench/build.sh ~/repos/bench/bin/tscaly_pgo
+scalyc/build/scaly build packages/tscaly/0.1.0/tscaly_exec.scaly --pgo ~/repos/bench/pgo/tscaly.profdata -o ~/repos/bench/bin/tscaly_pgo
 ```
 
-★ The triple is required, not optional: the seed's IR carries none, and the
-instrumentation then emits COMDATs that MachO cannot lower (`llc` aborts). ★ Take the
-triple from the host (`llc --version`), never write one in — the same build must work
-on an x86_64 machine. ★ The CPU Bottlenecks shares of `tools/xctrace-bottleneck.py`
+★ The CPU Bottlenecks shares of `tools/xctrace-bottleneck.py`
 cannot compare two builds: one build read 46 % and 35 % useful in two recordings.
 Compare alternating user times.
