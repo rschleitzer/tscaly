@@ -128,6 +128,19 @@ FILTER=${1:-}
 STAGE=${TSCALY_STAGE:-1}
 
 LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
+# What a link needs beside the archive: libm on POSIX; on the Windows box the
+# archive is libscaly.lib, the math is in the CRT, the archive drags in Winsock,
+# and the 64 MB the `ulimit` below asks for is a PE stack reserve (2026-10-02,
+# the first run there: `could not open 'm.lib'`).
+LINK_LIBS="-lm"
+EXE=
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    [ "$LIBSCALY" = /tmp/libscaly.a ] && LIBSCALY=/tmp/libscaly.lib
+    LINK_LIBS="-lws2_32 -Xlinker -stack:67108864,1048576"
+    EXE=.exe
+    ;;
+esac
 # ★ The port recurses where the reference's Go stack grows (slice 236): a 6 452-term
 # binary expression (binderBinaryExpressionStress) is ~10 frames per term through the
 # printer, and the default 8 MB stack faults at rc -11 — a crash, and one process writes
@@ -278,14 +291,14 @@ else
   cp "$PKG/tests/oracle/flow.go"    "$SUB/oracle/flow/main.go"
   cp "$PKG/tests/oracle/types.go"   "$SUB/oracle/types/main.go"
   cp "$PKG/tests/oracle/batch.go"   "$SUB/oracle/batch/main.go"
-  ( cd "$SUB" && go build -o "$REPO/$OUT/oracle_tokens"  ./oracle/tokens \
-              && go build -o "$REPO/$OUT/oracle_ast"     ./oracle/ast \
-              && go build -o "$REPO/$OUT/oracle_jsdoc"   ./oracle/jsdoc \
-              && go build -o "$REPO/$OUT/oracle_split"   ./oracle/split \
-              && go build -o "$REPO/$OUT/oracle_symbols" ./oracle/symbols \
-              && go build -o "$REPO/$OUT/oracle_flow"    ./oracle/flow \
-              && go build -o "$REPO/$OUT/oracle_types"   ./oracle/types \
-              && go build -o "$REPO/$OUT/oracle_batch"   ./oracle/batch ) \
+  ( cd "$SUB" && go build -o "$REPO/$OUT/oracle_tokens$EXE"  ./oracle/tokens \
+              && go build -o "$REPO/$OUT/oracle_ast$EXE"     ./oracle/ast \
+              && go build -o "$REPO/$OUT/oracle_jsdoc$EXE"   ./oracle/jsdoc \
+              && go build -o "$REPO/$OUT/oracle_split$EXE"   ./oracle/split \
+              && go build -o "$REPO/$OUT/oracle_symbols$EXE" ./oracle/symbols \
+              && go build -o "$REPO/$OUT/oracle_flow$EXE"    ./oracle/flow \
+              && go build -o "$REPO/$OUT/oracle_types$EXE"   ./oracle/types \
+              && go build -o "$REPO/$OUT/oracle_batch$EXE"   ./oracle/batch ) \
     > "$OUT/oracle-build.log" 2>&1
   orc=$?
   rm -rf "$SUB/oracle"
@@ -380,7 +393,7 @@ fi
 PROGS="tscaly_tokens tscaly_ast tscaly_jsdoc tscaly_symbols tscaly_flow tscaly_types tscaly_dump"
 for prog in $PROGS; do
   ( "$SCALYC" -c -o "$OUT/$prog.o" "$PKG/0.1.0/$prog.scaly" > "$OUT/$prog-build.log" 2>&1 || exit 1
-    clang -o "$OUT/$prog" "$OUT/$prog.o" "$OUT/tscaly.o" "$LIBSCALY" -lm > "$OUT/$prog-link.log" 2>&1 || exit 2
+    clang -o "$OUT/$prog$EXE" "$OUT/$prog.o" "$OUT/tscaly.o" "$LIBSCALY" $LINK_LIBS > "$OUT/$prog-link.log" 2>&1 || exit 2
   ) &
   eval "pid_$prog=$!"
 done
