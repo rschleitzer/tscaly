@@ -24,10 +24,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../../.." && pwd)"
 OUT="${1:-$ROOT/packages/tscaly/tests/out/tscaly_exec_o2}"
 BIN="${2:-$ROOT/scalyc/build/scalyc}"
+# the tool beside the compiler: scaly for REPL/run/build/test, scalyc for the flags
+SCALY=$("$ROOT/tools/scaly-of.sh" "$BIN")
 cd "$ROOT"
 ulimit -s 65520
 
 t0=$(date +%s)
-"$BIN" build packages/tscaly/0.1.0/tscaly_exec.scaly --release -o "$OUT" \
+"$SCALY" build packages/tscaly/0.1.0/tscaly_exec.scaly --release -o "$OUT" \
   || { echo "bench build: FAIL (rc=$?)"; exit 1; }
 echo "bench build: $OUT in $(( $(date +%s) - t0 ))s"
