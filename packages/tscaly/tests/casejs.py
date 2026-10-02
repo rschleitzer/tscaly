@@ -499,6 +499,10 @@ def stack_wrapper(args):
     """the dump under the stack tests/run.sh sets (a 40 KB binary-expression chain is a
     SIGSEGV at the default 8 MB): raised once in THIS process, which every dump inherits
     — a shell wrapper per chunk was a script file and a second exec per process"""
+    if os.name == "nt":
+        # no rlimit there: the stack is a reserve in the program's PE header, and
+        # tests/run.sh links the dump with 64 MB (2026-10-02)
+        return os.path.abspath(args.binary)
     import resource
     soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
     want = 65520 * 1024
