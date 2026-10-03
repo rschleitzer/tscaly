@@ -33,7 +33,6 @@ import os
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import difflib
@@ -360,31 +359,12 @@ def _chunks(items, k):
 
 
 def run_ours_batch(argv_head, pending, timeout):
-    """One of OUR batch programs over `pending` -> stream_process's four answers.
-
-    Everywhere but Windows: `--batch -`, the units through the pipe. On Windows a
-    Scaly program's standard streams are the CRT's TEXT mode, and both directions
-    broke the framing (measured 2026-10-02, the first run there): every line feed
-    the program writes arrives with a carriage return before it, so no unit ever
-    ended with UNIT_END and each was blamed and the process restarted -- one
-    process per unit; and a unit that CONTAINS a CR LF pair loses the CR on the
-    way in, so its declared length runs into the next header (a crash). So there
-    the units go through a FILE, which the program reads as bytes, and the answer
-    has the inserted carriage returns taken out again -- the exact inverse, since
-    text mode puts one before EVERY line feed it writes."""
-    if os.name != "nt":
-        return stream_process(argv_head + ["--batch", "-"], units_bytes(pending), timeout)
-    fd, path = tempfile.mkstemp(prefix="tscaly-units-", suffix=".txt")
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(units_bytes(pending))
-        rc, out, err, timed_out = stream_process(argv_head + ["--batch", path], None, timeout)
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-    return rc, out.replace(b"\r\n", b"\n"), err, timed_out
+    """One of OUR batch programs over `pending` -> stream_process's four answers:
+    `--batch -`, the units through the pipe, on every host. (On Windows this went
+    through a file with the carriage returns of the CRT's TEXT mode taken out of
+    the answer until 2026-10-03; a Scaly program's standard streams are binary
+    there since, so the pipe carries exactly the bytes, as on POSIX.)"""
+    return stream_process(argv_head + ["--batch", "-"], units_bytes(pending), timeout)
 
 
 def run_batch(binary, flag, units, scratch, jobs, timeout):

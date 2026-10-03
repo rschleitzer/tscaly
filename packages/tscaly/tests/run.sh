@@ -136,6 +136,9 @@ LINK_LIBS="-lm"
 EXE=
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
+    # clang, LIB and INCLUDE of the developer prompt: a shell that did not source
+    # them itself failed the first link with `clang: command not found`
+    . "$REPO/tools/win-env.sh" || exit 2
     [ "$LIBSCALY" = /tmp/libscaly.a ] && LIBSCALY=/tmp/libscaly.lib
     LINK_LIBS="-lws2_32 -Xlinker -stack:67108864,1048576"
     EXE=.exe
