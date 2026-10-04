@@ -142,9 +142,9 @@ def emit(entries):
     out.append("    if len > %d" % hi)
     out.append("        return KindIdentifier")
     out.append("    let c0 buf[0] as int")
-    out.append('    if c0 < ("a" as char) as int')
+    out.append('    if c0 < (("a" as char) as int)')
     out.append("        return KindIdentifier")
-    out.append('    if c0 > ("z" as char) as int')
+    out.append('    if c0 > (("z" as char) as int)')
     out.append("        return KindIdentifier")
     out.append("")
 
