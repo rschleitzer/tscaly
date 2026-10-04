@@ -126,7 +126,7 @@ def emit(entries):
     out.append("    {")
     out.append("        if (buf[i] as int) <> (word[i] as int)")
     out.append("            return false")
-    out.append("        set i: i + 1")
+    out.append("        i := i + 1")
     out.append("    }")
     out.append("    true")
     out.append("}")

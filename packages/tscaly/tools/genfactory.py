@@ -188,7 +188,7 @@ FACTORY_TAIL = """
                 let children this.syntax_list_children(v)
                 if (children.get_length() as int) <> 1
                     return null
-                set visited: children[0 as size_t]
+                visited := children[0 as size_t]
             }
         }
         visited
@@ -236,7 +236,7 @@ FACTORY_TAIL = """
     ; a SyntaxList answer splices its children in.
     procedure visit_slice(mutable this, mutable nodes: ref[Array[ref[AstNode]?]], mutable changed: ref[bool]) returns ref[Array[ref[AstNode]?]]
     {
-        set changed: false
+        changed := false
         let n nodes.get_length() as int
         var i 0
         while i < n
@@ -244,12 +244,12 @@ FACTORY_TAIL = """
             let node nodes[i as size_t]
             var visited: ref[AstNode]? null
             if node <> null
-                set visited: this.visit(node as ref[AstNode])
+                visited := this.visit(node as ref[AstNode])
             var same false
             if visited <> null
             {
                 if visited = node
-                    set same: true
+                    same := true
             }
             if same = false
             {
@@ -258,7 +258,7 @@ FACTORY_TAIL = """
                 while k < i
                 {
                     updated.add(nodes[k as size_t])
-                    set k: k + 1
+                    k := k + 1
                 }
                 while true
                 {
@@ -272,24 +272,24 @@ FACTORY_TAIL = """
                             while c < (children.get_length() as int)
                             {
                                 updated.add(children[c as size_t])
-                                set c: c + 1
+                                c := c + 1
                             }
                         }
                         else
                             updated.add(visited)
                     }
-                    set i: i + 1
+                    i := i + 1
                     if i >= n
                         break
                     let next nodes[i as size_t]
-                    set visited: null
+                    visited := null
                     if next <> null
-                        set visited: this.visit(next as ref[AstNode])
+                        visited := this.visit(next as ref[AstNode])
                 }
-                set changed: true
+                changed := true
                 return updated
             }
-            set i: i + 1
+            i := i + 1
         }
         nodes
     }
@@ -381,8 +381,8 @@ FACTORY_TAIL = """
                 if synthetic_location
                 {
                     let vn visited as ref[AstNode]
-                    set vn.pos: 0 - 1
-                    set vn.end: 0 - 1
+                    vn.pos := 0 - 1
+                    vn.end := 0 - 1
                 }
                 return visited
             }
@@ -390,8 +390,8 @@ FACTORY_TAIL = """
         let c factory.clone(node)
         if synthetic_location
         {
-            set c.pos: 0 - 1
-            set c.end: 0 - 1
+            c.pos := 0 - 1
+            c.end := 0 - 1
         }
         c
     }
@@ -414,9 +414,9 @@ FACTORY_TAIL = """
             while i < (list.get_length() as int)
             {
                 copy.add(list[i as size_t])
-                set i: i + 1
+                i := i + 1
             }
-            set new_list: factory.new_node_list_like(copy, nodes)
+            new_list := factory.new_node_list_like(copy, nodes)
         }
         if synthetic_location
         {
@@ -430,8 +430,8 @@ FACTORY_TAIL = """
                     if last <> null
                     {
                         let ln last as ref[AstNode]
-                        set ln.pos: 0 - 2
-                        set ln.end: 0 - 2
+                        ln.pos := 0 - 2
+                        ln.end := 0 - 2
                     }
                 }
             }
@@ -449,7 +449,7 @@ define DeepClone
     procedure visitor(host: ref[Page], mutable f: ref[NodeFactory], synthetic_location: bool) returns ref[NodeVisitor]
     {
         let v NodeVisitor.create(host, f, VisitTagDeepClone, HooksTagDeepClone)
-        set v.synthetic_location: synthetic_location
+        v.synthetic_location := synthetic_location
         v
     }
 
@@ -465,7 +465,7 @@ define DeepClone
             return null
         let n node as ref[AstNode]
         NodeFactory.set_parent_in_children(n)
-        set n.flags: n.flags | NodeFlagsReparsed
+        n.flags := n.flags | NodeFlagsReparsed
         n
     }
 
@@ -505,16 +505,16 @@ FACTORY_EXTRAS = """
         if (text.length as int) = 0
         {
             if node = null
-                set text: this.placeholder_text("auto", id)
+                text := this.placeholder_text("auto", id)
             else
             {
                 let n node as ref[AstNode]
                 if (n.kind = KindIdentifier) or (n.kind = KindPrivateIdentifier)
-                    set text: AstNode.identifier_text_of(n)
+                    text := AstNode.identifier_text_of(n)
                 else
-                    set text: this.placeholder_text("generated", this.the_context().get_node_for_generated_name_worker(n, id) as int)
+                    text := this.placeholder_text("generated", this.the_context().get_node_for_generated_name_worker(n, id) as int)
             }
-            set text: Printer.slice_on(host, Printer.format_generated_name(host, false, prefix, text, suffix))
+            text := Printer.slice_on(host, Printer.format_generated_name(host, false, prefix, text, suffix))
         }
         let name this.new_identifier(text)
         let info &AutoGenerateInfo^host(kind | (flags & ~GeneratedIdentifierFlagsKindMask), id, prefix, suffix, node)
@@ -547,7 +547,7 @@ FACTORY_EXTRAS = """
     {
         var flags flags_in
         if ((prefix.length as int) > 0) or ((suffix.length as int) > 0)
-            set flags: flags | GeneratedIdentifierFlagsOptimistic
+            flags := flags | GeneratedIdentifierFlagsOptimistic
         this.new_generated_identifier(GeneratedIdentifierFlagsNode, "", node, flags, prefix, suffix)
     }
 
@@ -558,16 +558,16 @@ FACTORY_EXTRAS = """
         if (text.length as int) = 0
         {
             if node = null
-                set text: this.placeholder_text("auto", id)
+                text := this.placeholder_text("auto", id)
             else
             {
                 let n node as ref[AstNode]
                 if (n.kind = KindIdentifier) or (n.kind = KindPrivateIdentifier)
-                    set text: AstNode.identifier_text_of(n)
+                    text := AstNode.identifier_text_of(n)
                 else
-                    set text: this.placeholder_text("generated", this.the_context().get_node_for_generated_name_worker(n, id) as int)
+                    text := this.placeholder_text("generated", this.the_context().get_node_for_generated_name_worker(n, id) as int)
             }
-            set text: Printer.slice_on(host, Printer.format_generated_name(host, true, prefix, text, suffix))
+            text := Printer.slice_on(host, Printer.format_generated_name(host, true, prefix, text, suffix))
         }
         let name this.new_private_identifier(text)
         let info &AutoGenerateInfo^host(kind | (flags & ~GeneratedIdentifierFlagsKindMask), id, prefix, suffix, node)
@@ -588,7 +588,7 @@ FACTORY_EXTRAS = """
     {
         var flags flags_in
         if ((prefix.length as int) > 0) or ((suffix.length as int) > 0)
-            set flags: flags | GeneratedIdentifierFlagsOptimistic
+            flags := flags | GeneratedIdentifierFlagsOptimistic
         this.new_generated_private_identifier(GeneratedIdentifierFlagsNode, "", node, flags, prefix, suffix)
     }
 
@@ -599,7 +599,7 @@ FACTORY_EXTRAS = """
         var text: Slice[char] ""
         let k text_source_node.kind
         if (k = KindIdentifier) or (k = KindPrivateIdentifier)
-            set text: AstNode.identifier_text_of(text_source_node)
+            text := AstNode.identifier_text_of(text_source_node)
         else
         {
             if k = KindJsxNamespacedName
@@ -611,12 +611,12 @@ FACTORY_EXTRAS = """
                 b.append(":" as char)
                 let nm AstNode.identifier_text_of(AstNode.namespaced_name_of(text_source_node))
                 b.append(nm.data, nm.length)
-                set text: Printer.slice_on(host, b.to_string())
+                text := Printer.slice_on(host, b.to_string())
             }
             else
             {
                 if (k = KindStringLiteral) or (k = KindNumericLiteral) or (k = KindBigIntLiteral) or (k = KindNoSubstitutionTemplateLiteral) or (k = KindTemplateHead) or (k = KindTemplateMiddle) or (k = KindTemplateTail) or (k = KindRegularExpressionLiteral)
-                    set text: AstNode.literal_text_of(text_source_node)
+                    text := AstNode.literal_text_of(text_source_node)
             }
         }
         let node this.new_string_literal(text, TokenFlagsNone)
@@ -666,7 +666,7 @@ FACTORY_EXTRAS = """
                 if op <> null
                 {
                     if (op as ref[AstNode]).kind = KindCommaToken
-                        set comma: true
+                        comma := true
                 }
             }
         }
@@ -697,14 +697,14 @@ FACTORY_EXTRAS = """
             let e expressions[i as size_t]
             if e <> null
                 this.flatten_comma_element(e as ref[AstNode], flat)
-            set i: i + 1
+            i := i + 1
         }
         var expression flat[0 as size_t]
-        set i: 1
+        i := 1
         while i < (flat.get_length() as int)
         {
-            set expression: this.new_comma_expression(expression, flat[i as size_t])
-            set i: i + 1
+            expression := this.new_comma_expression(expression, flat[i as size_t])
+            i := i + 1
         }
         expression
     }
@@ -718,18 +718,18 @@ FACTORY_EXTRAS = """
             let left this.create_expression_from_entity_name(AstNode.qualified_left_of(node) as ref[AstNode])
             let right_src AstNode.qualified_right_of(node) as ref[AstNode]
             let right this.clone(right_src)
-            set right.pos: right_src.pos
-            set right.end: right_src.end
-            set right.parent: right_src.parent
+            right.pos := right_src.pos
+            right.end := right_src.end
+            right.parent := right_src.parent
             let prop_access this.new_property_access_expression(left, null, right, NodeFlagsNone)
-            set prop_access.pos: node.pos
-            set prop_access.end: node.end
+            prop_access.pos := node.pos
+            prop_access.end := node.end
             return prop_access
         }
         let res this.clone(node)
-        set res.pos: node.pos
-        set res.end: node.end
-        set res.parent: node.parent
+        res.pos := node.pos
+        res.end := node.end
+        res.parent := node.parent
         res
     }
 
@@ -743,7 +743,7 @@ FACTORY_EXTRAS = """
         if stmt <> null
         {
             if (stmt as ref[AstNode]).kind = KindLabeledStatement
-                set inner_label: this.restore_enclosing_label(node, stmt)
+                inner_label := this.restore_enclosing_label(node, stmt)
         }
         this.update_labeled_statement(outer, AstNode.label_name_of(outer), inner_label)
     }
@@ -758,16 +758,16 @@ FACTORY_EXTRAS = """
             let one &Array[ref[AstNode]?]^host()
             one.add(updated_declaration)
             let statement this.new_variable_statement(null, this.update_variable_declaration_list(node, one, node.flags))
-            set statement.pos: node.pos
-            set statement.end: node.end
+            statement.pos := node.pos
+            statement.end := node.end
             return statement
         }
         let updated_expression this.new_assignment_expression(node, bound_value)
-        set updated_expression.pos: node.pos
-        set updated_expression.end: node.end
+        updated_expression.pos := node.pos
+        updated_expression.end := node.end
         let statement this.new_expression_statement(updated_expression)
-        set statement.pos: node.pos
-        set statement.end: node.end
+        statement.pos := node.pos
+        statement.end := node.end
         statement
     }
 
@@ -787,7 +787,7 @@ FACTORY_EXTRAS = """
         if object.kind = KindCallExpression
         {
             if (object.flags & NodeFlagsOptionalChain) <> 0
-                set flags: NodeFlagsOptionalChain
+                flags := NodeFlagsOptionalChain
         }
         this.new_call_expression(this.new_property_access_expression(object, null, method_name, NodeFlagsNone), null, null, arguments_list, flags)
     }
@@ -803,7 +803,7 @@ FACTORY_EXTRAS = """
         while i < (arguments_list.get_length() as int)
         {
             args.add(arguments_list[i as size_t])
-            set i: i + 1
+            i := i + 1
         }
         this.new_method_call(target, this.new_identifier("call"), args)
     }
@@ -886,7 +886,7 @@ FACTORY_EXTRAS = """
         while i < (statements.get_length() as int)
         {
             out.add(statements[i as size_t])
-            set i: i + 1
+            i := i + 1
         }
         out
     }
@@ -899,7 +899,7 @@ FACTORY_EXTRAS = """
         {
             if EmitContext.is_prologue_directive(source[i as size_t]) = false
                 return i
-            set i: i + 1
+            i := i + 1
         }
         i
     }
@@ -918,7 +918,7 @@ FACTORY_EXTRAS = """
                 if (ctx.emit_flags(s as ref[AstNode]) & EFCustomPrologue) = 0
                     return i
             }
-            set i: i + 1
+            i := i + 1
         }
         i
     }
@@ -948,9 +948,9 @@ FACTORY_EXTRAS = """
             let name this.clone(node_name as ref[AstNode])
             var emit_flags emit_flags_in
             if allow_comments = false
-                set emit_flags: emit_flags | EFNoComments
+                emit_flags := emit_flags | EFNoComments
             if allow_source_maps = false
-                set emit_flags: emit_flags | EFNoSourceMap
+                emit_flags := emit_flags | EFNoSourceMap
             this.the_context().add_emit_flags(name, emit_flags)
             return name
         }
@@ -980,7 +980,7 @@ FACTORY_EXTRAS = """
         let ctx this.the_context()
         var name name_in
         if ctx.has_auto_generate_info(name) = false
-            set name: this.clone(name)
+            name := this.clone(name)
         let qualified_name this.new_property_access_expression(ns, null, name, NodeFlagsNone)
         ctx.assign_comment_and_source_map_ranges(qualified_name, name)
         if allow_comments = false
@@ -1006,7 +1006,7 @@ FACTORY_EXTRAS = """
                 if (m as ref[AstNode]).kind = KindExportKeyword
                     return true
             }
-            set i: i + 1
+            i := i + 1
         }
         false
     }
@@ -1085,8 +1085,8 @@ FACTORY_EXTRAS = """
         let b StringBuilder^host()
         b.append(parameter_offset)
         let helper this.helper_call("__param", this.list2(this.new_numeric_literal(Printer.slice_on(host, b.to_string()), TokenFlagsNone), expression))
-        set helper.pos: location.pos as i32
-        set helper.end: location.end as i32
+        helper.pos := location.pos as i32
+        helper.end := location.end as i32
         helper
     }
 
@@ -1096,7 +1096,7 @@ FACTORY_EXTRAS = """
         ctx.request_emit_helper(ctx.helpers.add_disposable_resource_helper)
         var flag KindFalseKeyword
         if async
-            set flag: KindTrueKeyword
+            flag := KindTrueKeyword
         this.helper_call("__addDisposableResource", this.list3(env_binding, value, this.new_keyword_expression(flag)))
     }
 
@@ -1156,7 +1156,7 @@ FACTORY_EXTRAS = """
         while i < (arguments_list.get_length() as int)
         {
             args.add(arguments_list[i as size_t])
-            set i: i + 1
+            i := i + 1
         }
         this.new_method_call(target, this.new_identifier("bind"), args)
     }
@@ -1197,7 +1197,7 @@ FACTORY_EXTRAS = """
         ctx.add_emit_flags(generator_func, EFAsyncFunctionBody | EFReuseTempVariableScope)
         var this_arg this.new_void_zero_expression()
         if has_lexical_this
-            set this_arg: this.new_keyword_expression(KindThisKeyword)
+            this_arg := this.new_keyword_expression(KindThisKeyword)
         this.helper_call("__asyncGenerator", this.list3(this_arg, this.new_identifier("arguments"), generator_func))
     }
 
@@ -1222,15 +1222,15 @@ FACTORY_EXTRAS = """
         ctx.request_emit_helper(ctx.helpers.awaiter_helper)
         var params: ref[Array[ref[AstNode]?]]? parameters
         if params = null
-            set params: &Array[ref[AstNode]?]^host()
+            params := &Array[ref[AstNode]?]^host()
         let generator_func this.new_function_expression(null, this.new_token(KindAsteriskToken), null, null, params, null, null, body)
         ctx.add_emit_flags(generator_func, EFAsyncFunctionBody | EFReuseTempVariableScope)
         var this_arg this.new_void_zero_expression()
         if has_lexical_this
-            set this_arg: this.new_keyword_expression(KindThisKeyword)
+            this_arg := this.new_keyword_expression(KindThisKeyword)
         var args_arg this.new_void_zero_expression()
         if arguments_expression <> null
-            set args_arg: arguments_expression as ref[AstNode]
+            args_arg := arguments_expression as ref[AstNode]
         let args this.list3(this_arg, args_arg, this.new_void_zero_expression())
         args.add(generator_func)
         this.helper_call("__awaiter", args)
@@ -1280,7 +1280,7 @@ FACTORY_EXTRAS = """
             if name_expr <> null
             {
                 if (name_expr as ref[AstNode]).kind = KindIdentifier
-                    set property_name: this.new_string_literal_from_node(name_expr as ref[AstNode])
+                    property_name := this.new_string_literal_from_node(name_expr as ref[AstNode])
             }
         }
         let obj_param this.new_parameter_declaration(null, null, this.new_identifier("obj"), null, null, null)
@@ -1308,16 +1308,16 @@ FACTORY_EXTRAS = """
             {
                 let nk (name_expr as ref[AstNode]).kind
                 if (nk = KindPrivateIdentifier) or (nk = KindIdentifier)
-                    set name_value: this.new_string_literal_from_node(name_expr as ref[AstNode])
+                    name_value := this.new_string_literal_from_node(name_expr as ref[AstNode])
             }
         }
         let access_obj this.new_es_decorate_class_element_access_object(name_computed, name_expr, has_get, has_set)
         var static_expr this.new_false_expression()
         if is_static
-            set static_expr: this.new_true_expression()
+            static_expr := this.new_true_expression()
         var private_expr this.new_false_expression()
         if is_private
-            set private_expr: this.new_true_expression()
+            private_expr := this.new_true_expression()
         let props this.list3(
             this.new_property_assignment(null, this.new_identifier("kind"), null, null, this.new_string_literal(kind, TokenFlagsNone)),
             this.new_property_assignment(null, this.new_identifier("name"), null, null, name_value),
@@ -1472,18 +1472,18 @@ define NodeFactory
     procedure new_node(mutable this, kind: int, data: NodeData) returns ref[AstNode]
     {
         let n AstNode.alloc(host)
-        set n.kind: kind as i16
-        set n.flags: NodeFlagsNone
-        set n.pos: 0 - 1
-        set n.end: 0 - 1
-        set n.data: data
-        set n.parent: null
-        set n.symbol: null
-        set n.extras: null
-        set n.flow_node: null
-        set n.subtree_facts: 0
-        set n.link_ordinal: 0
-        set this.node_count: node_count + 1
+        n.kind := kind as i16
+        n.flags := NodeFlagsNone
+        n.pos := 0 - 1
+        n.end := 0 - 1
+        n.data := data
+        n.parent := null
+        n.symbol := null
+        n.extras := null
+        n.flow_node := null
+        n.subtree_facts := 0
+        n.link_ordinal := 0
+        this.node_count := node_count + 1
         if context <> null
             (context as ref[EmitContext]).on_create(n)
         n
@@ -1503,9 +1503,9 @@ define NodeFactory
     {
         if updated <> original
         {
-            set updated.flags: original.flags
-            set updated.pos: original.pos
-            set updated.end: original.end
+            updated.flags := original.flags
+            updated.pos := original.pos
+            updated.end := original.end
             if context <> null
                 (context as ref[EmitContext]).on_update(updated, original)
         }
@@ -1522,13 +1522,13 @@ define NodeFactory
                 if (sf.statements = statements) and (sf.end_of_file_token = end_of_file_token)
                     return node
                 var d: SourceFileData sf
-                set d.statements: statements
-                set d.end_of_file_token: end_of_file_token
+                d.statements := statements
+                d.end_of_file_token := end_of_file_token
                 let c AstNode.alloc(host)
-                set c: node
-                set c.subtree_facts: 0
-                set c.link_ordinal: 0
-                set c.data: NodeData.SourceFile(AstNode.box_source_file(host, d))
+                c := node
+                c.subtree_facts := 0
+                c.link_ordinal := 0
+                c.data := NodeData.SourceFile(AstNode.box_source_file(host, d))
                 return this.update_node(c, node)
             }
         node
@@ -1596,9 +1596,9 @@ define NodeFactory
             if c = null
                 break
             let child c as ref[AstNode]
-            set child.parent: node
+            child.parent := node
             NodeFactory.set_parent_in_children(child)
-            set i: i + 1
+            i := i + 1
         }
     }
 ''')
@@ -1669,10 +1669,10 @@ for name in order:
             for i, a in enumerate(arm_list):
                 if i < len(arm_list) - 1:
                     out('        if kind = Kind%s' % a)
-                    out('            set n: this.new_node(kind, %s)' % ctor(a))
+                    out('            n := this.new_node(kind, %s)' % ctor(a))
                 else:
                     out('        if n = null')
-                    out('            set n: this.new_node(kind, %s)' % ctor(a))
+                    out('            n := this.new_node(kind, %s)' % ctor(a))
             out('        let node n as ref[AstNode]')
     else:
         out('        let n this.new_node(%s, %s)' % (info['kind'], ctor(arm_list[0])))
@@ -1680,8 +1680,8 @@ for name in order:
     if info['flags']:
         op, expr = info['flags']
         expr = expr.replace('NodeFlagsOptionalChain', 'NodeFlagsOptionalChain')
-        if op == '|=': out('        set %s.flags: (%s.flags | (%s)) as u32' % (nvar, nvar, expr))
-        else: out('        set %s.flags: %s as u32' % (nvar, expr))
+        if op == '|=': out('        %s.flags := (%s.flags | (%s)) as u32' % (nvar, nvar, expr))
+        else: out('        %s.flags := %s as u32' % (nvar, expr))
     out('        %s' % nvar)
     out('    }')
     out()
@@ -1708,7 +1708,7 @@ for name in order:
             out('                var changed false')
             for pn, nf in cmp_params:
                 if nf == 'Flags':
-                    out('                if %s <> node.flags' % snake(pn)); out('                    set changed: true'); continue
+                    out('                if %s <> node.flags' % snake(pn)); out('                    changed := true'); continue
                 f = p2f.get(pn, '')
                 if not f: continue
                 t = ftype[f]
@@ -1717,7 +1717,7 @@ for name in order:
                     out('                if %s <> cmp_%s' % (snake(pn), f))
                 else:
                     out('                if %s <> d.%s' % (snake(pn), f))
-                out('                    set changed: true')
+                out('                    changed := true')
             out('                if changed')
             out('                    return this.update_node(this.new_%s(%s), node)' % (ctor_fn, callargs))
             out('                return node')
