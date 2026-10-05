@@ -59,8 +59,7 @@ JSNUM=$PKG/0.1.0/tscaly/jsnum.scaly
 FIX=$PKG/tests/fixtures
 LITOUT=$PKG/tests/out/lits
 
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
+. packages/tscaly/tests/toolchain.sh || exit 2
 
 # The fixtures the PIN reads — this slice's three, the two slice-70 grammar files
 # whose tag it moved, the two older files whose tag is a numeric literal's, and

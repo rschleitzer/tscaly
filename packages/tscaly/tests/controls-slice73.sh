@@ -38,8 +38,7 @@ PKG=packages/tscaly
 CHECKER=$PKG/0.1.0/tscaly/checker.scaly
 FIX=$PKG/tests/fixtures
 
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
+. packages/tscaly/tests/toolchain.sh || exit 2
 
 # The eighteen fixtures both pins read: the ten that report and the eight
 # negatives whose whole content is that they do NOT.

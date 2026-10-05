@@ -45,8 +45,7 @@ SUB=$PKG/_submodules/typescript-go
 OUT=$PKG/tests/out/lits
 COUNT=${1:-20000}
 
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
+. packages/tscaly/tests/toolchain.sh || exit 2
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }

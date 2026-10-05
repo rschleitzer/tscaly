@@ -127,7 +127,7 @@ SLOW=$PKG/tests/slow.txt
 FILTER=${1:-}
 STAGE=${TSCALY_STAGE:-1}
 
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
+. packages/tscaly/tests/toolchain.sh || exit 2
 # What a link needs beside the archive: libm on POSIX; on the Windows box the
 # archive is libscaly.lib, the math is in the CRT, the archive drags in Winsock,
 # and the 64 MB the `ulimit` below asks for is a PE stack reserve (2026-10-02,
@@ -136,10 +136,10 @@ LINK_LIBS="-lm"
 EXE=
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
-    # clang, LIB and INCLUDE of the developer prompt: a shell that did not source
-    # them itself failed the first link with `clang: command not found`
-    . "$REPO/tools/win-env.sh" || exit 2
-    [ "$LIBSCALY" = /tmp/libscaly.a ] && LIBSCALY=/tmp/libscaly.lib
+    # clang, LIB and INCLUDE of the developer prompt: a shell that did not set
+    # them failed the first link with `clang: command not found`. A script
+    # that sets them can be named in TSCALY_WIN_ENV.
+    if [ -n "${TSCALY_WIN_ENV:-}" ]; then . "$TSCALY_WIN_ENV" || exit 2; fi
     LINK_LIBS="-lws2_32 -Xlinker -stack:67108864,1048576"
     EXE=.exe
     ;;
@@ -150,7 +150,6 @@ esac
 # all seven artifacts, so every yardstick of that unit turns UNEXPLAINED. 64 MB is the
 # macOS hard limit; the batch inherits it.
 ulimit -s 65520 2>/dev/null || true
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -194,14 +193,14 @@ if ! command -v go >/dev/null 2>&1; then
 fi
 
 if [ ! -x "$SCALYC" ]; then
-  red "compiler not built: $SCALYC"
-  echo "  ./build.sh"
+  red "no compiler at: $SCALYC"
+  echo "  install Scaly (https://scaly.io), or set SCALYC=<path>"
   exit 2
 fi
 
 if [ ! -f "$LIBSCALY" ]; then
   red "runtime archive missing: $LIBSCALY"
-  echo "  see the recipe in the root CLAUDE.md, or set LIBSCALY=<path>"
+  echo "  it comes with an installed Scaly (lib/libscaly.a); or set LIBSCALY=<path>"
   exit 2
 fi
 

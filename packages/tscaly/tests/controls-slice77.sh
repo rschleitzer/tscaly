@@ -37,8 +37,7 @@ CHECKER=$PKG/0.1.0/tscaly/checker.scaly
 TYPEDUMP=$PKG/0.1.0/tscaly/TypeDump.scaly
 FIX=$PKG/tests/fixtures
 
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
+. packages/tscaly/tests/toolchain.sh || exit 2
 
 # One fixture per guard, plus the one shape that reaches the wall. ★ ONE MECHANISM
 # PER FILE: the tagpin is first-wins, so a fixture naming two mechanisms is a

@@ -53,8 +53,7 @@ PARSER=$PKG/0.1.0/tscaly/parser.scaly
 AST=$PKG/0.1.0/tscaly/ast.scaly
 FIX=$PKG/tests/fixtures
 
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
+. packages/tscaly/tests/toolchain.sh || exit 2
 
 # ★ ONE MECHANISM PER FILE (slice 72's rule): the tagpin is first-wins, so a
 # fixture naming two mechanisms is a fixture nobody can read a red row off.

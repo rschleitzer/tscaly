@@ -5,7 +5,7 @@
 #
 #   packages/tscaly/tools/bench/build.sh [out-binary] [scalyc-binary]
 #     out-binary     default: packages/tscaly/tests/out/tscaly_exec_o2
-#     scalyc-binary  default: scalyc/build/scalyc
+#     scalyc-binary  default: the scalyc on the PATH
 #
 # The yardsticks build their programs at the default opt level (none); a time
 # measured on that binary is several times too slow to compare with tsgo.
@@ -23,9 +23,10 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../../.." && pwd)"
 OUT="${1:-$ROOT/packages/tscaly/tests/out/tscaly_exec_o2}"
-BIN="${2:-$ROOT/scalyc/build/scalyc}"
-# the tool beside the compiler: scaly for REPL/run/build/test, scalyc for the flags
-SCALY=$("$ROOT/tools/scaly-of.sh" "$BIN")
+BIN="${2:-$(command -v scalyc)}"
+# the tool beside the compiler, named alike but for the `c`: scaly for
+# REPL/run/build/test, scalyc for the flags
+SCALY="${SCALY:-$(dirname "$BIN")/$(basename "$BIN" | sed 's/scalyc/scaly/')}"
 cd "$ROOT"
 ulimit -s 65520
 

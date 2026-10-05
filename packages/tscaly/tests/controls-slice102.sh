@@ -57,8 +57,7 @@ PKG=packages/tscaly
 CHECKER=$PKG/0.1.0/tscaly/checker.scaly
 FIX=$PKG/tests/fixtures
 
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
+. packages/tscaly/tests/toolchain.sh || exit 2
 
 # ★ ONE MECHANISM PER FILE (slice 72's rule). Five files: the arithmetic and
 # bitwise group with its boolean suggestion and its three result forks, the `+` arm

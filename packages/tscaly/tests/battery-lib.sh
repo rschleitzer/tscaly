@@ -42,8 +42,7 @@ AST=$PKG/0.1.0/tscaly/ast.scaly
 FIX=$PKG/tests/fixtures
 CASES=$PKG/tests/out/cases
 
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
+. packages/tscaly/tests/toolchain.sh || exit 2
 # ★★★ EVERY DUMPER CALL BELOW RUNS UNDER A TIME LIMIT, for slice 95's reason:
 # breaking one bit of a printer can remove the BASE CASE of its own recursion, and
 # a process that grows until the machine does is a verdict a battery cannot produce

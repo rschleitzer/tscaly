@@ -43,8 +43,7 @@ PKG=packages/tscaly
 CHECKER=$PKG/0.1.0/tscaly/checker.scaly
 FIX=$PKG/tests/fixtures
 
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
+. packages/tscaly/tests/toolchain.sh || exit 2
 
 # The seven fixtures the PIN reads. Three of them hold ONE statement each, and
 # that is a measurement decision rather than a style: a unit carries ONE unported

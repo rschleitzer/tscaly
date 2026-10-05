@@ -54,8 +54,7 @@ AST=$PKG/0.1.0/tscaly/ast.scaly
 TSPATH=$PKG/0.1.0/tscaly/tspath.scaly
 FIX=$PKG/tests/fixtures
 
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
+. packages/tscaly/tests/toolchain.sh || exit 2
 
 # The fixtures the PIN reads. EIGHT, and five of them exist for no other purpose:
 # three of the five sub-checks of checkCollisionsForDeclarationName are inert under

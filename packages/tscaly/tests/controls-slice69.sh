@@ -47,8 +47,7 @@ CHECKER=$PKG/0.1.0/tscaly/checker.scaly
 PARSER=$PKG/0.1.0/tscaly/parser.scaly
 FIX=$PKG/tests/fixtures
 
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
+. packages/tscaly/tests/toolchain.sh || exit 2
 
 # The fixtures the PIN reads. Most of them share `check-expression` on the
 # unpatched tree, which is the point: what they pin is that a row does not push a

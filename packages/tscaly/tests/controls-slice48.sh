@@ -51,8 +51,7 @@ CHECKER=$PKG/0.1.0/tscaly/checker.scaly
 DIAGS=$PKG/0.1.0/tscaly/Diagnostics.scaly
 DECLKINDS=$PKG/0.1.0/tscaly/DeclarationKinds.scaly
 
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
+. packages/tscaly/tests/toolchain.sh || exit 2
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }

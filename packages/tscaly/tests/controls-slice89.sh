@@ -45,8 +45,7 @@ AST=$PKG/0.1.0/tscaly/ast.scaly
 PARSER=$PKG/0.1.0/tscaly/parser.scaly
 FIX=$PKG/tests/fixtures
 
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
+. packages/tscaly/tests/toolchain.sh || exit 2
 
 # ★ ONE MECHANISM PER FILE (slice 72's rule). The last two break it on purpose:
 # `checker_binary_comma_in_call.ts` is slice 88's own negative control, which THIS

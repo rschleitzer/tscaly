@@ -60,8 +60,7 @@ CHECKER=$PKG/0.1.0/tscaly/checker.scaly
 FIX=$PKG/tests/fixtures
 OUT=$PKG/tests/out
 
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
+. packages/tscaly/tests/toolchain.sh || exit 2
 
 # ★ ONE MECHANISM PER FILE (slice 72's rule). Eleven files, all written by this
 # slice, and each is aimed at one arm of the flow half: the loops, the unreachable

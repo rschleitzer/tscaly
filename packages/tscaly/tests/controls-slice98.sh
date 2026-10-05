@@ -48,8 +48,7 @@ PKG=packages/tscaly
 CHECKER=$PKG/0.1.0/tscaly/checker.scaly
 FIX=$PKG/tests/fixtures
 
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
+. packages/tscaly/tests/toolchain.sh || exit 2
 
 # ★ ONE MECHANISM PER FILE (slice 72's rule). Six files: the premise arm, the
 # second producer of it, the concatenate path, the identity arm, the null-argument

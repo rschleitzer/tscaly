@@ -53,8 +53,7 @@ CHECKER=$PKG/0.1.0/tscaly/checker.scaly
 AST=$PKG/0.1.0/tscaly/ast.scaly
 FIX=$PKG/tests/fixtures
 
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
+. packages/tscaly/tests/toolchain.sh || exit 2
 
 # The fixtures the PIN reads — all eleven of this slice's. Three of them produce no
 # diagnostic of their own and exist for the tag alone (the two dynamic-name

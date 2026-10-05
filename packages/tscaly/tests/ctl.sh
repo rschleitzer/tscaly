@@ -134,8 +134,7 @@ bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
 PKG=packages/tscaly
 SUB=$PKG/_submodules/typescript-go
 OUT=$PKG/tests/out
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
+. packages/tscaly/tests/toolchain.sh || exit 2
 
 # Every INPUT a run of the yardsticks has, as one hash. This is what lets a
 # baseline be shared across a battery instead of re-measured 45 times, and it is

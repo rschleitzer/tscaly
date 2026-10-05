@@ -40,8 +40,7 @@ AST=$PKG/0.1.0/tscaly/ast.scaly
 PARSER=$PKG/0.1.0/tscaly/parser.scaly
 FIX=$PKG/tests/fixtures
 
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
+. packages/tscaly/tests/toolchain.sh || exit 2
 
 # ★ ONE MECHANISM PER FILE (slice 72's rule). Nine files, and the set is the set
 # that can ANSWER the claims rather than the set this slice wrote: eight are its own

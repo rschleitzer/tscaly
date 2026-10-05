@@ -48,8 +48,7 @@ DIAGCHECK=packages/tscaly/tests/diagcheck.sh
 PKG=packages/tscaly
 CHECKER=$PKG/0.1.0/tscaly/checker.scaly
 
-LIBSCALY=${LIBSCALY:-/tmp/libscaly.a}
-SCALYC=${SCALYC:-$REPO/scalyc/build/scalyc}
+. packages/tscaly/tests/toolchain.sh || exit 2
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }

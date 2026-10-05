@@ -48,18 +48,15 @@ packages/tscaly/
   LICENSE                  Apache 2.0 — this package only
   NOTICE.txt               attribution, ours + upstream
   README.md                this file
-  CLAUDE.md                working rules; the Go→Scaly mapping vocabulary
   TESTPLAN.md              the golden-master runner, sketched
   0.1.0/                   the Scaly sources (package `tscaly`)
   _submodules/
     typescript-go/         pinned reference + test corpus, never copied from
 ```
 
-The sources sit under `0.1.0/` because package resolution in this repo is by
-convention `packages/<name>/<version>/`. Everything above that level —
-submodule, licenses, docs — stays outside the directory the compiler scans, and
-travels with the package under a later
-`git filter-repo --path packages/tscaly`.
+The sources sit under `0.1.0/` because the Scaly compiler finds a package at
+`packages/<name>/<version>/`. Everything above that level — submodule,
+licenses, documents — stays outside the directory the compiler scans.
 
 The submodule
 -------------
@@ -74,20 +71,19 @@ that walks `packages/` must tolerate the directory being empty.
 
 The submodule serves two purposes at once: it is the reference source for the
 line-by-line port, and it is the test corpus. Nothing is copied out of it into
-this repository. See [CLAUDE.md](CLAUDE.md) for how it is updated.
+this repository.
 
 License boundary
 ----------------
 
-This package is Apache 2.0. The rest of Scaly is MIT, and `packages/dazzle` and
-`packages/opensp` carry the permissive Clark/OpenJade license. Licenses attach
-to works, not to repositories, so this is a normal arrangement — but it has one
-rule that is easy to violate by accident:
+tscaly is Apache 2.0. Scaly itself — compiler, runtime, standard library — is
+MIT and lives in a repository of its own. Licenses attach to works, so this is
+a normal arrangement, but it has one rule that is easy to violate by accident:
 
-> **No code moves out of `packages/tscaly` into the compiler, the runtime or the
-> stdlib. Concepts and ideas yes; literal code no.**
+> **No code moves out of tscaly into Scaly's compiler, runtime or standard
+> library. Concepts and ideas yes; literal code no.**
 
 The direction that is allowed (MIT into Apache) is not the risk. The risk is
-that a helper written while porting looks like a stdlib candidate and gets
-lifted upward, which would relicense a piece of the stdlib without anyone
-deciding to. `.github/workflows/license-boundary.yml` enforces it.
+that a helper written while porting looks like a standard-library candidate
+and gets lifted over, which would relicense a piece of the standard library
+without anyone deciding to.
