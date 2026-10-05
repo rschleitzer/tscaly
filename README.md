@@ -40,8 +40,15 @@ packages/tscaly/tests/run.sh
 ```
 
 The runner compares the port with the reference unit by unit in six yardsticks
-(scanner, parser, jsdoc, binder, flow, checker) at corpus stage 1;
-`TSCALY_STAGE=2` adds the reference's submodule corpus.
+(scanner, parser, jsdoc, binder, flow, checker) at corpus stage 1.
+
+Stage 2 adds the TypeScript project's own corpus, a submodule of the
+submodule (603 MB, a shallow clone is enough):
+
+```sh
+git -C packages/tscaly/_submodules/typescript-go submodule update --init --depth 1 _submodules/TypeScript
+TSCALY_STAGE=2 packages/tscaly/tests/run.sh
+```
 
 ## Measure
 
