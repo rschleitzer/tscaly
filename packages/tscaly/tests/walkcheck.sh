@@ -93,7 +93,7 @@ mkdir -p "$WORK"
 : > "$WORK/failures.txt"
 # ★★★ THE UNIT LOOP MOVED INTO ONE PYTHON PROCESS ON EVERY CORE (slice 58), and
 # nothing about WHAT is measured moved with it — see tests/checkloop.py for the
-# argument, and for why a POOL is safe where the batch-mode dumper TESTPLAN
+# argument, and for why a POOL is safe where the batch-mode dumper the runner
 # refused was not. Measured on this tree: the dumper answers a unit in 5.3 ms warm
 # and this loop spent ~22 ms on it, because per unit the shell ran an awk or a
 # grep, the dumper, a grep -c, a cmp — and, in diagcheck, a whole python3

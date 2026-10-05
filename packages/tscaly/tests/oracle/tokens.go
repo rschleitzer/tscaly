@@ -18,7 +18,6 @@
 // change that, because the rule is evaluated on module paths). The runner
 // therefore copies this file into the submodule's tree, builds it there, and
 // removes it again — and checks that the submodule is clean before and after.
-// See ../../TESTPLAN.md.
 package main
 
 import (

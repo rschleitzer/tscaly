@@ -6,8 +6,8 @@
 #
 # ★★★ WHY THERE IS A STORE AND NOT A TREE (2026-09-02). Until this file the runner
 # wrote every artifact of every unit to its own file — ~24 per unit, 443 317 files
-# for a stage-2 run — and the box's indexer and endpoint protection scanned each one
-# (packages/tscaly/CLAUDE.md §0.5). Nothing in the COMPARISON ever needed a file:
+# for a stage-2 run — and the box's indexer and endpoint protection scanned each one.
+# Nothing in the COMPARISON ever needed a file:
 # compare.py held both sides in memory and diffed them there. The files existed as
 # the exchange format between the runner and its eight readers. That exchange format
 # is now ONE SQLite file per run, `tests/out/run.db`, held open for the run

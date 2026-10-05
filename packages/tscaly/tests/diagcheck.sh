@@ -103,7 +103,7 @@ mkdir -p "$WORK"
 : > "$WORK/failures.txt"
 # ★★★ THE UNIT LOOP MOVED INTO ONE PYTHON PROCESS ON EVERY CORE (slice 58), and
 # nothing about WHAT is measured moved with it — see tests/checkloop.py for the
-# argument, and for why a POOL is safe where the batch-mode dumper TESTPLAN
+# argument, and for why a POOL is safe where the batch-mode dumper the runner
 # refused was not. This instrument was the worse of the two: it ran a python3
 # HEREDOC per unit, i.e. a fresh interpreter, to answer a subsequence test over a
 # handful of lines. The verdicts, the counters and failures.txt are byte-identical

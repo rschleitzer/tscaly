@@ -29,7 +29,7 @@
 #                between runs while every single run stayed internally consistent.
 #
 # ★★★ AND THE GATE IS SHOWN TO BITE RATHER THAN ASSERTED TO — a refuter that
-# cannot fire is worse than none (root CLAUDE.md). Four injections into a real
+# cannot fire is worse than none. Four injections into a real
 # dump of `flow_try.ts`, each of which must produce exactly its own sentence:
 #
 #   drop one `N` line                 -> "flow ids referenced but never defined:

@@ -4,7 +4,7 @@
 # ctl.sh — run ONE negative control against the yardsticks.
 #
 # A control breaks a specific claim on purpose and measures what turns red. Every
-# parser slice in CLAUDE.md carries a table of them, and the discipline behind
+# parser slice carries a table of them, and the discipline behind
 # that table is what this script mechanises, because each rule in it was paid for
 # once:
 #
@@ -110,7 +110,7 @@
 #   SPEC
 #
 # Reports, per yardstick: the baseline, the patched result, and the DELTA. Read
-# the delta the way CLAUDE.md's tables do:
+# the delta this way:
 #
 #   RED n            n units now differ — the strongest gate
 #   matched -n       n units fell to unported instead: real (unported is not a
@@ -156,8 +156,8 @@ fingerprint() {
 # ── `--establish-baseline`: fill the shared cache and stop ───────────────────
 #
 # ★ This mode exists so that the fingerprint rule has exactly ONE definition.
-# The first draft had the battery script compute its own, which is the shape the
-# root CLAUDE.md warns about twice — a second copy of a rule, and an instrument
+# The first draft had the battery script compute its own, which is a shape that
+# is wrong twice — a second copy of a rule, and an instrument
 # whose scope is narrower than its claim. A caller that wants a shared baseline
 # asks for one here.
 if [ "${1:-}" = "--establish-baseline" ]; then

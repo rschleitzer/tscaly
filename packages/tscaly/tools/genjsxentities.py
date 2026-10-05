@@ -21,7 +21,7 @@ lines.append("; reference's transformers/jsxtransforms/jsx.go entity table (`&nb
 lines.append("; kin). Edit the GENERATOR, never this file; tools/gencheck.sh compares.")
 lines.append(";")
 lines.append("; A structure with a field rather than a bare namespace: a field-less define's")
-lines.append("; functions are FREE and mangle without its name (packages/tscaly/CLAUDE-lessons.md §3.5jd).")
+lines.append("; functions are FREE and mangle without its name.")
 lines.append("define JsxEntities (unused: int)")
 lines.append("{")
 lines.append("    ; the code point of a named entity, or -1 when the name is not one")

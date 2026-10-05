@@ -246,7 +246,7 @@ fi
 # -- the comparison -----------------------------------------------------------
 #
 # No pipeline around either binary: `rc=$?` after `$(prog | ...)` reads the last
-# stage's status (root CLAUDE.md's harness rule).
+# stage's status.
 "$OUT/oracle_lits" "$OUT/corpus" > "$OUT/ref" 2> "$OUT/ref.err"
 rrc=$?
 "$OUT/tscaly_lits" "$OUT/corpus" > "$OUT/ours" 2> "$OUT/ours.err"

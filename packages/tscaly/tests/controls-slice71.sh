@@ -595,7 +595,7 @@ p = sys.argv[1]; s = open(p).read()
 # is what reads it. Break either and the pair disagrees with the reference; break
 # BOTH and `0n` comes out right again through the other route.
 # PREDICTION: UNGATED on all three instruments, and the prediction IS the finding
-# (root CLAUDE.md: a green suite is evidence about the PAIR, never about either
+# (a green suite is evidence about the PAIR, never about either
 # half).
 old = """        var i 0
         while i < m
@@ -727,5 +727,5 @@ control "g22 g17 AND g18 together (the cancelling pair)"     "$CHECKER" "$PATCHD
 echo
 echo "################################################################"
 bold "DONE — 22 rows."
-echo "A row that is UNGATED on all three instruments needs an argument in"
-echo "CLAUDE.md's table, not a shrug: §3.5v names the four kinds it can be."
+echo "A row that is UNGATED on all three instruments needs an argument,"
+echo "not a shrug."

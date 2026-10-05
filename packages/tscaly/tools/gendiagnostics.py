@@ -4,8 +4,8 @@
 # gendiagnostics.py — generate tscaly/DiagnosticCodes.scaly from the pinned
 # reference's diagnostic message table.
 #
-# The yardstick compares a diagnostic's CODE and SPAN, never its text (see
-# TESTPLAN.md — the message lives in a 2000-entry table this port has no reason
+# The yardstick compares a diagnostic's CODE and SPAN, never its text (the
+# message lives in a 2000-entry table this port has no reason
 # to carry). So what the port needs from `internal/diagnostics` is one integer
 # per message, and typing those by hand would be 60-odd magic numbers whose only
 # check is a reader's eye.
@@ -200,8 +200,8 @@ def main():
 
     # `diagnostics.Message` is the TYPE, not a message; it appears in every
     # signature. Anything else that does not resolve is a real problem with this
-    # scrape and is reported rather than skipped — the trap the root CLAUDE.md
-    # records for the ABI audit, where 82 wrong result types hid behind one
+    # scrape and is reported rather than skipped — the trap of
+    # the Scaly compiler's ABI audit, where 82 wrong result types hid behind one
     # silently unparsable type name.
     used.discard("Message")
     # ★ And `diagnostics.Category*` are the CATEGORY constants, not messages.
@@ -246,8 +246,8 @@ def main():
     out.append(";")
     out.append("; ONE INTEGER PER MESSAGE, and no text. The yardstick compares a diagnostic's")
     out.append("; code and span; the message string lives in a table this port has no reason to")
-    out.append("; carry, and TESTPLAN.md says so where it lists what the dump format does not")
-    out.append("; show — a wrong message with a right code passes here.")
+    out.append("; carry, so the dump format does not")
+    out.append("; show it — a wrong message with a right code passes here.")
     out.append(";")
     out.append("; The set is exactly the messages the reference's scanner.go, parser.go,")
     out.append("; jsdoc.go, binder.go, grammarchecks.go and checker.go reference, deduped —")

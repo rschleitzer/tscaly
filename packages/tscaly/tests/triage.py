@@ -8,8 +8,8 @@
 # turns the tree `run.sh` left behind into two histograms:
 #
 #   the UNPORTED histogram   which of the eleven `unported` markers the corpus
-#                            actually reaches, and how often. CLAUDE.md's §3.5
-#                            entries say the next slice is READ off this column;
+#                            actually reaches, and how often. The next slice
+#                            is READ off this column;
 #                            until stage 2 there was nothing to read.
 #   the MISMATCH histogram   for every failing artifact, the FIRST line where our
 #                            dump and the reference's disagree, named by the

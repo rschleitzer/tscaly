@@ -113,7 +113,7 @@ def check_sorted(name, pairs):
                      % (name, pairs[i][0]))
     for cp, to in pairs:
         # A const array literal takes BARE integers only: a negative element folds
-        # to several elements and shifts the tail (root CLAUDE.md).
+        # to several elements and shifts the tail.
         if cp < 0 or to < 0:
             sys.exit("genunicodecase: a negative element in %s" % name)
 
@@ -146,7 +146,7 @@ def emit_array(out, name, values):
     """One row of twelve, and EVERY row ends with a comma — the last one too.
 
     ★★★ THE TRAILING COMMA IS LOAD-BEARING AND ITS ABSENCE IS REPORTED AT THE
-    OPENING BRACKET — CLAUDE.md §3.9c, which this generator's first draft walked
+    OPENING BRACKET — a trap this generator's first draft walked
     into anyway. An LF separates constructs in Scaly, so an element followed by a
     newline ends the element list and the `]` on the next line is orphaned:
     `define X: int[] [` ... `0x37F` NEWLINE `]` fails as `expected ']'` at the

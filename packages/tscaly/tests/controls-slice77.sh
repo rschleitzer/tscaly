@@ -11,7 +11,7 @@
 # Every losing row below is caught by the DIAGPIN, which compares the seven
 # fixtures' C sections byte for byte and whose every line was checked against the
 # reference's own C section before this battery ran (five of seven are equal, two
-# are strict subsequences and CLAUDE.md §3.5dw names both).
+# are strict subsequences).
 #
 # ★★ THE THIRD INSTRUMENT IS THE STOPGATE, and it is not decoration: half of what
 # this slice does is move where the interface arm stops, which no diagnostic can

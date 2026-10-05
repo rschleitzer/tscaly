@@ -65,8 +65,7 @@
 // ★ THIS FILE IS OURS and lives in our repository, but it cannot be BUILT from
 // here — every upstream package is under internal/, which Go admits only from
 // inside the module rooted above it. The runner copies it into the submodule,
-// builds, removes it again, and checks the submodule clean on both sides. See
-// ../../TESTPLAN.md.
+// builds, removes it again, and checks the submodule clean on both sides.
 package main
 
 import (
@@ -114,8 +113,7 @@ func main() {
 	//
 	// ★ The sentence that stood here — "the pinned corpus contains no .d.ts
 	// case, so that path is unexercised on both sides" — was true of whole CASES
-	// and false of the sections they split into, which is the same expiry
-	// TESTPLAN.md records for its own version of it. A claim scoped to the unit
+	// and false of the sections they split into. A claim scoped to the unit
 	// of measurement expires when the unit changes.
 	cwd, err := os.Getwd()
 	if err != nil {

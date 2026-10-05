@@ -95,7 +95,7 @@ def dispatch(out, fn, doc, words, result):
             assert len(w) == n and w.isascii() and "\\" not in w, w
             # ★kw_eq takes the VIEW since 2026-09-05, so `s` goes in whole.
             # `s.data` was a Slice taken apart at the call site purely to fit a
-            # pointer parameter -- the shape tools/lenfix/scan.py chases.
+            # pointer parameter.
             out.append('        if kw_eq(s, "%s")' % w)
             out.append('            return %s' % (result[w] if result else 'true'))
         out.append('    }')
@@ -154,7 +154,7 @@ def main():
     out.append('; unqualified — Keywords.get_identifier_token is the precedent, and the scanner')
     out.append('; has called it without one since slice 3 — and an explicit `use` changes the')
     out.append('; MANGLED NAME at the call site while leaving the definition unqualified, which')
-    out.append('; links as an undefined symbol rather than as a diagnostic (root CLAUDE.md: a')
+    out.append('; links as an undefined symbol rather than as a diagnostic (a')
     out.append('; `use` line feeds the call-mangling machinery, not only visibility).')
     out.append('')
 

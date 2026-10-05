@@ -5,7 +5,7 @@
 #
 # Slice 24 is checkJSSyntax: the pass that reports TypeScript-only syntax found in
 # a JavaScript file. Each entry below breaks exactly ONE of its claims and measures
-# what turns red. Read them against the table in CLAUDE.md §4; a row there and a
+# what turns red. A row of the result table and a
 # `run` here carry the same label, deliberately, so the two can be diffed.
 #
 # ★★★ THIS SLICE'S CONTROLS ARE UNUSUALLY SHARP, and the reason is the dump

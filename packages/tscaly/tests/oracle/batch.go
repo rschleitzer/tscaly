@@ -5,7 +5,7 @@
 // ★★★ WHY IT EXISTS (2026-09-02). The runner used to spawn the split oracle once per
 // case and six dump oracles once per unit, and write every answer to its own file:
 // a stage-2 run was ~130 000 process starts and 443 000 files, and the box's
-// endpoint protection scanned every one of them (packages/tscaly/CLAUDE.md §0.5).
+// endpoint protection scanned every one of them.
 // This program reads `<case file>\t<case name>` lines on stdin, splits each case
 // with the reference's own splitter, dumps every unit's seven artifacts in-process
 // with a worker pool, and writes ONE framed stream to stdout. No file is created.

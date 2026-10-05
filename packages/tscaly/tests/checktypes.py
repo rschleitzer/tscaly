@@ -35,7 +35,7 @@
 #                of claim that stays true until it does not.
 #
 # ★ WHAT IT DELIBERATELY DOES NOT CHECK: that a TYPE is right. Nothing here can
-# know that, and a gate pretending to would be worse than none (root CLAUDE.md's
+# know that, and a gate pretending to would be worse than none (the
 # rule: a checker that cannot fail is worse than no checker). The types are
 # compared against our port, one slice at a time, by the yardstick itself.
 #

@@ -17,8 +17,8 @@
 #
 # ★★ THE DIAGPIN IS THE ONE TO READ FIRST. It is the only instrument here that is
 # symmetric in the direction the slice's product points: every line it holds was
-# checked against the reference's own C section when the fixture was written (see
-# CLAUDE.md §3.5ds for the table), so a red diagpin is a statement about the
+# checked against the reference's own C section when the fixture was written,
+# so a red diagpin is a statement about the
 # reference and not merely about a previous build of this port.
 #
 # ★★★ ITERATE AT STAGE 1 AND CONFIRM AT STAGE 2 ONCE — slice 64's rule. The
@@ -696,5 +696,5 @@ control "g25 symbol_name_equals without the length test"        "$CHECKER" "$PAT
 echo
 echo "################################################################"
 bold "DONE — 25 rows."
-echo "A row that is UNGATED on all three needs an argument in CLAUDE.md's"
-echo "table, not a shrug: §3.5v names the four kinds it can be."
+echo "A row that is UNGATED on all three needs an argument,"
+echo "not a shrug."

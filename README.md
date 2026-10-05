@@ -39,8 +39,9 @@ git submodule update --init packages/tscaly/_submodules/typescript-go
 packages/tscaly/tests/run.sh
 ```
 
-[`packages/tscaly/TESTPLAN.md`](packages/tscaly/TESTPLAN.md) describes the
-runner and its stages.
+The runner compares the port with the reference unit by unit in six yardsticks
+(scanner, parser, jsdoc, binder, flow, checker) at corpus stage 1;
+`TSCALY_STAGE=2` adds the reference's submodule corpus.
 
 ## Measure
 

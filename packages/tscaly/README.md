@@ -48,7 +48,6 @@ packages/tscaly/
   LICENSE                  Apache 2.0 — this package only
   NOTICE.txt               attribution, ours + upstream
   README.md                this file
-  TESTPLAN.md              the golden-master runner, sketched
   0.1.0/                   the Scaly sources (package `tscaly`)
   _submodules/
     typescript-go/         pinned reference + test corpus, never copied from

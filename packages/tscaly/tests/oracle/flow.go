@@ -58,7 +58,7 @@
 //
 // ★ THIS FILE IS OURS and cannot be BUILT from here; the runner copies it into
 // the submodule, builds, removes it and checks the submodule clean on both
-// sides. See ../../TESTPLAN.md.
+// sides.
 package main
 
 import (

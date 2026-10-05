@@ -4,7 +4,7 @@
 # controls-slice22.sh — the slice-22 control battery, forty-five of them.
 #
 # ★★★ WHY THIS FILE EXISTS AT ALL, when no earlier slice has one. `ctl.sh` is
-# committed and the RESULT tables are in CLAUDE.md §4 — but the SPECS were
+# committed and the RESULT tables were kept — but the SPECS were
 # thrown away after every battery through slice 21, so a row of those tables
 # names a claim and a number and nothing that can reproduce either. That is the
 # shape ctl.sh's own header argues against ("a harness whose rules live only in
@@ -12,7 +12,7 @@
 # table is prose about a measurement whose instrument no longer exists.
 #
 # Each entry below breaks exactly ONE claim of the JSDoc reparser and measures
-# what turns red. Read them against the table in CLAUDE.md §4; a row there and a
+# what turns red. A row of the result table and a
 # `run` here carry the same label, deliberately, so the two can be diffed.
 #
 # ★ THE NUMBERS IN THAT TABLE ARE A MEASUREMENT OF ONE TREE ON ONE DAY. Re-run

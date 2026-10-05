@@ -3,7 +3,7 @@
 #
 # dupmethods.py — TWO FUNCTIONS OF ONE CONCEPT WITH THE SAME NAME.
 #
-# ★★★ WHY IT EXISTS. The root CLAUDE.md carries this as an ACTIVE compiler trap: a method
+# ★★★ WHY IT EXISTS. This is a known compiler trap: a method
 # and a static of one concept with the same name and the same parameter list mangle to ONE
 # Itanium symbol, the emitter keeps ONE body, the linker has nothing to object to because
 # only one definition exists, and the other call form then passes its first argument into

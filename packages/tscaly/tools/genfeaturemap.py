@@ -12,8 +12,8 @@
 # the wrong DIAGNOSTIC CODE on one property of one type, several hundred units
 # away from the table, and only the corpus would ever see it.
 #
-# ★★ THE OUTPUT IS A FUNCTION AND NOT A TABLE, for the reason the root CLAUDE.md
-# gives about const array globals: an `[N x T]` value cannot be handed to a
+# ★★ THE OUTPUT IS A FUNCTION AND NOT A TABLE, because of how Scaly treats
+# const array globals: an `[N x T]` value cannot be handed to a
 # pointer parameter, and a table of STRINGS has no such spelling at all. The
 # lookup is a chain of byte comparisons — the same shape Keywords.scaly uses —
 # and it answers the lib name's bytes through two out-parameters.

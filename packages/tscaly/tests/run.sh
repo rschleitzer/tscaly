@@ -66,7 +66,7 @@
 #                                                     full submodule corpus
 #
 # ★★★ THE CORPUS HAS STAGES, AND THE REPORT SAYS WHICH ONE IT MEASURED. A count
-# without its corpus is not a result — TESTPLAN.md's table names three stages and
+# without its corpus is not a result — there are three stages and
 # `TSCALY_STAGE` selects between the first two:
 #
 #   1 (default)  our fixtures + typescript-go's repo-local cases, under
@@ -76,8 +76,8 @@
 #                through ../_submodules/TypeScript (compiler_runner.go:63), with
 #                the reference's own file regex `\.tsx?$`
 #
-# Stage 1 is the working yardstick: 12 s, small enough to run per slice, and every
-# number in CLAUDE.md's tables is one of its numbers. Stage 2 (7 min 23 s) is the
+# Stage 1 is the working yardstick: 12 s and small enough to run per slice.
+# Stage 2 (7 min 23 s) is the
 # one that can turn *it agrees over 834 units* into *the sample of 17 604 found
 # these 21 things*, which is what it did on its first pass.
 #
@@ -93,7 +93,7 @@
 # work list — `triage.py` groups it by tag so it names the arm that unlocks the most
 # units next. A number in it is not a failure and not a pass.
 # ★It is a MEASUREMENT and not a gate, and it does not say *finished* either: the
-# corpus is a SAMPLE and the reference is the SPECIFICATION (CLAUDE.md §3.5be).
+# corpus is a SAMPLE and the reference is the SPECIFICATION.
 #
 # ★ A stage-2 case key is prefixed `submodule_`, mirroring the reference's own
 # separation (testdata/baselines/reference/submodule/ against .../compiler/). It
@@ -108,8 +108,8 @@
 # sides here parse the same bytes, so skipping them would only remove units from
 # the yardstick.
 #
-# Harness rules observed here, each one paid for by an earlier suite in this repo
-# (root CLAUDE.md): no `git checkout -- .`; a per-case scratch directory; no
+# Harness rules observed here, each one paid for by an earlier suite in this repo:
+# no `git checkout -- .`; a per-case scratch directory; no
 # pipeline around a binary whose exit code is read; nothing writes to an absolute
 # POSIX path.
 
@@ -167,7 +167,7 @@ fi
 
 case $STAGE in
   1|2) ;;
-  *) red "TSCALY_STAGE=$STAGE: only stages 1 and 2 are built (3 is fourslash — see TESTPLAN.md)."
+  *) red "TSCALY_STAGE=$STAGE: only stages 1 and 2 are built (3 is fourslash)."
      exit 2 ;;
 esac
 
@@ -342,8 +342,7 @@ fi
 # `define` lines, which is exactly what mangles without a namespace. Nested
 # concepts and generics are out of its reach and out of the hazard.
 #
-# ★★★ THE COMPILER REPORTS THIS CLASS SINCE 2026-09-20 (`Planner.check_layout_
-# collision#`, gate `tests/regress/xfail_record_layout_collision.scaly`), and
+# ★★★ THE COMPILER REPORTS THIS CLASS SINCE 2026-09-20, and
 # this scan STAYS — the two ask different questions. The compiler judges the
 # LAYOUT: it fires when both records are laid out in one compilation and their
 # field lists differ, and it stays silent where an explicit `use ns.Name`
@@ -475,7 +474,7 @@ while IFS= read -r f; do cases+=("$f"); done < <(
 # rather than asserted: the `cut -d' ' -f1-<keep>` that drops the oracle's kind-NAME
 # column is reimplemented on bytes and was diffed against BSD `cut` over all 2 502
 # artifacts of a green run before the loop was retired. It is load-bearing and it
-# is not a normalisation — see the root CLAUDE.md's `od -c` lesson, where a
+# is not a normalisation — there is an earlier `od -c` lesson, where a
 # normalisation in the comparison hid exactly the class it hid in the comparison.
 # The dump binaries are still one process per (unit, artifact), because a
 # batch-mode dumper would share process state across units and that WOULD change
@@ -492,8 +491,7 @@ while IFS= read -r f; do cases+=("$f"); done < <(
 
 # ★ There is no reference-dump cache any more (2026-09-02): oracle_batch answers the
 # whole stage-1 reference in seconds, in-process, so there is nothing to cache and
-# no 38 000-file tree under $REPO/.tscaly-refcache to scan. Its history is in
-# CLAUDE-history.md under *The runner's history*.
+# no 38 000-file tree under $REPO/.tscaly-refcache to scan.
 
 # ── the OUTGOING store's verdicts, written out before it is destroyed ────────
 #
@@ -572,7 +570,7 @@ if [ "$STAGE" -ge 2 ]; then
   echo "  TypeScript submodule's own {compiler,conformance} corpus, $cases_seen cases in all."
 else
   echo "corpus stage 1 — our fixtures + typescript-go's repo-local cases, $cases_seen cases."
-  echo "  TSCALY_STAGE=2 adds the submodule corpus; see TESTPLAN.md's stage table."
+  echo "  TSCALY_STAGE=2 adds the submodule corpus."
 fi
 
 # ★★★ THE FIFTH NUMBER IS THE UNIT TOTAL'S FIFTH TERM, and leaving it out would

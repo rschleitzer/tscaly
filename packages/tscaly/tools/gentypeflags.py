@@ -23,8 +23,8 @@
 #
 # ★ Scaly cannot spell the expressions anyway, which is the second half of the
 # argument, verbatim from gensymbolflags.py: a module-level `define` initializer
-# folds constants only within ONE precedence level and has no bitwise complement
-# (root CLAUDE.md), so `A & ^B` cannot be written. Each composite is resolved here
+# folds constants only within ONE precedence level and has no bitwise complement,
+# so `A & ^B` cannot be written. Each composite is resolved here
 # to the PRIMITIVE bits it contains and emitted as an `|` chain of their names —
 # symbolic, so a moved bit position cannot leave a stale composite behind — with
 # the reference's own expression kept in the comment.

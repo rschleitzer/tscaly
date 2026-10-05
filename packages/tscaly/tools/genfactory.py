@@ -1651,7 +1651,7 @@ for name in order:
     fn = snake(name)
     sig = ', '.join('%s: %s' % (a, b) for a, b in sparams)
     out('    ; New%s' % name)
-    # R1 `mutable` marks (tools/purify/mark.py off the write census): a constructor
+    # R1 `mutable` marks (derived from the compiler's write census): a constructor
     # writes only its factory; an update also hands every child to update_node
     # through the new node, and the census counts that as a write of the child
     out('    procedure new_%s(mutable this%s) returns ref[AstNode]' % (fn, (', ' + sig) if sig else ''))

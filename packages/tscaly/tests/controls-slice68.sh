@@ -29,7 +29,7 @@
 # later one inside reportImplementationExpectedError, and g22 shows that the CLASS
 # call site is redundant today because every path that reports for a class symbol
 # needs a function-like declaration the function arm already walks. The other three
-# (g06, g11, g18) are named in CLAUDE.md §3.5dn's control table.
+# are g06, g11 and g18.
 #
 # ★★ FIVE OF THE FIFTEEN PIN FIXTURES EXIST ONLY BECAUSE A ROW WAS SILENT —
 # two_containers (g08), missing_name (g09), merged_namespace (g12),

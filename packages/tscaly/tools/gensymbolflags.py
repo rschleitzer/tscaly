@@ -16,7 +16,7 @@
 #
 # ★ AND SCALY CANNOT SPELL THE EXPRESSIONS ANYWAY, which is the second half of the
 # argument. A module-level `define` initializer folds constants only within ONE
-# precedence level and has no bitwise complement (root CLAUDE.md), so `A & ^B`
+# precedence level and has no bitwise complement, so `A & ^B`
 # cannot be written. This script resolves each composite to the set of PRIMITIVE
 # bits it contains and emits an `|` chain of their names — one precedence level,
 # symbolic, so a moved bit position cannot leave a stale composite behind — and

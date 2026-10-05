@@ -17,7 +17,7 @@
 # breaks it and a patch that LOSES one leaves it green. Every losing row below is
 # caught by the diagpin instead, which compares the twelve pin files' C sections
 # byte for byte; every line in it was checked against the reference's own C section
-# before the battery ran (CLAUDE.md §3.5dt names the three documented gaps).
+# before the battery ran (with three documented gaps).
 #
 # ★★★ ITERATE AT STAGE 1 AND CONFIRM AT STAGE 2 ONCE — slice 64's rule. The
 # recorded verdicts are stage 1's.
@@ -595,5 +595,5 @@ control "g18 the report's span moved to the member's NAME"       "$CHECKER" "$PA
 echo
 echo "################################################################"
 bold "DONE — 18 rows."
-echo "A row that is UNGATED on all three needs an argument in CLAUDE.md's"
-echo "table, not a shrug: §3.5v names the four kinds it can be."
+echo "A row that is UNGATED on all three needs an argument,"
+echo "not a shrug."

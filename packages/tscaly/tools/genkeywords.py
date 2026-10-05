@@ -17,8 +17,8 @@
 # within one length bucket, at most 15 candidates deep.
 #
 # That is deliberately NOT a hash map: HashMap[String, int] would mean
-# constructing a String per identifier scanned, and the root CLAUDE.md records
-# cross-package generic-init resolution as an open compiler defect. A flat
+# constructing a String per identifier scanned, and
+# cross-package generic-init resolution is a known compiler defect. A flat
 # comparison over the raw buffer has neither problem. If this ever shows up in a
 # profile, replace it with a perfect hash over the same generated table — but
 # measure first; the reference's own map lookup is guarded exactly this way.
@@ -108,7 +108,7 @@ def emit(entries):
     out.append(";")
     out.append("; \u2605\u2605\u2605BOTH SIDES ARE A VIEW since 2026-09-05. `buf` was a bare")
     out.append("; `pointer[char]` whose length lived in the CALLER -- the shape")
-    out.append("; tools/lenfix/scan.py reports as a chain: this body proved `buf` a")
+    out.append("; of a chain: this body proved `buf` a")
     out.append("; buffer while its own signature carried no length, and")
     out.append("; get_identifier_token one level up carried the length while proving")
     out.append("; nothing. Neither could convert alone.")
@@ -180,8 +180,8 @@ def emit(entries):
     # emitted sorted here so that the generated file is stable across runs.
     #
     # Two accessors rather than an array of Strings: a `define X: T[]` global is
-    # a VALUE, not a pointer, and cannot be handed to a pointer parameter (root
-    # CLAUDE.md), while a cstring literal per index costs nothing and is what
+    # a VALUE, not a pointer, and cannot be handed to a pointer parameter,
+    # while a cstring literal per index costs nothing and is what
     # kw_eq already compares against.
     viable = sorted(t for t, _ in entries if len(t) > 2)
     out.append(

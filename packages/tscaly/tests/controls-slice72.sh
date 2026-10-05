@@ -768,5 +768,5 @@ control "g27 IsImportCall's MetaProperty keyword conjunct"     "$PARSER"  "$PATC
 echo
 echo "################################################################"
 bold "DONE — 27 rows."
-echo "A row that is UNGATED on both instruments needs an argument in"
-echo "CLAUDE.md's table, not a shrug: §3.5v names the four kinds it can be."
+echo "A row that is UNGATED on both instruments needs an argument,"
+echo "not a shrug."

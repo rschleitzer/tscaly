@@ -13,8 +13,8 @@
 # KindFirstPunctuation/KindLastPunctuation, ...) are defined as the value of some
 # other member, and every predicate over them is a `>=` and `<=` against a
 # CONTIGUOUS run. Insert, drop or reorder one entry and those predicates keep
-# compiling and start answering wrong — the same failure mode the root CLAUDE.md
-# records for dazzle's `Insn union` declaration order.
+# compiling and start answering wrong — the same failure mode as
+# dazzle's `Insn union` declaration order.
 #
 # Usage (from the repo root, submodule initialized):
 #   packages/tscaly/tools/genkind.py

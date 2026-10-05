@@ -132,8 +132,8 @@ def emit(tables):
     out.append(";")
     out.append("; The search is written out once per table rather than shared: a const array")
     out.append("; global is an [N x T] VALUE, not a pointer, and passing one to a")
-    out.append("; pointer[T] parameter loses name resolution for the rest of the file (root")
-    out.append("; CLAUDE.md). It has to be indexed in place, so the duplication is the")
+    out.append("; pointer[T] parameter loses name resolution for the rest of the file.")
+    out.append("; It has to be indexed in place, so the duplication is the")
     out.append("; generator's job rather than a reviewer's problem.")
     out.append("")
 

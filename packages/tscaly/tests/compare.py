@@ -7,9 +7,7 @@
 # same sentence its predecessor opened with, and it was checked the same way: the
 # counters, the failures list and every artifact body were compared byte for byte
 # against the previous runner over the whole stage-1 corpus before the old shape was
-# retired. The history of that runner (the bash loop, the per-unit process model,
-# the reference-dump cache, the three levers of 2026-08-19) is in
-# CLAUDE-history.md under *The runner's history*.
+# retired.
 #
 # The shape since 2026-09-02:
 #
