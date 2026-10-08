@@ -32,7 +32,7 @@ SRC = os.path.join(
     REPO,
     "packages/tscaly/_submodules/typescript-go/internal/ast/kind_generated.go",
 )
-DST = os.path.join(REPO, "packages/tscaly/0.1.0/tscaly/Kind.scaly")
+DST = os.path.join(REPO, "packages/tscaly/0.1.1/tscaly/Kind.scaly")
 
 MEMBER = re.compile(r"^\tKind(\w+)(?:\s*//\s*(.*))?$")
 ALIAS = re.compile(r"^\tKind(\w+)\s*=\s*Kind(\w+)\s*$")

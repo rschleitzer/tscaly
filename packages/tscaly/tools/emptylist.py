@@ -31,7 +31,7 @@ import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(HERE, "..", "0.1.0", "tscaly", "checker.scaly")
+SRC = os.path.join(HERE, "..", "0.1.1", "tscaly", "checker.scaly")
 
 # The getters that answer a LIST and use null for "empty". Every one of them ends
 # in a slot that get_named_members or a `new_*_list` may have left null.

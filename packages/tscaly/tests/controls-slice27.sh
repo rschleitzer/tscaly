@@ -55,8 +55,8 @@ cd "$(dirname "$0")/../../.."
 
 CTL=packages/tscaly/tests/ctl.sh
 RUN=packages/tscaly/tests/run.sh
-B=packages/tscaly/0.1.0/tscaly/binder.scaly
-D=packages/tscaly/0.1.0/tscaly/SymbolDump.scaly
+B=packages/tscaly/0.1.1/tscaly/binder.scaly
+D=packages/tscaly/0.1.1/tscaly/SymbolDump.scaly
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }

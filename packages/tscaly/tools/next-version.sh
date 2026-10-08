@@ -41,4 +41,4 @@ if [ -f packages/tscaly/published ] && grep -q "^$old " packages/tscaly/publishe
 else
   echo "  $old was not published: this is a renumbering."
 fi
-echo "  Next: packages/tscaly/tools/interface.sh, the yardsticks, commit."
+echo "  Next: the yardsticks, commit."

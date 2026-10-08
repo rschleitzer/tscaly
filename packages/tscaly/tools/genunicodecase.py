@@ -44,7 +44,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.dirname(HERE)
 REPO = os.path.dirname(os.path.dirname(PKG))
-DST = os.path.join(PKG, "0.1.0", "tscaly", "UnicodeCase.scaly")
+DST = os.path.join(PKG, "0.1.1", "tscaly", "UnicodeCase.scaly")
 
 PROBE = r'''
 package main

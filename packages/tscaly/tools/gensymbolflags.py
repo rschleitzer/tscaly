@@ -36,7 +36,7 @@ import sys
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 SRC = os.path.join(
     REPO, "packages/tscaly/_submodules/typescript-go/internal/ast/symbolflags.go")
-DST = os.path.join(REPO, "packages/tscaly/0.1.0/tscaly/SymbolFlags.scaly")
+DST = os.path.join(REPO, "packages/tscaly/0.1.1/tscaly/SymbolFlags.scaly")
 
 MASK = 0xFFFFFFFF          # the reference declares SymbolFlags as uint32
 # A primitive is a single-bit flag written as `1 << n`; everything else is derived.

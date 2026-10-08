@@ -27,7 +27,7 @@ import io, os, re, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 SRC = os.path.join(ROOT, "packages/tscaly/_submodules/typescript-go/internal/checker/utilities.go")
-OUT = os.path.join(ROOT, "packages/tscaly/0.1.0/tscaly/FeatureMap.scaly")
+OUT = os.path.join(ROOT, "packages/tscaly/0.1.1/tscaly/FeatureMap.scaly")
 
 if not os.path.exists(SRC):
     sys.stderr.write("submodule absent — nothing to generate from.\n")

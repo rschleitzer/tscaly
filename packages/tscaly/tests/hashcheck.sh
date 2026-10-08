@@ -13,7 +13,7 @@
 # numcheck.sh makes for jsnum). So: one generated corpus, two producers, a byte
 # diff.
 #
-#   ours       packages/tscaly/0.1.0/tscaly_hash.scaly + tscaly/HashCheck.scaly
+#   ours       packages/tscaly/0.1.1/tscaly_hash.scaly + tscaly/HashCheck.scaly
 #   reference  packages/tscaly/tests/oracle/hash.go, over zeebo/xxh3 - the very
 #              package internal/tracing hashes its thread ids with
 #
@@ -139,12 +139,12 @@ if submodule_dirty; then
 fi
 
 # -- our side -----------------------------------------------------------------
-"$SCALYC" -c --no-prelude -o "$OUT/tscaly.o" "$PKG/0.1.0/tscaly.scaly" \
+"$SCALYC" -c --no-prelude -o "$OUT/tscaly.o" "$PKG/0.1.1/tscaly.scaly" \
   > "$OUT/pkg-build.log" 2>&1
 if [ $? -ne 0 ]; then
   red "the tscaly package failed to compile:"; sed 's/^/    /' "$OUT/pkg-build.log"; exit 2
 fi
-"$SCALYC" -c -o "$OUT/tscaly_hash.o" "$PKG/0.1.0/tscaly_hash.scaly" \
+"$SCALYC" -c -o "$OUT/tscaly_hash.o" "$PKG/0.1.1/tscaly_hash.scaly" \
   > "$OUT/prog-build.log" 2>&1
 if [ $? -ne 0 ]; then
   red "tscaly_hash failed to compile:"; sed 's/^/    /' "$OUT/prog-build.log"; exit 2

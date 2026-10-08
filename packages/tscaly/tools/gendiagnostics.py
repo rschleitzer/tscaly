@@ -170,7 +170,7 @@ SOURCES = [
     os.path.join(SUB, "internal/execute/incremental/program.go"),
     os.path.join(SUB, "internal/diagnosticwriter/diagnosticwriter.go"),
 ]
-DST = os.path.join(REPO, "packages/tscaly/0.1.0/tscaly/DiagnosticCodes.scaly")
+DST = os.path.join(REPO, "packages/tscaly/0.1.1/tscaly/DiagnosticCodes.scaly")
 
 # var X_0_expected = &Message{code: 1005, category: CategoryError, key: "...", text: "..."}
 ENTRY = re.compile(r'^var (\w+) = &Message\{code: (\d+), category: Category(\w+),')

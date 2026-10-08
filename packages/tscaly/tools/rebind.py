@@ -41,7 +41,7 @@ import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PKG = os.path.join(os.path.dirname(HERE), "0.1.0", "tscaly")
+PKG = os.path.join(os.path.dirname(HERE), "0.1.1", "tscaly")
 
 FUNC = re.compile(r"^    (function|procedure) ([a-z_0-9]+)\(([^)]*)\)")
 SEED = re.compile(r"^\s*var ([a-z_][a-z_0-9]*)(?::\s*\S+)?\s+([a-z_][a-z_0-9]*)\s*$")

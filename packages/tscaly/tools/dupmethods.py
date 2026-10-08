@@ -27,7 +27,7 @@
 # Usage:  packages/tscaly/tools/dupmethods.py      (exit 1 if any row)
 import io, re, sys, glob, os, collections
 
-root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '0.1.0')
+root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '0.1.1')
 seen = collections.defaultdict(list)
 for p in sorted(glob.glob(os.path.join(root, 'tscaly', '*.scaly')) +
                 glob.glob(os.path.join(root, '*.scaly'))):

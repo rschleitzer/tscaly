@@ -68,7 +68,7 @@ run() { echo; echo "############################################################
 # in the `unported` column are units that would fail if they answered.
 
 run "c1 our half answers a wrong dump instead of reporting unported" <<SPEC
-FILE $PKG/0.1.0/tscaly_symbols.scaly
+FILE $PKG/0.1.1/tscaly_symbols.scaly
 <<<OLD
     print "UNPORTED 0 binder 0"
 >>>NEW

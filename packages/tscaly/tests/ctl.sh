@@ -62,7 +62,7 @@
 #     file it patched and touches nothing else — so re-measuring it 45 times cost
 #     45 runs to learn what a hash answers in 0.2 s. `TSCALY_BASELINE=<file>`
 #     caches the baseline report and, beside it, a SHA-256 over every input a run
-#     has: all of `0.1.0/**/*.scaly`, every fixture (394 today, and the hash is over whatever is there), the four oracle sources,
+#     has: all of `0.1.1/**/*.scaly`, every fixture (394 today, and the hash is over whatever is there), the four oracle sources,
 #     accepted.txt, the submodule's pinned commit, the compiler binary and the
 #     runtime archive. Every control verifies that fingerprint before it trusts
 #     the cached numbers and again after it restores.
@@ -102,7 +102,7 @@
 # Usage:
 #
 #   packages/tscaly/tests/ctl.sh "the claim in one line" <<'SPEC'
-#   FILE packages/tscaly/0.1.0/tscaly/scanner.scaly
+#   FILE packages/tscaly/0.1.1/tscaly/scanner.scaly
 #   <<<OLD
 #   ...text exactly as it appears, one occurrence in that file...
 #   >>>NEW
@@ -145,7 +145,7 @@ OUT=$PKG/tests/out
 # names as well as the contents, so a RENAME moves the hash.
 fingerprint() {
   {
-    find "$PKG/0.1.0" -name '*.scaly' -print0 | sort -z
+    find "$PKG/0.1.1" -name '*.scaly' -print0 | sort -z
     find "$PKG/tests/fixtures" -type f -print0 | sort -z
     find "$PKG/tests/oracle" -name '*.go' -print0 | sort -z
     printf '%s\0' "$PKG/tests/accepted.txt" "$SCALYC" "$LIBSCALY"

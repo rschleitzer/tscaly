@@ -83,7 +83,7 @@ SUB = os.path.join(REPO, "packages/tscaly/_submodules/typescript-go")
 GEN = os.path.join(SUB, "internal/ast/ast_generated.go")
 HAND = os.path.join(SUB, "internal/ast/ast.go")
 KINDS = os.path.join(SUB, "internal/ast/kind_generated.go")
-DST = os.path.join(REPO, "packages/tscaly/0.1.0/tscaly/DeclarationKinds.scaly")
+DST = os.path.join(REPO, "packages/tscaly/0.1.1/tscaly/DeclarationKinds.scaly")
 
 # The three sections that declare a node struct and no Kind of their own: their
 # factories take the kind as a parameter and serve every token / keyword kind.

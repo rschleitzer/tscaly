@@ -55,7 +55,7 @@ def scan(skip):
 def snake(n):
     s = re.sub(r'(.)([A-Z][a-z]+)', r'\1_\2', n)
     return re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s).lower()
-port = io.open('0.1.0/tscaly/checker.scaly', encoding='utf-8').read()
+port = io.open('0.1.1/tscaly/checker.scaly', encoding='utf-8').read()
 defined = set(re.findall(r'^\s*(?:function|procedure)\s+([a-z_][a-z0-9_]*)', port, re.M))
 def pct(rows):
     tf, tl = len(rows), sum(l for _, _, l in rows)
@@ -122,7 +122,7 @@ grand = [0, 0, 0, 0]
 for d, files, rec in chapters:
     text = ''
     for f in files:
-        q = os.path.join('0.1.0/tscaly', f)
+        q = os.path.join('0.1.1/tscaly', f)
         if os.path.isfile(q): text += io.open(q, encoding='utf-8').read()
     have = set(re.findall(r'^\s*(?:function|procedure)\s+([a-z_][a-z0-9_]*)', text, re.M))
     rows = scan_dir(d, rec)

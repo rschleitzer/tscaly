@@ -31,6 +31,6 @@ cd "$ROOT"
 ulimit -s 65520
 
 t0=$(date +%s)
-"$SCALY" build packages/tscaly/0.1.0/tscaly_exec.scaly --release -o "$OUT" \
+"$SCALY" build packages/tscaly/0.1.1/tscaly_exec.scaly --release -o "$OUT" \
   || { echo "bench build: FAIL (rc=$?)"; exit 1; }
 echo "bench build: $OUT in $(( $(date +%s) - t0 ))s"

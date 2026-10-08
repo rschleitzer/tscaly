@@ -40,7 +40,7 @@ SRC = os.path.join(
     "packages/tscaly/_submodules/typescript-go/internal/stringutil/"
     "identifier_parts_generated.go",
 )
-DST = os.path.join(REPO, "packages/tscaly/0.1.0/tscaly/UnicodeId.scaly")
+DST = os.path.join(REPO, "packages/tscaly/0.1.1/tscaly/UnicodeId.scaly")
 
 TABLES = [
     ("unicodeESNextIdentifierStart", "UID_START", "is_unicode_identifier_start"),

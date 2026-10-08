@@ -17,7 +17,7 @@
 # is indistinguishable from a correct one, so: one generated corpus, two
 # producers, a byte diff.
 #
-#   ours       packages/tscaly/0.1.0/tscaly_arith.scaly + tscaly/ArithCheck.scaly
+#   ours       packages/tscaly/0.1.1/tscaly_arith.scaly + tscaly/ArithCheck.scaly
 #   reference  packages/tscaly/tests/oracle/arith.go, over the submodule's jsnum
 #
 # The corpus is GENERATED here rather than committed, from a fixed seed. One line
@@ -159,12 +159,12 @@ if submodule_dirty; then
 fi
 
 # -- our side -----------------------------------------------------------------
-"$SCALYC" -c --no-prelude -o "$OUT/tscaly.o" "$PKG/0.1.0/tscaly.scaly" \
+"$SCALYC" -c --no-prelude -o "$OUT/tscaly.o" "$PKG/0.1.1/tscaly.scaly" \
   > "$OUT/pkg-build.log" 2>&1
 if [ $? -ne 0 ]; then
   red "the tscaly package failed to compile:"; sed 's/^/    /' "$OUT/pkg-build.log"; exit 2
 fi
-"$SCALYC" -c -o "$OUT/tscaly_arith.o" "$PKG/0.1.0/tscaly_arith.scaly" \
+"$SCALYC" -c -o "$OUT/tscaly_arith.o" "$PKG/0.1.1/tscaly_arith.scaly" \
   > "$OUT/prog-build.log" 2>&1
 if [ $? -ne 0 ]; then
   red "tscaly_arith failed to compile:"; sed 's/^/    /' "$OUT/prog-build.log"; exit 2

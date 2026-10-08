@@ -53,8 +53,8 @@ cd "$(dirname "$0")/../../.."
 
 CTL=packages/tscaly/tests/ctl.sh
 RUN=packages/tscaly/tests/run.sh
-P=packages/tscaly/0.1.0/tscaly/parser.scaly
-A=packages/tscaly/0.1.0/tscaly/ast.scaly
+P=packages/tscaly/0.1.1/tscaly/parser.scaly
+A=packages/tscaly/0.1.1/tscaly/ast.scaly
 
 # The shared baseline lives for the length of this battery and no longer. A cache
 # that outlives the process it was measured in is the stale baseline slice 7

@@ -16,7 +16,7 @@
 # unexercised arm is indistinguishable from a correct one. So: one generated
 # corpus, two producers, a byte diff.
 #
-#   ours       packages/tscaly/0.1.0/tscaly_nums.scaly + tscaly/NumCheck.scaly
+#   ours       packages/tscaly/0.1.1/tscaly_nums.scaly + tscaly/NumCheck.scaly
 #   reference  packages/tscaly/tests/oracle/nums.go, over the submodule's jsnum
 #
 # The corpus is GENERATED here rather than committed, from a fixed seed, so the
@@ -189,12 +189,12 @@ if submodule_dirty; then
 fi
 
 # -- our side -----------------------------------------------------------------
-"$SCALYC" -c --no-prelude -o "$OUT/tscaly.o" "$PKG/0.1.0/tscaly.scaly" \
+"$SCALYC" -c --no-prelude -o "$OUT/tscaly.o" "$PKG/0.1.1/tscaly.scaly" \
   > "$OUT/pkg-build.log" 2>&1
 if [ $? -ne 0 ]; then
   red "the tscaly package failed to compile:"; sed 's/^/    /' "$OUT/pkg-build.log"; exit 2
 fi
-"$SCALYC" -c -o "$OUT/tscaly_nums.o" "$PKG/0.1.0/tscaly_nums.scaly" \
+"$SCALYC" -c -o "$OUT/tscaly_nums.o" "$PKG/0.1.1/tscaly_nums.scaly" \
   > "$OUT/prog-build.log" 2>&1
 if [ $? -ne 0 ]; then
   red "tscaly_nums failed to compile:"; sed 's/^/    /' "$OUT/prog-build.log"; exit 2

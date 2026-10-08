@@ -1,0 +1,817 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; tscaly_types — our half of the CHECKER yardstick (slice 46; answering since 47).
+;
+; Dumps our check of one file in the format tests/oracle/types.go produces:
+;
+;   C <pos> <end> <code>                 one line per checker diagnostic
+;   T <kind> <pos> <end> <typeString>    one line per node the type walk asks about
+;
+; ★★★ THE YARDSTICK SHIPPED BEFORE THE PHASE IT MEASURES, which is the fourth time
+; this suite has done that (§3.5bd for jsdoc, §3.5bv for the binder) and the same
+; reason each time: a TYPE is not in the tree and not on a symbol. It is computed on
+; demand, memoised inside the checker and never written back, so with four artifacts
+; a port that computes no types and a port that computes wrong ones compare exactly
+; equal, in both directions. Slice 46 committed the artifact with every unit
+; reporting `UNPORTED 0 checker 0`; slice 47 gave it a checker, and the report is
+; now the checker's own — one arm at a time, which is what makes the unported column
+; the work list (tests/triage.py groups it by tag).
+;
+; ★★ THE LAYERING IS THE SAME AS THE BINDER'S, and the order matters: a parse's own
+; unported report comes first, then the bind's, and only then the check's. A tree
+; built past a construct the parser could not scan has meaningless spans, and a
+; check over an incomplete bind would report the bind's gap as the checker's.
+;
+; ★ SINCE SLICE 47 THE CHECK IS A THIRD STEP rather than a marker: the report is
+; asked of `Checker.unported_at` the way the bind's is asked of the binder, and the
+; dump is built by `TypeDump` inside the package. This program stays three steps —
+; parse, bind, check — and grows no checker of its own: a generic instance handed to
+; a program root reads back as garbage, which is why every dumper asks for
+; everything through statics.
+;
+; ★★★ THE PROGRAM THE REFERENCE CHECKS AGAINST IS A STUB, AND OURS WILL HAVE TO BE
+; THE SAME STUB. tests/oracle/types.go builds no real program: it answers every
+; module-resolution question with nothing and fixes the lib set to lib.es5.d.ts,
+; priced there at a measured 3 % diagnostic delta against the reference's default
+; lib closure. So when this side starts answering, it inherits three obligations —
+; the same lib file, no module resolution, and the per-case `@target`/`@lib`
+; directives ignored — and the first one of them is where the RBMM question of
+; §3.11 lands: the lib's tree has to outlive a per-unit region without being copied
+; into it.
+
+package scaly 0.1.0
+package tscaly 0.1.1
+
+use scaly.memory.Page
+use scaly.os.File
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use tscaly.ast.AstNode
+use tscaly.tspath.TsPath
+use tscaly.parser.Parser
+use tscaly.binder.Binder
+use tscaly.checker.Checker
+use tscaly.factory.NodeFactory
+use tscaly.factory.DeepClone
+use tscaly.factory.NodeVisitor
+use tscaly.ast.NodeData
+use tscaly.ast.SourceFileData
+use tscaly.AstDump.AstDump
+use tscaly.TypeDump.TypeDump
+
+; getcwd(3), for the reason tscaly_symbols states at its own declaration: the
+; reference asks the same question in the same place, and tspath computes over
+; strings while the caller supplies them.
+use scaly.os.Console
+
+function getcwd(buf: pointer[char], size: size_t) returns pointer[char] extern
+
+; `--gates` prints FIVE sections off ONE checker run — the type dump and the four
+; event logs the control battery's corpus gates read (relations, kinds, forks,
+; calls) — where the battery used to spawn five processes per unit, each of which
+; parsed, bound and checked the unit again to print one of them. The walk is the
+; same walk (`emit`'s `stops_only` only suppresses printing), so each section is
+; byte-identical to its standalone flag; measured over all stage-1 units when the
+; mode landed (2026-09-02). An unported report BEFORE the checker is
+; mode-independent, so it becomes every section — tscaly_dump's `fill`.
+procedure gates_stop(message: String)
+{
+    Console.println(message.to_c_string())
+    Console.println("==== TSCALY-SECTION relations")
+    Console.println(message.to_c_string())
+    Console.println("==== TSCALY-SECTION kinds")
+    Console.println(message.to_c_string())
+    Console.println("==== TSCALY-SECTION forks")
+    Console.println(message.to_c_string())
+    Console.println("==== TSCALY-SECTION calls")
+    Console.println(message.to_c_string())
+}
+
+procedure run_unit(flag: String, arg: String, mutable text: String) returns int
+{
+    ; ★ THREE MODES, and the two flagged ones are INSTRUMENTS rather than dumps.
+    ; Both exist because the fifth yardstick's two sections gate each other, so
+    ; each one asks about the half the other hides:
+    ;
+    ;   --walk    the node LIST the type walk would ask about (`W kind pos end`),
+    ;             no types, no check — tests/walkcheck.sh diffs it against the
+    ;             reference's own T lines. Without it the walk's exclusions are
+    ;             transcribed code no control can turn red in 1 030 of 1 040 units.
+    ;   --diags   the C section ALONE, printed whether or not the check reported —
+    ;             so the grammar checks, the span grammarErrorOnFirstToken computes
+    ;             and the diagnostic SORT are measured on the units whose dump is
+    ;             suppressed. tests/diagcheck.sh asserts the lines are a
+    ;             SUBSEQUENCE of the reference's.
+    ; ★★★ AND A FOURTH, `--sections`, WHICH IS THE OTHER THREE IN ONE PROCESS.
+    ; diagcheck and walkcheck each spawned this program once per unit — 35 784
+    ; processes on stage 2, 216 s — to recompute a parse and a bind that run.sh had
+    ; just performed in the same minute. This mode prints all three answers,
+    ; separated, so ONE invocation feeds all three readers.
+    ;
+    ; ★★★ IT IS NOT A FOURTH ANSWER: each section is produced by the SAME call
+    ; sequence on a FRESH Checker that its own mode uses, in that mode's own order
+    ; — the walk BEFORE any check (its mode returns before `get_diagnostics`), then
+    ; the diags, then the dump. Sharing one checker across the three would be the
+    ; cheaper thing and the wrong one: `write_walk` may memoise, and a walk taken
+    ; after a check is a different question from the one walkcheck asks. What is
+    ; shared is the process, the read, the PARSE and the BIND — the parts that are
+    ; identical in all three by construction.
+    ;
+    ; ★★★ AND EVERY LINE THIS MODE PRINTS GOES THROUGH `Console.println`, NEVER
+    ; THROUGH THE PRELUDE'S `print` — THE TWO ARE DIFFERENT STREAMS TO THE SAME FD.
+    ; `print` is the prelude's, which calls `puts`, i.e. C stdio and its BUFFER;
+    ; `Console.print` is `Io.write_all(1, …)`, a raw write. Mix them and stdio's
+    ; buffer flushes at exit, so every `print` line lands AFTER everything the
+    ; other stream already wrote. Measured the first time this mode ran: 97 of
+    ; 1 123 units had the diags section's C line sitting inside the WALK section
+    ; and the separators at the end. ★It is latent in the other three modes only
+    ; because none of them emits through both — the dump path prints UNPORTED
+    ; exactly when `emit` returned before its `Console.print`. This mode is the
+    ; first to need both, and the rule is: one stream per program run.
+    ;
+    ; ★ The four early exits below (`File.exists`, an unported parse, a null tree,
+    ; an unported bind) are MODE-INDEPENDENT — every mode prints the same line and
+    ; returns — so in this mode that one line becomes all three sections, which is
+    ; exactly what the three separate processes would each have printed.
+    var walk_only false
+    var clone_only false
+    var diags_only false
+    var stops_only false
+    var flow_only false
+    var unions_only false
+    var typerefs_only false
+    var props_only false
+    var this_only false
+    var with_only false
+    var objlits_only false
+    var functions_only false
+    var relations_only false
+    var kinds_only false
+    var forks_only false
+    var calls_only false
+    var members_only false
+    var sections false
+    var gates false
+    var path_arg 1
+    if flag.get_length() > 0
+    {
+        var known false
+        if flag.equals(String("--walk"))
+            known := true
+        if flag.equals(String("--clone"))
+            known := true
+        if flag.equals(String("--diags"))
+            known := true
+        if flag.equals(String("--stops"))
+            known := true
+        if flag.equals(String("--members"))
+            known := true
+        if flag.equals(String("--flow"))
+            known := true
+        if flag.equals(String("--unions"))
+            known := true
+        if flag.equals(String("--typerefs"))
+            known := true
+        if flag.equals(String("--props"))
+            known := true
+        if flag.equals(String("--this"))
+            known := true
+        if flag.equals(String("--withthis"))
+            known := true
+        if flag.equals(String("--objlits"))
+            known := true
+        if flag.equals(String("--functions"))
+            known := true
+        if flag.equals(String("--relations"))
+            known := true
+        if flag.equals(String("--kinds"))
+            known := true
+        if flag.equals(String("--forks"))
+            known := true
+        if flag.equals(String("--calls"))
+            known := true
+        if flag.equals(String("--sections"))
+            known := true
+        if flag.equals(String("--gates"))
+            known := true
+        if known = false
+        {
+            let m String("unknown flag `flag`")
+            Console.println(m.to_c_string())
+            return 2
+        }
+        if flag.equals(String("--walk"))
+        {
+            walk_only := true
+            path_arg := 2
+        }
+        if flag.equals(String("--clone"))
+        {
+            clone_only := true
+            path_arg := 2
+        }
+        if flag.equals(String("--diags"))
+        {
+            diags_only := true
+            path_arg := 2
+        }
+        ; ★ THE STOP HISTOGRAM'S FLAG (slice 75). It is deliberately NOT part of
+        ; `--sections`: that mode exists to spare the loop a process where the parse
+        ; and the bind have already been paid for, and this instrument is not run
+        ; per slice — adding it there would make every run.sh write a third sidecar
+        ; for the sake of a question asked once a chapter.
+        if flag.equals(String("--stops"))
+        {
+            stops_only := true
+            path_arg := 2
+        }
+        ; ★ THE MEMBER PIN'S FLAG (slice 86), out of `--sections` for the reason
+        ; `--stops` is out of it: it is a control-battery instrument, asked once a
+        ; chapter, and a fourth sidecar per run.sh would be paid by every run.
+        if flag.equals(String("--members"))
+        {
+            members_only := true
+            path_arg := 2
+        }
+        ; ★ THE FLOW PIN'S FLAG (slice 93), out of `--sections` for `--members`'
+        ; reason.
+        if flag.equals(String("--flow"))
+        {
+            flow_only := true
+            path_arg := 2
+        }
+        ; ★ THE UNION PIN'S FLAG (slice 94), out of `--sections` for `--flow`'s
+        ; reason.
+        if flag.equals(String("--unions"))
+        {
+            unions_only := true
+            path_arg := 2
+        }
+        ; ★ THE TYPEREF PIN'S FLAG (slice 95), out of `--sections` for `--unions`'
+        ; reason.
+        if flag.equals(String("--typerefs"))
+        {
+            typerefs_only := true
+            path_arg := 2
+        }
+        ; ★ THE PROPPIN'S FLAG (slice 96), out of `--sections` for `--typerefs`'
+        ; reason.
+        if flag.equals(String("--props"))
+        {
+            props_only := true
+            path_arg := 2
+        }
+        ; ★ THE THISPIN'S FLAG (slice 97), out of `--sections` for `--props`'
+        ; reason.
+        if flag.equals(String("--this"))
+        {
+            this_only := true
+            path_arg := 2
+        }
+        ; ★ THE WITHPIN'S FLAG (slice 98), out of `--sections` for `--this`'
+        ; reason.
+        if flag.equals(String("--withthis"))
+        {
+            with_only := true
+            path_arg := 2
+        }
+        ; ★ THE OBJPIN'S FLAG (slice 99), out of `--sections` for `--withthis`'
+        ; reason.
+        if flag.equals(String("--objlits"))
+        {
+            objlits_only := true
+            path_arg := 2
+        }
+        ; ★ THE FNPIN'S FLAG (slice 100), out of `--sections` for `--objlits`'
+        ; reason.
+        if flag.equals(String("--functions"))
+        {
+            functions_only := true
+            path_arg := 2
+        }
+        ; ★ THE RELPIN'S FLAG (slice 101), out of `--sections` for `--functions`'
+        ; reason.
+        if flag.equals(String("--relations"))
+        {
+            relations_only := true
+            path_arg := 2
+        }
+        ; ★ THE KINDPIN'S FLAG (slice 102), for the same reason again.
+        if flag.equals(String("--kinds"))
+        {
+            kinds_only := true
+            path_arg := 2
+        }
+        ; ★ THE FORKPIN'S FLAG (slice 103), for the same reason again.
+        if flag.equals(String("--forks"))
+        {
+            forks_only := true
+            path_arg := 2
+        }
+        ; ★ THE CALLPIN'S FLAG (slice 108), for the same reason again.
+        if flag.equals(String("--calls"))
+        {
+            calls_only := true
+            path_arg := 2
+        }
+        if flag.equals(String("--sections"))
+        {
+            sections := true
+            path_arg := 2
+        }
+        if flag.equals(String("--gates"))
+        {
+            gates := true
+            path_arg := 2
+        }
+    }
+
+
+    ; The run region and its small anchor: §3.12's rule, because the source text of
+    ; a large unit is an OVERSIZED allocation and Page.get() of an address inside
+    ; one answers a page whose first allocation trips the oversized-page trap.
+    let anchor String("tscaly")
+    let host Page.get(anchor.get_buffer())
+
+    let cwd_cap 4096
+    let cwd_buf host.allocate(cwd_cap as size_t, 1) as pointer[char]
+    if getcwd(cwd_buf, cwd_cap as size_t) = null
+    {
+        print "cannot read the working directory"
+        return 1
+    }
+    var cwd_len 0
+    while (*(cwd_buf + cwd_len) as int) <> 0
+        cwd_len := cwd_len + 1
+
+    var name_data Slice[char]()
+    name_data := TsPath.normalized_absolute_path(host, Slice[char](arg.get_length() as int, arg.get_buffer() as pointer[char]), Slice[char](cwd_len, cwd_buf))
+    let path String(name_data.data as pointer[const_char], name_data.length as size_t)
+
+    var unported 0 - 1
+    var unported_tag: Slice[char] ""
+    var unported_detail 0
+    let script_kind Parser.supported_script_kind(path)
+    ; ★ parse_ex rather than parse (slice 78): the checker's JSDoc pass reads the
+    ; parser's own eager-JSDoc table, so the parser has to survive the parse here
+    ; for the same reason the JSDoc yardstick needed it in slice 21.
+    let p Parser.parse_ex(host, path, text, script_kind, &unported, &unported_tag, &unported_detail)
+    let file Parser.source_file_of(p)
+
+    if unported >= 0
+    {
+        if sections
+        {
+            let m String("UNPORTED `unported` `Parser.tag_text(unported_tag)` `unported_detail`")
+            Console.println(m.to_c_string())
+            Console.println("==== TSCALY-SECTION diags")
+            Console.println(m.to_c_string())
+            Console.println("==== TSCALY-SECTION dump")
+            Console.println(m.to_c_string())
+            return 0
+        }
+        if gates
+        {
+            let m String("UNPORTED `unported` `Parser.tag_text(unported_tag)` `unported_detail`")
+            gates_stop(m)
+            return 0
+        }
+        print "UNPORTED `unported` `Parser.tag_text(unported_tag)` `unported_detail`"
+        return 0
+    }
+
+    if file = null
+    {
+        if sections
+        {
+            Console.println("UNPORTED 0 no-tree 0")
+            Console.println("==== TSCALY-SECTION diags")
+            Console.println("UNPORTED 0 no-tree 0")
+            Console.println("==== TSCALY-SECTION dump")
+            Console.println("UNPORTED 0 no-tree 0")
+            return 0
+        }
+        if gates
+        {
+            gates_stop(String("UNPORTED 0 no-tree 0"))
+            return 0
+        }
+        print "UNPORTED 0 no-tree 0"
+        return 0
+    }
+
+    ; ★ `--clone` (slice 231): the node factory's round trip. Every top-level
+    ; statement is deep-cloned through the visitor WITHOUT synthetic locations
+    ; (the reference's DeepCloneReparse minus its reparse mark), the clones are
+    ; put under a copy of the source file, and the AST dump of that copy is
+    ; printed — byte-identical to `tscaly_ast`'s dump of the original when every
+    ; constructor, updater and clone carries every child in order. Not a
+    ; yardstick: a probe for the generated factory, run over a corpus by hand.
+    if clone_only
+    {
+        let sfile file as ref[AstNode]
+        let ranges AstNode.list_ranges_of(sfile)
+        let f NodeFactory.create(host, null, ranges)
+        let v DeepClone.visitor(host, f, false)
+        var copy: ref[AstNode]? null
+        choose sfile.data
+            when sf: SourceFile
+            {
+                var d: SourceFileData sf
+                d.statements := v.visit_nodes_h(sf.statements)
+                d.end_of_file_token := v.visit_node(sf.end_of_file_token)
+                let c AstNode.alloc(host)
+                c := sfile
+                c.link_ordinal := 0
+                c.data := NodeData.SourceFile(AstNode.box_source_file(host, d))
+                copy := c
+            }
+        if copy = null
+        {
+            print "no source file"
+            return 1
+        }
+        AstDump.write(host, copy as ref[AstNode])
+        ; The refuter: a dispatch that finds no arm answers the ORIGINAL node and
+        ; matches trivially, so the count of nodes the factory made is printed as
+        ; the LAST line — it must be the tree's node count (drop it before comparing).
+        let counted String("=== clone nodes=`f.node_count`")
+        Console.println(counted.to_c_string())
+        return 0
+    }
+
+    let is_external Parser.external_module_indicator(file, AstNode.statements_of(file))
+    let b Binder.bind_source_file(host, file, text, path, is_external)
+
+    if Binder.unported_at(b) >= 0
+    {
+        if sections
+        {
+            let m String("UNPORTED `Binder.unported_at(b)` `Parser.tag_text(Binder.unported_tag_at(b))` `Binder.unported_detail_at(b)`")
+            Console.println(m.to_c_string())
+            Console.println("==== TSCALY-SECTION diags")
+            Console.println(m.to_c_string())
+            Console.println("==== TSCALY-SECTION dump")
+            Console.println(m.to_c_string())
+            return 0
+        }
+        if gates
+        {
+            let m String("UNPORTED `Binder.unported_at(b)` `Parser.tag_text(Binder.unported_tag_at(b))` `Binder.unported_detail_at(b)`")
+            gates_stop(m)
+            return 0
+        }
+        print "UNPORTED `Binder.unported_at(b)` `Parser.tag_text(Binder.unported_tag_at(b))` `Binder.unported_detail_at(b)`"
+        return 0
+    }
+
+    ; ── the LIB, the second file of the program (slice 113) ─────────────────
+    ;
+    ; Loaded ONCE and handed to every Checker this run builds: `--sections` builds
+    ; three of them, and a parse plus a bind of 4 599 lines apiece would be three
+    ; identical trees. The oracle's `main` reads it in exactly this position, before
+    ; the unit is added and before a checker exists.
+    var lib_file: ref[AstNode]? null
+    var lib_b: ref[Binder]? null
+    if Checker.load_lib(host, &lib_file, &lib_b) = false
+    {
+        if sections
+        {
+            Console.println("UNPORTED 0 lib 0")
+            Console.println("==== TSCALY-SECTION diags")
+            Console.println("UNPORTED 0 lib 0")
+            Console.println("==== TSCALY-SECTION dump")
+            Console.println("UNPORTED 0 lib 0")
+            return 0
+        }
+        if gates
+        {
+            gates_stop(String("UNPORTED 0 lib 0"))
+            return 0
+        }
+        print "UNPORTED 0 lib 0"
+        return 0
+    }
+
+    ; The check, and the dump. TypeDump answers false when either half met
+    ; something this slice does not implement, and then the checker's own report is
+    ; the unit's whole answer — the same arrangement the parse and the bind use two
+    ; steps up.
+    if sections
+    {
+        let cw Checker.create(host, file, path, b, p, lib_file, lib_b)
+        cw.record_logs(0)
+        TypeDump.write_walk(host, cw, file)
+        Console.println("==== TSCALY-SECTION diags")
+        let cd Checker.create(host, file, path, b, p, lib_file, lib_b)
+        cd.record_logs(0)
+        cd.get_diagnostics()
+        TypeDump.write_diags(host, cd, file)
+        Console.println("==== TSCALY-SECTION dump")
+        let cs Checker.create(host, file, path, b, p, lib_file, lib_b)
+        cs.record_logs(0)
+        cs.get_diagnostics()
+        if TypeDump.write(host, cs, file) = false
+        {
+            let m String("UNPORTED `Checker.unported_at(cs)` `Parser.tag_text(Checker.unported_tag_at(cs))` `Checker.unported_detail_at(cs)`")
+            Console.println(m.to_c_string())
+        }
+        return 0
+    }
+
+    if gates
+    {
+        let cg Checker.create(host, file, path, b, p, lib_file, lib_b)
+        cg.record_logs(Checker.log_relations() | Checker.log_kinds() | Checker.log_forks() | Checker.log_calls())
+        cg.get_diagnostics()
+        if TypeDump.write(host, cg, file) = false
+        {
+            let m String("UNPORTED `Checker.unported_at(cg)` `Parser.tag_text(Checker.unported_tag_at(cg))` `Checker.unported_detail_at(cg)`")
+            Console.println(m.to_c_string())
+        }
+        Console.println("==== TSCALY-SECTION relations")
+        TypeDump.print_relations(host, cg)
+        Console.println("==== TSCALY-SECTION kinds")
+        TypeDump.print_kinds(host, cg)
+        Console.println("==== TSCALY-SECTION forks")
+        TypeDump.print_forks(host, cg)
+        Console.println("==== TSCALY-SECTION calls")
+        TypeDump.print_calls(host, cg)
+        return 0
+    }
+
+    let c Checker.create(host, file, path, b, p, lib_file, lib_b)
+    ; ★A checker records only the pin log its mode prints (none for the walk, the
+    ; diagnostics, the stops, the unions and the type dump): every log costs one
+    ; event per question, and some questions are asked per PAIR of nodes -- the
+    ; KINDPIN alone kept 2.8 GB on binderBinaryExpressionStressJs (2026-10-03).
+    var logs 0
+    if members_only
+        logs := Checker.log_members()
+    if flow_only
+        logs := Checker.log_flow()
+    if typerefs_only
+        logs := Checker.log_typerefs()
+    if props_only
+        logs := Checker.log_props()
+    if this_only
+        logs := Checker.log_this()
+    if with_only
+        logs := Checker.log_with()
+    if objlits_only
+        logs := Checker.log_objlits()
+    if relations_only
+        logs := Checker.log_relations()
+    if kinds_only
+        logs := Checker.log_kinds()
+    if forks_only
+        logs := Checker.log_forks()
+    if calls_only
+        logs := Checker.log_calls()
+    if functions_only
+        logs := Checker.log_functions()
+    c.record_logs(logs)
+    if walk_only
+    {
+        TypeDump.write_walk(host, c, file)
+        return 0
+    }
+    c.get_diagnostics()
+    if diags_only
+    {
+        TypeDump.write_diags(host, c, file)
+        return 0
+    }
+    ; ★ The check has to RUN before the log can be read — the log is what the check
+    ; left behind — which is why this sits after get_diagnostics and not beside the
+    ; walk, whose caller deliberately does not run it.
+    if stops_only
+    {
+        TypeDump.write_stops(host, c, file)
+        return 0
+    }
+    if members_only
+    {
+        TypeDump.write_members(host, c, file)
+        return 0
+    }
+    if flow_only
+    {
+        TypeDump.write_flow(host, c, file)
+        return 0
+    }
+    if unions_only
+    {
+        TypeDump.write_unions(host, c, file)
+        return 0
+    }
+    if typerefs_only
+    {
+        TypeDump.write_typerefs(host, c, file)
+        return 0
+    }
+    if props_only
+    {
+        TypeDump.write_props(host, c, file)
+        return 0
+    }
+    if this_only
+    {
+        TypeDump.write_this(host, c, file)
+        return 0
+    }
+    if with_only
+    {
+        TypeDump.write_with_this(host, c, file)
+        return 0
+    }
+    if objlits_only
+    {
+        TypeDump.write_objlits(host, c, file)
+        return 0
+    }
+    if relations_only
+    {
+        TypeDump.write_relations(host, c, file)
+        return 0
+    }
+    if kinds_only
+    {
+        TypeDump.write_kinds(host, c, file)
+        return 0
+    }
+    if forks_only
+    {
+        TypeDump.write_forks(host, c, file)
+        return 0
+    }
+    if calls_only
+    {
+        TypeDump.write_calls(host, c, file)
+        return 0
+    }
+    if functions_only
+    {
+        TypeDump.write_functions(host, c, file)
+        return 0
+    }
+    if TypeDump.write(host, c, file) = false
+    {
+        print "UNPORTED `Checker.unported_at(c)` `Parser.tag_text(Checker.unported_tag_at(c))` `Checker.unported_detail_at(c)`"
+        return 0
+    }
+    0
+}
+
+; ★★★ `--batch <units file>` — EVERY UNIT OF A CORPUS IN ONE PROCESS (2026-09-02).
+; The runner used to start this program once per unit (18 435 times at stage 2) and
+; write each answer to its own file. In batch mode it reads ONE file of framed units,
+;
+;     ==== TSCALY-UNIT <bytes> <path>\n<content>\n      (repeated)
+;
+; and answers each on stdout between `==== TSCALY-UNIT <path>` and `==== TSCALY-END`,
+; so a supervisor can tell a finished unit from the one a crash or a hang was in.
+; ★Each unit runs in `run_unit_at`'s OWN frame — path, content and everything the
+; port allocates live on that call's region and go with it — and the port keeps no
+; mutable globals, so nothing of one unit is visible to the next; the symbol-id
+; counter that DOES shape output lives in the Binder, which is fresh per unit. The
+; reference side needs an explicit reset for the same reason (tests/oracle/batch.go).
+; Measured on landing: byte-identical to the per-process answers over the whole
+; stage-1 tree. Console writes are unbuffered syscalls, so a crash loses nothing.
+procedure run_unit_at(flag: String, mutable text: String, path_start: int, path_len: int, body_start: int, body_len: int)
+{
+    reset_symbol_ids()
+    let path text.substring(path_start as size_t, path_len as size_t)
+    let content text.substring(body_start as size_t, body_len as size_t)
+    let hdr String("==== TSCALY-UNIT `path`")
+    Console.println(hdr.to_c_string())
+    run_unit(flag, path, content)
+    Console.println("==== TSCALY-END")
+}
+
+; the whole of standard input: `--batch -` takes the units through a pipe, so a
+; batch touches no file (the endpoint protection scans every file a run writes)
+procedure read_stdin_to_string() returns String
+{
+    var sb StringBuilder()
+    var buf u8[65536]
+    repeat
+    {
+        let n read(0, &buf[0] as pointer[void], 65536)
+        if n = 0
+            break
+        ; read(2) answers -1 on an error, which a size_t holds as a huge count
+        if n > 65536
+            break
+        sb.append(&buf[0] as pointer[char], n)
+    }
+    sb.to_string()
+}
+
+procedure run_batch(flag: String, mutable units_path: String) returns int
+{
+    var text String()
+    if units_path.equals(String("-"))
+        text := read_stdin_to_string()
+    else
+    {
+        if File.exists(units_path) = false
+        {
+            let m String("cannot read `units_path`")
+            Console.println(m.to_c_string())
+            return 1
+        }
+        text := File.read_to_string(units_path)
+    }
+    let n text.get_length() as int
+    var pos 0
+    while pos < n
+    {
+        let eol text.index_of(10 as u8, pos as size_t)
+        if eol < 0
+        {
+            Console.println("==== TSCALY-BATCH-ERROR unterminated header")
+            return 3
+        }
+        var p pos + 17
+        var bytes 0
+        while (text.get(p as size_t) as int) <> 32
+        {
+            bytes := bytes * 10 + ((text.get(p as size_t) as int) - 48)
+            p := p + 1
+        }
+        let path_start p + 1
+        let path_len eol - path_start
+        let body_start eol + 1
+        run_unit_at(flag, text, path_start, path_len, body_start, bytes)
+        pos := body_start + bytes + 1
+    }
+    0
+}
+
+procedure main(argc: int, argv: pointer[pointer[char]]) returns int
+{
+    var flag String("")
+    var batch String("")
+    var path String("")
+    var i 1
+    var bad false
+    while i < argc
+    {
+        let a String(*(argv + i))
+        var handled false
+        if a.equals(String("--batch"))
+        {
+            handled := true
+            if i + 1 >= argc
+                bad := true
+            if i + 1 < argc
+            {
+                batch := String(*(argv + i + 1))
+                i := i + 1
+            }
+        }
+        if handled = false
+        {
+            if a.starts_with("--")
+            {
+                if flag.get_length() > 0
+                    bad := true
+                flag := a
+                handled := true
+            }
+        }
+        if handled = false
+        {
+            if path.get_length() > 0
+                bad := true
+            path := a
+        }
+        i := i + 1
+    }
+    if batch.get_length() > 0
+    {
+        if path.get_length() > 0
+            bad := true
+    }
+    if batch.get_length() = 0
+    {
+        if path.get_length() = 0
+            bad := true
+    }
+    if bad
+    {
+        print "usage: tscaly_types [--walk|--diags|--stops|--members|--flow|--unions|--typerefs|--props|--this|--withthis|--objlits|--functions|--relations|--kinds|--forks|--calls|--sections|--gates] (<file> | --batch <units file>)"
+        return 2
+    }
+    if batch.get_length() > 0
+        return run_batch(flag, batch)
+    if File.exists(path) = false
+    {
+        let m String("cannot read `path`")
+        Console.println(m.to_c_string())
+        return 1
+    }
+    let text File.read_to_string(path)
+    run_unit(flag, path, text)
+}

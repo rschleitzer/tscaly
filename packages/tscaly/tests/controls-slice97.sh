@@ -52,8 +52,8 @@ REPO=$(pwd)
 
 DIAGCHECK=packages/tscaly/tests/diagcheck.sh
 PKG=packages/tscaly
-CHECKER=$PKG/0.1.0/tscaly/checker.scaly
-BINDER=$PKG/0.1.0/tscaly/binder.scaly
+CHECKER=$PKG/0.1.1/tscaly/checker.scaly
+BINDER=$PKG/0.1.1/tscaly/binder.scaly
 FIX=$PKG/tests/fixtures
 
 . packages/tscaly/tests/toolchain.sh || exit 2
@@ -110,8 +110,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 build_bins() {
-  "$SCALYC" -c --no-prelude -o "$WORK/pkg.o" "$PKG/0.1.0/tscaly.scaly" > "$WORK/build.log" 2>&1 || return 1
-  "$SCALYC" -c -o "$WORK/types.o" "$PKG/0.1.0/tscaly_types.scaly" >> "$WORK/build.log" 2>&1 || return 1
+  "$SCALYC" -c --no-prelude -o "$WORK/pkg.o" "$PKG/0.1.1/tscaly.scaly" > "$WORK/build.log" 2>&1 || return 1
+  "$SCALYC" -c -o "$WORK/types.o" "$PKG/0.1.1/tscaly_types.scaly" >> "$WORK/build.log" 2>&1 || return 1
   clang -o "$WORK/tscaly_types" "$WORK/types.o" "$WORK/pkg.o" "$LIBSCALY" -lm >> "$WORK/build.log" 2>&1
 }
 

@@ -382,7 +382,7 @@ mk('g26.py',
         {''')
 MK
 
-JS=$PKG/0.1.0/tscaly/jsnum.scaly
+JS=$PKG/0.1.1/tscaly/jsnum.scaly
 
 control "g01 computeEnumMemberValues back to a report"          $CHECKER "$PATCHDIR/g01.py"
 control "g02 the once-bit never set"                            $CHECKER "$PATCHDIR/g02.py"

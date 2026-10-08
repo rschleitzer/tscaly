@@ -43,7 +43,7 @@
 # 2026-09-04, of which `mark-node-assignments` was one. A hit is a note to re-read.
 #
 # Usage:  packages/tscaly/tools/expiredstops.py [file.scaly] [tags]
-#         (default: 0.1.0/tscaly/checker.scaly, relative to the package;
+#         (default: 0.1.1/tscaly/checker.scaly, relative to the package;
 #          the second argument selects the TAG mode instead of the claim mode)
 
 import io
@@ -106,7 +106,7 @@ def main():
     mode = "claims"
     if args and args[-1] in ("tags", "claims"):
         mode = args.pop()
-    path = args[0] if args else os.path.join(root, "0.1.0/tscaly/checker.scaly")
+    path = args[0] if args else os.path.join(root, "0.1.1/tscaly/checker.scaly")
     src = io.open(path, encoding="utf-8").read()
     lines = src.split("\n")
     defined = set(DEFN.findall(src))
