@@ -54,7 +54,7 @@ import tempfile
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 SUB = os.path.join(REPO, "packages/tscaly/_submodules/typescript-go")
 SRC = os.path.join(SUB, "internal/checker/types.go")
-DST = os.path.join(REPO, "packages/tscaly/0.1.1/tscaly/TypeFlags.scaly")
+DST = os.path.join(REPO, "packages/tscaly/0.1.2/tscaly/TypeFlags.scaly")
 
 MASK = 0xFFFFFFFF          # the reference declares TypeFlags as uint32
 PRIMITIVE = re.compile(r"^1\s*<<\s*(\d+)$")

@@ -13,7 +13,7 @@
 # arm is indistinguishable from a correct one — so they get their own instrument:
 # one generated corpus, two producers, a byte diff.
 #
-#   ours       packages/tscaly/0.1.1/tscaly_paths.scaly + tscaly/PathCheck.scaly
+#   ours       packages/tscaly/0.1.2/tscaly_paths.scaly + tscaly/PathCheck.scaly
 #   reference  packages/tscaly/tests/oracle/paths.go, over the submodule's tspath
 #
 # The corpus is GENERATED here rather than committed, from a fixed seed, so the
@@ -138,12 +138,12 @@ if submodule_dirty; then
 fi
 
 # ── our side ─────────────────────────────────────────────────────────────────
-"$SCALYC" -c --no-prelude -o "$OUT/tscaly.o" "$PKG/0.1.1/tscaly.scaly" \
+"$SCALYC" -c --no-prelude -o "$OUT/tscaly.o" "$PKG/0.1.2/tscaly.scaly" \
   > "$OUT/pkg-build.log" 2>&1
 if [ $? -ne 0 ]; then
   red "the tscaly package failed to compile:"; sed 's/^/    /' "$OUT/pkg-build.log"; exit 2
 fi
-"$SCALYC" -c -o "$OUT/tscaly_paths.o" "$PKG/0.1.1/tscaly_paths.scaly" \
+"$SCALYC" -c -o "$OUT/tscaly_paths.o" "$PKG/0.1.2/tscaly_paths.scaly" \
   > "$OUT/prog-build.log" 2>&1
 if [ $? -ne 0 ]; then
   red "tscaly_paths failed to compile:"; sed 's/^/    /' "$OUT/prog-build.log"; exit 2

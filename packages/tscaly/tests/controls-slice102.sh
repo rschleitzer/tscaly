@@ -54,7 +54,7 @@ REPO=$(pwd)
 
 DIAGCHECK=packages/tscaly/tests/diagcheck.sh
 PKG=packages/tscaly
-CHECKER=$PKG/0.1.1/tscaly/checker.scaly
+CHECKER=$PKG/0.1.2/tscaly/checker.scaly
 FIX=$PKG/tests/fixtures
 
 . packages/tscaly/tests/toolchain.sh || exit 2
@@ -109,8 +109,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 build_bins() {
-  "$SCALYC" -c --no-prelude -o "$WORK/pkg.o" "$PKG/0.1.1/tscaly.scaly" > "$WORK/build.log" 2>&1 || return 1
-  "$SCALYC" -c -o "$WORK/types.o" "$PKG/0.1.1/tscaly_types.scaly" >> "$WORK/build.log" 2>&1 || return 1
+  "$SCALYC" -c --no-prelude -o "$WORK/pkg.o" "$PKG/0.1.2/tscaly.scaly" > "$WORK/build.log" 2>&1 || return 1
+  "$SCALYC" -c -o "$WORK/types.o" "$PKG/0.1.2/tscaly_types.scaly" >> "$WORK/build.log" 2>&1 || return 1
   clang -o "$WORK/tscaly_types" "$WORK/types.o" "$WORK/pkg.o" "$LIBSCALY" -lm >> "$WORK/build.log" 2>&1
 }
 
@@ -1030,7 +1030,7 @@ control "g31 the + arm's isErrorType fork dropped" $CHECKER "$PATCHDIR/g31.py"
 control "g32 the ES-SYMBOL polarity inverted (the defect this slice made and caught)" $CHECKER "$PATCHDIR/g32.py"
 control "g33 the + arm's second MARK guard removed" $CHECKER "$PATCHDIR/g33.py"
 control "g34 the prefix arm NUMERIC-LITERAL fold dropped" $CHECKER "$PATCHDIR/g34.py"
-control "g35 jsnum_negate replaced by the IDENTITY" $PKG/0.1.1/tscaly/jsnum.scaly "$PATCHDIR/g35.py"
+control "g35 jsnum_negate replaced by the IDENTITY" $PKG/0.1.2/tscaly/jsnum.scaly "$PATCHDIR/g35.py"
 control "g36 the prefix arm's BIGINT-LITERAL fold dropped" $CHECKER "$PATCHDIR/g36.py"
 control "g37 the prefix arm's ESSymbolLike report dropped" $CHECKER "$PATCHDIR/g37.py"
 control "g38 the plus-on-a-bigint TS2736 dropped" $CHECKER "$PATCHDIR/g38.py"

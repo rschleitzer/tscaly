@@ -179,11 +179,11 @@ The profile transfers: trained on VS Code alone, the TypeScript repository's own
 # on a small program); NOT yet rerun on this scenario in this form. The recipe
 # of 2026-09-18 went through tools/link-lto.sh, which is deleted.
 ulimit -s 65520
-scalyc/build/scaly build packages/tscaly/0.1.1/tscaly_exec.scaly --pgo-train -o ~/repos/bench/bin/tscaly_pgogen
+scalyc/build/scaly build packages/tscaly/0.1.2/tscaly_exec.scaly --pgo-train -o ~/repos/bench/bin/tscaly_pgogen
 (cd ~/repos/bench && LLVM_PROFILE_FILE=$PWD/pgo/tscaly-%p.profraw \
   ./bin/tscaly_pgogen --bench-batch vscode-paths.scenario > /dev/null)
 "$LLVM_PREFIX/bin/llvm-profdata" merge -o ~/repos/bench/pgo/tscaly.profdata ~/repos/bench/pgo/*.profraw
-scalyc/build/scaly build packages/tscaly/0.1.1/tscaly_exec.scaly --pgo ~/repos/bench/pgo/tscaly.profdata -o ~/repos/bench/bin/tscaly_pgo
+scalyc/build/scaly build packages/tscaly/0.1.2/tscaly_exec.scaly --pgo ~/repos/bench/pgo/tscaly.profdata -o ~/repos/bench/bin/tscaly_pgo
 ```
 
 ★ The CPU Bottlenecks shares of `tools/xctrace-bottleneck.py`

@@ -29,7 +29,7 @@ import os, re, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 TSO = os.path.join(ROOT, "packages/tscaly/_submodules/typescript-go/internal/tsoptions")
-OUT = os.path.join(ROOT, "packages/tscaly/0.1.1/tscaly/TsOptionDecls.scaly")
+OUT = os.path.join(ROOT, "packages/tscaly/0.1.2/tscaly/TsOptionDecls.scaly")
 
 KINDS = {"CommandLineOptionTypeString": 1, "CommandLineOptionTypeNumber": 2, "CommandLineOptionTypeBoolean": 3,
          "CommandLineOptionTypeObject": 4, "CommandLineOptionTypeList": 5, "CommandLineOptionTypeListOrElement": 6,

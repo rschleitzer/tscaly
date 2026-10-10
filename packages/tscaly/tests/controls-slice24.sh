@@ -61,8 +61,8 @@ cd "$(dirname "$0")/../../.."
 
 CTL=packages/tscaly/tests/ctl.sh
 RUN=packages/tscaly/tests/run.sh
-P=packages/tscaly/0.1.1/tscaly/parser.scaly
-A=packages/tscaly/0.1.1/tscaly/ast.scaly
+P=packages/tscaly/0.1.2/tscaly/parser.scaly
+A=packages/tscaly/0.1.2/tscaly/ast.scaly
 
 export TSCALY_BASELINE=$(mktemp -t tscaly-baseline)
 BATTERY_START=$(python3 -c 'import time; print(time.time())')

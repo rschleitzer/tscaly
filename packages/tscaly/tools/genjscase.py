@@ -43,7 +43,7 @@ SRC = os.path.join(
     "packages/tscaly/_submodules/typescript-go/internal/stringutil/"
     "js_case_generated.go",
 )
-DST = os.path.join(REPO, "packages/tscaly/0.1.1/tscaly/JsCase.scaly")
+DST = os.path.join(REPO, "packages/tscaly/0.1.2/tscaly/JsCase.scaly")
 
 MULTI_MAX = 4
 

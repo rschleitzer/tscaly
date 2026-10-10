@@ -39,7 +39,7 @@ import sys
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 SUB = os.path.join(REPO, "packages/tscaly/_submodules/typescript-go")
 SRC = os.path.join(SUB, "internal/scanner/unicodeproperties.go")
-DST = os.path.join(REPO, "packages/tscaly/0.1.1/tscaly/UnicodeProps.scaly")
+DST = os.path.join(REPO, "packages/tscaly/0.1.2/tscaly/UnicodeProps.scaly")
 
 STRING = re.compile(r'"([^"]*)"')
 

@@ -46,7 +46,7 @@ REPO=$(pwd)
 
 DIAGCHECK=packages/tscaly/tests/diagcheck.sh
 PKG=packages/tscaly
-CHECKER=$PKG/0.1.1/tscaly/checker.scaly
+CHECKER=$PKG/0.1.2/tscaly/checker.scaly
 
 . packages/tscaly/tests/toolchain.sh || exit 2
 
@@ -65,8 +65,8 @@ cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
 build_diag_bin() {
-  "$SCALYC" -c --no-prelude -o "$WORK/pkg.o" "$PKG/0.1.1/tscaly.scaly" > "$WORK/build.log" 2>&1 || return 1
-  "$SCALYC" -c -o "$WORK/types.o" "$PKG/0.1.1/tscaly_types.scaly" >> "$WORK/build.log" 2>&1 || return 1
+  "$SCALYC" -c --no-prelude -o "$WORK/pkg.o" "$PKG/0.1.2/tscaly.scaly" > "$WORK/build.log" 2>&1 || return 1
+  "$SCALYC" -c -o "$WORK/types.o" "$PKG/0.1.2/tscaly_types.scaly" >> "$WORK/build.log" 2>&1 || return 1
   clang -o "$WORK/tscaly_types" "$WORK/types.o" "$WORK/pkg.o" "$LIBSCALY" -lm >> "$WORK/build.log" 2>&1
 }
 

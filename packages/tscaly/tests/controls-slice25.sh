@@ -35,7 +35,7 @@ cd "$(dirname "$0")/../../.."
 
 CTL=packages/tscaly/tests/ctl.sh
 RUN=packages/tscaly/tests/run.sh
-S=packages/tscaly/0.1.1/tscaly/scanner.scaly
+S=packages/tscaly/0.1.2/tscaly/scanner.scaly
 
 export TSCALY_BASELINE=$(mktemp -t tscaly-baseline)
 BATTERY_START=$(python3 -c 'import time; print(time.time())')
@@ -144,7 +144,7 @@ SPEC
 # right, disabling the call would move nothing.
 
 run "c6 the invalid-escape re-scan of a no-substitution template never runs" <<SPEC
-FILE packages/tscaly/0.1.1/tscaly/parser.scaly
+FILE packages/tscaly/0.1.2/tscaly/parser.scaly
 <<<OLD
             if (scanner.token_flags() & TokenFlagsIsInvalid) <> 0
             {
@@ -158,7 +158,7 @@ FILE packages/tscaly/0.1.1/tscaly/parser.scaly
 SPEC
 
 run "c7 the invalid-escape re-scan of a template HEAD never runs" <<SPEC
-FILE packages/tscaly/0.1.1/tscaly/parser.scaly
+FILE packages/tscaly/0.1.2/tscaly/parser.scaly
 <<<OLD
         if is_tagged_template = false
         {

@@ -48,12 +48,12 @@ packages/tscaly/
   LICENSE                  Apache 2.0 — this package only
   NOTICE.txt               attribution, ours + upstream
   README.md                this file
-  0.1.1/                   the Scaly sources (package `tscaly`)
+  0.1.2/                   the Scaly sources (package `tscaly`)
   _submodules/
     typescript-go/         pinned reference + test corpus, never copied from
 ```
 
-The sources sit under `0.1.1/` because the Scaly compiler finds a package at
+The sources sit under `0.1.2/` because the Scaly compiler finds a package at
 `packages/<name>/<version>/`. Everything above that level — submodule,
 licenses, documents — stays outside the directory the compiler scans.
 

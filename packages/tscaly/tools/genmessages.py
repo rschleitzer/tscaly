@@ -26,7 +26,7 @@ import sys
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 SUB = os.path.join(REPO, "packages/tscaly/_submodules/typescript-go")
 TABLE = os.path.join(SUB, "internal/diagnostics/diagnostics_generated.go")
-DST = os.path.join(REPO, "packages/tscaly/0.1.1/tscaly/DiagnosticMessages.scaly")
+DST = os.path.join(REPO, "packages/tscaly/0.1.2/tscaly/DiagnosticMessages.scaly")
 
 ENTRY = re.compile(r'^var (\w+) = &Message\{code: (\d+), category: Category(\w+), key: "([^"]*)", text: "((?:[^"\\]|\\.)*)"')
 CATEGORIES = {"Warning": 0, "Error": 1, "Suggestion": 2, "Message": 3}

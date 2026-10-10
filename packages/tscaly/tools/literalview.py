@@ -28,8 +28,8 @@ import os
 import re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOTS = sorted(glob.glob(os.path.join(HERE, "..", "0.1.1", "*.scaly")) +
-               glob.glob(os.path.join(HERE, "..", "0.1.1", "tscaly", "*.scaly")))
+ROOTS = sorted(glob.glob(os.path.join(HERE, "..", "0.1.2", "*.scaly")) +
+               glob.glob(os.path.join(HERE, "..", "0.1.2", "tscaly", "*.scaly")))
 
 # An untyped binding — no `:` annotation — whose initializer is a string literal.
 BIND = re.compile(r'\s*(?:let|var)\s+([a-z_0-9]+)\s+"')

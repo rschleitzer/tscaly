@@ -27,8 +27,8 @@ import re, sys, os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 GEN = os.path.join(ROOT, 'packages/tscaly/_submodules/typescript-go/internal/ast/ast_generated.go')
-AST = os.path.join(ROOT, 'packages/tscaly/0.1.1/tscaly/ast.scaly')
-OUT = os.path.join(ROOT, 'packages/tscaly/0.1.1/tscaly/factory.scaly')
+AST = os.path.join(ROOT, 'packages/tscaly/0.1.2/tscaly/ast.scaly')
+OUT = os.path.join(ROOT, 'packages/tscaly/0.1.2/tscaly/factory.scaly')
 
 RESERVED = {'label': 'label_name', 'init': 'init_value', 'loop': 'loop_value', 'shared': 'shared_value', 'operator': 'operator_kind', 'namespace': 'namespace_name'}
 def snake(n):

@@ -23,7 +23,7 @@ GODEF_RE = re.compile(r"^func (?:\([^)]*\) )?(\w+)\(")
 
 def port_sites(name):
     out = []
-    for f in sorted(glob.glob(os.path.join(PKG, "0.1.1", "tscaly", "*.scaly"))) + [os.path.join(PKG, "0.1.1", "tscaly_dump.scaly")]:
+    for f in sorted(glob.glob(os.path.join(PKG, "0.1.2", "tscaly", "*.scaly"))) + [os.path.join(PKG, "0.1.2", "tscaly_dump.scaly")]:
         if f.endswith("DiagnosticCodes.scaly"):
             continue
         lines = open(f).read().split("\n")

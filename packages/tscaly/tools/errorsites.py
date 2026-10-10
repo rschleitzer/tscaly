@@ -120,7 +120,7 @@ DEF_RE = re.compile(r"^    (?:function|procedure) ([A-Za-z_0-9]+)\(")
 
 
 def src_path(fname):
-    return os.path.join(PKG, "0.1.1", "tscaly", fname)
+    return os.path.join(PKG, "0.1.2", "tscaly", fname)
 
 
 def enclosing(lines, i):
@@ -338,7 +338,7 @@ def code_witnesses():
     """
     import re as _re
     num = {}
-    dc = os.path.join(PKG, "0.1.1", "tscaly", "DiagnosticCodes.scaly")
+    dc = os.path.join(PKG, "0.1.2", "tscaly", "DiagnosticCodes.scaly")
     for line in open(dc, encoding="utf-8"):
         m = _re.match(r"define (Diag\w+):\s+int (\d+)", line.strip())
         if m:
