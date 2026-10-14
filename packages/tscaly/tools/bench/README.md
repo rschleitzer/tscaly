@@ -1,191 +1,107 @@
 # tools/bench — the port on a real workload
 
-The Hejlsberg demo: VS Code type-checked by tsc, tsgo and this port. Everything
-here runs OUTSIDE the yardsticks; the yardsticks decide correctness, this measures
-time and memory.
+VS Code type-checked by tsc, tsgo and this port. Everything here runs OUTSIDE
+the yardsticks; the yardsticks decide correctness, this measures time and
+memory.
 
 ## ⚠ Read first
 
-**A full VS Code run peaked at a 23 GB footprint on a 24 GB machine and swapped**
-(2026-09-16). Run it only under `runwatch.sh` with a footprint limit well below
-the machine's memory, never while `build.sh` or a yardstick runs, and prefer a
-sub-project while the port's memory is what it is.
+The port's footprint on the whole of VS Code is 9.4 GB with four checkers and
+7.8 GB with one; building it peaks at 8.5 GB. Run a measurement only under
+`runwatch.sh`, with a footprint limit well below the machine's memory, and
+never while `build.sh` or a yardstick runs.
 
 ## Setup (outside the repository)
 
 ```bash
-mkdir -p ~/repos/bench && cd ~/repos/bench
+mkdir -p ~/repos/bench/bin && cd ~/repos/bench
 git clone --depth 1 https://github.com/microsoft/vscode.git
 (cd vscode && npm ci --ignore-scripts --no-audit --no-fund)
-(cd <repo>/packages/tscaly/_submodules/typescript-go && go build -o ~/repos/bench/tsgo ./cmd/tsgo)
+(cd <repo>/packages/tscaly/_submodules/typescript-go && go build -o ~/repos/bench/bin/tsgo ./cmd/tsgo)
+python3 <repo>/packages/tscaly/tools/bench/mkscenario.py vscode vscode-paths.scenario --paths-only
 ```
 
 `--ignore-scripts` skips the post-install steps, so the Electron typings are
-missing: every compiler sees the same input and reports the same ~355 errors.
+missing: every compiler sees the same input and reports the same errors.
+
+The scenario holds the ABSOLUTE paths of the default libraries in this
+checkout's submodule. Make it anew when the checkout moves: an old scenario
+then names libraries that are not there, and the port reports `Cannot find
+global type 'Array'` and nine more instead of the project's errors.
 
 ## Measure
 
 ```bash
 cd ~/repos/bench/vscode
-/usr/bin/time -l ../tsgo -p src/tsconfig.json --noEmit --extendedDiagnostics
-/usr/bin/time -l ../tsgo -p src/tsconfig.json --noEmit --singleThreaded
+/usr/bin/time -l ../bin/tsgo -p src/tsconfig.json --noEmit
+/usr/bin/time -l ../bin/tsgo -p src/tsconfig.json --noEmit --singleThreaded
 /usr/bin/time -l node --max-old-space-size=16384 node_modules/typescript/bin/tsc6 -p src/tsconfig.json --noEmit
 
 cd <repo>
-packages/tscaly/tools/bench/build.sh ~/repos/bench/tscaly_exec_o2
-python3 packages/tscaly/tools/bench/mkscenario.py ~/repos/bench/vscode ~/repos/bench/vscode.scenario
+packages/tscaly/tools/bench/build.sh ~/repos/bench/bin/tscaly
 cd ~/repos/bench
-TSCALY_PROGRESS=1 <repo>/packages/tscaly/tools/bench/runwatch.sh vscode 1800 16000 -- \
-  ./tscaly_exec_o2 --bench-batch vscode.scenario
+TSCALY_CHECKERS=4 <repo>/packages/tscaly/tools/bench/runwatch.sh vscode 900 16000 -- \
+  ./bin/tscaly --bench-batch vscode-paths.scenario
 ```
 
-`--paths-only` writes the file names without their texts; tscaly_exec reads a text
-from disk the first time something asks for it (vs/editor: 2.7 → 1.9 GB).
+`--paths-only` writes the file names without their texts; tscaly_exec reads a
+text from disk the first time something asks for it.
 
-`--bench-batch` replays the scenario without the file trees, the snapshots and the
-shadow build that the driver yardstick needs (`--batch`); on a one-file config that
-is 1.66 → 0.92 GB of harness alone.
+`--bench-batch` replays the scenario without the file trees, the snapshots and
+the shadow build that the driver yardstick needs (`--batch`).
 
-`TSCALY_PROGRESS=1` prints `check <index> <path>` as each file is checked, so a
-run that ends early says how far it came (`grep -c '^check ' vscode.out`). The
-diagnostics are in the `==== OUTPUT` block of `vscode.out`, in pretty format.
+`TSCALY_CHECKERS` is the number of checkers that check the files in parallel
+(default one). `TSCALY_PROGRESS=1` prints `check <index> <path>` as each file
+is checked, so a run that ends early says how far it came
+(`grep -c '^check ' vscode.out`). The diagnostics are in the `==== OUTPUT`
+block of `vscode.out`, in pretty format.
 
-## Measured 2026-09-16 (M-series, 10 cores, 24 GB)
+## Measured 2026-10-14
 
-| | wall | memory |
-|---|---|---|
-| tsc 6.0.2 | 63.8 s | 5.2 GB RSS, 8.8 GB peak (dies at node's default 4 GB heap) |
-| tsgo 7.0.2, default | 9.4 s | 7.2 GB RSS, 7.9 GB peak |
-| tsgo `--singleThreaded` | 19.3 s | 6.3 GB |
-| tscaly `-O2` | 492 s, swapping | 23.1 GB peak |
-
-That run reported 709 errors: all 355 of tsgo's, text-identical, and 354 more that
-are port defects (an earlier version of this line read the intersection as equality).
-The time is not a comparison yet — most of it was the swap.
-
-## Measured 2026-09-17 (same machine, `--paths-only` scenario)
-
-| | wall | CPU | memory |
-|---|---|---|---|
-| tscaly after the memory work | 470 s | 392 s | 10.85 GB footprint |
-| tscaly after the project-size indexes (slice 312) | 105.5 s | 97 s | 11.2 GB footprint |
-
-630 errors: tsgo's 355 and 275 port defects (the `@xterm/addon-*` typings' self-augmenting
-`declare module`, JSON modules outside the scenario, and what follows from them).
-
-## Measured 2026-09-23 (same machine, idle, tree at `5a82fcd5`)
-
-The whole of VS Code, `--bench-batch vscode-paths.scenario`, tsgo built from the
-submodule (`-p src/tsconfig.json --noEmit`, default settings). One warm-up run, then
-rounds alternating between the binaries; `/usr/bin/time -l`, footprint = its
-`peak memory footprint`. Every tscaly run reports tsgo's 355 errors — the same file,
-line, column and code — and `TSCALY_CHECKERS=1` and `=4` print identical text.
-
-**The default build** (`build.sh`, LTO, no PGO):
+Apple M4 (four performance and six efficiency cores), 24 GB, macOS 26. VS Code
+at `0a9c4d28` (19 259 scenario files), tscaly at `b305a22` (0.1.2) built with
+Scaly 0.2.13, tsgo built from the submodule (typescript-go 7.0.2), tsc 6.0.3 on
+node 22. `/usr/bin/time -l`, footprint = its `peak memory footprint`. One
+warm-up run, then rounds alternating between the binaries; the median of each
+column and, in brackets, the range.
 
 | | wall | user | sys | footprint |
 |---|---|---|---|---|
-| tsgo | 6.55 / 7.21 s | 30.5 / 35.7 s | 1.9 / 2.5 s | 7.6 / 7.8 GB |
-| tscaly, `TSCALY_CHECKERS=4` | **5.22 / 4.81 s** | **16.2 / 16.3 s** | 3.0 / 2.9 s | 8.7 GB |
-| tscaly, one checker (the default) | 10.72 / 10.43 s | 13.1 / 13.0 s | 2.4 / 2.4 s | 7.2 GB |
+| tsc 6.0.3 (3 runs) | 71.97 s (71.02–72.29) | 82.90 s | 2.6 s | 9.7 GB |
+| tsgo (6 runs) | 6.71 s (6.66–7.28) | 32.17 s (31.53–36.61) | 1.9 s | 7.8 GB (7.75–8.17) |
+| tsgo `--singleThreaded` (3 runs) | 18.13 s (18.04–18.24) | 21.18 s (19.58–21.40) | 1.0 s | 6.9 GB (6.78–7.19) |
+| tscaly, 4 checkers (6 runs) | **4.97 s** (4.78–5.10) | **16.34 s** (15.72–16.90) | 2.9 s | 9.4 GB |
+| tscaly, 1 checker (3 runs) | 10.47 s (10.45–10.48) | 13.07 s (13.05–13.11) | 2.6 s | 7.8 GB |
+| tscaly, 4 checkers, PGO (3 runs) | **4.25 s** (4.20–5.06) | **13.61 s** (13.57–13.66) | 2.8 s | 9.4 GB |
+| tscaly, 1 checker, PGO (3 runs) | 8.68 s (8.67–8.69) | 10.83 s (10.80–10.85) | 2.5 s | 7.8 GB |
 
-**With PGO** (the recipe below, trained on this scenario with one checker; a second
-series the same evening):
+Every tscaly run reports tsgo's 359 errors — the same file, line, column, code
+and text — and one checker and four print byte-identical output. tsc 6.0.3
+reports the same 359 and six more, implicit-`any` cycles (`TS7022`, `TS7024`)
+in one test file.
 
-| | wall | user | sys | footprint |
-|---|---|---|---|---|
-| tsgo | 6.19 / 6.51 s | 27.8 / 30.1 s | 1.9 / 1.9 s | 7.9 / 7.7 GB |
-| tscaly, 4 checkers, no PGO | 5.13 / 5.01 s | 16.3 / 16.9 s | 3.1 / 3.0 s | 8.7 GB |
-| tscaly, 4 checkers, **PGO** | **3.95 / 4.17 s** | **13.1 / 13.5 s** | 2.7 / 3.2 s | 8.7 GB |
-| tscaly, one checker, PGO | 8.63 / 8.24 s | 10.5 / 10.5 s | 2.3 / 2.4 s | 7.2 GB |
-
-Against 2026-09-18 (6.0 s against tsgo's 6.5 s, four checkers) the wall clock moved
-with the parse pool, binding on the pool and file discovery inside the parse tasks;
-the footprint with four checkers came down from 9.2 to 8.7 GB and is still about
-0.9 GB above tsgo's. The sys time is the page faults of that footprint. PGO takes
-another fifth off wall and user time and leaves the output and the memory unchanged
-— it stays out of the default build (below); name it whenever these rows are quoted.
-
-## Measured 2026-09-23 on the second Mac (M1 Pro, 8P+2E, 32 GB)
-
-A fresh VS Code clone (`0a9c4d28`, 19 259 scenario files, 359 errors in both
-compilers, identical file, line, column and code), the default build, three
-alternating rounds. The first series found `invoke_once`'s linear walk of the
-visit table in 93 % of all samples — VS Code's newer sources run one inference
-over far more than "a handful" of pairs — and the table has an index since:
-
-| | wall | user | sys | footprint |
-|---|---|---|---|---|
-| tsgo | 8.01–8.16 s | 36.5–40.0 s | 2.1–2.4 s | 7.7–8.1 GB |
-| tscaly x4, linear visit table | 20.92–21.07 s | 37.4–37.6 s | 3.8–3.9 s | 9.3 GB |
-| tscaly x1, linear visit table | 29.54–29.87 s | 32.9–33.3 s | 3.4–3.7 s | 7.7 GB |
-| tscaly x4, indexed | **6.51–6.53 s** | 22.4–23.4 s | 3.9 s | 9.4 GB |
-| tscaly x1, indexed | 14.62–15.00 s | 18.3–18.9 s | 3.6–3.7 s | 7.8 GB |
-
-Output byte-identical across both builds and both checker counts. The profile
-after the index is flat (the top entry, `AddressIndex::find`, at about 6 %).
-
-**With PGO** on the indexed tree (the recipe below, trained on this scenario with one
-checker on this machine; a second series right after the first):
-
-| | wall | user | sys | footprint |
-|---|---|---|---|---|
-| tsgo | 7.96–8.40 s | 37.3–43.3 s | 2.3 s | 7.8–8.1 GB |
-| tscaly x4, no PGO | 6.52–6.58 s | 23.2–23.3 s | 3.8–3.9 s | 9.4 GB |
-| tscaly x4, **PGO** | **5.46–5.80 s** | **18.9–19.5 s** | 4.0–4.2 s | 9.4 GB |
-| tscaly x1, PGO | 11.67–12.15 s | 14.9–15.5 s | 3.6–3.8 s | 7.8 GB |
-
-Output identical in every run. PGO takes about 15 % off wall and 17 % off user time
-here, a little less than the fifth measured on the first Mac.
-
-## The same fresh snapshot on the first Mac (2026-09-23, evening)
-
-VS Code `0a9c4d28` cloned beside the older snapshot (`vscode-new`, 19 259 scenario
-files), the default build before and after the visit-table index (`aac614ff` and
-its merge with `1895a25c`), one warm-up run, two alternating rounds. Every run
-reports tsgo's 359 errors — the same file, line, column and code — and both builds
-and both checker counts print identical text.
-
-| | wall | user | sys | footprint |
-|---|---|---|---|---|
-| tsgo | 7.23 / 7.24 s | 33.9 / 37.2 s | 2.1 / 1.8 s | 7.8 / 8.1 GB |
-| tscaly x4, linear visit table | 17.88 / 17.35 s | 29.8 / 30.1 s | 2.8 / 2.9 s | 9.3 GB |
-| tscaly x4, indexed | **5.55 / 5.77 s** | **17.5 / 17.9 s** | 2.8 / 2.9 s | 9.4 GB |
-| tscaly x1, indexed | 11.40 / 11.41 s | 14.2 / 14.3 s | 2.6 / 2.4 s | 7.8 GB |
-
-The older snapshot (355 errors) never showed the linear scan: an inference there
-stayed within the "handful" the table was written for. **A benchmark input ages
-like a measurement does** — the index was found only because the second Mac cloned
-a newer VS Code.
+With four checkers the port takes 0.74 of tsgo's wall time and half its user
+time, and needs 1.6 GB more memory; with PGO, 0.63 of the wall time and 0.42 of
+the user time. On one thread each, the port takes 0.58 of tsgo's wall time
+(0.48 with PGO). The sys time is the page faults of the footprint.
 
 ## Profile-guided optimization
 
-An ordinary build step since 2026-10-02 (the author's decision; from 2026-09-18 it had
-been a reserve for the demo, kept out of every build because the port shipped as `.ll`
-and PGO was a script with environment variables). It is one switch on `scaly build` now.
-The figures below are the 2026-09-18 measurement.
-
-| VS Code, three alternating rounds, output identical | user | real |
-|---|---|---|
-| today's bench build | 10.56 s | 12.3 s |
-| `opt` told the host triple | 10.04 s | 12.0 s |
-| host triple + PGO trained on VS Code | 8.15 s | 9.7 s |
-
-The profile transfers: trained on VS Code alone, the TypeScript repository's own
-`src/compiler` (305 files, 22 errors = tsgo) goes 0.89 → 0.71 s user.
+Two switches of `scaly build`: an instrumented build, trained on the scenario,
+and a build with the profile. The training run uses one checker. The profile
+needs the `llvm-profdata` of the LLVM the toolchain is built on (21; on macOS
+Homebrew's `llvm@21`). Measured above, 2026-10-14: the instrumented build takes
+40 s, the training run 10 s, the build with the profile 82 s.
 
 ```bash
-# ★Written 2026-10-02 from the tool's switches (tests/tool/run.sh `pgo` runs them
-# on a small program); NOT yet rerun on this scenario in this form. The recipe
-# of 2026-09-18 went through tools/link-lto.sh, which is deleted.
 ulimit -s 65520
-scalyc/build/scaly build packages/tscaly/0.1.2/tscaly_exec.scaly --pgo-train -o ~/repos/bench/bin/tscaly_pgogen
+mkdir -p ~/repos/bench/pgo
+cd <repo>
+scaly build packages/tscaly/0.1.2/tscaly_exec.scaly --pgo-train -o ~/repos/bench/bin/tscaly_pgogen
 (cd ~/repos/bench && LLVM_PROFILE_FILE=$PWD/pgo/tscaly-%p.profraw \
   ./bin/tscaly_pgogen --bench-batch vscode-paths.scenario > /dev/null)
-"$LLVM_PREFIX/bin/llvm-profdata" merge -o ~/repos/bench/pgo/tscaly.profdata ~/repos/bench/pgo/*.profraw
-scalyc/build/scaly build packages/tscaly/0.1.2/tscaly_exec.scaly --pgo ~/repos/bench/pgo/tscaly.profdata -o ~/repos/bench/bin/tscaly_pgo
+llvm-profdata merge -o ~/repos/bench/pgo/tscaly.profdata ~/repos/bench/pgo/*.profraw
+scaly build packages/tscaly/0.1.2/tscaly_exec.scaly --pgo ~/repos/bench/pgo/tscaly.profdata -o ~/repos/bench/bin/tscaly_pgo
 ```
 
-★ The CPU Bottlenecks shares of `tools/xctrace-bottleneck.py`
-cannot compare two builds: one build read 46 % and 35 % useful in two recordings.
-Compare alternating user times.
+PGO stays out of the default build: name it whenever its rows are quoted.

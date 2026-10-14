@@ -25,7 +25,7 @@ scaly build packages/tscaly/0.1.2/tscaly_exec.scaly --release -o tscaly_exec
 ```
 
 The compiler finds the package `tscaly` in `packages/` here and the standard
-library in the installation. The build takes under a minute and about 7.5 GB
+library in the installation. The build takes under a minute and about 8.5 GB
 of memory.
 
 ## Test

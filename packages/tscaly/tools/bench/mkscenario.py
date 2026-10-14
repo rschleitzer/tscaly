@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """
 mkscenario.py — a whole TypeScript project as ONE tscaly_exec scenario, so the
-port's driver can be measured on a real workload (the Hejlsberg demo: VS Code).
+port's driver can be measured on a real workload: VS Code.
 
 tscaly_exec has no OS file system; it replays a virtual tree. This writes that
 tree: the project's package.json files and every `.ts` under the source root,
