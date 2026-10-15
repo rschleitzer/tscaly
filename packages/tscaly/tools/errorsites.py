@@ -69,6 +69,7 @@ import os
 import re
 import shutil
 import sys
+import portfiles
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.dirname(HERE)
@@ -120,7 +121,7 @@ DEF_RE = re.compile(r"^    (?:function|procedure) ([A-Za-z_0-9]+)\(")
 
 
 def src_path(fname):
-    return os.path.join(PKG, "0.1.2", "tscaly", fname)
+    return portfiles.module_path(fname)
 
 
 def enclosing(lines, i):
@@ -338,7 +339,7 @@ def code_witnesses():
     """
     import re as _re
     num = {}
-    dc = os.path.join(PKG, "0.1.2", "tscaly", "DiagnosticCodes.scaly")
+    dc = portfiles.module_path("DiagnosticCodes.scaly")
     for line in open(dc, encoding="utf-8"):
         m = _re.match(r"define (Diag\w+):\s+int (\d+)", line.strip())
         if m:

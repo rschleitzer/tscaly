@@ -32,7 +32,7 @@ SRC = os.path.join(
     REPO,
     "packages/tscaly/_submodules/typescript-go/internal/scanner/scanner.go",
 )
-DST = os.path.join(REPO, "packages/tscaly/0.1.2/tscaly/Keywords.scaly")
+DST = os.path.join(REPO, "packages/tsbase/0.1.0/tsbase/Keywords.scaly")
 
 ENTRY = re.compile(r'^\t"([a-z]+)":\s*ast\.(Kind\w+),\s*$')
 

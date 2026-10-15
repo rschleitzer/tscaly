@@ -32,6 +32,8 @@ TS=_submodules/typescript-go/internal/checker
 [ -d "$TS" ] || { echo "submodule absent — nothing to measure against." >&2; exit 2; }
 python3 - "$TS" <<'PY'
 import re, os, glob, io, sys
+sys.path.insert(0, 'tools')
+import portfiles
 TS = sys.argv[1]
 NOT_A_GOAL = {'nodebuilderimpl.go','emitresolver.go','nodecopy.go','pseudotypenodebuilder.go',
               'nodebuilder_hover.go','symbolaccessibility.go','tracer.go','services.go'}
@@ -55,7 +57,7 @@ def scan(skip):
 def snake(n):
     s = re.sub(r'(.)([A-Z][a-z]+)', r'\1_\2', n)
     return re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s).lower()
-port = io.open('0.1.2/tscaly/checker.scaly', encoding='utf-8').read()
+port = io.open(portfiles.module_path('checker.scaly'), encoding='utf-8').read()
 defined = set(re.findall(r'^\s*(?:function|procedure)\s+([a-z_][a-z0-9_]*)', port, re.M))
 def pct(rows):
     tf, tl = len(rows), sum(l for _, _, l in rows)
@@ -122,7 +124,7 @@ grand = [0, 0, 0, 0]
 for d, files, rec in chapters:
     text = ''
     for f in files:
-        q = os.path.join('0.1.2/tscaly', f)
+        q = portfiles.module_path(f)
         if os.path.isfile(q): text += io.open(q, encoding='utf-8').read()
     have = set(re.findall(r'^\s*(?:function|procedure)\s+([a-z_][a-z0-9_]*)', text, re.M))
     rows = scan_dir(d, rec)

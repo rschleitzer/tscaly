@@ -40,11 +40,12 @@ import os
 import subprocess
 import sys
 import tempfile
+import portfiles
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.dirname(HERE)
 REPO = os.path.dirname(os.path.dirname(PKG))
-DST = os.path.join(PKG, "0.1.2", "tscaly", "UnicodeCase.scaly")
+DST = portfiles.module_path("UnicodeCase.scaly")
 
 PROBE = r'''
 package main

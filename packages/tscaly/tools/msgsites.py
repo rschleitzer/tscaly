@@ -7,6 +7,7 @@ arguments it passes. Phase (b)1's worklist tool: a site whose line carries fewer
 than the message has placeholders is the one to port.
 """
 import glob, os, re, sys
+import portfiles
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.dirname(HERE)
@@ -23,7 +24,7 @@ GODEF_RE = re.compile(r"^func (?:\([^)]*\) )?(\w+)\(")
 
 def port_sites(name):
     out = []
-    for f in sorted(glob.glob(os.path.join(PKG, "0.1.2", "tscaly", "*.scaly"))) + [os.path.join(PKG, "0.1.2", "tscaly_dump.scaly")]:
+    for f in portfiles.module_files() + [os.path.join(portfiles.version_dir("tscaly"), "tscaly_dump.scaly")]:
         if f.endswith("DiagnosticCodes.scaly"):
             continue
         lines = open(f).read().split("\n")

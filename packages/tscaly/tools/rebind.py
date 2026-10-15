@@ -39,9 +39,10 @@
 import os
 import re
 import sys
+import portfiles
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PKG = os.path.join(os.path.dirname(HERE), "0.1.2", "tscaly")
+PKG = os.path.join(portfiles.version_dir("tscaly"), "tscaly")
 
 FUNC = re.compile(r"^    (function|procedure) ([a-z_0-9]+)\(([^)]*)\)")
 SEED = re.compile(r"^\s*var ([a-z_][a-z_0-9]*)(?::\s*\S+)?\s+([a-z_][a-z_0-9]*)\s*$")
@@ -136,7 +137,7 @@ def scan(path):
 
 def main():
     args = [a for a in sys.argv[1:] if a != "--all"]
-    files = args or sorted(os.path.join(PKG, f) for f in os.listdir(PKG) if f.endswith(".scaly"))
+    files = args or portfiles.module_files()
     total = 0
     rows = []
     for path in files:

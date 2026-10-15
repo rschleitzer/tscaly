@@ -17,7 +17,7 @@
 # is indistinguishable from a correct one, so: one generated corpus, two
 # producers, a byte diff.
 #
-#   ours       packages/tscaly/0.1.2/tscaly_arith.scaly + tscaly/ArithCheck.scaly
+#   ours       packages/tscaly/0.1.3/tscaly_arith.scaly + tscaly/ArithCheck.scaly
 #   reference  packages/tscaly/tests/oracle/arith.go, over the submodule's jsnum
 #
 # The corpus is GENERATED here rather than committed, from a fixed seed. One line
@@ -34,6 +34,7 @@ cd "$(dirname "$0")/../../.."
 REPO=$(pwd)
 
 PKG=packages/tscaly
+. "$PKG/tests/packages.sh"
 SUB=$PKG/_submodules/typescript-go
 OUT=$PKG/tests/out/arith
 COUNT=${1:-20000}
@@ -159,17 +160,16 @@ if submodule_dirty; then
 fi
 
 # -- our side -----------------------------------------------------------------
-"$SCALYC" -c --no-prelude -o "$OUT/tscaly.o" "$PKG/0.1.2/tscaly.scaly" \
-  > "$OUT/pkg-build.log" 2>&1
+build_packages "$OUT" "$OUT/pkg-build.log"
 if [ $? -ne 0 ]; then
-  red "the tscaly package failed to compile:"; sed 's/^/    /' "$OUT/pkg-build.log"; exit 2
+  red "the port's packages failed to compile:"; sed 's/^/    /' "$OUT/pkg-build.log"; exit 2
 fi
-"$SCALYC" -c -o "$OUT/tscaly_arith.o" "$PKG/0.1.2/tscaly_arith.scaly" \
+"$SCALYC" -c -o "$OUT/tscaly_arith.o" "$PKG/$(packages/tscaly/tools/version.sh)/tscaly_arith.scaly" \
   > "$OUT/prog-build.log" 2>&1
 if [ $? -ne 0 ]; then
   red "tscaly_arith failed to compile:"; sed 's/^/    /' "$OUT/prog-build.log"; exit 2
 fi
-clang -o "$OUT/tscaly_arith" "$OUT/tscaly_arith.o" "$OUT/tscaly.o" "$LIBSCALY" -lm \
+clang -o "$OUT/tscaly_arith" "$OUT/tscaly_arith.o" $(package_objects "$OUT") "$LIBSCALY" -lm \
   > "$OUT/link.log" 2>&1
 if [ $? -ne 0 ]; then
   red "the tscaly_arith link failed:"; sed 's/^/    /' "$OUT/link.log"; exit 2

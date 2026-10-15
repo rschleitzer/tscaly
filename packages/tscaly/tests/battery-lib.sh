@@ -37,8 +37,9 @@ REPO=$(pwd)
 
 DIAGCHECK=packages/tscaly/tests/diagcheck.sh
 PKG=packages/tscaly
-CHECKER=$PKG/0.1.2/tscaly/checker.scaly
-AST=$PKG/0.1.2/tscaly/ast.scaly
+. "$PKG/tests/packages.sh"
+CHECKER=$PKG/$(packages/tscaly/tools/version.sh)/tscaly/checker.scaly
+AST=packages/tsbase/$(packages/tscaly/tools/version.sh tsbase)/tsbase/ast.scaly
 FIX=$PKG/tests/fixtures
 CASES=$PKG/tests/out/cases
 
@@ -78,9 +79,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 build_bins() {
-  "$SCALYC" -c --no-prelude -o "$WORK/pkg.o" "$PKG/0.1.2/tscaly.scaly" > "$WORK/build.log" 2>&1 || return 1
-  "$SCALYC" -c -o "$WORK/types.o" "$PKG/0.1.2/tscaly_types.scaly" >> "$WORK/build.log" 2>&1 || return 1
-  clang -o "$WORK/tscaly_types" "$WORK/types.o" "$WORK/pkg.o" "$LIBSCALY" -lm >> "$WORK/build.log" 2>&1
+  build_packages "$WORK" "$WORK/build.log" || return 1
+  "$SCALYC" -c -o "$WORK/types.o" "$PKG/$(packages/tscaly/tools/version.sh)/tscaly_types.scaly" >> "$WORK/build.log" 2>&1 || return 1
+  clang -o "$WORK/tscaly_types" "$WORK/types.o" $(package_objects "$WORK") "$LIBSCALY" -lm >> "$WORK/build.log" 2>&1
 }
 
 diags_of() {

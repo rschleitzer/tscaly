@@ -45,15 +45,22 @@ Layout
 
 ```
 packages/tscaly/
-  LICENSE                  Apache 2.0 — this package only
+  LICENSE                  Apache 2.0 — this package and the two beside it
   NOTICE.txt               attribution, ours + upstream
   README.md                this file
-  0.1.2/                   the Scaly sources (package `tscaly`)
+  0.1.3/                   the Scaly sources (package `tscaly`) and the programs
   _submodules/
     typescript-go/         pinned reference + test corpus, never copied from
+packages/tsbase/0.1.0/     the bottom: constant tables, scanner, AST, parser
+packages/tsdriver/0.1.0/   the top: options, program host, tsc's execute, build
 ```
 
-The sources sit under `0.1.2/` because the Scaly compiler finds a package at
+The port is three packages, each built over the ones before it: `tsbase`,
+`tscaly` (binder, program, checker, printer, emitter) and `tsdriver`. A change
+to the checker does not compile the scanner and the parser again, nor a change
+to the driver the checker. Each has the same license and notice.
+
+The sources sit under `0.1.3/` because the Scaly compiler finds a package at
 `packages/<name>/<version>/`. Everything above that level — submodule,
 licenses, documents — stays outside the directory the compiler scans.
 

@@ -16,7 +16,7 @@
 # unexercised arm is indistinguishable from a correct one. So: one generated
 # corpus, two producers, a byte diff.
 #
-#   ours       packages/tscaly/0.1.2/tscaly_nums.scaly + tscaly/NumCheck.scaly
+#   ours       packages/tscaly/0.1.3/tscaly_nums.scaly + tscaly/NumCheck.scaly
 #   reference  packages/tscaly/tests/oracle/nums.go, over the submodule's jsnum
 #
 # The corpus is GENERATED here rather than committed, from a fixed seed, so the
@@ -36,6 +36,7 @@ cd "$(dirname "$0")/../../.."
 REPO=$(pwd)
 
 PKG=packages/tscaly
+. "$PKG/tests/packages.sh"
 SUB=$PKG/_submodules/typescript-go
 OUT=$PKG/tests/out/nums
 COUNT=${1:-20000}
@@ -189,17 +190,16 @@ if submodule_dirty; then
 fi
 
 # -- our side -----------------------------------------------------------------
-"$SCALYC" -c --no-prelude -o "$OUT/tscaly.o" "$PKG/0.1.2/tscaly.scaly" \
-  > "$OUT/pkg-build.log" 2>&1
+build_packages "$OUT" "$OUT/pkg-build.log"
 if [ $? -ne 0 ]; then
-  red "the tscaly package failed to compile:"; sed 's/^/    /' "$OUT/pkg-build.log"; exit 2
+  red "the port's packages failed to compile:"; sed 's/^/    /' "$OUT/pkg-build.log"; exit 2
 fi
-"$SCALYC" -c -o "$OUT/tscaly_nums.o" "$PKG/0.1.2/tscaly_nums.scaly" \
+"$SCALYC" -c -o "$OUT/tscaly_nums.o" "$PKG/$(packages/tscaly/tools/version.sh)/tscaly_nums.scaly" \
   > "$OUT/prog-build.log" 2>&1
 if [ $? -ne 0 ]; then
   red "tscaly_nums failed to compile:"; sed 's/^/    /' "$OUT/prog-build.log"; exit 2
 fi
-clang -o "$OUT/tscaly_nums" "$OUT/tscaly_nums.o" "$OUT/tscaly.o" "$LIBSCALY" -lm \
+clang -o "$OUT/tscaly_nums" "$OUT/tscaly_nums.o" $(package_objects "$OUT") "$LIBSCALY" -lm \
   > "$OUT/link.log" 2>&1
 if [ $? -ne 0 ]; then
   red "the tscaly_nums link failed:"; sed 's/^/    /' "$OUT/link.log"; exit 2

@@ -13,7 +13,7 @@
 # numcheck.sh makes for jsnum). So: one generated corpus, two producers, a byte
 # diff.
 #
-#   ours       packages/tscaly/0.1.2/tscaly_hash.scaly + tscaly/HashCheck.scaly
+#   ours       packages/tscaly/0.1.3/tscaly_hash.scaly + tscaly/HashCheck.scaly
 #   reference  packages/tscaly/tests/oracle/hash.go, over zeebo/xxh3 - the very
 #              package internal/tracing hashes its thread ids with
 #
@@ -34,6 +34,7 @@ cd "$(dirname "$0")/../../.."
 REPO=$(pwd)
 
 PKG=packages/tscaly
+. "$PKG/tests/packages.sh"
 SUB=$PKG/_submodules/typescript-go
 OUT=$PKG/tests/out/hash
 COUNT=${1:-20000}
@@ -139,17 +140,16 @@ if submodule_dirty; then
 fi
 
 # -- our side -----------------------------------------------------------------
-"$SCALYC" -c --no-prelude -o "$OUT/tscaly.o" "$PKG/0.1.2/tscaly.scaly" \
-  > "$OUT/pkg-build.log" 2>&1
+build_packages "$OUT" "$OUT/pkg-build.log"
 if [ $? -ne 0 ]; then
-  red "the tscaly package failed to compile:"; sed 's/^/    /' "$OUT/pkg-build.log"; exit 2
+  red "the port's packages failed to compile:"; sed 's/^/    /' "$OUT/pkg-build.log"; exit 2
 fi
-"$SCALYC" -c -o "$OUT/tscaly_hash.o" "$PKG/0.1.2/tscaly_hash.scaly" \
+"$SCALYC" -c -o "$OUT/tscaly_hash.o" "$PKG/$(packages/tscaly/tools/version.sh)/tscaly_hash.scaly" \
   > "$OUT/prog-build.log" 2>&1
 if [ $? -ne 0 ]; then
   red "tscaly_hash failed to compile:"; sed 's/^/    /' "$OUT/prog-build.log"; exit 2
 fi
-clang -o "$OUT/tscaly_hash" "$OUT/tscaly_hash.o" "$OUT/tscaly.o" "$LIBSCALY" -lm \
+clang -o "$OUT/tscaly_hash" "$OUT/tscaly_hash.o" $(package_objects "$OUT") "$LIBSCALY" -lm \
   > "$OUT/link.log" 2>&1
 if [ $? -ne 0 ]; then
   red "the tscaly_hash link failed:"; sed 's/^/    /' "$OUT/link.log"; exit 2

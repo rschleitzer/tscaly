@@ -9,6 +9,7 @@ a message of that function. Heuristic by design: a site whose arguments are comp
 line before, or passed through a variable code, still shows and is judged by reading.
 """
 import argparse, glob, os, re, collections
+import portfiles
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.dirname(HERE)
@@ -55,7 +56,7 @@ def main():
     args = ap.parse_args()
     want = set(int(c) for c in args.codes.split(",") if c)
     refs = ref_functions()
-    files = sorted(glob.glob(os.path.join(PKG, "0.1.2", "tscaly", "*.scaly")))
+    files = portfiles.module_files()
     per_member = collections.OrderedDict()
     for f in files:
         base = os.path.basename(f)

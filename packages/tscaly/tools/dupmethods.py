@@ -26,11 +26,11 @@
 #
 # Usage:  packages/tscaly/tools/dupmethods.py      (exit 1 if any row)
 import io, re, sys, glob, os, collections
+import portfiles
 
-root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '0.1.2')
+root = portfiles.version_dir('tscaly')
 seen = collections.defaultdict(list)
-for p in sorted(glob.glob(os.path.join(root, 'tscaly', '*.scaly')) +
-                glob.glob(os.path.join(root, '*.scaly'))):
+for p in sorted(portfiles.module_files() + portfiles.root_files()):
     concept = '<top level>'
     for i, l in enumerate(io.open(p, encoding='utf-8').read().split('\n')):
         m = re.match(r'define\s+([A-Za-z_][A-Za-z0-9_]*)', l)

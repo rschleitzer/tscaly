@@ -43,13 +43,14 @@
 # 2026-09-04, of which `mark-node-assignments` was one. A hit is a note to re-read.
 #
 # Usage:  packages/tscaly/tools/expiredstops.py [file.scaly] [tags]
-#         (default: 0.1.2/tscaly/checker.scaly, relative to the package;
+#         (default: the checker module's file, portfiles.py;
 #          the second argument selects the TAG mode instead of the claim mode)
 
 import io
 import os
 import re
 import sys
+import portfiles
 
 CLAIM = re.compile(
     r"unreachable|is DEAD|dead here|has no subject|nothing in this port"
@@ -106,7 +107,7 @@ def main():
     mode = "claims"
     if args and args[-1] in ("tags", "claims"):
         mode = args.pop()
-    path = args[0] if args else os.path.join(root, "0.1.2/tscaly/checker.scaly")
+    path = args[0] if args else portfiles.module_path("checker.scaly")
     src = io.open(path, encoding="utf-8").read()
     lines = src.split("\n")
     defined = set(DEFN.findall(src))

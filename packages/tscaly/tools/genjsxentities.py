@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""genjsxentities.py — writes packages/tscaly/0.1.2/tscaly/JsxEntities.scaly from the
+"""genjsxentities.py — writes packages/tsbase/0.1.0/tsbase/JsxEntities.scaly from the
 reference's entity table (transformers/jsxtransforms/jsx.go, `var entities = map[string]rune`),
 as a generated if-chain (§3.23: a lookup table the reference builds as data becomes a
 GENERATED function). Idempotent; tools/gencheck.sh runs it."""
 import os, re, sys
+import portfiles
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.dirname(HERE)
 SRC = os.path.join(PKG, "_submodules", "typescript-go", "internal", "transformers", "jsxtransforms", "jsx.go")
-OUT = os.path.join(PKG, "0.1.2", "tscaly", "JsxEntities.scaly")
+OUT = portfiles.module_path("JsxEntities.scaly")
 text = open(SRC, encoding="utf-8").read()
 block = text[text.index("var entities = map[string]rune{"):]
 block = block[:block.index("\n}")]

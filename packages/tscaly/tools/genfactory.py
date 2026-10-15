@@ -27,8 +27,8 @@ import re, sys, os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 GEN = os.path.join(ROOT, 'packages/tscaly/_submodules/typescript-go/internal/ast/ast_generated.go')
-AST = os.path.join(ROOT, 'packages/tscaly/0.1.2/tscaly/ast.scaly')
-OUT = os.path.join(ROOT, 'packages/tscaly/0.1.2/tscaly/factory.scaly')
+AST = os.path.join(ROOT, 'packages/tsbase/0.1.0/tsbase/ast.scaly')
+OUT = os.path.join(ROOT, 'packages/tscaly/0.1.3/tscaly/factory.scaly')
 
 RESERVED = {'label': 'label_name', 'init': 'init_value', 'loop': 'loop_value', 'shared': 'shared_value', 'operator': 'operator_kind', 'namespace': 'namespace_name'}
 def snake(n):
@@ -1442,7 +1442,7 @@ out('''; SPDX-License-Identifier: Apache-2.0
 
 use scaly.memory.Page
 use scaly.containers.Array
-use tscaly.ast.*
+use tsbase.ast.*
 use tscaly.printer.EmitContext
 use tscaly.printer.EmitHelper
 use tscaly.printer.EmitHelpers
@@ -1451,7 +1451,7 @@ use tscaly.emitter.Transformer
 use tscaly.printer.AutoGenerateInfo
 use tscaly.printer.Printer
 use tscaly.printer.TextRange
-use tscaly.parser.Parser
+use tsbase.parser.Parser
 use tscaly.binder.Binder
 use scaly.containers.StringBuilder
 

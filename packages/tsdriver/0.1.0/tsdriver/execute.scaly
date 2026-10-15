@@ -1,0 +1,885 @@
+; SPDX-License-Identifier: Apache-2.0
+;
+; execute — internal/execute's command line (tsc.go and execute/tsc) (phase (b)2).
+;
+; ★ The reporters are closures upstream (CreateDiagnosticReporter,
+; CreateReportErrorSummary); here they are the two booleans they close over —
+; quiet and pretty — decided at the same call sites.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use tscaly.program.JsonValue
+use tscaly.program.ProgramFiles
+use tsdriver.tsoptions.TsOptions
+use tsdriver.tsoptions.TsConfigParser
+use tsdriver.tsoptions.TsParsedCommandLine
+use tsdriver.tsoptions.ProjectReference
+use tsbase.TsOptionDecls.TsOptionDecls
+use tscaly.buildinfojson.JsonText
+use tscaly.emitter.EmitOptions
+use tsdriver.system.ExecSystem
+use tsdriver.system.CompileStats
+use tsdriver.system.VfsFile
+use tsdriver.commandline.CommandLine
+use tsdriver.commandline.ParsedCommandLine
+use tscaly.diagnosticwriter.DriverDiagnostic
+use tscaly.diagnosticwriter.DiagnosticWriter
+use tsdriver.programhost.DriverProgram
+use tscaly.tracing.Tracing
+use tscaly.tracing.TraceArg
+use tscaly.checker.Checker
+use tsdriver.programhost.ConfigFiles
+use tsdriver.incremental.IncProgram
+use tsdriver.incremental.IncEmitResult
+use tsdriver.incremental.ToSnapshot
+use tsdriver.incremental.PathMap
+use tsdriver.help.Help
+use tsdriver.build.Orchestrator
+use tsdriver.help.Init
+use tscaly.diagnosticwriter.Localization
+use tsdriver.watcher.Watcher
+
+; tsc.ExitStatus
+define ExitStatusSuccess: int 0
+define ExitStatusDiagnosticsPresent_OutputsSkipped: int 1
+define ExitStatusDiagnosticsPresent_OutputsGenerated: int 2
+define ExitStatusInvalidProject_OutputsSkipped: int 3
+define ExitStatusProjectReferenceCycle_OutputsSkipped: int 4
+define ExitStatusNotImplemented: int 5
+
+; a reporter's two decisions
+define Reporter (quiet: bool  pretty: bool)
+
+; EmitAndReportStatistics' answer
+define CompileOutcome (status: int  diagnostics: ref[Array[ref[DriverDiagnostic]]]  emitted_files: ref[Array[Slice[char]]]  emit_skipped: bool)
+
+; a concept with a field, so its statics mangle with its name (§3.38)
+define Execute (reserved: int)
+{
+    ; execute.CommandLine
+    procedure command_line(mutable sys: ref[ExecSystem], mutable args: ref[Array[Slice[char]]]) returns int mutable checker_allow_arbitrary_extensions, checker_allow_importing_ts_extensions, checker_allow_umd_global_access, checker_allow_unreachable_code, checker_allow_unused_labels, checker_check_js, checker_check_js_unset, checker_defer_initialize, checker_exact_optional_property_types, checker_lib_option_has_dom, checker_no_emit, checker_no_fallthrough_cases_in_switch, checker_no_implicit_any, checker_no_implicit_any_explicit, checker_no_implicit_returns, checker_no_implicit_this, checker_no_property_access_from_index_signature, checker_no_unchecked_indexed_access, checker_no_unused_locals, checker_no_unused_parameters, checker_rewrite_relative_import_extensions, checker_strict_bind_call_apply, checker_strict_builtin_iterator_return, checker_strict_function_types, checker_strict_null_checks, checker_strict_property_initialization, checker_trace_types, checker_use_unknown_in_catch_variables, localized_messages
+    {
+        let host sys.host
+        Localization.reset()
+        if args.get_length() > 0
+        {
+            let first TsConfigParser.to_lower(host, args[0])
+            if first.equals("-b") or first.equals("--b") or first.equals("-build") or first.equals("--build")
+            {
+                let build_cl CommandLine.parse_build(host, sys, args)
+                if (sys.stop_tag.length as int) > 0
+                    return ExitStatusNotImplemented
+                if Execute.load_locale(sys, build_cl) = false
+                    return ExitStatusNotImplemented
+                return Orchestrator.compile(sys, build_cl)
+            }
+        }
+        let cl CommandLine.parse(host, sys, args)
+        if (sys.stop_tag.length as int) > 0
+            return ExitStatusNotImplemented
+        if Execute.load_locale(sys, cl) = false
+            return ExitStatusNotImplemented
+        Execute.tsc_compilation(sys, cl)
+    }
+
+    ; the command line's locale: its translated messages, when it has them
+    procedure load_locale(mutable sys: ref[ExecSystem], cl: ref[ParsedCommandLine]) returns bool mutable localized_messages
+    {
+        let locale cl.options.text_of("locale")
+        if CommandLine.locale_is_translated(sys.host, locale) = false
+            return true
+        let file Localization.translation_file(sys.host, locale)
+        if (file.length as int) = 0
+            return true
+        if Localization.load(sys.host, file) = false
+        {
+            sys.stop("locale-messages")
+            return false
+        }
+        true
+    }
+
+    ; defaultIsPretty
+    function default_is_pretty(sys: ref[ExecSystem]) returns bool
+    {
+        if (sys.get_environment_variable("NO_COLOR").length as int) > 0
+            return false
+        if (sys.get_environment_variable("FORCE_COLOR").length as int) > 0
+            return true
+        true
+    }
+
+    ; shouldBePretty
+    function should_be_pretty(sys: ref[ExecSystem], options: ref[TsOptions]) returns bool
+    {
+        let pretty options.tristate_of("pretty")
+        if pretty < 0
+            return Execute.default_is_pretty(sys)
+        pretty = 1
+    }
+
+    ; CreateDiagnosticReporter
+    function reporter(sys: ref[ExecSystem], options: ref[TsOptions]) returns Reporter
+        Reporter(options.tristate_of("quiet") = 1, Execute.should_be_pretty(sys, options))
+
+    procedure report(mutable sys: ref[ExecSystem], r: Reporter, mutable d: ref[DriverDiagnostic])
+    {
+        if r.quiet
+            return
+        let out sys.output
+        if r.pretty
+        {
+            DiagnosticWriter.format_with_color_and_context(sys.host, out, d, sys.cwd, "\n")
+            out.append("\n")
+            return
+        }
+        DiagnosticWriter.write_format_diagnostic(sys.host, out, d, sys.cwd, "\n")
+    }
+
+    procedure report_all(mutable sys: ref[ExecSystem], r: Reporter, mutable list: ref[Array[ref[DriverDiagnostic]]])
+    {
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            Execute.report(sys, r, list[i as size_t])
+            i := i + 1
+        }
+    }
+
+    ; ast.NewCompilerDiagnostic, reported
+    procedure report_compiler(mutable sys: ref[ExecSystem], r: Reporter, code: int, mutable args: ref[Array[String]]?)
+    {
+        let none: Slice[char] ""
+        let h sys.host
+        Execute.report(sys, r, &DriverDiagnostic^h(none, none, 0, 0, code, args, null, null))
+    }
+
+    function arg1(host: ref[Page], a0: Slice[char]) returns ref[Array[String]]
+        CommandLine.args1(host, a0)
+
+    ; findConfigFile over the ancestors of the search path
+    procedure find_config_file(mutable sys: ref[ExecSystem], search_path: Slice[char]) returns Slice[char]
+    {
+        let host sys.host
+        var dir search_path
+        repeat
+        {
+            let candidate combine_paths(host, dir, "tsconfig.json")
+            if sys.file_exists(candidate)
+                return candidate
+            let parent get_directory_path(host, dir)
+            if parent.equals(dir)
+                return Slice[char]()
+            dir := parent
+        }
+    }
+
+    ; tscCompilation
+    procedure tsc_compilation(mutable sys: ref[ExecSystem], mutable cl: ref[ParsedCommandLine]) returns int mutable checker_allow_arbitrary_extensions, checker_allow_importing_ts_extensions, checker_allow_umd_global_access, checker_allow_unreachable_code, checker_allow_unused_labels, checker_check_js, checker_check_js_unset, checker_defer_initialize, checker_exact_optional_property_types, checker_lib_option_has_dom, checker_no_emit, checker_no_fallthrough_cases_in_switch, checker_no_implicit_any, checker_no_implicit_any_explicit, checker_no_implicit_returns, checker_no_implicit_this, checker_no_property_access_from_index_signature, checker_no_unchecked_indexed_access, checker_no_unused_locals, checker_no_unused_parameters, checker_rewrite_relative_import_extensions, checker_strict_bind_call_apply, checker_strict_builtin_iterator_return, checker_strict_function_types, checker_strict_null_checks, checker_strict_property_initialization, checker_trace_types, checker_use_unknown_in_catch_variables
+    {
+        let host sys.host
+        ; --diagnostics' clock starts with the compilation (slice 348)
+        sys.stats := &CompileStats^host(scaly_eio_now_ns(), 0, 0, 0, 0, 0, 0)
+        let options cl.options
+        ; `Memory used` / `Memory allocs` are counted only when asked for (the
+        ; runtime's counters cost 4 % when always on); a tsconfig's own
+        ; `diagnostics` turns them on in DriverProgram.load
+        if (options.tristate_of("diagnostics") = 1) or (options.tristate_of("extendedDiagnostics") = 1)
+            Page.enable_statistics()
+        ; the runtime's poison mode: a released page is overwritten, so a
+        ; dangling read faults at once (a debugging aid, see Page.page_poison)
+        if getenv("SCALY_POISON") <> null
+            Page.enable_poison()
+        var report_diagnostic Execute.reporter(sys, options)
+        if cl.errors.get_length() > 0
+        {
+            Execute.report_all(sys, report_diagnostic, cl.errors)
+            return ExitStatusDiagnosticsPresent_OutputsSkipped
+        }
+        if options.tristate_of("init") = 1
+        {
+            if Init.write_config_file(sys, Execute.default_is_pretty(sys), cl.raw)
+            {
+                let file get_normalized_absolute_path(host, combine_paths(host, sys.cwd, "tsconfig.json"), Slice[char]())
+                Execute.report_compiler(sys, report_diagnostic, DiagA_tsconfig_json_file_is_already_defined_at_Colon_0, Execute.arg1(host, file))
+            }
+            return ExitStatusSuccess
+        }
+        if options.tristate_of("version") = 1
+        {
+            Help.print_version(sys)
+            return ExitStatusSuccess
+        }
+        if (options.tristate_of("help") = 1) or (options.tristate_of("all") = 1)
+        {
+            Help.print_help(sys, Execute.default_is_pretty(sys), options.tristate_of("all") = 1)
+            return ExitStatusSuccess
+        }
+        if (options.tristate_of("watch") = 1) and (options.tristate_of("listFilesOnly") = 1)
+        {
+            Execute.report_compiler(sys, report_diagnostic, DiagOptions_0_and_1_cannot_be_combined, CommandLine.args2(host, "watch", String("listFilesOnly")))
+            return ExitStatusDiagnosticsPresent_OutputsSkipped
+        }
+        var config_file_name Slice[char]()
+        let project options.text_of("project")
+        let file_count cl.file_names.get_length() as int
+        if (project.length as int) > 0
+        {
+            if file_count <> 0
+            {
+                Execute.report_compiler(sys, report_diagnostic, DiagOption_project_cannot_be_mixed_with_source_files_on_a_command_line, null)
+                return ExitStatusDiagnosticsPresent_OutputsSkipped
+            }
+            let file_or_directory get_normalized_absolute_path(host, project, sys.cwd)
+            if sys.directory_exists(file_or_directory)
+            {
+                config_file_name := combine_paths(host, file_or_directory, "tsconfig.json")
+                if sys.file_exists(config_file_name) = false
+                {
+                    Execute.report_compiler(sys, report_diagnostic, DiagCannot_find_a_tsconfig_json_file_at_the_current_directory_Colon_0, Execute.arg1(host, config_file_name))
+                    return ExitStatusDiagnosticsPresent_OutputsSkipped
+                }
+            }
+            else
+            {
+                config_file_name := file_or_directory
+                if sys.file_exists(config_file_name) = false
+                {
+                    Execute.report_compiler(sys, report_diagnostic, DiagThe_specified_path_does_not_exist_Colon_0, Execute.arg1(host, file_or_directory))
+                    return ExitStatusDiagnosticsPresent_OutputsSkipped
+                }
+            }
+        }
+        else
+        {
+            if (options.tristate_of("ignoreConfig") <> 1) or (file_count = 0)
+            {
+                let search_path get_normalized_absolute_path(host, sys.cwd, Slice[char]())
+                config_file_name := Execute.find_config_file(sys, search_path)
+                if file_count <> 0
+                {
+                    if (config_file_name.length as int) > 0
+                    {
+                        Execute.report_compiler(sys, report_diagnostic, DiagX_tsconfig_json_is_present_but_will_not_be_loaded_if_files_are_specified_on_commandline_Use_ignoreConfig_to_skip_this_error, null)
+                        return ExitStatusDiagnosticsPresent_OutputsSkipped
+                    }
+                }
+                else
+                {
+                    if (config_file_name.length as int) = 0
+                    {
+                        if options.tristate_of("showConfig") = 1
+                        {
+                            Execute.report_compiler(sys, report_diagnostic, DiagCannot_find_a_tsconfig_json_file_at_the_current_directory_Colon_0, Execute.arg1(host, search_path))
+                            return ExitStatusDiagnosticsPresent_OutputsSkipped
+                        }
+                        Help.print_version(sys)
+                        Help.print_help(sys, Execute.default_is_pretty(sys), options.tristate_of("all") = 1)
+                        return ExitStatusDiagnosticsPresent_OutputsSkipped
+                    }
+                }
+            }
+        }
+        var compile_options options
+        var root_names cl.file_names
+        var config_text Slice[char]()
+        var root_config: ref[TsParsedCommandLine]? null
+        let config_diagnostics &Array[ref[DriverDiagnostic]]^host()
+        if (config_file_name.length as int) > 0
+        {
+            sys.now()
+            let config_t0 scaly_eio_now_ns()
+            let absolute get_normalized_absolute_path(host, config_file_name, sys.cwd)
+            config_file_name := absolute
+            var text Slice[char]()
+            if sys.read_file(absolute, &text) = false
+            {
+                sys.now()
+                Execute.report_compiler(sys, report_diagnostic, DiagCannot_read_file_0, Execute.arg1(host, absolute))
+                return ExitStatusDiagnosticsPresent_OutputsGenerated
+            }
+            config_text := text
+            let parsed Execute.parse_config(sys, cl, absolute, text, config_diagnostics)
+            sys.now()
+            Execute.add_stat_time(sys, 0, config_t0)
+            if parsed = null
+                return ExitStatusNotImplemented
+            let p parsed as ref[TsParsedCommandLine]
+            root_config := p
+            compile_options := p.options
+            root_names := p.file_names
+            report_diagnostic := Execute.reporter(sys, options)
+        }
+        else
+        {
+            ; ParseCommandLine keeps the file names as written (addRootFileTask
+            ; normalizes, a diagnostic names the file as given)
+            root_names := cl.file_names
+        }
+        let summary_pretty Execute.should_be_pretty(sys, compile_options)
+        if options.tristate_of("showConfig") = 1
+        {
+            if config_diagnostics.get_length() > 0
+            {
+                sys.stop("show-config-with-errors")
+                return ExitStatusNotImplemented
+            }
+            Execute.show_config(sys, compile_options, root_names, root_config, config_file_name)
+            return ExitStatusSuccess
+        }
+        if compile_options.tristate_of("watch") = 1
+        {
+            let w Watcher.create(sys, cl, compile_options, root_names, config_file_name, config_text, config_diagnostics, root_config, report_diagnostic, summary_pretty)
+            sys.watcher := w
+            w.start()
+            if (sys.stop_tag.length as int) > 0
+                return ExitStatusNotImplemented
+            return ExitStatusSuccess
+        }
+        if (compile_options.tristate_of("incremental") = 1) or (compile_options.tristate_of("composite") = 1)
+            return Execute.perform_incremental_compilation(sys, compile_options, root_names, config_file_name, config_text, config_diagnostics, report_diagnostic, summary_pretty, root_config)
+        Execute.perform_compilation(sys, compile_options, root_names, config_file_name, config_text, config_diagnostics, report_diagnostic, summary_pretty, root_config)
+    }
+
+    ; GetParsedCommandLineOfConfigFilePath with the command line's options: the
+    ; config's parse diagnostics into `diagnostics`; null after a stop
+    procedure parse_config(mutable sys: ref[ExecSystem], cl: ref[ParsedCommandLine], mutable config_file_name: Slice[char], mutable text: Slice[char], mutable diagnostics: ref[Array[ref[DriverDiagnostic]]]) returns ref[TsParsedCommandLine]?
+        ConfigFiles.parse(sys, cl.options, cl.raw, config_file_name, text, diagnostics)
+
+    ; showConfig: tsoptions.ConvertToTSConfig, MarshalIndent with four spaces
+    procedure show_config(mutable sys: ref[ExecSystem], mutable options: ref[TsOptions], mutable file_names: ref[Array[Slice[char]]], config: ref[TsParsedCommandLine]?, mutable config_file_name_in: Slice[char])
+    {
+        let host sys.host
+        var config_file_name config_file_name_in
+        if (config_file_name.length as int) = 0
+            config_file_name := "tsconfig.json"
+        let config_path get_normalized_absolute_path(host, config_file_name, sys.cwd)
+        let config_dir get_directory_path(host, config_path)
+        let option_map JsonText.new_object(host)
+        var f 0
+        while f < TsOptionDecls.compiler_field_count()
+        {
+            let i TsOptionDecls.compiler_field_option(f)
+            f := f + 1
+            if i < 0
+                continue
+            let category TsOptionDecls.category_of(i)
+            ; Command_line_Options, Output_Formatting
+            if (category = 6171) or (category = 6256)
+                continue
+            let name TsOptionDecls.name_of(i)
+            if Execute.show_config_omits(name)
+                continue
+            let value options.get(name)
+            if value = null
+                continue
+            let v value as ref[JsonValue]
+            if TsOptions.is_zero(v)
+                continue
+            let serialized Execute.show_config_value(sys, i, v, config_path, config_dir)
+            if serialized <> null
+                JsonText.put_member(option_map, name, serialized as ref[JsonValue])
+        }
+        Execute.add_implied_options(sys, option_map, options, config_file_name_in)
+        let result JsonText.new_object(host)
+        JsonText.put_member(result, "compilerOptions", option_map)
+        if config <> null
+        {
+            let c config as ref[TsParsedCommandLine]
+            if c.references <> null
+            {
+                let refs c.references as ref[Array[ProjectReference]]
+                if refs.get_length() > 0
+                {
+                    let list JsonText.new_array(host)
+                    var r 0
+                    while r < (refs.get_length() as int)
+                    {
+                        let reference refs[r as size_t]
+                        r := r + 1
+                        let entry JsonText.new_object(host)
+                        JsonText.put_member(entry, "path", JsonText.new_string(host, reference.original_path))
+                        if reference.circular
+                            JsonText.put_member(entry, "circular", JsonText.new_bool(host, true))
+                        JsonText.push(list, entry)
+                    }
+                    JsonText.put_member(result, "references", list)
+                }
+            }
+        }
+        if file_names.get_length() > 0
+        {
+            let files JsonText.new_array(host)
+            var k 0
+            while k < (file_names.get_length() as int)
+            {
+                let absolute get_normalized_absolute_path(host, file_names[k as size_t], sys.cwd)
+                k := k + 1
+                JsonText.push(files, JsonText.new_string(host, Execute.relative_path_from_file(sys, config_dir, absolute)))
+            }
+            JsonText.put_member(result, "files", files)
+        }
+        if config <> null
+        {
+            let c config as ref[TsParsedCommandLine]
+            var default_include false
+            if c.include_specs.get_length() = 1
+            {
+                let only c.include_specs[0]
+                default_include := only.equals("**/*")
+            }
+            if (c.include_specs.get_length() > 0) and (default_include = false)
+                JsonText.put_member(result, "include", Execute.string_array(host, c.include_specs))
+            if c.exclude_specs.get_length() > 0
+                JsonText.put_member(result, "exclude", Execute.string_array(host, c.exclude_specs))
+            if c.compile_on_save
+                JsonText.put_member(result, "compileOnSave", JsonText.new_bool(host, true))
+        }
+        let text JsonText.to_text(host, result, true)
+        Execute.append_four_space_indent(sys.output, text)
+    }
+
+    function show_config_omits(name: Slice[char]) returns bool
+    {
+        name.equals("showConfig") or name.equals("configFile") or name.equals("configFilePath") or name.equals("help") or name.equals("init") or name.equals("listFilesOnly") or name.equals("listEmittedFiles") or name.equals("project") or name.equals("build") or name.equals("version")
+    }
+
+    function string_array(host: ref[Page], list: ref[Array[Slice[char]]]) returns ref[JsonValue]
+    {
+        let arr JsonText.new_array(host)
+        var i 0
+        while i < (list.get_length() as int)
+        {
+            JsonText.push(arr, JsonText.new_string(host, list[i as size_t]))
+            i := i + 1
+        }
+        arr
+    }
+
+    ; the two-space MarshalIndent text with every indentation doubled
+    procedure append_four_space_indent(mutable out: ref[StringBuilder], text: Slice[char])
+    {
+        var at_line_start true
+        var i 0
+        while i < (text.length as int)
+        {
+            let c text[i as size_t]
+            if at_line_start and ((c as int) = ((" " as char) as int))
+            {
+                out.append("  ")
+                i := i + 1
+                continue
+            }
+            at_line_start := (c as int) = (("\n" as char) as int)
+            out.append(c)
+            i := i + 1
+        }
+    }
+
+    ; tspath.GetRelativePathFromFile: relative to the config's directory, `./` led
+    procedure relative_path_from_file(mutable sys: ref[ExecSystem], mutable from_directory: Slice[char], mutable to: Slice[char]) returns Slice[char]
+    {
+        let host sys.host
+        let relative get_relative_path_to_directory_or_url(host, from_directory, to, false, sys.cwd)
+        if is_rooted_disk_path(relative) or relative.starts_with("./") or relative.starts_with("../")
+            return relative
+        join_slices(host, "./", relative)
+    }
+
+    ; serializeCompilerOptions' value of option `i`; null to leave it out
+    procedure show_config_value(mutable sys: ref[ExecSystem], i: int, mutable v: ref[JsonValue], config_path: Slice[char], mutable config_dir: Slice[char]) returns ref[JsonValue]?
+    {
+        let host sys.host
+        let kind TsOptionDecls.kind_of(i)
+        if kind = TsOptionKindEnum
+        {
+            var n 0 - 1
+            if v.kind = JsonKindString
+                n := TsOptionDecls.enum_number(i, TsConfigParser.to_lower(host, v.text))
+            if v.kind = JsonKindNumber
+                n := JsonText.int_of(v)
+            let key TsOptionDecls.enum_key_of_number(i, n)
+            if (key.length as int) = 0
+                return null
+            return JsonText.new_string(host, key)
+        }
+        if (kind = TsOptionKindList) and (v.kind = JsonKindArray)
+        {
+            if TsOptionDecls.element_is_file_path(i)
+            {
+                let arr JsonText.new_array(host)
+                var k 0
+                while k < v.size()
+                {
+                    let e v.value_at(k)
+                    k := k + 1
+                    if e = null
+                        continue
+                    let ev e as ref[JsonValue]
+                    if ev.kind = JsonKindString
+                        JsonText.push(arr, JsonText.new_string(host, Execute.relative_path_from_file(sys, config_dir, get_normalized_absolute_path(host, ev.text, config_dir))))
+                    else
+                        JsonText.push(arr, ev)
+                }
+                return arr
+            }
+            if TsOptionDecls.element_kind_of(i) = TsOptionKindEnum
+            {
+                sys.stop("show-config-enum-list")
+                return null
+            }
+            return v
+        }
+        if (kind = TsOptionKindString) and TsOptionDecls.is_file_path(i) and (v.kind = JsonKindString)
+            return JsonText.new_string(host, Execute.relative_path_from_file(sys, config_dir, get_normalized_absolute_path(host, v.text, config_dir)))
+        v
+    }
+
+    ; addImpliedOptions over the implied options' table
+    procedure add_implied_options(mutable sys: ref[ExecSystem], mutable option_map: ref[JsonValue], options: ref[TsOptions], config_path: Slice[char])
+    {
+        let host sys.host
+        let provided &Array[Slice[char]]^host()
+        var p 0
+        while p < option_map.size()
+        {
+            provided.add(option_map.key_at(p))
+            p := p + 1
+        }
+        let o DriverProgram.emit_options_of(host, options, sys.cwd, config_path)
+        let d EmitOptions.defaults()
+        ; module (Target)
+        if Execute.implied_eligible(provided, "module", "target", "", "", "")
+        {
+            let n o.get_emit_module_kind()
+            if n <> d.get_emit_module_kind()
+                Execute.put_implied_enum(host, option_map, "module", n)
+        }
+        if Execute.implied_eligible(provided, "moduleResolution", "module", "target", "", "")
+        {
+            let n o.get_module_resolution_kind()
+            if n <> d.get_module_resolution_kind()
+                Execute.put_implied_enum(host, option_map, "moduleResolution", n)
+        }
+        if Execute.implied_eligible(provided, "moduleDetection", "module", "target", "", "")
+        {
+            let n o.get_module_detection_kind()
+            ; the emitter numbers Auto 0, Legacy 1, Force 2; core.ModuleDetectionKind 1, 2, 3
+            if n <> d.get_module_detection_kind()
+                Execute.put_implied_enum(host, option_map, "moduleDetection", n + 1)
+        }
+        if Execute.implied_eligible(provided, "isolatedModules", "verbatimModuleSyntax", "", "", "")
+            Execute.put_implied_bool(host, option_map, "isolatedModules", o.get_isolated_modules(), d.get_isolated_modules())
+        if Execute.implied_eligible(provided, "preserveConstEnums", "isolatedModules", "verbatimModuleSyntax", "", "")
+            Execute.put_implied_bool(host, option_map, "preserveConstEnums", o.should_preserve_const_enums(), d.should_preserve_const_enums())
+        let declaration EmitOptions.on(o.declaration) or EmitOptions.on(o.composite)
+        if Execute.implied_eligible(provided, "declaration", "composite", "", "", "")
+            Execute.put_implied_bool(host, option_map, "declaration", declaration, false)
+        if Execute.implied_eligible(provided, "declarationMap", "declaration", "composite", "", "")
+            Execute.put_implied_bool(host, option_map, "declarationMap", EmitOptions.on(o.declaration_map) and declaration, false)
+        if Execute.implied_eligible(provided, "incremental", "composite", "", "", "")
+            Execute.put_implied_bool(host, option_map, "incremental", EmitOptions.on(o.incremental) or EmitOptions.on(o.composite), false)
+        if Execute.implied_eligible(provided, "useDefineForClassFields", "target", "module", "", "")
+            Execute.put_implied_bool(host, option_map, "useDefineForClassFields", o.get_use_define_for_class_fields(), d.get_use_define_for_class_fields())
+        ; resolvePackageJsonExports/Imports: IsTrueOrUnknown answers the default for
+        ; every unset value, so neither is ever implied
+        if Execute.implied_eligible(provided, "resolveJsonModule", "moduleResolution", "module", "target", "")
+            Execute.put_implied_bool(host, option_map, "resolveJsonModule", o.get_resolve_json_module(), d.get_resolve_json_module())
+        if Execute.implied_eligible(provided, "allowJs", "checkJs", "", "", "")
+            Execute.put_implied_bool(host, option_map, "allowJs", EmitOptions.on(o.allow_js), false)
+        if Execute.implied_eligible(provided, "allowImportingTsExtensions", "rewriteRelativeImportExtensions", "", "", "")
+            Execute.put_implied_bool(host, option_map, "allowImportingTsExtensions", EmitOptions.on(o.allow_importing_ts_extensions) or EmitOptions.on(o.rewrite_relative_import_extensions), false)
+    }
+
+    ; not provided itself, and one of its dependencies provided
+    function implied_eligible(provided: ref[Array[Slice[char]]], name: Slice[char], dep1: Slice[char], dep2: Slice[char], dep3: Slice[char], dep4: Slice[char]) returns bool
+    {
+        if ExecSystem.contains(provided, name)
+            return false
+        if ExecSystem.contains(provided, dep1)
+            return true
+        if ((dep2.length as int) > 0) and ExecSystem.contains(provided, dep2)
+            return true
+        if ((dep3.length as int) > 0) and ExecSystem.contains(provided, dep3)
+            return true
+        ((dep4.length as int) > 0) and ExecSystem.contains(provided, dep4)
+    }
+
+    procedure put_implied_enum(host: ref[Page], mutable option_map: ref[JsonValue], name: Slice[char], n: int)
+    {
+        let key TsOptionDecls.enum_key_of_number(TsOptionDecls.index_of(name), n)
+        if (key.length as int) > 0
+            JsonText.put_member(option_map, name, JsonText.new_string(host, key))
+    }
+
+    procedure put_implied_bool(host: ref[Page], mutable option_map: ref[JsonValue], name: Slice[char], value: bool, default_value: bool)
+    {
+        if value <> default_value
+            JsonText.put_member(option_map, name, JsonText.new_bool(host, value))
+    }
+
+    ; the compile options this port does not implement, as a stop; true when one stopped
+    procedure unported_compile_options(mutable sys: ref[ExecSystem], options: ref[TsOptions]) returns bool
+    {
+        ; diagnostics/extendedDiagnostics: the statistics sit between the harness's
+        ; markers, which the baseline drops with their contents
+        if (options.text_of("generateTrace").length as int) > 0
+        {
+            sys.stop("generate-trace")
+            return true
+        }
+        false
+    }
+
+    ; performIncrementalCompilation, then EmitAndReportStatistics and the harness's
+    ; OnProgram
+    procedure perform_incremental_compilation(mutable sys: ref[ExecSystem], mutable options: ref[TsOptions], mutable root_names: ref[Array[Slice[char]]], mutable config_file_name: Slice[char], mutable config_text: Slice[char], mutable config_diagnostics: ref[Array[ref[DriverDiagnostic]]], r: Reporter, summary_pretty: bool, root_config: ref[TsParsedCommandLine]?) returns int mutable checker_allow_arbitrary_extensions, checker_allow_importing_ts_extensions, checker_allow_umd_global_access, checker_allow_unreachable_code, checker_allow_unused_labels, checker_check_js, checker_check_js_unset, checker_defer_initialize, checker_exact_optional_property_types, checker_lib_option_has_dom, checker_no_emit, checker_no_fallthrough_cases_in_switch, checker_no_implicit_any, checker_no_implicit_any_explicit, checker_no_implicit_returns, checker_no_implicit_this, checker_no_property_access_from_index_signature, checker_no_unchecked_indexed_access, checker_no_unused_locals, checker_no_unused_parameters, checker_rewrite_relative_import_extensions, checker_strict_bind_call_apply, checker_strict_builtin_iterator_return, checker_strict_function_types, checker_strict_null_checks, checker_strict_property_initialization, checker_use_unknown_in_catch_variables
+    {
+        let host sys.host
+        if Execute.unported_compile_options(sys, options)
+            return ExitStatusNotImplemented
+        let program DriverProgram.create(host, sys, options, root_names, config_file_name, config_text, config_diagnostics)
+        program.root_config := root_config
+        sys.now()
+        let old ToSnapshot.read(host, program)
+        sys.now()
+        sys.now()
+        let parse_t0 scaly_eio_now_ns()
+        if program.load() = false
+            return ExitStatusNotImplemented
+        Execute.add_stat_time(sys, 1, parse_t0)
+        sys.now()
+        sys.now()
+        let created IncProgram.create(host, program, old)
+        if created = null
+            return ExitStatusNotImplemented
+        let ip created as ref[IncProgram]
+        sys.now()
+        let outcome Execute.emit_and_report_incremental(sys, ip, r, summary_pretty, null, null)
+        if outcome = null
+            return ExitStatusNotImplemented
+        program.report_statistics()
+        ip.baseline(sys.programs)
+        (outcome as ref[CompileOutcome]).status
+    }
+
+    ; EmitAndReportStatistics over an incremental program: the diagnostics reported
+    ; (and collected into `collected`, a build task's errors), the emitted files
+    ; touched (their times into a build's cache when it holds them); null after a stop
+    procedure emit_and_report_incremental(mutable sys: ref[ExecSystem], mutable ip: ref[IncProgram], r: Reporter, summary_pretty: bool, mutable collected: ref[Array[ref[DriverDiagnostic]]]?, mutable mtimes: ref[PathMap[int]]?) returns ref[CompileOutcome]?
+    {
+        let outcome Execute.emit_files_and_report_errors(sys, ip, r, summary_pretty, collected, mtimes)
+        if outcome = null
+            return null
+        ; SinceStart
+        sys.now()
+        outcome
+    }
+
+    ; EmitFilesAndReportErrors over an incremental program (the watcher's
+    ; compileAndEmit); the status is EmitAndReportStatistics'
+    procedure emit_files_and_report_errors(mutable sys: ref[ExecSystem], mutable ip: ref[IncProgram], r: Reporter, summary_pretty: bool, mutable collected: ref[Array[ref[DriverDiagnostic]]]?, mutable mtimes: ref[PathMap[int]]?) returns ref[CompileOutcome]?
+    {
+        let host sys.host
+        let check_t0 scaly_eio_now_ns()
+        let all &Array[ref[DriverDiagnostic]]^host()
+        if ip.diagnostics_of_any_program(all, false, true) = false
+            return null
+        sys.now()
+        Execute.add_stat_time(sys, 2, check_t0)
+        let emit_t0 scaly_eio_now_ns()
+        var result IncEmitResult.create(host, true)
+        if ip.program.flag("listFilesOnly") = false
+        {
+            let emitted ip.emit()
+            if emitted = null
+                return null
+            result := emitted as ref[IncEmitResult]
+        }
+        sys.now()
+        Execute.add_stat_time(sys, 3, emit_t0)
+        var ei 0
+        while ei < (result.diagnostics.get_length() as int)
+        {
+            all.add(result.diagnostics[ei as size_t])
+            ei := ei + 1
+        }
+        var ti 0
+        while ti < (result.emitted_files.get_length() as int)
+        {
+            let file result.emitted_files[ti as size_t]
+            ti := ti + 1
+            if sys.touch_emitted(file) = false
+                continue
+            if mtimes <> null
+            {
+                let cache mtimes as ref[PathMap[int]]
+                if cache.has(file)
+                    cache.store(file, sys.clock)
+            }
+        }
+        let sorted DriverProgram.sort_and_deduplicate(host, all)
+        Execute.report_all(sys, r, sorted)
+        if ip.program.list_files(result.emitted_files) = false
+            return null
+        if collected <> null
+        {
+            let list collected as ref[Array[ref[DriverDiagnostic]]]
+            var ci 0
+            while ci < (sorted.get_length() as int)
+            {
+                list.add(sorted[ci as size_t])
+                ci := ci + 1
+            }
+        }
+        if summary_pretty
+            DiagnosticWriter.write_error_summary(host, sys.output, sorted, sys.cwd, "\n")
+        var status ExitStatusSuccess
+        if sorted.get_length() > 0
+        {
+            if result.emit_skipped
+                status := ExitStatusDiagnosticsPresent_OutputsSkipped
+            else
+                status := ExitStatusDiagnosticsPresent_OutputsGenerated
+        }
+        &CompileOutcome^host(status, sorted, result.emitted_files, result.emit_skipped)
+    }
+
+    ; --diagnostics' phases on the real clock (slice 348): 0 config, 1 parse,
+    ; 2 check, 3 emit. The parse is the program's creation MINUS its bind: the
+    ; reference creates the program and binds lazily after, this port binds each
+    ; file in the walk, so the bind time the loader measured is taken out here.
+    procedure add_stat_time(mutable sys: ref[ExecSystem], phase: int, t0: int)
+    {
+        if sys.stats = null
+            return
+        let st sys.stats as ref[CompileStats]
+        let d scaly_eio_now_ns() - t0
+        if phase = 0
+            st.config := st.config + d
+        if phase = 1
+            st.parse := st.parse + (d - st.bind)
+        if phase = 2
+            st.check := st.check + d
+        if phase = 3
+            st.emit := st.emit + d
+    }
+
+    ; performCompilation, then EmitAndReportStatistics
+    procedure perform_compilation(mutable sys: ref[ExecSystem], mutable options: ref[TsOptions], mutable root_names: ref[Array[Slice[char]]], mutable config_file_name: Slice[char], mutable config_text: Slice[char], mutable config_diagnostics: ref[Array[ref[DriverDiagnostic]]], r: Reporter, summary_pretty: bool, root_config: ref[TsParsedCommandLine]?) returns int mutable checker_allow_arbitrary_extensions, checker_allow_importing_ts_extensions, checker_allow_umd_global_access, checker_allow_unreachable_code, checker_allow_unused_labels, checker_check_js, checker_check_js_unset, checker_defer_initialize, checker_exact_optional_property_types, checker_lib_option_has_dom, checker_no_emit, checker_no_fallthrough_cases_in_switch, checker_no_implicit_any, checker_no_implicit_any_explicit, checker_no_implicit_returns, checker_no_implicit_this, checker_no_property_access_from_index_signature, checker_no_unchecked_indexed_access, checker_no_unused_locals, checker_no_unused_parameters, checker_rewrite_relative_import_extensions, checker_strict_bind_call_apply, checker_strict_builtin_iterator_return, checker_strict_function_types, checker_strict_null_checks, checker_strict_property_initialization, checker_trace_types, checker_use_unknown_in_catch_variables
+    {
+        let host sys.host
+        ; ★★★ THE WALL IS DOWN (slice 293). `--generateTrace` writes its three
+        ; artifacts and the smaller baseline is byte-identical — trace.json,
+        ; legend.json and types_0.json alike. What the bigger one still differs in
+        ; is two ordinary defects rather than an absence: the two program files are
+        ; parsed and emitted in the opposite order to the reference's, and the
+        ; relater's SIGNATURE chapter still drops its chain links (the property
+        ; ones landed in slice 288; this is `Types of parameters 0 and 1 are
+        ; incompatible` and what hangs under it).
+        Execute.start_tracing(sys, options, config_file_name)
+        sys.now()
+        let parse_t0 scaly_eio_now_ns()
+        let cp_args Tracing.no_args(host)
+        Tracing.add_arg(host, cp_args, "configFilePath", config_file_name)
+        let cp_tid sys.trace_push(TracePhaseProgram, "createProgram", cp_args)
+        let program DriverProgram.create(host, sys, options, root_names, config_file_name, config_text, config_diagnostics)
+        program.cp_tid := cp_tid
+        program.cp_args := cp_args
+        program.root_config := root_config
+        let loaded program.load()
+        ; `load` closes the event itself where the program is finished being
+        ; created; this is the path that never got that far
+        program.close_create_program()
+        if loaded = false
+            return ExitStatusNotImplemented
+        sys.now()
+        Execute.add_stat_time(sys, 1, parse_t0)
+        ; EmitFilesAndReportErrors
+        let check_t0 scaly_eio_now_ns()
+        let all &Array[ref[DriverDiagnostic]]^host()
+        if program.diagnostics_of_any_program(all, false, true) = false
+            return ExitStatusNotImplemented
+        sys.now()
+        Execute.add_stat_time(sys, 2, check_t0)
+        let emit_t0 scaly_eio_now_ns()
+        if program.flag("listFilesOnly")
+            program.emit_skipped := true
+        else
+        {
+            let em_tid sys.trace_push(TracePhaseEmit, "emit", null)
+            let emitted program.emit()
+            sys.trace_pop(em_tid, TracePhaseEmit, "emit", null)
+            if emitted = false
+                return ExitStatusNotImplemented
+        }
+        sys.now()
+        Execute.add_stat_time(sys, 3, emit_t0)
+        var ei 0
+        while ei < (program.emit_diagnostics.get_length() as int)
+        {
+            all.add(program.emit_diagnostics[ei as size_t])
+            ei := ei + 1
+        }
+        ; OnEmittedFiles
+        var ti 0
+        while ti < (program.emitted_files.get_length() as int)
+        {
+            let emitted_file program.emitted_files[ti as size_t]
+            sys.touch_emitted(emitted_file)
+            ti := ti + 1
+        }
+        let sorted DriverProgram.sort_and_deduplicate(host, all)
+        Execute.report_all(sys, r, sorted)
+        if program.list_files(program.emitted_files) = false
+            return ExitStatusNotImplemented
+        if summary_pretty
+            DiagnosticWriter.write_error_summary(host, sys.output, sorted, sys.cwd, "\n")
+        program.report_statistics()
+        Execute.stop_tracing(sys, program)
+        if sorted.get_length() = 0
+            return ExitStatusSuccess
+        if program.emit_skipped
+            return ExitStatusDiagnosticsPresent_OutputsSkipped
+        ExitStatusDiagnosticsPresent_OutputsGenerated
+    }
+
+    ; ── tsc.go's startTracing / StopTracing ──────────────────────────────────
+    ;
+    ; `deterministic` is `testing != nil` upstream, and every program in this
+    ; repository runs under the harness — see tracing.scaly's header for what the
+    ; flag decides.
+    procedure start_tracing(mutable sys: ref[ExecSystem], mutable options: ref[TsOptions], mutable config_file_name: Slice[char]) mutable checker_trace_types
+    {
+        let dir options.text_of("generateTrace")
+        if (dir.length as int) = 0
+            return
+        let host sys.host
+        sys.tracing := Tracing.create(host, dir, config_file_name, true)
+        Checker.set_trace_types(true)
+    }
+
+    ; StopTracing: the types file of every checker the session legended, then the
+    ; stream and the legend
+    procedure stop_tracing(mutable sys: ref[ExecSystem], mutable program: ref[DriverProgram]) mutable checker_trace_types
+    {
+        if sys.tracing = null
+            return
+        let tr sys.tracing as ref[Tracing]
+        let host sys.host
+        let c program.trace_checker()
+        if c <> null
+        {
+            let types_path tr.new_type_tracer(0)
+            let text (c as ref[Checker]).dump_types_text()
+            if (text.length as int) > 0
+                sys.write_file(types_path, text)
+        }
+        sys.write_file(tr.trace_path, tr.trace_text())
+        sys.write_file(Tracing.combine(host, tr.trace_dir, "legend.json"), tr.legend_text())
+        sys.tracing := null
+        Checker.set_trace_types(false)
+    }
+}

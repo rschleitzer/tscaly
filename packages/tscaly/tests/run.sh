@@ -119,6 +119,7 @@ cd "$(dirname "$0")/../../.."
 REPO=$(pwd)
 
 PKG=packages/tscaly
+. "$PKG/tests/packages.sh"
 SUB=$PKG/_submodules/typescript-go
 TS=$SUB/_submodules/TypeScript
 OUT=$PKG/tests/out
@@ -351,7 +352,7 @@ fi
 # records in one package are a porting mistake even when today's roots happen
 # not to lay both out, and a pair with the SAME field names would pass the
 # compiler's test and still be wrong here (TypeReferenceData was that pair).
-DUPES=$(grep -h '^define [A-Za-z_]' "$PKG"/0.1.2/tscaly/*.scaly \
+DUPES=$(grep -h '^define [A-Za-z_]' packages/{tsbase,tscaly,tsdriver}/[0-9]*/*/*.scaly \
         | awk '{print $2}' | sed 's/\[.*//' | grep -v ':' | sort | uniq -d)
 if [ -n "$DUPES" ]; then
   red "two top-level concepts in packages/tscaly share a name, and the emitter keeps ONE:"
@@ -371,7 +372,7 @@ fi
 # artifacts through the dump programs and has no legitimate use for the
 # runtime's stderr printers. If one ever appears, it belongs behind an
 # environment switch and this line gets the exception with a reason.
-PROBES=$(grep -ln 'scaly_eput' "$PKG"/0.1.2/*.scaly "$PKG"/0.1.2/tscaly/*.scaly 2>/dev/null)
+PROBES=$(grep -ln 'scaly_eput' packages/{tsbase,tscaly,tsdriver}/[0-9]*/*.scaly packages/{tsbase,tscaly,tsdriver}/[0-9]*/*/*.scaly 2>/dev/null)
 if [ -n "$PROBES" ]; then
   red "a debug probe writes to stderr in the ported sources — no yardstick reads it:"
   echo "$PROBES" | sed 's/^/    /'
@@ -384,17 +385,16 @@ fi
 # Two objects per program, the way the opensp drop-in is built: the package
 # object carries the bodies, the program object the entry point.
 
-"$SCALYC" -c --no-prelude -o "$OUT/tscaly.o" "$PKG/0.1.2/tscaly.scaly" \
-  > "$OUT/pkg-build.log" 2>&1
+build_packages "$OUT" "$OUT/pkg-build.log"
 if [ $? -ne 0 ]; then
-  red "the tscaly package failed to compile:"; sed 's/^/    /' "$OUT/pkg-build.log"; exit 2
+  red "the port's packages failed to compile:"; sed 's/^/    /' "$OUT/pkg-build.log"; exit 2
 fi
 
 # The seven programs are independent of each other: one job each.
 PROGS="tscaly_tokens tscaly_ast tscaly_jsdoc tscaly_symbols tscaly_flow tscaly_types tscaly_dump"
 for prog in $PROGS; do
-  ( "$SCALYC" -c -o "$OUT/$prog.o" "$PKG/0.1.2/$prog.scaly" > "$OUT/$prog-build.log" 2>&1 || exit 1
-    clang -o "$OUT/$prog$EXE" "$OUT/$prog.o" "$OUT/tscaly.o" "$LIBSCALY" $LINK_LIBS > "$OUT/$prog-link.log" 2>&1 || exit 2
+  ( "$SCALYC" -c -o "$OUT/$prog.o" "$PKG/$(packages/tscaly/tools/version.sh)/$prog.scaly" > "$OUT/$prog-build.log" 2>&1 || exit 1
+    clang -o "$OUT/$prog$EXE" "$OUT/$prog.o" $(package_objects "$OUT") "$LIBSCALY" $LINK_LIBS > "$OUT/$prog-link.log" 2>&1 || exit 2
   ) &
   eval "pid_$prog=$!"
 done

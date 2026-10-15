@@ -14,7 +14,7 @@
 #
 # ★★ IT IS A LEAD LIST, NOT A DEFECT LIST. Four honest populations answer here and are
 # labelled rather than filtered away, because filtering by name is how a scan starts lying:
-#   ENTRY     a program's own entry point (0.1.2/tscaly_*.scaly drive them)
+#   ENTRY     a program's own entry point (tscaly's tscaly_*.scaly drive them)
 #   DUMP      an artifact writer selected by a flag rather than called by name
 #   ARM       a helper written for an arm that is not written yet  ← the interesting one
 #   WRAP      a one-line forward to the same name's `_ex`, where every caller took the
@@ -38,10 +38,10 @@
 #
 # Usage:  packages/tscaly/tools/nocaller.py [file-substring ...]
 import io, re, sys, glob, os
+import portfiles
 
-root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '0.1.2')
-files = sorted(glob.glob(os.path.join(root, 'tscaly', '*.scaly')) +
-               glob.glob(os.path.join(root, '*.scaly')))
+root = portfiles.version_dir('tscaly')
+files = sorted(portfiles.module_files() + portfiles.root_files())
 want = sys.argv[1:]
 
 defs, calls, wraps = {}, set(), set()

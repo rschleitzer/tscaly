@@ -29,9 +29,10 @@
 import os
 import re
 import sys
+import portfiles
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(HERE, "..", "0.1.2", "tscaly", "checker.scaly")
+SRC = portfiles.module_path("checker.scaly")
 
 # The getters that answer a LIST and use null for "empty". Every one of them ends
 # in a slot that get_named_members or a `new_*_list` may have left null.

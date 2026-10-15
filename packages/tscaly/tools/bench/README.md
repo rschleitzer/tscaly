@@ -97,11 +97,11 @@ Homebrew's `llvm@21`). Measured above, 2026-10-14: the instrumented build takes
 ulimit -s 65520
 mkdir -p ~/repos/bench/pgo
 cd <repo>
-scaly build packages/tscaly/0.1.2/tscaly_exec.scaly --pgo-train -o ~/repos/bench/bin/tscaly_pgogen
+scaly build packages/tscaly/0.1.3/tscaly_exec.scaly --pgo-train -o ~/repos/bench/bin/tscaly_pgogen
 (cd ~/repos/bench && LLVM_PROFILE_FILE=$PWD/pgo/tscaly-%p.profraw \
   ./bin/tscaly_pgogen --bench-batch vscode-paths.scenario > /dev/null)
 llvm-profdata merge -o ~/repos/bench/pgo/tscaly.profdata ~/repos/bench/pgo/*.profraw
-scaly build packages/tscaly/0.1.2/tscaly_exec.scaly --pgo ~/repos/bench/pgo/tscaly.profdata -o ~/repos/bench/bin/tscaly_pgo
+scaly build packages/tscaly/0.1.3/tscaly_exec.scaly --pgo ~/repos/bench/pgo/tscaly.profdata -o ~/repos/bench/bin/tscaly_pgo
 ```
 
 PGO stays out of the default build: name it whenever its rows are quoted.
