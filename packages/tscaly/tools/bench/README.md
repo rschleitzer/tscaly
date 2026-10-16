@@ -56,32 +56,32 @@ is checked, so a run that ends early says how far it came
 (`grep -c '^check ' vscode.out`). The diagnostics are in the `==== OUTPUT`
 block of `vscode.out`, in pretty format.
 
-## Measured 2026-10-14
+## Measured 2026-10-16
 
-Apple M4 (four performance and six efficiency cores), 24 GB, macOS 26. VS Code
-at `0a9c4d28` (19 259 scenario files), tscaly at `b305a22` (0.1.2) built with
-Scaly 0.2.13, tsgo built from the submodule (typescript-go 7.0.2), tsc 6.0.3 on
-node 22. `/usr/bin/time -l`, footprint = its `peak memory footprint`. One
-warm-up run, then rounds alternating between the binaries; the median of each
-column and, in brackets, the range.
+Apple M4 (four performance and six efficiency cores), 24 GB, macOS 26, freshly
+restarted. VS Code at `0a9c4d28` (19 259 scenario files), tscaly at `5b47d46`
+(0.1.3) built with Scaly 0.2.15, tsgo built from the submodule (typescript-go
+7.0.2), tsc 6.0.3 on node 22. `/usr/bin/time -l`, footprint = its `peak memory
+footprint`. One warm-up run, then rounds alternating between the binaries; the
+median of each column and, in brackets, the range.
 
 | | wall | user | sys | footprint |
 |---|---|---|---|---|
-| tsc 6.0.3 (3 runs) | 71.97 s (71.02–72.29) | 82.90 s | 2.6 s | 9.7 GB |
-| tsgo (6 runs) | 6.71 s (6.66–7.28) | 32.17 s (31.53–36.61) | 1.9 s | 7.8 GB (7.75–8.17) |
-| tsgo `--singleThreaded` (3 runs) | 18.13 s (18.04–18.24) | 21.18 s (19.58–21.40) | 1.0 s | 6.9 GB (6.78–7.19) |
-| tscaly, 4 checkers (6 runs) | **4.97 s** (4.78–5.10) | **16.34 s** (15.72–16.90) | 2.9 s | 9.4 GB |
-| tscaly, 1 checker (3 runs) | 10.47 s (10.45–10.48) | 13.07 s (13.05–13.11) | 2.6 s | 7.8 GB |
-| tscaly, 4 checkers, PGO (3 runs) | **4.25 s** (4.20–5.06) | **13.61 s** (13.57–13.66) | 2.8 s | 9.4 GB |
-| tscaly, 1 checker, PGO (3 runs) | 8.68 s (8.67–8.69) | 10.83 s (10.80–10.85) | 2.5 s | 7.8 GB |
+| tsc 6.0.3 (3 runs) | 68.88 s (68.82–68.91) | 80.55 s | 2.2 s | 9.6 GB |
+| tsgo (6 runs) | 6.85 s (6.43–7.16) | 34.26 s (29.21–37.33) | 1.8 s | 8.0 GB (7.74–8.06) |
+| tsgo `--singleThreaded` (3 runs) | 17.87 s (17.78–18.29) | 21.01 s (20.42–24.62) | 0.9 s | 7.0 GB (6.90–7.14) |
+| tscaly, 4 checkers (6 runs) | **4.90 s** (4.68–5.04) | **16.58 s** (15.73–17.15) | 2.8 s | 9.4 GB |
+| tscaly, 1 checker (3 runs) | 10.34 s (10.33–10.37) | 13.12 s (13.08–13.14) | 2.6 s | 7.8 GB |
+| tscaly, 4 checkers, PGO (3 runs) | **4.03 s** (3.98–4.03) | **13.29 s** (13.22–13.36) | 2.6 s | 9.4 GB |
+| tscaly, 1 checker, PGO (3 runs) | 8.51 s (8.51–8.52) | 10.80 s (10.74–10.86) | 2.6 s | 7.8 GB |
 
 Every tscaly run reports tsgo's 359 errors — the same file, line, column, code
 and text — and one checker and four print byte-identical output. tsc 6.0.3
 reports the same 359 and six more, implicit-`any` cycles (`TS7022`, `TS7024`)
 in one test file.
 
-With four checkers the port takes 0.74 of tsgo's wall time and half its user
-time, and needs 1.6 GB more memory; with PGO, 0.63 of the wall time and 0.42 of
+With four checkers the port takes 0.72 of tsgo's wall time and half its user
+time, and needs 1.4 GB more memory; with PGO, 0.59 of the wall time and 0.39 of
 the user time. On one thread each, the port takes 0.58 of tsgo's wall time
 (0.48 with PGO). The sys time is the page faults of the footprint.
 
@@ -138,8 +138,8 @@ seconds do not answer the same question.
 Two switches of `scaly build`: an instrumented build, trained on the scenario,
 and a build with the profile. The training run uses one checker. The profile
 needs the `llvm-profdata` of the LLVM the toolchain is built on (21; on macOS
-Homebrew's `llvm@21`). Measured above, 2026-10-14: the instrumented build takes
-40 s, the training run 10 s, the build with the profile 82 s.
+Homebrew's `llvm@21`). Measured above, 2026-10-16: the instrumented build takes
+46 s, the training run 8 s, the build with the profile 84 s.
 
 ```bash
 ulimit -s 65520
