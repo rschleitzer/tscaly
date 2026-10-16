@@ -7,7 +7,7 @@ memory.
 ## ⚠ Read first
 
 The port's footprint on the whole of VS Code is 9.4 GB with four checkers and
-7.8 GB with one; building it peaks at 8.5 GB. Run a measurement only under
+7.8 GB with one; building it peaks at 5.7 GB. Run a measurement only under
 `runwatch.sh`, with a footprint limit well below the machine's memory, and
 never while `build.sh` or a yardstick runs.
 
@@ -84,6 +84,54 @@ With four checkers the port takes 0.74 of tsgo's wall time and half its user
 time, and needs 1.6 GB more memory; with PGO, 0.63 of the wall time and 0.42 of
 the user time. On one thread each, the port takes 0.58 of tsgo's wall time
 (0.48 with PGO). The sys time is the page faults of the footprint.
+
+## Building the compilers
+
+The port and tsgo built from their sources on the same machine, 2026-10-16,
+the median of three runs of `/usr/bin/time -l`. CPU is the user and system
+time of every process of a build, memory the largest resident set of any one
+process. A clean build starts with the language's standard library already
+compiled.
+
+- tscaly at `1fb6050`: `scaly build packages/tscaly/0.1.3/tscaly_exec.scaly`,
+  with and without `--release`, Scaly 0.2.15. Its three packages are 326 000
+  lines of Scaly: `tsbase` 69 000, `tscaly` 236 000 (the checker alone
+  154 000), `tsdriver` 21 000.
+- tsgo from the submodule (`2bd066d87`): `go build ./cmd/tsgo`, Go 1.26.6;
+  276 000 lines of the module's own Go in 72 packages, the checker's package
+  60 000.
+
+| build | wall | CPU | memory |
+|---|---|---|---|
+| tscaly, release | 38.0 s | 36.7 s | 5.5 GB |
+| tscaly, debug | 30.7 s | 40.6 s | 5.7 GB |
+| tsgo | 44.4 s | 188.2 s | 2.0 GB |
+| tsgo, `-p 1` | 54.7 s | 164.4 s | 2.0 GB |
+
+From scratch the port builds in less wall time than tsgo and with a fifth of
+its CPU. It needs almost three times the memory: the compiler is one process
+that holds a whole package, and a release build the whole program. A debug
+build generates the code of a large package in parts, in worker processes,
+so its CPU exceeds its wall time. (`-p 1` builds one Go package at a time;
+the Go compiler still runs its back end on several threads.)
+
+After a change:
+
+| changed | tscaly, release | tscaly, debug | tsgo |
+|---|---|---|---|
+| nothing | 0.5 s | 0.5 s | 0.5 s |
+| the checker (a comment line appended) | 35.6 s | 24.6 s | 7.4 s |
+
+tsgo compiles the checker's package again and links. The port compiles the
+whole package the checker belongs to again, 236 000 lines, planned on one
+thread; `tsbase` and `tsdriver` come from the cache, `tsdriver` because it is
+keyed on the interface of `tscaly`, which a change inside a body leaves as it
+was. A release build then optimizes and generates the code of the whole
+program again, as one module: that is the binary measured above.
+
+tsc is not in these tables. Its build type-checks the compiler and bundles
+it as JavaScript; no machine code is made until node runs it, so its few
+seconds do not answer the same question.
 
 ## Profile-guided optimization
 

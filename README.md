@@ -26,7 +26,7 @@ scaly build packages/tscaly/0.1.3/tscaly_exec.scaly --release -o tscaly_exec
 
 The compiler finds the port's three packages — `tsbase`, `tscaly`,
 `tsdriver` — in `packages/` here and the standard library in the
-installation. The build takes under a minute and about 8.5 GB
+installation. The build takes about 40 seconds and 5.5 GB
 of memory.
 
 ## Test
