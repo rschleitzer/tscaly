@@ -17,7 +17,7 @@
 # is indistinguishable from a correct one, so: one generated corpus, two
 # producers, a byte diff.
 #
-#   ours       packages/tscaly/0.1.3/tscaly_arith.scaly + tscaly/ArithCheck.scaly
+#   ours       packages/tscaly/0.2.0/tscaly_arith.scaly + tscaly/ArithCheck.scaly
 #   reference  packages/tscaly/tests/oracle/arith.go, over the submodule's jsnum
 #
 # The corpus is GENERATED here rather than committed, from a fixed seed. One line

@@ -13,7 +13,7 @@
 # yardstick this repository has. An unexercised arm is indistinguishable from a
 # correct one, so: one generated corpus, two producers, a byte diff.
 #
-#   ours       packages/tscaly/0.1.3/tscaly_lits.scaly + tscaly/LitCheck.scaly
+#   ours       packages/tscaly/0.2.0/tscaly_lits.scaly + tscaly/LitCheck.scaly
 #   reference  packages/tscaly/tests/oracle/lits.go, over the submodule's own
 #              printer.EscapeString and jsnum.ParsePseudoBigInt
 #

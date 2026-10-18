@@ -13,7 +13,7 @@
 # arm is indistinguishable from a correct one — so they get their own instrument:
 # one generated corpus, two producers, a byte diff.
 #
-#   ours       packages/tscaly/0.1.3/tscaly_paths.scaly + tscaly/PathCheck.scaly
+#   ours       packages/tscaly/0.2.0/tscaly_paths.scaly + tscaly/PathCheck.scaly
 #   reference  packages/tscaly/tests/oracle/paths.go, over the submodule's tspath
 #
 # The corpus is GENERATED here rather than committed, from a fixed seed, so the

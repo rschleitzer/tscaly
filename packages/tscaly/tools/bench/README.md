@@ -93,7 +93,7 @@ time of every process of a build, memory the largest resident set of any one
 process. A clean build starts with the language's standard library already
 compiled.
 
-- tscaly at `1fb6050`: `scaly build packages/tscaly/0.1.3/tscaly_exec.scaly`,
+- tscaly at `1fb6050`: `scaly build packages/tscaly/0.2.0/tscaly_exec.scaly`,
   with and without `--release`, Scaly 0.2.15. Its three packages are 326 000
   lines of Scaly: `tsbase` 69 000, `tscaly` 236 000 (the checker alone
   154 000), `tsdriver` 21 000.
@@ -145,11 +145,11 @@ Homebrew's `llvm@21`). Measured above, 2026-10-16: the instrumented build takes
 ulimit -s 65520
 mkdir -p ~/repos/bench/pgo
 cd <repo>
-scaly build packages/tscaly/0.1.3/tscaly_exec.scaly --pgo-train -o ~/repos/bench/bin/tscaly_pgogen
+scaly build packages/tscaly/0.2.0/tscaly_exec.scaly --pgo-train -o ~/repos/bench/bin/tscaly_pgogen
 (cd ~/repos/bench && LLVM_PROFILE_FILE=$PWD/pgo/tscaly-%p.profraw \
   ./bin/tscaly_pgogen --bench-batch vscode-paths.scenario > /dev/null)
 llvm-profdata merge -o ~/repos/bench/pgo/tscaly.profdata ~/repos/bench/pgo/*.profraw
-scaly build packages/tscaly/0.1.3/tscaly_exec.scaly --pgo ~/repos/bench/pgo/tscaly.profdata -o ~/repos/bench/bin/tscaly_pgo
+scaly build packages/tscaly/0.2.0/tscaly_exec.scaly --pgo ~/repos/bench/pgo/tscaly.profdata -o ~/repos/bench/bin/tscaly_pgo
 ```
 
 PGO stays out of the default build: name it whenever its rows are quoted.

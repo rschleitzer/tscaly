@@ -16,7 +16,7 @@
 # unexercised arm is indistinguishable from a correct one. So: one generated
 # corpus, two producers, a byte diff.
 #
-#   ours       packages/tscaly/0.1.3/tscaly_nums.scaly + tscaly/NumCheck.scaly
+#   ours       packages/tscaly/0.2.0/tscaly_nums.scaly + tscaly/NumCheck.scaly
 #   reference  packages/tscaly/tests/oracle/nums.go, over the submodule's jsnum
 #
 # The corpus is GENERATED here rather than committed, from a fixed seed, so the

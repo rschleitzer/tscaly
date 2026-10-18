@@ -13,7 +13,7 @@
 # numcheck.sh makes for jsnum). So: one generated corpus, two producers, a byte
 # diff.
 #
-#   ours       packages/tscaly/0.1.3/tscaly_hash.scaly + tscaly/HashCheck.scaly
+#   ours       packages/tscaly/0.2.0/tscaly_hash.scaly + tscaly/HashCheck.scaly
 #   reference  packages/tscaly/tests/oracle/hash.go, over zeebo/xxh3 - the very
 #              package internal/tracing hashes its thread ids with
 #

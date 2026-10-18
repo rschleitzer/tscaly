@@ -102,7 +102,7 @@
 # Usage:
 #
 #   packages/tscaly/tests/ctl.sh "the claim in one line" <<'SPEC'
-#   FILE packages/tscaly/0.1.3/tscaly/scanner.scaly
+#   FILE packages/tscaly/0.2.0/tscaly/scanner.scaly
 #   <<<OLD
 #   ...text exactly as it appears, one occurrence in that file...
 #   >>>NEW

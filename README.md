@@ -21,7 +21,7 @@ Install Scaly (`curl -fsSL https://scaly.io/install.sh | sh`, or see
 [scaly.io/download](https://scaly.io/download/)), then from this directory:
 
 ```sh
-scaly build packages/tscaly/0.1.3/tscaly_exec.scaly --release -o tscaly_exec
+scaly build packages/tscaly/0.2.0/tscaly_exec.scaly --release -o tscaly_exec
 ```
 
 The compiler finds the port's three packages — `tsbase`, `tscaly`,
@@ -59,7 +59,7 @@ when, and what it cost — memory included.
 
 ## Layout and license
 
-The sources are in `packages/tscaly/0.1.3/`; origin, the pinned upstream
+The sources are in `packages/tscaly/0.2.0/`; origin, the pinned upstream
 commit and the statement of changes are in
 [`packages/tscaly/README.md`](packages/tscaly/README.md).
 

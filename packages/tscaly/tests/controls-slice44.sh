@@ -86,8 +86,8 @@ set -u
 cd "$(dirname "$0")/../../.."
 
 CTL=packages/tscaly/tests/ctl.sh
-J=packages/tscaly/0.1.3/tscaly/jsnum.scaly
-S=packages/tscaly/0.1.3/tscaly/scanner.scaly
+J=packages/tscaly/0.2.0/tscaly/jsnum.scaly
+S=packages/tscaly/0.2.0/tscaly/scanner.scaly
 
 export TSCALY_BASELINE=$(mktemp -t tscaly-baseline)
 cleanup() { rm -f "$TSCALY_BASELINE" "$TSCALY_BASELINE.fp"; }
